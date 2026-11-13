@@ -2,7 +2,7 @@
 
 > Release stage: [Pre-release](https://docs.temporal.io/develop/dotnet/integrations/microsoft-agent-framework).
 
-This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) runs [Microsoft Agent Framework](https://github.com/microsoft/microsoft-agent-framework) agents inside Temporal Workflows. You write the Workflow, build the agent in it with Agent Framework and Microsoft.Extensions.AI types, and call `RunAsync`. Every model call, every MCP call and every tool you opt in runs as a Temporal Activity, so a worker crash, a provider outage or a week-long approval wait does not lose the run. The provider client and its credentials live on the worker; Workflow code passes a model name.
+This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) runs [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) agents inside Temporal Workflows. You write the Workflow, build the agent in it with Agent Framework and Microsoft.Extensions.AI types, and call `RunAsync`. Every model call, every MCP call and every tool you opt in runs as a Temporal Activity, so a worker crash, a provider outage or a week-long approval wait does not lose the run. The provider client and its credentials live on the worker; Workflow code passes a model name.
 
 The package targets `net10.0` and needs `Temporalio` 1.22.0 or later and `Microsoft.Agents.AI` 1.26.0 or later. .NET 8 and 9 left support on 2026-11-10, so there is no older target.
 
@@ -90,7 +90,7 @@ The plugin registers three Activities on the worker: `MicrosoftAgentFramework.In
 
 ## Chat clients and credentials
 
-`MicrosoftAgentFrameworkPluginOptions.ChatClients` maps a model name to a factory. The factory runs once per worker, on the first model call that names it, and the client is reused for the worker's lifetime. The Workflow only ever sees the name: `new TemporalAgent("gpt-4o-mini")` or `new TemporalChatClient("gpt-4o-mini")`. A name without a factory fails the Activity with error type `MicrosoftAgentFrameworkConfigurationError` and no retry.
+`MicrosoftAgentFrameworkPluginOptions.ChatClients` maps a model name to a factory. The factory runs once per worker, on the first model call that names it, and the client is reused for the worker's lifetime. The Workflow only ever sees the name: `new TemporalAgent("gpt-4o-mini")` or `new TemporalChatClient("gpt-4o-mini")`. A name without a factory, or a factory that throws (for example when `OPENAI_API_KEY` is not set), fails the Activity with error type `MicrosoftAgentFrameworkConfigurationError` and no retry; the failure carries the factory's exception message, and the Workflow fails unless it catches the `ActivityFailureException`.
 
 Register as many names as you need; two agents in one Workflow can use two models. Any `ChatClientBuilder` pipeline works in the factory (`UseOpenTelemetry`, `UseLogging`, caching) with one exception: a client that contains `FunctionInvokingChatClient` is rejected with `MicrosoftAgentFrameworkConfigurationError`, because it would run tools inside the model Activity instead of in the Workflow.
 
@@ -127,7 +127,7 @@ Provider errors are classified by HTTP status, never by message text. 400, 401, 
 
 Tools go in `ChatOptions.Tools`, as in Agent Framework. Where a tool runs is your choice per tool:
 
-- A plain `AIFunction` from `AIFunctionFactory.Create` runs inside the Workflow. Its code must be deterministic: no clock, no random numbers, no I/O, no `Task.Run`. Use it for string handling, routing and lookups in Workflow state.
+- A plain `AIFunction` from `AIFunctionFactory.Create` runs inside the Workflow. Its code must be deterministic: no clock, no random numbers, no I/O, no `Task.Run`. It runs again on every replay, so keep its effects in Workflow state. Use it for string handling, routing and lookups in Workflow state.
 - `ActivityAsTool.Create` wraps one of your Temporal Activities. Each invocation is one Activity with the options you pass; the parameter schema comes from the method signature and `[Description]` attributes. Register the Activity on the worker as usual.
 - `TemporalMcpTool` runs an MCP tool as an Activity; see the next section.
 
@@ -173,7 +173,7 @@ public class ToolsWorkflow
 }
 ```
 
-`ActivityAsTool.Create` also takes a static call expression (`() => Activities.Fetch(default!)`), a delegate or a `MethodInfo`. The argument values in the expression are placeholders; the model supplies the real ones.
+`ActivityAsTool.Create` also takes a static call expression (`() => Activities.Fetch(default!)`), a delegate or a `MethodInfo`. The argument values in the expression are placeholders; the model supplies the real ones. A trailing `CancellationToken` parameter with a default value stays out of the schema and of the call, and the Activity reads cancellation from `ActivityExecutionContext.Current.CancellationToken`; a token parameter anywhere else is rejected, because a token cannot cross the Activity boundary.
 
 The loop follows `FunctionInvokingChatClient`. With `AllowConcurrentInvocation = true` the tool calls of one response run at the same time through `Workflow.WhenAllAsync`, with results in call order; the default runs them one after the other. A tool that throws gives the model the result `Error: Function failed.`; three consecutive failing rounds are tolerated and the fourth fails the run with `MicrosoftAgentFrameworkWorkflowError`. A call to a name that is not in `ChatOptions.Tools` gives the model `Error: Requested function "name" not found.` `MaximumIterationsPerRun` (default 40) caps the model calls of one run; at the cap the agent makes one more call without function tools and returns that answer.
 
@@ -231,13 +231,13 @@ public class McpWorkflow
 
 `ListToolsAsync` is one `MicrosoftAgentFramework.McpListTools` Activity and returns a `TemporalMcpTool` per tool with the server's full input schema, so the model sees the parameters. Each call is one `MicrosoftAgentFramework.McpCallTool` Activity (60-second start-to-close timeout by default). The worker opens one `McpClient` per server on first use, shares it across Activities, closes it after `McpConnectionIdleTimeout` (default 5 minutes) without a call, and closes everything when the worker stops. `CacheTools = true` lets the worker answer the list Activity from the list it fetched earlier on the same connection; the default lists every time so a changed server is seen. Set `ToolNamePrefix` when two servers share a tool name; calls reach the server under the original name.
 
-A result with `isError`, an unknown tool or bad arguments fails the Activity with error type `MicrosoftAgentFrameworkMcpError` and no retry; the model is told the tool failed. A transport that cannot connect retries under the Activity's retry policy.
+A result with `isError`, an unknown tool or bad arguments fails the Activity with error type `MicrosoftAgentFrameworkMcpError` and no retry; the model is told the tool failed. A transport that cannot connect retries under the Activity's retry policy. A transport factory that throws fails the Activity with `MicrosoftAgentFrameworkConfigurationError` and no retry, like a chat client factory that throws.
 
 The listed catalog says nothing about which tools have side effects. To pin a catalog instead of discovering it, build `TemporalMcpTool` yourself from a `ToolDeclaration` with the schema you expect, and wrap tools that need a human in `ApprovalRequiredAIFunction`. Sessions are stateless: one connection per worker per server, no session affinity.
 
 ## Approvals
 
-Agent Framework's approval contract works unchanged. Wrap a tool in `ApprovalRequiredAIFunction` and the run returns a `ToolApprovalRequestContent` instead of calling it; the request id is `ficc_` plus the call id. Your Workflow decides how the answer arrives. The example uses a Query to show the pending request and an Update with a validator to deliver the decision:
+Agent Framework's approval contract applies, with the two differences described below. Wrap a tool in `ApprovalRequiredAIFunction` and the run returns a `ToolApprovalRequestContent` instead of calling it; the request id is `ficc_` plus the call id. Your Workflow decides how the answer arrives. The example uses a Query to show the pending request and an Update with a validator to deliver the decision:
 
 ```csharp
 using Microsoft.Agents.AI;
@@ -297,7 +297,11 @@ public class ApprovalWorkflow
 }
 ```
 
-The client reads `PendingApproval`, shows the `FunctionCallContent` in `request.ToolCall`, and sends `request.CreateResponse(approved: true)` or `request.CreateResponse(false, "reason")` through the Update. A Signal works the same way when no validation or return value is needed. The next run on the same session executes approved calls, gives the model `Tool call invocation was rejected by the approver and must not be retried.` plus your reason for rejected ones, and never sends the approval contents to the provider. A run that starts with an unanswered request on the session fails with `MicrosoftAgentFrameworkWorkflowError`.
+The client reads `PendingApproval`, shows the `FunctionCallContent` in `request.ToolCall`, and sends `request.CreateResponse(approved: true)` or `request.CreateResponse(false, "reason")` through the Update. A Signal works the same way when no validation or return value is needed. The next run on the same session executes approved calls, gives the model `Tool call invocation was rejected by the approver and must not be retried.` plus your reason for rejected ones, and never sends the approval contents to the provider.
+
+The plugin binds each response to the request it surfaced, as Agent Framework's default middleware does: the call that runs is the one the session recorded under that request id, with the name and arguments the human saw, so a response that carries a changed `FunctionCallContent` cannot redirect the call. Your Workflow only has to check the request id, as the validator above does. A request that appears only in a run's input cannot authorize anything.
+
+Two things differ from `ChatClientAgent`, which rejects an unanswered request on the caller's behalf and ignores a response it did not record. Here a request that reaches the next run without a response, and a response whose request id the session never surfaced, both fail the run with `MicrosoftAgentFrameworkWorkflowError`: a durable Workflow should not drop a pending decision silently. A run that fails after the decision, for example because the final model call failed for good, stores nothing in the session, as under `ChatClientAgent`; retry the same run with the same decision, and expect the approved call to run again.
 
 While the Workflow waits, no Activity is open: the wait costs nothing and survives worker restarts. When one response mixes approval-required calls with plain ones, nothing runs until the human answers: the response carries the requests that need a decision, the plain calls are held in the session, and the next run executes both groups in one tool round, which is what Agent Framework's default middleware does.
 
@@ -382,7 +386,7 @@ public class ChatWorkflow
 }
 ```
 
-What carries over: the serialized session (transcript and any provider state in the bag) and whatever you put in the input. What does not: the `TemporalAgent` instance (build a new one), MCP connections (the worker reconnects), and an approval request you have not answered yet (answer it before continuing, or carry the pending request in your own input). The serialized form is `{"stateBag": ...}`, the shape `ChatClientAgent` writes, so a session saved by one can be read by the other.
+What carries over: the serialized session (transcript and any provider state in the bag) and whatever you put in the input. What does not: the `TemporalAgent` instance (build a new one), MCP connections (the worker reconnects), and an approval request you have not answered yet (answer it before continuing, or carry the pending request in your own input). The serialized form is `{"stateBag": ...}`, the shape `ChatClientAgent` writes, so a transcript saved by one can be read by the other. Approvals in flight do not carry across: the two keep pending and held requests under different state keys, so finish the approval round before you hand a session to the other side.
 
 ## Structured output
 
@@ -411,7 +415,7 @@ The schema comes from `AgentAbstractionsJsonUtilities.DefaultOptions` (camelCase
 
 ## Context and history providers
 
-`TemporalAgentOptions.ChatHistoryProvider` and `AIContextProviders` run inside the Workflow around each run, through the same `InvokingAsync` and `InvokedAsync` calls `ChatClientAgent` makes, with the same request list: history, your input and the messages the context providers added, so their messages are stored the way `ChatClientAgent` stores them. Providers must complete synchronously and deterministically. The plugin calls them with the SDK's scheduler tracing off and checks the `ValueTask` they return: one that is not complete (the provider awaited I/O, a timer or another thread) fails the run with `MicrosoftAgentFrameworkWorkflowError` naming the provider, and whatever the provider started in the background is abandoned. Providers that read a database or a memory service belong in an Activity whose result you add to the prompt.
+`TemporalAgentOptions.ChatHistoryProvider` and `AIContextProviders` run inside the Workflow around each run, through the same `InvokingAsync` and `InvokedAsync` calls `ChatClientAgent` makes, with the same request list: history, your input and the messages the context providers added, so their messages are stored the way `ChatClientAgent` stores them. Providers must complete synchronously and deterministically. The plugin calls them with the SDK's scheduler tracing off and checks what comes back. A `ValueTask` that is not complete, because the provider awaited I/O, a timer or another thread, fails the run with `MicrosoftAgentFrameworkWorkflowError` naming the provider; the rest of that provider's code may still resume inside a later Workflow Task of the same run, so do not rely on it, and fix the provider. A provider that awaits an Activity, `Workflow.DelayAsync` or a child Workflow fails the run with the same error type and a message that says so; the Activity or timer it started is not cancelled. A provider that throws fails the Workflow Task, and Temporal retries the task until the code is fixed or the run times out, as for any exception in Workflow code; throw `ApplicationFailureException` from the provider to fail the run instead. Providers that read a database or a memory service belong in an Activity your Workflow runs before the agent, with the result added to the prompt or the provider's state.
 
 The default history provider is `InMemoryChatHistoryProvider`. Setting another one logs a warning and runs, because it persists the conversation next to Event History, which already holds it. Two providers that share a state key are rejected at construction.
 
