@@ -32,7 +32,10 @@ public sealed class McpToolOptions
 
     /// <summary>
     /// Gets or sets a prefix for the names the model sees, so two servers with the same tool
-    /// name do not clash. Calls go to the server under the original name.
+    /// name do not clash. The name is built the way Agent Framework's MCP tool builds it:
+    /// characters outside <c>A-Za-z0-9_.-</c> become <c>-</c> and the prefix is joined with one
+    /// <c>_</c>, so <c>gh</c> and <c>gh_</c> both give <c>gh_tool</c>. Calls go to the server
+    /// under the original name.
     /// </summary>
     public string? ToolNamePrefix { get; set; }
 

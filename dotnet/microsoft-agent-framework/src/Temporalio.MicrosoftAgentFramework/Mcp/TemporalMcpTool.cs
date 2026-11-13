@@ -27,7 +27,7 @@ public sealed class TemporalMcpTool : AIFunction
         this.options = options ?? new McpToolOptions();
         Server = server;
         ServerToolName = declaration.Name;
-        Name = (this.options.ToolNamePrefix ?? string.Empty) + declaration.Name;
+        Name = McpToolNames.Build(this.options.ToolNamePrefix, declaration.Name);
         Description = declaration.Description ?? string.Empty;
         JsonSchema = declaration.JsonSchema;
         ReturnJsonSchema = declaration.ReturnJsonSchema;
