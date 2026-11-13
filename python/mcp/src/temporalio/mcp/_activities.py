@@ -1,14 +1,16 @@
 # pyright: reportUnusedClass=false
 
 import asyncio
+import json
 import logging
-import sys
+import re
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, TypeVar, cast
 
 from mcp import MCPError
+from mcp.client import InputRequiredRoundsExceededError
 from mcp.types import (
     HEADER_MISMATCH,
     INVALID_PARAMS,
@@ -36,9 +38,6 @@ from temporalio.mcp._activity import (
 )
 from temporalio.mcp._backend import _MCPBackend, _MCPBackendFactory
 from temporalio.mcp._pool import _MCPConnectionPool
-
-if sys.version_info < (3, 11):
-    from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
 
 _Result = TypeVar("_Result")
 _ListResult = TypeVar("_ListResult", bound=BaseModel)
@@ -79,11 +78,38 @@ def _session_lost(err: MCPError) -> bool:
     )
 
 
-def _lone_mcp_error(group: BaseExceptionGroup[Any]) -> MCPError | None:
-    """The MCPError that a nest of ExceptionGroups carries alone, if it does."""
+# The MCP client checks a tool's result against the tool's output schema and
+# raises RuntimeError with one of these messages (mcp/client/session.py). It
+# also raises InputRequiredRoundsExceededError when a call runs past its round
+# limit. A retry of the same request can't fix either.
+_REJECTED_RESULT = re.compile(
+    r"Tool .+ has an output schema but did not return structured content$"
+    r"|Invalid structured content returned by tool "
+    r"|Invalid schema for tool ",
+    re.DOTALL,
+)
+
+
+def _rejected_result(err: RuntimeError) -> bool:
+    """Whether the MCP client rejected a result that the server returned."""
+    return isinstance(err, InputRequiredRoundsExceededError) or bool(
+        _REJECTED_RESULT.match(str(err))
+    )
+
+
+def _rejected(err: RuntimeError) -> ApplicationError:
+    return ApplicationError(str(err), type="MCPProtocolError", non_retryable=True)
+
+
+def _lone_error(
+    group: BaseExceptionGroup[Any],
+) -> MCPError | ValidationError | RuntimeError | ApplicationError | None:
+    """The error we classify that a nest of ExceptionGroups carries alone, if it does."""
     while len(group.exceptions) == 1:
         (inner,) = group.exceptions
-        if isinstance(inner, MCPError):
+        if isinstance(inner, (MCPError, ValidationError, ApplicationError)):
+            return inner
+        if isinstance(inner, RuntimeError) and _rejected_result(inner):
             return inner
         if not isinstance(inner, BaseExceptionGroup):
             return None
@@ -102,8 +128,45 @@ def _protocol_error(err: MCPError, has_session: bool) -> ApplicationError:
     )
 
 
+def _invalid_response(err: ValidationError) -> ApplicationError:
+    # A validator's ctx can hold the exception it raised, which the payload
+    # converter cannot serialize; pydantic's JSON form renders it as a string.
+    return ApplicationError(
+        "MCP server returned an invalid response",
+        json.loads(err.json(include_url=False, include_input=False)),
+        type="MCPProtocolError",
+        non_retryable=True,
+    )
+
+
 def _dump(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json")
+
+
+@asynccontextmanager
+async def _heartbeating() -> AsyncGenerator[None, None]:
+    """Heartbeat at half the Activity's heartbeat timeout while the block runs.
+
+    A cancel reaches a running Activity only in a heartbeat's response. The
+    beats come from a timer, not from the request's progress, so a slow request
+    isn't mistaken for a lost worker.
+    """
+    timeout = activity.info().heartbeat_timeout if activity.in_activity() else None
+    if not timeout:
+        yield
+        return
+
+    async def beat(interval: float) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            activity.heartbeat()
+
+    task = asyncio.create_task(beat(timeout.total_seconds() / 2))
+    try:
+        yield
+    finally:
+        # Not awaited: awaiting it here could swallow a cancel of the Activity.
+        task.cancel()
 
 
 def _normalize_list_result(
@@ -141,10 +204,13 @@ class _MCPActivities:
     ) -> _Result:
         has_session = False
         try:
-            async with self._pool.backend(
-                server,
-                factory_argument=request.factory_argument,
-            ) as backend:
+            async with (
+                _heartbeating(),
+                self._pool.backend(
+                    server,
+                    factory_argument=request.factory_argument,
+                ) as backend,
+            ):
                 # Only older-protocol connections have MCP sessions. Each
                 # Activity attempt opens its own, so a retry starts a new one.
                 has_session = not backend.cacheable
@@ -155,17 +221,23 @@ class _MCPActivities:
             # ``Client.__aexit__`` re-raises an error from the ``async with`` body
             # wrapped in task-group ExceptionGroups, which a factory argument or a
             # failed connect lets through.
-            mcp_error = _lone_mcp_error(group)
-            if mcp_error is None:
-                raise
-            raise _protocol_error(mcp_error, has_session) from mcp_error
+            inner = _lone_error(group)
+            if isinstance(inner, ApplicationError):
+                # Already classified, such as a repeated pagination cursor.
+                raise inner
+            if isinstance(inner, MCPError):
+                raise _protocol_error(inner, has_session) from inner
+            if isinstance(inner, ValidationError):
+                raise _invalid_response(inner) from inner
+            if isinstance(inner, RuntimeError):
+                raise _rejected(inner) from inner
+            raise
         except ValidationError as err:
-            raise ApplicationError(
-                "MCP server returned an invalid response",
-                err.errors(include_url=False, include_input=False),
-                type="MCPProtocolError",
-                non_retryable=True,
-            ) from err
+            raise _invalid_response(err) from err
+        except RuntimeError as err:
+            if _rejected_result(err):
+                raise _rejected(err) from err
+            raise
 
     def _build_activities(self) -> Sequence[Callable[..., Any]]:
         activities: list[Callable[..., Any]] = []

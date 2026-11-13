@@ -2,6 +2,8 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { BaseModelConfig, JSONValue, Message, ModelStreamEvent, StreamOptions, Tool } from '@strands-agents/sdk';
 import { McpClient, Model } from '@strands-agents/sdk';
 import type { TestFn } from 'ava';
+import { optionalTsToMs } from '@temporalio/common/lib/time';
+import type { temporal } from '@temporalio/proto';
 import type { BaseContext } from '@temporalio/test-helpers';
 import { createBaseBundlerOptions, TestWorkflowEnvironment } from '@temporalio/test-helpers';
 import { bundleWorkflowCode, DefaultLogger } from '@temporalio/worker';
@@ -70,6 +72,13 @@ export function toolCallTurn(toolName: string, toolUseId: string, input: object)
     { type: 'modelContentBlockStopEvent' },
     { type: 'modelMessageStopEvent', stopReason: 'toolUse' },
   ];
+}
+
+/** Each scheduled activity's type and heartbeat timeout in milliseconds, 0 for none. */
+export function heartbeatTimeouts(events: temporal.api.history.v1.IHistoryEvent[] | null | undefined): [string, number][] {
+  return (events ?? [])
+    .flatMap((e) => e.activityTaskScheduledEventAttributes ?? [])
+    .map((a): [string, number] => [a.activityType?.name ?? '', optionalTsToMs(a.heartbeatTimeout) ?? 0]);
 }
 
 /**

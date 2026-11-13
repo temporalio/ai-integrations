@@ -1,8 +1,8 @@
 /**
  * Destination end-to-end. With no plugin project, runs go where LangSmith's env defaults send them unless a client-side
  * or workflow-body `traceable` names its own project or address. A misconfigured agent env traces nothing that starts
- * without a parent, while user runs below a parent that names a destination still join it. A plugin project outranks a
- * parent's address on runs built outside the workflow isolate. The plugin's client is a real LangSmith `Client` over a
+ * without a parent, while runs below a parent that names a destination still join it, ahead of a plugin project.
+ * The plugin's client is a real LangSmith `Client` over a
  * capturing `fetch`, so LangSmith's own destination rules run. Some tests load LangSmith's ESM build for the app side,
  * as an ESM app does, beside the plugin's CommonJS build.
  *
@@ -289,12 +289,9 @@ test.serial(
 );
 
 test.serial(
-  'client traceable with an address and a plugin projectName: runs built outside the isolate go to the plugin project',
+  'client traceable with an address and a plugin projectName: every run inherits the parent address',
   async (t) => {
-    for (const [addTemporalRuns, pluginProjectRuns] of [
-      [true, ['StartWorkflow:DestinationWorkflow']],
-      [false, ['comprehensive_activity', 'comprehensive_activity_inner', 'nexus_inner_call']],
-    ] as const) {
+    for (const addTemporalRuns of [true, false]) {
       const { result, runs } = await runWithEnv(
         { LANGSMITH_PROJECT: 'env-project' },
         addTemporalRuns,
@@ -305,19 +302,13 @@ test.serial(
         'plugin-project'
       );
       t.is(result, 'wf:d');
-      const destinationsOf = (name: string): (string | undefined)[] => [
-        ...new Set(runs.filter((run) => run.name === name).map((run) => run.destination)),
-      ];
-      t.deepEqual(destinationsOf('user_pipeline'), [AGENT_ADDRESS]);
-      for (const name of pluginProjectRuns) {
-        t.deepEqual(destinationsOf(name), ['plugin-project'], name);
-      }
+      t.deepEqual([...new Set(runs.map((run) => run.destination))], [AGENT_ADDRESS]);
     }
   }
 );
 
 test.serial(
-  'workflow-body traceables naming their own project or address keep it under a parent (addTemporalRuns=false)',
+  'workflow-body traceables inherit their parent destination using native LangSmith rules (addTemporalRuns=false)',
   async (t) => {
     for (const [clientOptions, parentDestination] of [
       [{}, 'env-project'],
@@ -327,8 +318,8 @@ test.serial(
       t.is(result, 'pawf:d');
       t.deepEqual(Object.fromEntries(runs.map((run) => [run.name, run.destination])), {
         user_pipeline: parentDestination,
-        own_project_call: 'own-project',
-        own_address_call: OTHER_ADDRESS,
+        own_project_call: parentDestination,
+        own_address_call: parentDestination,
         workflow_inner_call: parentDestination,
       });
     }

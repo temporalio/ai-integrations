@@ -56,7 +56,10 @@ def _generated_class_doc(cls: type) -> str | None:
                 # generated unevaluated, and the field keeps the reference from
                 # that time.
                 annotate = getattr(cls.__init__, "__annotate__", None)
-                if getattr(annotate, "__generated_by_dataclasses__", False):
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
                     field_types = {
                         n: f.type for n, f in cls.__dataclass_fields__.items()
                     }
@@ -165,10 +168,6 @@ def activity_as_tool(
 ) -> Callable:
     """Convert a Temporal activity into a Gemini-compatible async tool callable.
 
-    .. warning::
-        This API is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Returns an async callable with the activity's name, and the parameters and
     docstring it is called with (``__call__``'s for a class). When Gemini's automatic function calling (AFC) invokes the returned
     callable from within a Temporal workflow, the call is executed as a Temporal
@@ -244,6 +243,23 @@ def activity_as_tool(
         sig = inspect.signature(schema_fn)
         annotations = getattr(schema_fn, "__annotations__", {})
         doc = schema_fn.__doc__
+        # A quoted annotation (or `from __future__ import annotations`) can
+        # only be resolved in the function's own module: the wrapper has other
+        # globals, so Gemini would leave it a string and fail on it.
+        try:
+            hints = typing.get_type_hints(fn, include_extras=True)
+        except Exception as e:
+            raise ValueError(
+                f"Cannot read the parameters of {getattr(fn, '__name__', fn)}: {e}"
+            ) from e
+        sig = sig.replace(
+            parameters=[
+                p.replace(annotation=hints.get(p.name, p.annotation))
+                for p in sig.parameters.values()
+            ],
+            return_annotation=hints.get("return", sig.return_annotation),
+        )
+        annotations = {**annotations, **hints}
 
     activity_name: str = ret.name
 
