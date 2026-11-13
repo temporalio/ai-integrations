@@ -10,16 +10,12 @@ already-resolved agent model). One pin per seam.
 
 from __future__ import annotations
 
-import sys
 import uuid
 
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 
@@ -27,8 +23,7 @@ from temporalio import workflow
 from temporalio.deepagents import DeepAgentsPlugin, TemporalModel
 from temporalio.worker import Worker
 
-# Bind deepagents symbols off importorskip modules: static imports cannot
-# resolve on Python 3.10 environments, where deepagents is absent.
+# Resolve framework symbols through the imported modules.
 _backends_mod = pytest.importorskip("deepagents.backends")
 _middleware_mod = pytest.importorskip("deepagents.middleware")
 _summarization_mod = pytest.importorskip("deepagents.middleware.summarization")

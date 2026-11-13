@@ -4,7 +4,17 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
-from agents import Agent, AgentBase, RunContextWrapper, Runner
+from agents import (
+    Agent,
+    AgentBase,
+    RunContextWrapper,
+    Runner,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrailData,
+    ToolOutputGuardrailData,
+    tool_input_guardrail,
+    tool_output_guardrail,
+)
 from agents.mcp import MCPServer as AgentsMCPServer
 from agents.mcp import MCPServerStdio
 from mcp import Client as MCPClient
@@ -297,6 +307,40 @@ def test_worker_side_tool_meta_resolver_is_rejected() -> None:
         create_backend(factory)
     assert err.value.non_retryable
     assert "temporal_mcp_server(tool_meta_resolver=...)" in str(err.value)
+
+
+@tool_input_guardrail
+def reject_input(_data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    return ToolGuardrailFunctionOutput.reject_content("blocked")
+
+
+@tool_output_guardrail
+def reject_output(_data: ToolOutputGuardrailData) -> ToolGuardrailFunctionOutput:
+    return ToolGuardrailFunctionOutput.reject_content("blocked")
+
+
+@pytest.mark.parametrize(
+    ("setting", "guardrail"),
+    [
+        ("tool_input_guardrails", reject_input),
+        ("tool_output_guardrails", reject_output),
+    ],
+)
+def test_worker_side_tool_guardrails_are_rejected(setting: str, guardrail: Any) -> None:
+    def factory() -> AgentsMCPServer:
+        value = InProcessMCPServer(server())
+        # Set after construction: MCPServer takes guardrails as options only
+        # from openai-agents 0.22.3.
+        setattr(value, setting, [guardrail])
+        return value
+
+    with pytest.raises(ApplicationError) as err:
+        create_backend(factory)
+    assert err.value.non_retryable
+    assert (
+        "temporal_mcp_server(tool_input_guardrails=..., tool_output_guardrails=...)"
+        in str(err.value)
+    )
 
 
 def test_static_worker_side_tool_filter_is_allowed() -> None:

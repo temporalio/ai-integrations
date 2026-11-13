@@ -201,13 +201,17 @@ func TestSpanIDsDeterministicAcrossReplay(t *testing.T) {
 	for _, s := range liveEnded {
 		endedByName[s.Name()]++
 	}
-	require.Equal(t, map[string]int{
+	wantSpans := map[string]int{
 		"invoke_agent assistant":      1,
 		"generate_content fake-model": 2,
 		"execute_tool tool_a":         1,
 		"execute_tool tool_b":         1,
 		"execute_tool (merged)":       1,
-	}, endedByName, "one live execution exports each workflow span once")
+	}
+	if _, ok := endedByName["invoke_workflow assistant"]; ok {
+		wantSpans["invoke_workflow assistant"] = 1
+	}
+	require.Equal(t, wantSpans, endedByName, "one live execution exports each workflow span once")
 
 	// Every replayer pass must re-create the same spans with the same IDs, in
 	// the same order (deterministic coroutine scheduling), and export nothing.

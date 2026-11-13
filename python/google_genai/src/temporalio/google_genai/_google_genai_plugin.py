@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -54,10 +55,6 @@ def _data_converter(converter: DataConverter | None) -> DataConverter:
 
 class GoogleGenAIPlugin(SimplePlugin):
     """A Temporal Worker Plugin configured for the Google Gemini SDK.
-
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
 
     This plugin registers the ``gemini_api_client_async_request`` activity
     using the provided ``genai.Client`` with real credentials.  Workflows
@@ -112,7 +109,7 @@ class GoogleGenAIPlugin(SimplePlugin):
                 ``tools`` list; ``list_tools`` / ``call_tool`` then run as the
                 ``{name}-list-tools`` / ``{name}-call-tool`` activities against a
                 worker-side connection. Requires the
-                ``temporalio-google-genai[mcp]`` extra (MCP Python SDK v1).
+                ``temporalio-google-genai[mcp]`` extra (MCP Python SDK v1 or v2).
             mcp_connection_idle_timeout: How long a worker-process MCP
                 connection stays open while idle before being disconnected
                 (the timer resets on each reuse).  Defaults to 5 minutes.
@@ -157,3 +154,10 @@ class GoogleGenAIPlugin(SimplePlugin):
             workflow_runner=workflow_runner,
             workflow_failure_exception_types=[GoogleGenAIError],
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-google-genai")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
