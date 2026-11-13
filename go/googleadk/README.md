@@ -351,8 +351,13 @@ Worker is noticed within about 10 seconds instead of at the
 - In Temporal Cloud, each heartbeat that reaches the server is an
   [Action](https://docs.temporal.io/cloud/actions). The first one comes a third
   of the timeout into a call, so a call shorter than that, about 3 seconds by
-  default, sends none. After that, the SDK sends at most one every 8 seconds:
-  four for a 30-second call.
+  default, sends none. After that, the SDK holds heartbeats back to one every
+  0.8 times the timeout (8 seconds by default), or every
+  `MaxHeartbeatThrottleInterval` of the Worker if that's shorter. So with the
+  default Worker options, a 30-second call that succeeds sends four. A call
+  that fails or is canceled also sends the one the SDK was holding back as it
+  ends: a 30-second call that fails sends five, the last two under 3 seconds
+  apart. Each retry is a new attempt, and heartbeats again.
 - `CancelA2ATask` gets the same default, but the server caps its heartbeat
   timeout at the cancellation's 5-second `StartToCloseTimeout`. Nothing cancels
   a cancellation, so its heartbeats only notice a lost Worker, and only a
