@@ -117,8 +117,8 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
 #pragma warning disable CA2000 // The session owns the server end and the server and disposes both.
         var toServer = Channel.CreateUnbounded<JsonRpcMessage>();
         var toClient = Channel.CreateUnbounded<JsonRpcMessage>();
-        var serverEnd = new ChannelTransport(toServer.Reader, toClient.Writer, null);
-        var clientEnd = new ChannelTransport(toClient.Reader, toServer.Writer, Count);
+        var serverEnd = new ChannelTransport(toServer.Reader, toClient.Writer, toServer.Writer, null);
+        var clientEnd = new ChannelTransport(toClient.Reader, toServer.Writer, toClient.Writer, Count);
         var options = new McpServerOptions
         {
             ServerInfo = new Implementation { Name = "in-memory", Version = "1.0.0" },
@@ -153,20 +153,30 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
             Task.FromResult<ITransport>(owner.Connect());
     }
 
-    /// <summary>One end of a channel pair.</summary>
+    /// <summary>
+    /// One end of a channel pair. Disposing either end completes both channels, so the message
+    /// loops on both sides finish and <c>McpClient.DisposeAsync</c> returns.
+    /// </summary>
     private sealed class ChannelTransport : ITransport
     {
         private readonly ChannelWriter<JsonRpcMessage> outgoing;
+        private readonly ChannelWriter<JsonRpcMessage> incomingWriter;
         private readonly Action<JsonRpcMessage>? onSend;
 
         /// <summary>Initializes a new instance of the <see cref="ChannelTransport"/> class.</summary>
         /// <param name="incoming">Messages for this end.</param>
         /// <param name="outgoing">Messages to the other end.</param>
+        /// <param name="incomingWriter">Writer of the incoming channel, completed on dispose.</param>
         /// <param name="onSend">Called for every message sent through this end.</param>
-        public ChannelTransport(ChannelReader<JsonRpcMessage> incoming, ChannelWriter<JsonRpcMessage> outgoing, Action<JsonRpcMessage>? onSend)
+        public ChannelTransport(
+            ChannelReader<JsonRpcMessage> incoming,
+            ChannelWriter<JsonRpcMessage> outgoing,
+            ChannelWriter<JsonRpcMessage> incomingWriter,
+            Action<JsonRpcMessage>? onSend)
         {
             MessageReader = incoming;
             this.outgoing = outgoing;
+            this.incomingWriter = incomingWriter;
             this.onSend = onSend;
         }
 
@@ -187,6 +197,7 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
         public ValueTask DisposeAsync()
         {
             outgoing.TryComplete();
+            incomingWriter.TryComplete();
             return default;
         }
     }

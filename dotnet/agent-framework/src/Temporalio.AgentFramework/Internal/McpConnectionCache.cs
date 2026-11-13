@@ -13,6 +13,7 @@ namespace Temporalio.AgentFramework.Internal;
 internal sealed class McpConnectionCache : IAsyncDisposable
 {
     private static readonly TimeSpan MaxSweepInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(10);
 
     private readonly IReadOnlyDictionary<string, Func<IClientTransport>> factories;
     private readonly TimeSpan idleTimeout;
@@ -188,7 +189,16 @@ internal sealed class McpConnectionCache : IAsyncDisposable
 
                 foreach (var entry in all)
                 {
-                    await entry.CloseIfIdleAsync(idleTimeout).ConfigureAwait(false);
+                    try
+                    {
+                        await entry.CloseIfIdleAsync(idleTimeout).ConfigureAwait(false);
+                    }
+#pragma warning disable CA1031 // One connection's close failure must not stop the sweep of the others.
+                    catch (Exception) when (!stop.IsCancellationRequested)
+#pragma warning restore CA1031
+                    {
+                        // The entry stays open and is retried on the next sweep.
+                    }
                 }
             }
         }
@@ -287,9 +297,20 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             var client = Client;
             Client = null;
             Tools = null;
-            if (client is not null)
+            if (client is null)
             {
-                await client.DisposeAsync().ConfigureAwait(false);
+                return;
+            }
+
+            try
+            {
+                // A transport whose read loop never ends would otherwise hold this entry's gate and
+                // block the next call on the same server, or the worker's shutdown.
+                await client.DisposeAsync().AsTask().WaitAsync(DisposeTimeout).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                // The client is dropped; its transport finishes on its own or with the process.
             }
         }
     }
