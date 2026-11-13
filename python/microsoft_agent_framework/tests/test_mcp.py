@@ -31,6 +31,7 @@ from tests.helpers.microsoft_agent_framework import (
     contents_summary,
     count_scheduled_activities,
     new_worker,
+    scheduled_activities,
     started_activities,
     workflow_id,
 )
@@ -58,6 +59,9 @@ class MCPInput:
     approval_mapping: bool = False
     parse: bool = False
     detailed_errors: bool = False
+    # heartbeat_set tells an explicit None (heartbeats off) from unset.
+    heartbeat_set: bool = False
+    heartbeat_seconds: float | None = None
 
 
 def _count_blocks(result: Any) -> str:
@@ -110,6 +114,13 @@ class MCPWorkflow:
         if input.approval_mapping:
             # MCPTool's per-tool form, which the provider refuses.
             approval_mode = {"always_require_approval": ["echo"]}
+        heartbeat: dict[str, Any] = {}
+        if input.heartbeat_set:
+            heartbeat["heartbeat_timeout"] = (
+                timedelta(seconds=input.heartbeat_seconds)
+                if input.heartbeat_seconds is not None
+                else None
+            )
         providers = [
             TemporalMCPToolProvider(
                 "echo",
@@ -120,6 +131,7 @@ class MCPWorkflow:
                 parse_tool_results=_count_blocks if input.parse else None,
                 start_to_close_timeout=timedelta(seconds=10),
                 retry_policy=retry_policy,
+                **heartbeat,
             )
         ]
         tools: list[Any] = []
@@ -515,3 +527,56 @@ async def test_mcp_factory_failure(client: Client, kind: str, attempts: int) -> 
     assert await count_scheduled_activities(handle) == {LIST_TOOLS: 1}
     (started,) = await started_activities(handle)
     assert started.attempt == attempts
+
+
+def test_provider_passes_heartbeat_timeout_only_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import temporalio.mcp
+
+    configs: list[dict[str, Any]] = []
+
+    class Recorder:
+        def __init__(
+            self, server: str, *, activity_config: Any, cache_tools_list: bool
+        ):
+            configs.append(dict(activity_config))
+
+    monkeypatch.setattr(temporalio.mcp, "TemporalMCPClient", Recorder)
+    TemporalMCPToolProvider("echo")
+    TemporalMCPToolProvider("echo", heartbeat_timeout=timedelta(seconds=3))
+    TemporalMCPToolProvider("echo", heartbeat_timeout=None)
+    default, three_seconds, off = configs
+    # Left unset, the key is absent so temporalio-mcp applies its own default;
+    # a value, including an explicit None, reaches temporalio-mcp as given.
+    assert "heartbeat_timeout" not in default
+    assert three_seconds["heartbeat_timeout"] == timedelta(seconds=3)
+    assert "heartbeat_timeout" in off and off["heartbeat_timeout"] is None
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_set", "seconds", "expected"),
+    [(False, None, 10), (True, 3, 3), (True, None, 0)],
+    ids=["default", "set", "off"],
+)
+async def test_mcp_heartbeat_timeout(
+    client: Client, heartbeat_set: bool, seconds: float | None, expected: int
+) -> None:
+    plugin, _, _ = _plugin(_ECHO_SCRIPT)
+    result, handle = await _run(
+        client,
+        plugin,
+        MCPInput(heartbeat_set=heartbeat_set, heartbeat_seconds=seconds),
+    )
+    assert result["texts"] == ["Echoed."]
+    # temporalio-mcp's 10 second default, the provider's value, or none at all
+    # (an explicit None turns heartbeats off), on both MCP Activities.
+    timeouts = {
+        attrs.activity_type.name: attrs.heartbeat_timeout.ToTimedelta()
+        for attrs in await scheduled_activities(handle)
+        if attrs.activity_type.name in (LIST_TOOLS, CALL_TOOL)
+    }
+    assert timeouts == {
+        LIST_TOOLS: timedelta(seconds=expected),
+        CALL_TOOL: timedelta(seconds=expected),
+    }

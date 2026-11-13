@@ -35,6 +35,13 @@ if TYPE_CHECKING:
     from temporalio.mcp import TemporalMCPClient
 
 
+class _Unset:
+    """The type of ``_UNSET``: an option the caller did not give."""
+
+
+_UNSET = _Unset()
+
+
 class TemporalMCPToolProvider(ContextProvider):
     """Gives an agent the tools of an MCP server registered on the worker.
 
@@ -67,8 +74,12 @@ class TemporalMCPToolProvider(ContextProvider):
     The activity options apply to every MCP Activity of this provider;
     ``summary`` defaults to the server name. Without ``start_to_close_timeout``
     or ``schedule_to_close_timeout`` the ``temporalio-mcp`` default of one
-    minute applies. The provider sets no ``heartbeat_timeout``;
-    ``temporalio-mcp`` 0.3 does not heartbeat its Activities.
+    minute applies. ``heartbeat_timeout`` left unset means ``temporalio-mcp``'s
+    default of 10 seconds: the MCP Activities heartbeat at half the heartbeat
+    timeout while they run, which is how a cancel reaches a request already
+    running on a worker and how a lost worker is noticed before the
+    start-to-close timeout. Pass a ``timedelta`` to change it, or ``None`` to
+    turn heartbeats off.
     """
 
     def __init__(
@@ -85,6 +96,7 @@ class TemporalMCPToolProvider(ContextProvider):
         schedule_to_close_timeout: timedelta | None = None,
         schedule_to_start_timeout: timedelta | None = None,
         start_to_close_timeout: timedelta | None = None,
+        heartbeat_timeout: timedelta | None | _Unset = _UNSET,
         retry_policy: RetryPolicy | None = None,
         cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL,
         versioning_intent: VersioningIntent | None = None,
@@ -133,19 +145,25 @@ class TemporalMCPToolProvider(ContextProvider):
         self._approval_mode: ApprovalMode | None = approval_mode
         self._parse_tool_results = parse_tool_results
         self._tools: list[FunctionTool] | None = None
+        activity_config = ActivityConfig(
+            task_queue=task_queue,
+            schedule_to_close_timeout=schedule_to_close_timeout,
+            schedule_to_start_timeout=schedule_to_start_timeout,
+            start_to_close_timeout=start_to_close_timeout,
+            retry_policy=retry_policy,
+            cancellation_type=cancellation_type,
+            versioning_intent=versioning_intent,
+            summary=summary if summary is not None else server,
+            priority=priority,
+        )
+        if not isinstance(heartbeat_timeout, _Unset):
+            # temporalio-mcp applies its 10-second default when the key is
+            # absent and keeps an explicit None, which turns heartbeats off, so
+            # the key is set only when the caller chose a value.
+            activity_config["heartbeat_timeout"] = heartbeat_timeout
         self._client: TemporalMCPClient = TemporalMCPClient(
             server,
-            activity_config=ActivityConfig(
-                task_queue=task_queue,
-                schedule_to_close_timeout=schedule_to_close_timeout,
-                schedule_to_start_timeout=schedule_to_start_timeout,
-                start_to_close_timeout=start_to_close_timeout,
-                retry_policy=retry_policy,
-                cancellation_type=cancellation_type,
-                versioning_intent=versioning_intent,
-                summary=summary if summary is not None else server,
-                priority=priority,
-            ),
+            activity_config=activity_config,
             # This provider decides when to list; the durable client never caches.
             cache_tools_list=False,
         )
