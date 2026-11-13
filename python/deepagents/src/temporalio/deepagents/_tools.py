@@ -47,7 +47,6 @@ if sys.version_info >= (3, 14):
 
 from temporalio import activity as activity_mod
 from temporalio import workflow
-from temporalio.common import RetryPolicy
 from temporalio.deepagents import _activity, _serde
 from temporalio.workflow import ActivityConfig
 
@@ -220,8 +219,6 @@ def lookup_backend(ref: str) -> Any | None:
 
 # Options activity_as_tool builds itself from the model's tool call.
 _RESERVED_ACTIVITY_OPTIONS = frozenset({"arg", "args"})
-# activity_as_tool's former dedicated arguments, now set through activity_options.
-_DEPRECATED_TOOL_ARGUMENTS = ("start_to_close_timeout", "retry_policy", "summary")
 
 
 def _call_function(method: Any) -> Callable | None:
@@ -368,9 +365,6 @@ def activity_as_tool(
     name: str | None = None,
     description: str | None = None,
     activity_options: ActivityConfig | None = None,
-    start_to_close_timeout: timedelta | None = None,
-    retry_policy: RetryPolicy | None = None,
-    summary: str | None = None,
 ) -> BaseTool:
     """Expose an existing Temporal activity as a Deep Agents tool.
 
@@ -391,18 +385,14 @@ def activity_as_tool(
             set ``start_to_close_timeout`` or ``schedule_to_close_timeout``.
             ``summary`` defaults to ``"tool:<name>"``. ``arg`` and ``args`` are
             reserved: the tool builds them from the model's call.
-        start_to_close_timeout: Deprecated; set it in ``activity_options``.
-        retry_policy: Deprecated; set it in ``activity_options``.
-        summary: Deprecated; set it in ``activity_options``.
 
     Raises:
         ValueError: If ``activity`` is not a named activity, is an instance of a
             callable-class activity, is a class without a ``__call__`` the tool
             can use, or takes arguments the tool can't pass: ``*args``,
             keyword-only arguments or ``**kwargs``; if ``activity_options``
-            sets ``arg`` or ``args``, or an option also passed as a deprecated
-            argument; or if no start-to-close or schedule-to-close timeout is
-            set.
+            sets ``arg`` or ``args``; or if it sets neither a start-to-close
+            nor a schedule-to-close timeout.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -436,27 +426,6 @@ def activity_as_tool(
             f"activity_options must not set {', '.join(sorted(reserved))}: "
             "the tool builds the activity arguments from the model's call."
         )
-    legacy = {
-        "start_to_close_timeout": start_to_close_timeout,
-        "retry_policy": retry_policy,
-        "summary": summary,
-    }
-    passed = [key for key in _DEPRECATED_TOOL_ARGUMENTS if legacy[key] is not None]
-    if passed:
-        both = [key for key in passed if key in opts]
-        if both:
-            raise ValueError(
-                f"{', '.join(both)} given both as an argument and in "
-                "activity_options; set it only in activity_options."
-            )
-        warnings.warn(
-            f"activity_as_tool's {', '.join(passed)} argument"
-            f"{'s are' if len(passed) > 1 else ' is'} deprecated; "
-            "set it in activity_options instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        opts.update((key, legacy[key]) for key in passed)
     if (
         opts.get("start_to_close_timeout") is None
         and opts.get("schedule_to_close_timeout") is None
@@ -465,8 +434,7 @@ def activity_as_tool(
             "activity_as_tool requires start_to_close_timeout or "
             "schedule_to_close_timeout in activity_options."
         )
-    # Same default summary as before activity_options existed, so call sites
-    # that only move their arguments schedule the same activity.
+    # The default summary this helper has always recorded.
     opts.setdefault("summary", f"tool:{tool_name}")
 
     async def _run(*args: Any, **kwargs: Any) -> Any:

@@ -169,9 +169,7 @@ tool to its own workers with `task_queue="weather-tools"` (a worker registered
 for `get_weather` must then poll that queue), or set `heartbeat_timeout` for an
 activity that heartbeats, so a lost worker is noticed at the heartbeat instead
 of at start-to-close. `arg` and `args` are reserved: the tool builds them from
-the model's call. The older `start_to_close_timeout=`, `retry_policy=` and
-`summary=` arguments still work but are deprecated; moving them into
-`activity_options` schedules the same activity, so running workflows replay.
+the model's call.
 
 Call `tool_as_activity(...)` at module import or worker startup on **every
 activity worker** that can receive `deepagents.invoke_tool`. Registration is

@@ -274,25 +274,6 @@ def test_activity_as_tool_requires_a_timeout() -> None:
     assert tool.name == "echo_activity"
 
 
-def test_activity_as_tool_deprecated_arguments() -> None:
-    """The former dedicated arguments still work, with a DeprecationWarning,
-    and can't also be set in activity_options."""
-    with pytest.warns(DeprecationWarning, match="start_to_close_timeout"):
-        tool = activity_as_tool(
-            echo_activity,
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-            summary="echo",
-        )
-    assert tool.name == "echo_activity"
-    with pytest.raises(ValueError, match="start_to_close_timeout"):
-        activity_as_tool(
-            echo_activity,
-            start_to_close_timeout=timedelta(seconds=10),
-            activity_options=TEN_SECONDS,
-        )
-
-
 @workflow.defn
 class ActivityAsToolOptionsWorkflow:
     @workflow.run
@@ -363,60 +344,6 @@ async def test_activity_as_tool_activity_options(env: WorkflowEnvironment) -> No
     assert echo_attrs.activity_id == "echo-call"
     await Replayer(
         workflows=[ActivityAsToolOptionsWorkflow], plugins=[DeepAgentsPlugin()]
-    ).replay_workflow(await handle.fetch_history())
-
-
-@workflow.defn(name="ActivityAsToolMigration")
-class ActivityAsToolLegacyArgumentsWorkflow:
-    @workflow.run
-    async def run(self, text: str) -> str:
-        tool = activity_as_tool(
-            echo_activity,
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=RetryPolicy(maximum_attempts=2),
-        )
-        return await tool.ainvoke({"text": text})
-
-
-@workflow.defn(name="ActivityAsToolMigration")
-class ActivityAsToolMigratedWorkflow:
-    @workflow.run
-    async def run(self, text: str) -> str:
-        tool = activity_as_tool(
-            echo_activity,
-            activity_options=ActivityConfig(
-                start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            ),
-        )
-        return await tool.ainvoke({"text": text})
-
-
-@pytest.mark.asyncio
-async def test_activity_as_tool_migration_replays(env: WorkflowEnvironment) -> None:
-    """A workflow recorded with the deprecated arguments replays after its
-    call site moves the same settings into activity_options, so in-flight
-    workflows can be migrated without a patch."""
-    async with Worker(
-        env.client,
-        task_queue="da-act-tool-migrate",
-        workflows=[ActivityAsToolLegacyArgumentsWorkflow],
-        activities=[echo_activity],
-        plugins=[DeepAgentsPlugin()],
-    ):
-        handle = await env.client.start_workflow(
-            "ActivityAsToolMigration",
-            "hi",
-            id=f"da-act-tool-migrate-{uuid.uuid4()}",
-            task_queue="da-act-tool-migrate",
-        )
-        assert await handle.result() == "echo:hi"
-
-    legacy = await scheduled_activity_attrs(handle, "echo_activity")
-    assert legacy is not None
-    assert legacy.retry_policy.maximum_attempts == 2
-    await Replayer(
-        workflows=[ActivityAsToolMigratedWorkflow], plugins=[DeepAgentsPlugin()]
     ).replay_workflow(await handle.fetch_history())
 
 
