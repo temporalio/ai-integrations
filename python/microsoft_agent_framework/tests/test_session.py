@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +44,7 @@ from temporalio.microsoft_agent_framework.testing import (
 )
 from tests.helpers.microsoft_agent_framework import (
     INVOKE_MODEL,
+    SlowFakeChatClient,
     count_scheduled_activities,
     new_worker,
     role_of,
@@ -57,6 +58,8 @@ from tests.helpers.microsoft_agent_framework import (
 class ChatInput:
     session: dict[str, Any] | None = None
     continue_after_turns: int | None = 1
+    pending: list[str] = field(default_factory=list)
+    done: bool = False
 
 
 @workflow.defn
@@ -81,6 +84,9 @@ class ChatWorkflow:
             if input.session
             else agent.create_session()
         )
+        # Prompts and an end_chat that arrived while the previous run was busy.
+        self._pending = list(input.pending) + self._pending
+        self._done = self._done or input.done
         replies: list[str] = []
         while True:
             await workflow.wait_condition(lambda: bool(self._pending) or self._done)
@@ -96,9 +102,15 @@ class ChatWorkflow:
                 input.continue_after_turns
                 and len(replies) >= input.continue_after_turns
             ):
-                # The continued run carries the session and keeps going until end_chat.
+                # The continued run carries the session, the prompts not yet
+                # answered and a pending end_chat, and keeps going until the end.
                 workflow.continue_as_new(
-                    ChatInput(session=session.to_dict(), continue_after_turns=None)
+                    ChatInput(
+                        session=session.to_dict(),
+                        continue_after_turns=None,
+                        pending=self._pending,
+                        done=self._done,
+                    )
                 )
 
 
@@ -189,6 +201,31 @@ async def test_continue_as_new_carries_session(client: Client) -> None:
     ]
     assert second_call["messages"][1].text == "First reply."
     assert (await count_scheduled_activities(first_run)).total() == 1
+
+
+async def test_continue_as_new_carries_pending_prompts(client: Client) -> None:
+    slow = SlowFakeChatClient(["First reply.", "Second reply."], delay=0.5)
+    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": lambda: slow})
+    async with new_worker(client, ChatWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ChatWorkflow.run,
+            ChatInput(),
+            id=workflow_id("chat-pending"),
+            task_queue=worker.task_queue,
+        )
+        # The second prompt and the end of the chat arrive while the first
+        # turn's model call (0.5 seconds) is still running.
+        await handle.signal(ChatWorkflow.user_says, "first question")
+        await handle.signal(ChatWorkflow.user_says, "second question")
+        await handle.signal(ChatWorkflow.end_chat)
+        result = await handle.result()
+    # The run continued as new after the first turn and carried the prompt
+    # and the end_chat with it; without that the new run would wait forever.
+    first_run = client.get_workflow_handle(handle.id, run_id=handle.result_run_id)
+    status = (await first_run.describe()).status
+    assert status == WorkflowExecutionStatus.CONTINUED_AS_NEW
+    assert result["replies"] == ["Second reply."]
+    assert result["messages"] == 4
 
 
 async def test_store_true_uses_service_conversation(client: Client) -> None:

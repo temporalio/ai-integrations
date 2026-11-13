@@ -359,7 +359,7 @@ If the updates cannot all be published, the Activity fails with an `ApplicationE
 
 By default Temporal owns the history: unless you set `store` yourself, `TemporalChatClient` sends `store=False` to the provider, so the provider keeps no conversation of its own (the OpenAI Responses API stores one and returns its id when `store` is left unset), and when you pass a session Agent Framework keeps the transcript in the session's in-memory history and resends it on every call. Event history is the durable record and replay rebuilds the session exactly.
 
-A long chat grows the history. Check `workflow.info().is_continue_as_new_suggested()` after each turn and carry the session as `session.to_dict()`; the next run restores it with `AgentSession.from_dict`. The dict carries the transcript, pending approval state and the provider's conversation id. Live `Agent` objects, provider connections and spans do not carry over; build them again in the new run.
+A long chat grows the history. Check `workflow.info().is_continue_as_new_suggested()` after each turn and carry the session as `session.to_dict()`; the next run restores it with `AgentSession.from_dict`. The dict carries the transcript, pending approval state and the provider's conversation id. Live `Agent` objects, provider connections and spans do not carry over; build them again in the new run. Your own workflow state does not carry over either: a prompt or an `end_chat` that arrived while a turn was running sits in the workflow's fields, so `ChatInput` carries those too.
 
 ```python
 from dataclasses import dataclass, field
@@ -371,6 +371,8 @@ from agent_framework import Agent, AgentSession
 @dataclass
 class ChatInput:
     session: dict[str, Any] | None = None
+    pending: list[str] = field(default_factory=list)
+    done: bool = False
 
 
 @workflow.defn
@@ -391,13 +393,18 @@ class ChatWorkflow:
     async def run(self, input: ChatInput) -> None:
         agent = Agent(client=TemporalChatClient("gpt-4o"), instructions="Chat.")
         session = AgentSession.from_dict(input.session) if input.session else agent.create_session()
+        # Prompts and an end_chat that arrived while the previous run was busy.
+        self._pending = list(input.pending) + self._pending
+        self._done = self._done or input.done
         while True:
             await workflow.wait_condition(lambda: bool(self._pending) or self._done)
             if not self._pending:
                 return
             await agent.run(self._pending.pop(0), session=session)
             if workflow.info().is_continue_as_new_suggested():
-                workflow.continue_as_new(ChatInput(session=session.to_dict()))
+                workflow.continue_as_new(
+                    ChatInput(session=session.to_dict(), pending=self._pending, done=self._done)
+                )
 ```
 
 To let the provider keep the conversation instead, pass `store=True` in the agent's `default_options` or a run's `options`. The returned conversation id lands in `session.service_session_id`, the next call carries it, and only the new turn crosses the boundary.
