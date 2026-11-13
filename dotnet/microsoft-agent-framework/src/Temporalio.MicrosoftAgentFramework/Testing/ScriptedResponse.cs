@@ -97,7 +97,7 @@ public sealed class ScriptedResponse
     {
         if (delay > TimeSpan.Zero)
         {
-            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(delay, cancellationToken);
         }
 
         return produce(call);

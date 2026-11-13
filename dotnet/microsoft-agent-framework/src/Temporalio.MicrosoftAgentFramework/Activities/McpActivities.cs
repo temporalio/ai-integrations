@@ -56,7 +56,7 @@ public sealed class McpActivities
             result = await connections.UseAsync(
                 input.Server,
                 (client, token) => client.CallToolAsync(input.Name, input.Arguments, cancellationToken: token).AsTask(),
-                context.CancellationToken).ConfigureAwait(false);
+                context.CancellationToken);
         }
         catch (McpProtocolException exception) when (exception.ErrorCode is McpErrorCode.InvalidParams or McpErrorCode.MethodNotFound or McpErrorCode.InvalidRequest)
         {

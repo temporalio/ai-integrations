@@ -114,6 +114,10 @@ DOTNET_POLICY_PROPERTIES = {
     "CodeAnalysisTreatWarningsAsErrors": "true", "MSBuildTreatWarningsAsErrors": "true", "NuGetAudit": "true",
     "DiscoverGlobalAnalyzerConfigFiles": "false",
 }
+# Workflow code must stay on the Workflow scheduler; dotnet/_shared/analyzers.globalconfig turns CA2007 off for that.
+# The call form only: a comment or a message that names ConfigureAwait(false) is not an await.
+DOTNET_CONFIGURE_AWAIT_FALSE = re.compile(r"\.ConfigureAwait\(\s*false\s*\)")
+
 
 def _local(tag: str) -> str:
     """The element name without the MSBuild namespace an older project file may declare."""
@@ -551,6 +555,11 @@ class Checker:
                     nested = path.relative_to(d).as_posix()
                     self.fail(f"{rel}/{nested}: {DOTNET_DIRECTORY_FILES[name]}; the plugin-root Directory.Build.props and "
                               ".editorconfig are the only build settings files a plugin may have")
+                if name.endswith(".cs") and path.is_relative_to(d / "src"):
+                    for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                        if DOTNET_CONFIGURE_AWAIT_FALSE.search(line) and not line.lstrip().startswith("//"):
+                            self.fail(f"{rel}/{path.relative_to(d).as_posix()}:{lineno}: ConfigureAwait(false) leaves the Workflow "
+                                      "scheduler; no await under src/ may carry it (dotnet/_shared/analyzers.globalconfig turns CA2007 off)")
         props = d / "Directory.Build.props"
         if props.is_file():
             self.check_dotnet_build_props(plugin, props)

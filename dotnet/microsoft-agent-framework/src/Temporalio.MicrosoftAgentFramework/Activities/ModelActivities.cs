@@ -65,8 +65,8 @@ public sealed class ModelActivities
         try
         {
             return input.Stream
-                ? await StreamAsync(client, input, options, context).ConfigureAwait(false)
-                : await client.GetResponseAsync(input.Messages, options, context.CancellationToken).ConfigureAwait(false);
+                ? await StreamAsync(client, input, options, context)
+                : await client.GetResponseAsync(input.Messages, options, context.CancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException && ModelErrorClassifier.Classify(exception) is { } failure)
         {
@@ -77,7 +77,7 @@ public sealed class ModelActivities
 #pragma warning disable CA1849 // Cancel is the form the Temporal .NET SDK recommends.
             stop.Cancel();
 #pragma warning restore CA1849
-            await pump.ConfigureAwait(false);
+            await pump;
         }
     }
 
@@ -99,7 +99,7 @@ public sealed class ModelActivities
         {
             var topic = streamClient?.GetTopic<ChatResponseUpdate>(input.StreamingTopic);
             var stream = client.GetStreamingResponseAsync(input.Messages, options, context.CancellationToken);
-            await foreach (var update in stream.WithCancellation(context.CancellationToken).ConfigureAwait(false))
+            await foreach (var update in stream.WithCancellation(context.CancellationToken))
             {
                 context.Heartbeat();
                 topic?.Publish(update);
@@ -108,14 +108,14 @@ public sealed class ModelActivities
 
             if (streamClient is not null)
             {
-                await streamClient.FlushAsync(context.CancellationToken).ConfigureAwait(false);
+                await streamClient.FlushAsync(context.CancellationToken);
             }
         }
         finally
         {
             if (streamClient is not null)
             {
-                await streamClient.DisposeAsync().ConfigureAwait(false);
+                await streamClient.DisposeAsync();
             }
         }
 
@@ -134,7 +134,7 @@ public sealed class ModelActivities
         using var timer = new PeriodicTimer(interval);
         try
         {
-            while (await timer.WaitForNextTickAsync(stop).ConfigureAwait(false))
+            while (await timer.WaitForNextTickAsync(stop))
             {
                 context.Heartbeat();
             }

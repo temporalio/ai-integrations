@@ -52,11 +52,13 @@ lock: ## Re-resolve and rewrite packages.lock.json after editing a csproj
 check-deps: ## Dependency cooldown: every locked version is older than nuget.config's minPublishAgeHours
 	uv run --project ../../scripts --locked python ../../scripts/ci/check_dotnet_deps.py --plugin-dir .
 
+# CA2007 is excluded twice over (here and in analyzers.globalconfig): its fixer adds
+# ConfigureAwait(false), which moves an await in Workflow code off the Workflow scheduler.
 format: ## Apply formatting and style fixes
-	$(DOTNET) format $(SOLUTION)
+	$(DOTNET) format $(SOLUTION) --exclude-diagnostics CA2007
 
 lint: ## Formatting, style and analyzer fixers would change nothing
-	$(DOTNET) format $(SOLUTION) --verify-no-changes
+	$(DOTNET) format $(SOLUTION) --verify-no-changes --exclude-diagnostics CA2007
 
 test: ## Build in Release with the release version and run the suite under Microsoft.Testing.Platform
 	$(DOTNET) test --solution $(SOLUTION) -c $(CONFIGURATION) $(BUILD_PROPS) --results-directory TestResults --minimum-expected-tests 1 -- --report-trx $(TEST_ARGS)

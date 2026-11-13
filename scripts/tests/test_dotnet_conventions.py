@@ -209,6 +209,10 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
                   "Directory.Build.rsp: Directory.Build.rsp adds MSBuild switches"),
     "nested-editorconfig": (lambda r: (r / PLUGIN / "src/.editorconfig").write_text("root = true\n"),
                             "src/.editorconfig: a nested .editorconfig overrides"),
+    "configure-await-false": (
+        lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/Awaits.cs").write_text(
+            "namespace Temporalio.Fakedotnet;\n\npublic static class Awaits\n{\n    public static async Task RunAsync() => await Task.Yield().ConfigureAwait(false);\n}\n"),
+        "src/Temporalio.Fakedotnet/Awaits.cs:5: ConfigureAwait(false) leaves the Workflow scheduler"),
 }
 
 
@@ -296,12 +300,25 @@ def test_language_root_build_files_are_forbidden(dotnet_repo: Path) -> None:
         assert any(f"dotnet/{name}: language-root build files are forbidden" in v for v in violations), name
 
 
+def test_configure_await_false_is_reported_only_under_src(dotnet_repo: Path) -> None:
+    (dotnet_repo / PLUGIN / "tests/Temporalio.Fakedotnet.Tests/Awaits.cs").write_text(
+        "public static class Awaits\n{\n    public static async Task RunAsync() => await Task.Yield().ConfigureAwait(false);\n}\n")
+    assert Checker(dotnet_repo).run() == []
+
+
 def test_shared_props_do_not_discover_globalconfigs() -> None:
     props = ET.parse(REPO_ROOT / "dotnet" / "_shared" / "dotnet.props").getroot()
     properties = {prop.tag: (prop.text or "").strip() for group in props.iter("PropertyGroup") for prop in group}
     assert properties["DiscoverGlobalAnalyzerConfigFiles"] == "false"
     includes = [item.get("Include", "") for group in props.iter("ItemGroup") for item in group if item.tag == "EditorConfigFiles"]
     assert len(includes) == 2 and all("$(MSBuildThisFileDirectory)analyzers" in include for include in includes)
+
+
+def test_format_and_lint_exclude_the_configure_await_fixer() -> None:
+    mk = (REPO_ROOT / "dotnet" / "_shared" / "dotnet.mk").read_text()
+    assert mk.count("--exclude-diagnostics CA2007") == 2, "format and lint both skip CA2007"
+    config = (REPO_ROOT / "dotnet" / "_shared" / "analyzers.globalconfig").read_text()
+    assert "dotnet_diagnostic.CA2007.severity = none" in config
 
 
 def test_missing_shared_files_are_reported(dotnet_repo: Path) -> None:

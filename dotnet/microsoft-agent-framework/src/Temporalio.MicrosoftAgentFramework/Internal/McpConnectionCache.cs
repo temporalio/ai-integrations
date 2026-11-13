@@ -50,7 +50,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
     public async Task<IReadOnlyList<ToolDeclaration>> ListToolsAsync(string server, bool useCache, CancellationToken cancellationToken)
     {
         var entry = GetEntry(server);
-        await entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await entry.Lock.WaitAsync(cancellationToken);
         try
         {
             entry.Touch();
@@ -59,8 +59,8 @@ internal sealed class McpConnectionCache : IAsyncDisposable
                 return cached;
             }
 
-            var client = await entry.ConnectAsync(server, factories[server], cancellationToken).ConfigureAwait(false);
-            var tools = await client.ListToolsAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+            var client = await entry.ConnectAsync(server, factories[server], cancellationToken);
+            var tools = await client.ListToolsAsync(cancellationToken: cancellationToken);
             var declarations = tools
                 .Select(tool => new ToolDeclaration(tool.Name, tool.Description, tool.JsonSchema, tool.ReturnJsonSchema))
                 .ToList();
@@ -86,11 +86,11 @@ internal sealed class McpConnectionCache : IAsyncDisposable
     {
         var entry = GetEntry(server);
         McpClient client;
-        await entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await entry.Lock.WaitAsync(cancellationToken);
         try
         {
             entry.Touch();
-            client = await entry.ConnectAsync(server, factories[server], cancellationToken).ConfigureAwait(false);
+            client = await entry.ConnectAsync(server, factories[server], cancellationToken);
             entry.InFlight++;
         }
         finally
@@ -100,11 +100,11 @@ internal sealed class McpConnectionCache : IAsyncDisposable
 
         try
         {
-            return await action(client, cancellationToken).ConfigureAwait(false);
+            return await action(client, cancellationToken);
         }
         finally
         {
-            await entry.Lock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            await entry.Lock.WaitAsync(CancellationToken.None);
             entry.InFlight--;
             entry.Touch();
             entry.Lock.Release();
@@ -139,7 +139,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             }
         }
 
-        await DisposeAsync().ConfigureAwait(false);
+        await DisposeAsync();
     }
 
     /// <summary>
@@ -171,12 +171,12 @@ internal sealed class McpConnectionCache : IAsyncDisposable
 
         if (sweep is not null)
         {
-            await sweep.ConfigureAwait(false);
+            await sweep;
         }
 
         foreach (var entry in all)
         {
-            await entry.CloseAsync().ConfigureAwait(false);
+            await entry.CloseAsync();
         }
 
         stop?.Dispose();
@@ -217,7 +217,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         using var timer = new PeriodicTimer(half < MaxSweepInterval ? half : MaxSweepInterval);
         try
         {
-            while (await timer.WaitForNextTickAsync(stop).ConfigureAwait(false))
+            while (await timer.WaitForNextTickAsync(stop))
             {
                 List<Entry> all;
                 lock (sync)
@@ -229,7 +229,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
                 {
                     try
                     {
-                        await entry.CloseIfIdleAsync(idleTimeout).ConfigureAwait(false);
+                        await entry.CloseIfIdleAsync(idleTimeout);
                     }
 #pragma warning disable CA1031 // One connection's close failure must not stop the sweep of the others.
                     catch (Exception) when (!stop.IsCancellationRequested)
@@ -312,7 +312,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
                     nonRetryable: true);
             }
 
-            var client = await McpClient.CreateAsync(transport, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var client = await McpClient.CreateAsync(transport, cancellationToken: cancellationToken);
             Client = client;
             Tools = null;
             return client;
@@ -326,7 +326,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         /// <returns>A task that completes when the check, and any close, is done.</returns>
         public async Task CloseIfIdleAsync(TimeSpan idleTimeout)
         {
-            if (!await Lock.WaitAsync(0).ConfigureAwait(false))
+            if (!await Lock.WaitAsync(0))
             {
                 return;
             }
@@ -335,7 +335,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             {
                 if (Client is not null && InFlight == 0 && Stopwatch.GetElapsedTime(lastUsed) > idleTimeout)
                 {
-                    await CloseLockedAsync().ConfigureAwait(false);
+                    await CloseLockedAsync();
                 }
             }
             finally
@@ -354,12 +354,12 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             var started = Stopwatch.GetTimestamp();
             while (true)
             {
-                await Lock.WaitAsync().ConfigureAwait(false);
+                await Lock.WaitAsync();
                 try
                 {
                     if (InFlight == 0 || Stopwatch.GetElapsedTime(started) > DisposeTimeout)
                     {
-                        await CloseLockedAsync().ConfigureAwait(false);
+                        await CloseLockedAsync();
                         return;
                     }
                 }
@@ -368,7 +368,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
                     Lock.Release();
                 }
 
-                await Task.Delay(InFlightPollInterval).ConfigureAwait(false);
+                await Task.Delay(InFlightPollInterval);
             }
         }
 
@@ -386,7 +386,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             {
                 // A transport whose read loop never ends would otherwise hold this entry's lock and
                 // block the next call on the same server, or the worker's shutdown.
-                await client.DisposeAsync().AsTask().WaitAsync(DisposeTimeout).ConfigureAwait(false);
+                await client.DisposeAsync().AsTask().WaitAsync(DisposeTimeout);
             }
             catch (TimeoutException)
             {

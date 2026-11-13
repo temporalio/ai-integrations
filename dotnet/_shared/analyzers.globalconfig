@@ -39,6 +39,11 @@ dotnet_diagnostic.CA1847.severity = none
 dotnet_diagnostic.CA1848.severity = none
 dotnet_diagnostic.CA1873.severity = none
 
+# No ConfigureAwait(false) anywhere: Workflow code must stay on the Workflow scheduler, so the fixer
+# `dotnet format` runs for this rule would turn a correct await into a hop off it, and worker code
+# gains nothing from it. check_conventions.py fails on ConfigureAwait(false) under dotnet/*/src/.
+dotnet_diagnostic.CA2007.severity = none
+
 # Do not want to make all exceptions [Serializable], we don't support cross-AppDomain currently
 dotnet_diagnostic.CA2237.severity = none
 

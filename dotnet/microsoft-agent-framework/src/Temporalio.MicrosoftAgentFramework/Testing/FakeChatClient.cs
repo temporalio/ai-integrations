@@ -72,7 +72,7 @@ public sealed partial class FakeChatClient : IChatClient
     /// <inheritdoc />
     public async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
     {
-        var (response, _) = await ProduceAsync(messages, options, cancellationToken).ConfigureAwait(false);
+        var (response, _) = await ProduceAsync(messages, options, cancellationToken);
         return response;
     }
 
@@ -82,7 +82,7 @@ public sealed partial class FakeChatClient : IChatClient
         ChatOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var (response, entry) = await ProduceAsync(messages, options, cancellationToken).ConfigureAwait(false);
+        var (response, entry) = await ProduceAsync(messages, options, cancellationToken);
         var pause = entry?.StreamingDelay ?? TimeSpan.Zero;
         for (var m = 0; m < response.Messages.Count; m++)
         {
@@ -105,7 +105,7 @@ public sealed partial class FakeChatClient : IChatClient
             {
                 if (pause > TimeSpan.Zero)
                 {
-                    await Task.Delay(pause, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(pause, cancellationToken);
                 }
 
                 yield return new ChatResponseUpdate(message.Role, [pieces[i]])
@@ -166,6 +166,6 @@ public sealed partial class FakeChatClient : IChatClient
         }
 
         var entry = script[Math.Min(number, script.Length) - 1];
-        return (await entry.ProduceAsync(number, cancellationToken).ConfigureAwait(false), entry);
+        return (await entry.ProduceAsync(number, cancellationToken), entry);
     }
 }

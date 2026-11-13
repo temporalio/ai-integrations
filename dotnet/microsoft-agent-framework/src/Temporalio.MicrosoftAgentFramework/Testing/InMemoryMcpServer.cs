@@ -85,7 +85,7 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
 
         foreach (var session in open)
         {
-            await session.DisposeAsync().ConfigureAwait(false);
+            await session.DisposeAsync();
         }
     }
 
@@ -234,7 +234,7 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
 #pragma warning restore CA1849
             try
             {
-                await run.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                await run.WaitAsync(TimeSpan.FromSeconds(5));
             }
             catch (OperationCanceledException)
             {
@@ -245,7 +245,7 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
                 // The server did not stop in time; disposal below releases what it can.
             }
 
-            await server.DisposeAsync().ConfigureAwait(false);
+            await server.DisposeAsync();
             stop.Dispose();
         }
     }
