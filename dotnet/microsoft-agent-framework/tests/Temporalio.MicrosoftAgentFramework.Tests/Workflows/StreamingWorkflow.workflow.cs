@@ -12,11 +12,11 @@ public class StreamingWorkflow
     // Constructing the stream registers its publish Signal, poll Update and offset Query before
     // the first Activity publishes to it.
 #pragma warning disable IDE0052 // The stream is used through its registered handlers.
-    private readonly WorkflowStream stream;
+    private readonly WorkflowStream? stream;
 #pragma warning restore IDE0052
 
     [WorkflowInit]
-    public StreamingWorkflow(StreamingInput input) => stream = new(input.StreamState);
+    public StreamingWorkflow(StreamingInput input) => stream = input.HostStream ? new(input.StreamState) : null;
 
     [WorkflowRun]
     public async Task<StreamingResult> RunAsync(StreamingInput input)

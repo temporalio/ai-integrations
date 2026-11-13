@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
+using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.MicrosoftAgentFramework.Activities;
 using Temporalio.MicrosoftAgentFramework.Internal;
 using Temporalio.Workflows;
@@ -136,6 +137,13 @@ public sealed class TemporalChatClient : IChatClient
             throw new InvalidOperationException(
                 "TemporalChatClient runs model calls as Temporal Activities and must be called inside a Workflow. " +
                 "Outside a Workflow, use the provider client that your MicrosoftAgentFrameworkPluginOptions.ChatClients factory builds.");
+        }
+
+        if (StreamingTopic is not null && !Workflow.Signals.ContainsKey(WorkflowStreamConstants.PublishSignalName))
+        {
+            throw new MicrosoftAgentFrameworkWorkflowException(
+                $"StreamingTopic '{StreamingTopic}' is set, but this Workflow hosts no WorkflowStream, so the updates the model Activity publishes would arrive as Signals nothing handles. " +
+                "Construct a WorkflowStream in the Workflow, for example in a [WorkflowInit] constructor, before the first model call, or leave StreamingTopic unset.");
         }
 
         var (transportOptions, tools, hostedTools) = ChatOptionsTransport.Prepare(options, Workflow.Logger);

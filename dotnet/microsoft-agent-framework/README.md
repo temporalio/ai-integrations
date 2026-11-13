@@ -430,7 +430,7 @@ While the Workflow waits, no Activity is open: the wait costs nothing and surviv
 
 `RunStreamingAsync` works in a Workflow. The model Activity consumes the provider's stream, heartbeats on every update, and returns the whole response; the Workflow then yields that response as `AgentResponseUpdate`s: for each model call, one per response message and one carrying its usage, plus one per tool result message. One model call is still one Activity.
 
-To get the updates as the provider produces them, name a Workflow Stream topic. The Activity publishes each `ChatResponseUpdate` through `Temporalio.Extensions.WorkflowStreams`, batched every `StreamingBatchInterval` (default 100 milliseconds) or every 256 updates, whichever comes first, and the Workflow hosts the stream:
+To get the updates as the provider produces them, name a Workflow Stream topic; a topic on an agent whose Workflow hosts no `WorkflowStream` fails the run with `MicrosoftAgentFrameworkWorkflowError` before the first model call. The Activity publishes each `ChatResponseUpdate` through `Temporalio.Extensions.WorkflowStreams`, batched every `StreamingBatchInterval` (default 100 milliseconds) or every 256 updates, whichever comes first, and the Workflow hosts the stream:
 
 ```csharp
 using Microsoft.Extensions.AI;

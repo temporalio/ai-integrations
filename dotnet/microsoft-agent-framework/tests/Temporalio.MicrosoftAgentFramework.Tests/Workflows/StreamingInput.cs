@@ -7,4 +7,5 @@ public sealed record StreamingInput(
     string? Topic = null,
     bool WithTool = false,
     WorkflowStreamState? StreamState = null,
-    TimeSpan? BatchInterval = null);
+    TimeSpan? BatchInterval = null,
+    bool HostStream = true);

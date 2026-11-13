@@ -83,6 +83,20 @@ public class StreamingTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task StreamingTopic_WithoutAHostedStream_FailsTheRunBeforeTheModelCall()
+    {
+        var fake = new FakeChatClient(ScriptedResponse.Text("never"));
+        var input = new StreamingInput("hi", "deltas", HostStream: false);
+        var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (StreamingWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);
+        Assert.Contains("hosts no WorkflowStream", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(0, fake.CallCount);
+        Assert.Empty(HistoryAssert.Scheduled(await handle.FetchHistoryAsync()));
+    }
+
+    [Fact]
     public async Task StreamingTopic_LongStream_FlushesEveryMaxBatchSizeUpdates()
     {
         var text = string.Join(' ', Enumerable.Range(1, 300).Select(i => $"w{i}"));
