@@ -5,6 +5,7 @@ import dataclasses
 import gc
 import json
 import time
+import typing
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Collection, Sequence
@@ -38,6 +39,7 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
 )
+from typing_extensions import TypeAliasType
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -727,6 +729,66 @@ class _FieldTaggedEnvelope(pydantic.BaseModel):
     item: _FieldTaggedMessage | int
 
 
+class _TimeOrTextResult(pydantic.BaseModel):
+    at: datetime | str
+    record: ModelResponse
+
+
+class _StrictTimeOrCountResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(strict=True)
+    at: datetime | int
+    record: ModelResponse
+
+
+class _TimeOrTextEnvelope(pydantic.BaseModel):
+    item: _TimeOrTextResult | _TaggedB
+
+
+class _PassedOnHolder(pydantic.BaseModel):
+    held: _InPlaceA | _LooseA
+    other: ModelResponse
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _pass_on(cls, value: Any) -> Any:
+        # Its fields get the value as Python, not JSON.
+        return value
+
+
+class _ConfigTaggedMessage(ResponseOutputMessage):
+    model_config = pydantic.ConfigDict(str_to_lower=True)
+
+    @pydantic.model_serializer(mode="wrap")
+    def _upper_type(self, handler: Any) -> Any:
+        return {**handler(self), "type": "MESSAGE"}
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _lower(cls, value: Any, info: pydantic.ValidationInfo) -> Any:
+        # Lowers its type as its own config asks.
+        if (info.config or {}).get("str_to_lower"):
+            return _lower_type(value)
+        return value
+
+
+class _ConfigTaggedEnvelope(pydantic.BaseModel):
+    item: _ConfigTaggedMessage | int
+
+
+class _ConfigTaggedField(pydantic.BaseModel):
+    item: _ConfigTaggedMessage
+
+
+_DescribedAlias = TypeAliasType("_DescribedAlias", _DescribedResult)
+_OptionalDescribedAlias = TypeAliasType(
+    "_OptionalDescribedAlias", _DescribedResult | None
+)
+# What a ``type`` statement makes, where Python has it.
+_NativeDescribedAlias = getattr(typing, "TypeAliasType", TypeAliasType)(
+    "_NativeDescribedAlias", _DescribedResult
+)
+
+
 def _extra_side() -> _ExtraSide:
     side = _ExtraSide(name="n")
     cast(Any, side).sentinel = "keep-me"
@@ -1224,6 +1286,83 @@ def _is_response(value: Any) -> bool:
                 and _is_message(got.item)
             ),
         ),
+        (
+            _TimeOrTextResult(at=_AT, record=_response()),
+            _TimeOrTextResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: got.at == _AT and _is_response(got.record),
+        ),
+        (
+            _StrictTimeOrCountResult(at=_AT, record=_response()),
+            _StrictTimeOrCountResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: got.at == _AT and _is_response(got.record),
+        ),
+        (
+            _TimeOrTextEnvelope(item=_TimeOrTextResult(at=_AT, record=_response())),
+            _TimeOrTextEnvelope,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _TimeOrTextResult)
+                and got.item.at == _AT
+                and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _PassedOnHolder(
+                held=_InPlaceA(kind="a", record=_response()), other=_response()
+            ),
+            _PassedOnHolder,
+            # Both, so plain validation, whose union shares the held value, fails too.
+            (
+                ["held", "record", "output", 0, "content", 0, "annotations"],
+                ["other", "output", 0, "content", 0, "annotations"],
+            ),
+            lambda got: (
+                isinstance(got.held, _InPlaceA) and _is_response(got.held.record)
+            ),
+        ),
+        (
+            _ConfigTaggedEnvelope(
+                item=_ConfigTaggedMessage.model_validate(_message().model_dump())
+            ),
+            _ConfigTaggedEnvelope,
+            ["item", "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _ConfigTaggedMessage)
+                and got.item.type == "message"
+                and _is_message(got.item)
+            ),
+        ),
+        (
+            _ConfigTaggedField(
+                item=_ConfigTaggedMessage.model_validate(_message().model_dump())
+            ),
+            _ConfigTaggedField,
+            ["item", "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _ConfigTaggedMessage)
+                and got.item.type == "message"
+            ),
+        ),
+        (
+            _DescribedResult(record=_response()),
+            _DescribedAlias,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _DescribedResult) and _is_response(got.record),
+        ),
+        (
+            _DescribedResult(record=_response()),
+            _OptionalDescribedAlias,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _DescribedResult) and _is_response(got.record),
+        ),
+        (
+            _DescribedResult(record=_response()),
+            _NativeDescribedAlias,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _DescribedResult) and _is_response(got.record),
+        ),
     ],
     ids=[
         "extra",
@@ -1284,18 +1423,31 @@ def _is_response(value: Any) -> bool:
         "nested-union-variant-changing-its-tag-in-place",
         "deferred-model",
         "openai-variant-normalizing-its-tag-by-field",
+        "datetime-or-str-beside-a-response",
+        "strict-datetime-or-int-beside-a-response",
+        "datetime-or-str-in-a-union-variant",
+        "union-below-a-model-validator-changing-its-tag-in-place",
+        "openai-variant-normalizing-its-tag-by-its-config",
+        "openai-model-normalizing-its-tag-by-its-config",
+        "declared-type-alias",
+        "declared-type-alias-of-an-optional",
+        "declared-native-type-alias",
     ],
 )
 def test_lenient_caller_model_shapes(
-    value: Any, type_: Any, path: list[Any], check: Callable[[Any], bool]
+    value: Any,
+    type_: Any,
+    path: list[Any] | tuple[list[Any], ...],
+    check: Callable[[Any], bool],
 ):
     converter = OpenAIPayloadConverter()
     payload = converter.to_payload(value)
     raw = json.loads(payload.data)
-    node = raw
-    for key in path[:-1]:
-        node = node[key]
-    del node[path[-1]]
+    for one in path if isinstance(path, tuple) else [path]:
+        node = raw
+        for key in one[:-1]:
+            node = node[key]
+        del node[one[-1]]
     payload.data = json.dumps(raw).encode()
 
     received = converter.from_payload(payload, type_)

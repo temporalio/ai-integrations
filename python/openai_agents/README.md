@@ -240,9 +240,10 @@ The plugin automatically handles several important setup tasks:
 
 OpenAI's response models can lag behind live API payloads, so a value that holds a model response
 may fail strict validation when it is decoded. The plugin then validates a Pydantic model or
-dataclass you declare again, with its own config and validators and those of an `Annotated` type
-you declare it in, and builds only the OpenAI models that fail without validation, from the
-value their own validators return. An instance
+dataclass you declare again, directly or through a type alias, with its own config and
+validators and those of an `Annotated` type you declare it in, and builds only the OpenAI models
+that fail without validation, from the value their own validators return. The rest of the value
+decodes from JSON as it would if it were valid, unions included. An instance
 that a validator returns is kept or revalidated as Pydantic would. Inside a union, it builds a
 variant only if it is the one whose kind and type tag fit the value and that validates; a
 variant's validators that change the value, an OpenAI model's included, run before its kind and

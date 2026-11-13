@@ -41,7 +41,7 @@ from agents.tracing.provider import DefaultTraceProvider
 # has no public alias.
 from openai._models import construct_type
 from pydantic.fields import FieldInfo
-from typing_extensions import NotRequired, Required, is_typeddict
+from typing_extensions import NotRequired, Required, TypeAliasType, is_typeddict
 
 import temporalio.api.common.v1
 from temporalio.contrib.opentelemetry._tracer_provider import ReplaySafeTracerProvider
@@ -227,7 +227,14 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     ``construct_type``. ``include_extras`` preserves the ``Annotated``
     discriminators the unions rely on.
     """
+    type_ = _unalias(type_)
     origin = typing.get_origin(type_)
+    if isinstance(origin, _TYPE_ALIASES):
+        # A generic alias's specialization, whose value only its schema resolves.
+        try:
+            return _lenient_validate(type_, value)
+        except (pydantic.ValidationError, pydantic_core.SchemaError):
+            return value
     if origin in (Required, NotRequired):
         return _lenient_construct(typing.get_args(type_)[0], value)
     if origin is typing.Annotated and (
@@ -332,6 +339,17 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     return construct_type(type_=type_, value=value)
 
 
+# Named type aliases: ``type Alias = ...`` statements, and their backport.
+_TYPE_ALIASES = tuple({TypeAliasType, getattr(typing, "TypeAliasType", TypeAliasType)})
+
+
+def _unalias(type_: typing.Any) -> typing.Any:
+    """The type a named alias, such as ``type Alias = Result``, stands for."""
+    while isinstance(type_, _TYPE_ALIASES):
+        type_ = type_.__value__
+    return type_
+
+
 def _lenient_validate(type_: typing.Any, value: typing.Any) -> typing.Any:
     """Validate a caller's model or dataclass whose OpenAI parts fail strict validation.
 
@@ -348,7 +366,12 @@ def _lenient_validate(type_: typing.Any, value: typing.Any) -> typing.Any:
         validator = _lenient_validator.__wrapped__(type_)
     else:
         validator = _lenient_validator(type_)
-    return validator.validate_json(json.dumps(value))
+    # A union that an error other than a validation error interrupts leaves its attempt behind.
+    attempts = _union_attempts.set(())
+    try:
+        return validator.validate_json(json.dumps(value))
+    finally:
+        _union_attempts.reset(attempts)
 
 
 # A validator holds its type through its schema and functions, so a weak cache would never
@@ -371,31 +394,19 @@ def _core_schema(type_: typing.Any) -> typing.Any:
     return adapter.core_schema
 
 
-# The choice a lenient union validates next: all its variants strictly, as a union, or the
-# index of the one variant it validates leniently.
-_union_choice: ContextVar[str | int] = ContextVar("_union_choice", default="strict")
-
-# Whether an OpenAI model validates strictly or falls back to ``construct_type``.
-_model_choice: ContextVar[str] = ContextVar("_model_choice", default="strict")
-
-# Whether the value is validated strictly, as a union's strict attempt does, so no OpenAI model
-# or union in it falls back.
-_strict_only: ContextVar[bool] = ContextVar("_strict_only", default=False)
-
-# Whether the next OpenAI model to validate is a lenient union variant reached through a
-# validator that can change the value, so it must check the value's kind and tags itself.
-_variant_check: ContextVar[bool] = ContextVar("_variant_check", default=False)
-
 _LENIENT_REF = ":lenient"
 
 
-def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.Any:
+def _lenient_schema(
+    schema: typing.Any, refs: dict[str, typing.Any], check: bool = False
+) -> typing.Any:
     """A copy of a Pydantic core schema in which OpenAI models fall back to ``construct_type``.
 
     Each OpenAI model first validates strictly. A union first validates all its variants
     strictly, as a union, and only then as the one variant whose shape and ``Literal`` tags fit
     the value and that validates, so the fallback never picks among several variants.
-    Definitions are copied under a new ref.
+    Definitions are copied under a new ref. With ``check``, the OpenAI model that the schema's
+    value reaches past its validators checks the value's kind and tags before it builds.
     """
     if isinstance(schema, list | tuple):
         return type(schema)(_lenient_schema(item, refs) for item in schema)
@@ -414,11 +425,24 @@ def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.A
             ],
         }
     if kind == "definition-ref":
+        if check and schema["schema_ref"] in refs:
+            # A copy of its own that checks, in place of the shared definition.
+            target = {**refs[schema["schema_ref"]]}
+            target.pop("ref", None)
+            return _lenient_schema(target, refs, check)
         return {**schema, "schema_ref": schema["schema_ref"] + _LENIENT_REF}
     if kind == "union":
         return _lenient_union(schema, refs)
+    # The schema the value reaches next past a validator, a default or a root model.
+    passes_check = check and (
+        kind in _VALIDATORS
+        or kind in ("nullable", "default")
+        or (kind == "model" and bool(schema.get("root_model")))
+    )
     copy: typing.Any = {
-        key: item if key in _SCHEMA_DATA_KEYS else _lenient_schema(item, refs)
+        key: item
+        if key in _SCHEMA_DATA_KEYS
+        else _lenient_schema(item, refs, passes_check and key == "schema")
         for key, item in schema.items()
     }
     ref = copy.pop("ref", None)
@@ -433,7 +457,7 @@ def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.A
     if kind != "model" or not isinstance(cls, type):
         return {**copy, "ref": ref} if ref is not None else copy
     if issubclass(cls, openai.BaseModel):
-        return _lenient_openai_model(cls, schema, copy, ref)
+        return _lenient_openai_model(cls, schema, copy, ref, check)
     if schema.get("custom_init"):
         # Pydantic would call the model's own __init__; keep its strict validator. Its refs are
         # renamed like the rest of the copy, so they stay unique beside the original definitions.
@@ -478,59 +502,56 @@ def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.A
 
 
 def _lenient_openai_model(
-    cls: type, schema: dict[str, typing.Any], copy: typing.Any, ref: str | None
+    cls: type,
+    schema: dict[str, typing.Any],
+    copy: typing.Any,
+    ref: str | None,
+    check: bool,
 ) -> typing.Any:
     """An OpenAI model that validates strictly, or else is built with ``construct_type``.
 
     pydantic-core replaces a model schema with the model's prebuilt strict validator once the
-    class has one. So the fallback is a separate choice: the model's own before validators, run
-    in this validation so they get its mode, context and field, and then ``construct_type`` on
-    the value they return. As a union variant reached through a validator that can change the
-    value, it is built only if that value's kind and tags fit.
+    class has one. So the fallback is a separate choice: the model's own before validators, and
+    then ``construct_type`` on the value they return. They run in a stand-in model with the
+    model's config, in this validation, so they get the same mode, context, field, data and
+    config as when the model validates. With ``check``, it is built only if that value's kind
+    and tags fit, and in a union's strict attempt it is not built. Neither choice is behind a
+    function validator, so a JSON value reaches both as JSON, and each gets its own copy of it.
     """
     cs = pydantic_core.core_schema
 
     def build(value: typing.Any) -> typing.Any:
-        if _variant_check.get() and not _shape_fits(schema, value):
+        if check and not _shape_fits(schema, value):
             raise pydantic_core.PydanticCustomError(
                 "lenient_variant", "The value does not fit this variant"
             )
-        return construct_type(type_=cls, value=value)
+        # The stand-in's fields, extra fields and fields set.
+        return {"built": construct_type(type_=cls, value=value)}, None, set()
 
-    def validate(value: typing.Any, handler: typing.Any) -> typing.Any:
-        # Its own validators may consume the value they read.
-        sent = _json_copy(value)
-        choice = _model_choice.set("strict")
-        # The models inside it are not the variant.
-        check = _variant_check.set(False)
-        try:
-            return handler(value)
-        except pydantic.ValidationError as error:
-            strict_error = error
-        finally:
-            _variant_check.reset(check)
-            _model_choice.reset(choice)
-        if _strict_only.get():
-            raise strict_error
-        choice = _model_choice.set("fallback")
-        try:
-            return handler(sent)
-        except pydantic.ValidationError:
-            raise strict_error from None
-        finally:
-            _model_choice.reset(choice)
-
-    return cs.no_info_wrap_validator_function(
-        validate,
-        cs.tagged_union_schema(
-            {
-                "strict": copy,
-                "fallback": _past_validators(
-                    copy["schema"], cs.no_info_plain_validator_function(build)
-                ),
-            },
-            discriminator=lambda _: _model_choice.get(),
+    stand_in: dict[str, typing.Any] = {
+        "type": "model",
+        "cls": _ModelState,
+        "schema": _past_validators(
+            copy["schema"], cs.no_info_plain_validator_function(build)
         ),
+    }
+    if "config" in schema:
+        stand_in["config"] = schema["config"]
+    return cs.union_schema(
+        [
+            copy,
+            cs.tagged_union_schema(
+                {
+                    "fallback": cs.no_info_after_validator_function(
+                        lambda state: state.__dict__["built"],
+                        typing.cast(typing.Any, stand_in),
+                    ),
+                    "skip": cs.no_info_plain_validator_function(_next_choice),
+                },
+                discriminator=lambda _: "skip" if _in_strict_attempt() else "fallback",
+            ),
+        ],
+        mode="left_to_right",
         ref=ref,
     )
 
@@ -705,102 +726,173 @@ _SCHEMA_DATA_KEYS = frozenset(
 )
 
 
+class _UnionAttempt:
+    """A lenient union's validation of one value."""
+
+    __slots__ = ("built", "candidates", "received", "sent", "strict")
+
+    def __init__(self, value: typing.Any) -> None:
+        self.received = value
+        # The value before a variant's validator changes it in place.
+        self.sent = _json_copy(value)
+        self.strict = True
+        self.candidates: list[int] = []
+        self.built: list[typing.Any] = []
+
+
+# The lenient unions being validated, innermost last.
+_union_attempts: ContextVar[tuple[_UnionAttempt, ...]] = ContextVar(
+    "_union_attempts", default=()
+)
+
+
+def _in_strict_attempt() -> bool:
+    """Whether a lenient union is validating strictly, so nothing in it falls back."""
+    return any(attempt.strict for attempt in _union_attempts.get())
+
+
+def _next_choice(_value: typing.Any = None) -> typing.NoReturn:
+    """Move a left-to-right union on to its next choice."""
+    raise pydantic_core.PydanticCustomError("lenient_step", "Not this choice")
+
+
 def _lenient_union(
     schema: dict[str, typing.Any], refs: dict[str, typing.Any]
 ) -> typing.Any:
     """A union that validates strictly first, then as the only variant that validates leniently.
 
-    Both are the same union of the variants' lenient copies. Its strict attempt validates every
-    variant with no fallback in it, so it picks the variant the original union would. A lenient
-    attempt validates just one.
+    It is a left-to-right union of steps. The first is the union of the variants' lenient copies,
+    with no fallback in them, so it picks the variant the original union would. Then each variant
+    whose kind and tags fit validates leniently, and the result is the one that validates, if only
+    one does. No step is behind a function validator, so a JSON value reaches every variant as
+    JSON, as in plain JSON validation, and each gets its own copy of it. A value from Python, such
+    as one a validator returns, is the same object in every step, so each variant then gets a copy
+    of it as it was sent.
     """
     cs = pydantic_core.core_schema
     choices = [
         choice[0] if isinstance(choice, tuple) else choice
         for choice in schema["choices"]
     ]
-    gated = [
-        _attempt_gate(i, _lenient_schema(choice, refs))
-        for i, choice in enumerate(choices)
-    ]
-    union = {
-        **{key: item for key, item in schema.items() if key != "ref"},
-        "choices": [
-            (gate, choice[1]) if isinstance(choice, tuple) else gate
-            for gate, choice in zip(gated, schema["choices"], strict=True)
-        ],
-    }
-    # A variant whose value a before, wrap or plain validator can change is judged only after
-    # that validator runs: by its own validation, or for an OpenAI model, which builds from any
-    # object, by the kind and tag check in its lenient copy (see ``_lenient_schema``).
-    checks_itself = []
-    for choice in choices:
+    # Each variant's lenient copy is defined once, for both of its attempts. A variant whose value
+    # a before, wrap or plain validator can change is judged only after that validator runs: by
+    # its own validation, or for an OpenAI model, which builds from any object, by the kind and
+    # tag check in its lenient copy.
+    variant_refs = [f"lenient-variant:{next(_stand_ins)}" for _ in choices]
+    definitions = []
+    for choice, ref in zip(choices, variant_refs, strict=True):
         transformed, target = _variant_target(choice, refs)
-        checks_itself.append(
-            transformed
+        lenient = _lenient_schema(
+            choice,
+            refs,
+            check=transformed
             and isinstance(target, dict)
             and target.get("type") == "model"
             and isinstance(target.get("cls"), type)
-            and issubclass(target["cls"], openai.BaseModel)
+            and issubclass(target["cls"], openai.BaseModel),
+        )
+        definitions.append({**lenient, "ref": ref})
+
+    def attempt() -> _UnionAttempt:
+        return _union_attempts.get()[-1]
+
+    def end() -> _UnionAttempt:
+        attempts = _union_attempts.get()
+        _union_attempts.set(attempts[:-1])
+        return attempts[-1]
+
+    def begin(value: typing.Any) -> typing.Any:
+        _union_attempts.set((*_union_attempts.get(), _UnionAttempt(value)))
+        _next_choice()
+
+    def validated(value: typing.Any) -> typing.Any:
+        end()
+        return value
+
+    def prepare(_value: typing.Any) -> typing.Any:
+        current = attempt()
+        current.strict = False
+        # An enclosing union's strict attempt builds nothing leniently. Otherwise, OpenAI models in
+        # a lenient variant build from any object, so only the variants whose kind and tags fit
+        # are tried. Their own validators and aliases then decide.
+        if not _in_strict_attempt():
+            current.candidates = [
+                i
+                for i, choice in enumerate(choices)
+                if _schema_may_hold(choice, current.sent, refs)
+            ]
+        _next_choice()
+
+    def record(value: typing.Any) -> typing.Any:
+        attempt().built.append(value)
+        _next_choice()
+
+    def own_copy(
+        variant: typing.Any, skips: Callable[[_UnionAttempt], bool] | None = None
+    ) -> typing.Any:
+        def choose(value: typing.Any) -> str:
+            current = attempt()
+            if skips is not None and skips(current):
+                return "skip"
+            # A JSON value is a new object in each step.
+            if value is current.received and isinstance(value, dict | list):
+                return "copy"
+            return "input"
+
+        return cs.tagged_union_schema(
+            {
+                "input": variant,
+                "copy": cs.no_info_before_validator_function(
+                    lambda _: _json_copy(attempt().sent), variant
+                ),
+                "skip": cs.no_info_plain_validator_function(_next_choice),
+            },
+            discriminator=choose,
         )
 
-    # Each variant gets its own copy of the value in each attempt, as it does in JSON
-    # validation, so a validator that consumes or changes the value it reads leaves it whole
-    # for the other variants and attempts.
-    def validate(value: typing.Any, handler: typing.Any) -> typing.Any:
-        token = _union_choice.set("strict")
-        strict = _strict_only.set(True)
-        try:
-            return handler(value)
-        except pydantic.ValidationError as error:
-            strict_error = error
-        finally:
-            _strict_only.reset(strict)
-            _union_choice.reset(token)
-        if _strict_only.get():
-            raise strict_error
-        # OpenAI models in a lenient variant build from any object, so only the variants whose
-        # kind and tags fit are tried. Their own validators and aliases then decide.
-        built: list[typing.Any] = []
-        for i, choice in enumerate(choices):
-            if len(built) > 1:
-                break
-            if not _schema_may_hold(choice, value, refs):
-                continue
-            token = _union_choice.set(i)
-            check = _variant_check.set(checks_itself[i])
-            try:
-                built.append(handler(_json_copy(value)))
-            except pydantic.ValidationError:
-                pass
-            finally:
-                _variant_check.reset(check)
-                _union_choice.reset(token)
+    def lenient_step(index: int) -> typing.Any:
+        return own_copy(
+            cs.no_info_after_validator_function(
+                record, cs.definition_reference_schema(variant_refs[index])
+            ),
+            lambda current: index not in current.candidates or len(current.built) > 1,
+        )
+
+    def finish(_value: typing.Any) -> typing.Any:
+        built = end().built
         if len(built) != 1:
-            raise strict_error
+            raise pydantic_core.PydanticCustomError(
+                "lenient_union", "No single variant fits the value"
+            )
         return built[0]
 
-    return cs.no_info_wrap_validator_function(
-        validate,
-        typing.cast(typing.Any, union),
-        ref=schema["ref"] + _LENIENT_REF if "ref" in schema else None,
-    )
-
-
-def _attempt_gate(index: int, schema: typing.Any) -> typing.Any:
-    """A lenient union's variant, which validates in its strict attempt and its own attempt."""
-
-    def validate(value: typing.Any, handler: typing.Any) -> typing.Any:
-        choice = _union_choice.get()
-        if choice == "strict":
-            return handler(_json_copy(value))
-        if choice != index:
-            raise pydantic_core.PydanticCustomError(
-                "lenient_attempt", "Another variant is being validated"
+    strict = {
+        **{key: item for key, item in schema.items() if key != "ref"},
+        "choices": [
+            (variant, choice[1]) if isinstance(choice, tuple) else variant
+            for variant, choice in zip(
+                (own_copy(cs.definition_reference_schema(ref)) for ref in variant_refs),
+                schema["choices"],
+                strict=True,
             )
-        return handler(value)
-
-    return pydantic_core.core_schema.no_info_wrap_validator_function(validate, schema)
+        ],
+    }
+    union = cs.definitions_schema(
+        cs.union_schema(
+            [
+                cs.no_info_plain_validator_function(begin),
+                cs.no_info_after_validator_function(
+                    validated, typing.cast(typing.Any, strict)
+                ),
+                cs.no_info_plain_validator_function(prepare),
+                *(lenient_step(i) for i in range(len(choices))),
+                cs.no_info_plain_validator_function(finish),
+            ],
+            mode="left_to_right",
+        ),
+        typing.cast(typing.Any, definitions),
+    )
+    return {**union, "ref": schema["ref"] + _LENIENT_REF} if "ref" in schema else union
 
 
 def _schema_may_hold(
@@ -990,7 +1082,11 @@ def _field_type(field: FieldInfo) -> typing.Any:
 
 def _plugin_builds(type_: typing.Any) -> bool:
     """Whether the fallback builds ``type_`` itself rather than handing it to ``construct_type``."""
+    type_ = _unalias(type_)
     origin = typing.get_origin(type_)
+    if isinstance(origin, _TYPE_ALIASES):
+        # Validated as declared (see ``_lenient_construct``).
+        return True
     if origin is typing.Annotated:
         # Built with its metadata (see ``_lenient_construct``).
         return _plugin_builds(typing.get_args(type_)[0])
@@ -1023,6 +1119,7 @@ def _may_hold(type_: typing.Any, value: typing.Any) -> bool:
     A variant behind a validator that can change the value always may: its validation decides
     after the validator runs.
     """
+    type_ = _unalias(type_)
     if _changes_input(type_):
         return True
     origin = typing.get_origin(type_) or type_
@@ -1082,6 +1179,7 @@ def _changes_input(type_: typing.Any) -> bool:
     before the lenient union checks them (see ``_lenient_schema``). Collections and unions judge
     their items' and variants' kinds themselves.
     """
+    type_ = _unalias(type_)
     origin = typing.get_origin(type_)
     if origin in (
         list,
