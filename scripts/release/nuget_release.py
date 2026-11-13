@@ -94,7 +94,8 @@ def unsigned_entries(payload: bytes) -> list[tuple[str, int, int, bytes]]:
         if infos and infos[-1].filename == SIGNATURE and infos[-1].compress_type == zipfile.ZIP_STORED:
             infos = infos[:-1]
         if any(info.filename == SIGNATURE for info in infos):
-            raise NuGetReleaseError("package has a signature entry that is not the trailing stored repository signature")
+            # A signature anywhere but last, or compressed, never changes on retry: a mismatch, not propagation.
+            raise NuGetMismatchError("package has a signature entry that is not the trailing stored repository signature")
         return [(info.filename, info.file_size, info.CRC, archive.read(info)) for info in infos]
 
 

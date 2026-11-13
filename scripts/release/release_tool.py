@@ -31,6 +31,7 @@ Policy (AGENTS.md, "Release runbook"):
 from __future__ import annotations
 
 import argparse
+import http.client
 import hashlib
 import json
 import os
@@ -849,7 +850,8 @@ def cmd_nuget_registry_state(args: argparse.Namespace) -> int:
             error = f"nuget.org does not yet serve {args.coordinate} {args.version}"
         except NuGetMismatchError as exc:
             raise PolicyError(str(exc)) from exc
-        except (NuGetReleaseError, urllib.error.URLError, TimeoutError) as exc:
+        except (NuGetReleaseError, urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+            # urllib does not wrap a connection reset or a short read; those are propagation noise too.
             error = str(exc)
         if attempt + 1 < args.attempts:
             print(f"NuGet verification attempt {attempt + 1}: {error}")

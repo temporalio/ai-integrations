@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import os
@@ -184,7 +185,8 @@ def test_unsigned_entries_strip_only_the_trailing_stored_signature() -> None:
     assert nuget_release.served_matches(nupkg(signature=b"repository signature"), nupkg())
     assert not nuget_release.served_matches(nupkg(dll=b"MZ-other", signature=b"sig"), nupkg())
     for payload in (nupkg(signature=b"sig", stored=False), nupkg(signature=b"sig", signature_first=True)):
-        with pytest.raises(nuget_release.NuGetReleaseError, match="trailing stored repository signature"):
+        # Permanent: a signature in the wrong place or compressed never changes on retry.
+        with pytest.raises(nuget_release.NuGetMismatchError, match="trailing stored repository signature"):
             nuget_release.unsigned_entries(payload)
 
 
@@ -250,6 +252,25 @@ def test_cli_registry_state_outputs_and_retries_propagation(tmp_path: Path, monk
     monkeypatch.setattr(release_tool, "nuget_registry_state", lambda *args: next(responses))
     output.unlink()
     assert release_tool.main([*args, "--require-present", "--attempts", "2", "--delay", "0"]) == 0
+    assert output.read_text() == "exists=true\n"
+
+
+@pytest.mark.parametrize("transient", [ConnectionResetError("reset by peer"), http.client.IncompleteRead(b"half"), TimeoutError("slow")])
+def test_cli_registry_state_retries_connection_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transient: Exception) -> None:
+    dist = dist_with(tmp_path)
+    responses = iter([transient, True])
+
+    def flaky(*args):
+        value = next(responses)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(release_tool, "nuget_registry_state", flaky)
+    output = tmp_path / "output"
+    args = ["nuget-registry-state", "--coordinate", COORDINATE, "--version", VERSION, "--dist", str(dist),
+            "--github-output", str(output), "--require-present", "--attempts", "2", "--delay", "0"]
+    assert release_tool.main(args) == 0
     assert output.read_text() == "exists=true\n"
 
 
