@@ -3,7 +3,7 @@
 
 Reads the jobs of the current workflow run through `gh api`, maps reusable
 workflow job names such as `Python (openai_agents) / ...`, `Go (googleadk) / ...`
-and `.NET (agent-framework) / ...` to a plugin, and keeps exactly one open issue
+and `.NET (microsoft-agent-framework) / ...` to a plugin, and keeps exactly one open issue
 per failing plugin labelled `nightly`.
 Passing plugins with an open issue get a comment and are closed.
 """

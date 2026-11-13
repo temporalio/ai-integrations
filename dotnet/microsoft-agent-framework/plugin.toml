@@ -1,0 +1,18 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "microsoft-agent-framework"
+language = "dotnet"
+coordinate = "Temporalio.MicrosoftAgentFramework"
+registry = "nuget"
+root-api = "Temporalio.MicrosoftAgentFramework"
+maturity = "pre-release"
+docs = "https://github.com/temporalio/ai-integrations/tree/main/dotnet/microsoft-agent-framework"
+
+[ci]
+# .NET SDK channels (major.minor). First = floor pinned by global.json, last = dist cell.
+runtime-versions = ["10.0"]
+
+[smoke]
+# Fully qualified type names a clean consumer must load from the package assembly.
+imports = ["Temporalio.MicrosoftAgentFramework.MicrosoftAgentFrameworkPlugin"]

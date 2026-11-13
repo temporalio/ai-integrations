@@ -267,6 +267,6 @@ def test_missing_shared_files_are_reported(dotnet_repo: Path) -> None:
 
 def test_coordinate_casing_in_plugin_toml_is_canonical(repo: Path) -> None:
     from conftest import commit_all
-    make_dotnet_plugin(repo, "agent-framework", "Temporalio.AgentFramework")
+    make_dotnet_plugin(repo, "microsoft-agent-framework", "Temporalio.MicrosoftAgentFramework")
     commit_all(repo, "add agent framework")
     assert Checker(repo).run() == []

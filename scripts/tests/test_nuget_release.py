@@ -30,7 +30,7 @@ def test_nuget_rejects_noncanonical_versions(version: str) -> None:
     with pytest.raises(nuget_release.NuGetReleaseError, match="NuGet version"):
         nuget_release.NuGetVersion(version)
     with pytest.raises(release_tool.PolicyError):
-        release_tool.parse_tag(f"dotnet/agent-framework/v{version}")
+        release_tool.parse_tag(f"dotnet/microsoft-agent-framework/v{version}")
 
 
 def test_uppercase_labels_never_reach_nuget_org() -> None:
@@ -49,11 +49,11 @@ def test_dotted_prerelease_labels_order_numerically() -> None:
 
 
 def test_dotnet_tags_parse_with_the_prerelease_flag() -> None:
-    assert release_tool.parse_tag("dotnet/agent-framework/v0.0.1-rc.1") == {
-        "tag": "dotnet/agent-framework/v0.0.1-rc.1", "language": "dotnet", "plugin": "agent-framework",
-        "version": "0.0.1-rc.1", "prerelease": "true", "plugin_dir": "dotnet/agent-framework",
+    assert release_tool.parse_tag("dotnet/microsoft-agent-framework/v0.0.1-rc.1") == {
+        "tag": "dotnet/microsoft-agent-framework/v0.0.1-rc.1", "language": "dotnet", "plugin": "microsoft-agent-framework",
+        "version": "0.0.1-rc.1", "prerelease": "true", "plugin_dir": "dotnet/microsoft-agent-framework",
     }
-    assert release_tool.parse_tag("dotnet/agent-framework/v0.0.1")["prerelease"] == "false"
+    assert release_tool.parse_tag("dotnet/microsoft-agent-framework/v0.0.1")["prerelease"] == "false"
 
 
 def test_cli_parse_dotnet_tag_emits_the_sdk_channel(dotnet_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:

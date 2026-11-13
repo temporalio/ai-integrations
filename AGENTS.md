@@ -196,7 +196,7 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   `UseMicrosoftTestingPlatformRunner`), with `Microsoft.Testing.Extensions.TrxReport` for reports.
   VSTest packages (`Microsoft.NET.Test.Sdk`, `xunit.runner.visualstudio`, xunit 2) are not allowed;
   MTP mode rejects them. The runner's switches differ from VSTest: `make test` passes `--report-trx`,
-  and `make test TEST_ARGS='--filter-class Temporalio.AgentFramework.Tests.ReplayTests'` selects a
+  and `make test TEST_ARGS='--filter-class Temporalio.MicrosoftAgentFramework.Tests.ReplayTests'` selects a
   class. Tests self-provision the Temporal dev server with the repository's retry policy and need no
   provider credentials.
 - Tooling: `make sync`, `make lint` (`dotnet format --verify-no-changes` on the solution; analyzers run

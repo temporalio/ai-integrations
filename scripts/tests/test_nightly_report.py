@@ -110,11 +110,11 @@ def test_java_failures_are_aggregated_by_plugin() -> None:
 def test_dotnet_failures_use_the_language_root_key() -> None:
     failing, passing = nightly_report.classify(
         [
-            _job(".NET (agent-framework) / agent-framework (windows-latest, dotnet10.0)", "failure"),
-            _job(".NET (agent-framework) / matrix", "success"),
+            _job(".NET (microsoft-agent-framework) / microsoft-agent-framework (windows-latest, dotnet10.0)", "failure"),
+            _job(".NET (microsoft-agent-framework) / matrix", "success"),
             _job(".NET (other) / other (ubuntu-latest, dotnet10.0)", "success"),
         ]
     )
-    assert failing == {"dotnet/agent-framework"}
+    assert failing == {"dotnet/microsoft-agent-framework"}
     assert passing == {"dotnet/other"}
-    assert nightly_report.title_for("dotnet/agent-framework") == release_tool.nightly_issue_title("dotnet", "agent-framework")
+    assert nightly_report.title_for("dotnet/microsoft-agent-framework") == release_tool.nightly_issue_title("dotnet", "microsoft-agent-framework")

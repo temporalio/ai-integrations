@@ -308,7 +308,7 @@ NIGHTLY_ISSUES = [
     {"number": 444, "title": "nightly: openai_agents failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/444"},
     {"number": 500, "title": "nightly: typescript/langsmith failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/500"},
     {"number": 501, "title": "nightly: go/googleadk failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/501"},
-    {"number": 502, "title": "nightly: dotnet/agent-framework failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/502"},
+    {"number": 502, "title": "nightly: dotnet/microsoft-agent-framework failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/502"},
 ]
 
 
@@ -316,7 +316,7 @@ NIGHTLY_ISSUES = [
     ("python/openai_agents/v2.0.0", 444),
     ("typescript/langsmith/v1.24.0", 500),
     ("go/googleadk/v0.1.0", 501),
-    ("dotnet/agent-framework/v0.0.1-rc.1", 502),
+    ("dotnet/microsoft-agent-framework/v0.0.1-rc.1", 502),
     ("dotnet/other/v0.0.1", None),
     ("python/langsmith/v0.2.0", None),  # the TypeScript plugin's issue doesn't block the Python one
     ("typescript/openai-agents/v1.24.0", None),

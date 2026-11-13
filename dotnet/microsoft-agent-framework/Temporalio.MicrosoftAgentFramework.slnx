@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/Temporalio.MicrosoftAgentFramework/Temporalio.MicrosoftAgentFramework.csproj" />
+  <Project Path="tests/Temporalio.MicrosoftAgentFramework.Tests/Temporalio.MicrosoftAgentFramework.Tests.csproj" />
+</Solution>
