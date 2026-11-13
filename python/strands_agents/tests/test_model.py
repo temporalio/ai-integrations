@@ -25,6 +25,7 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, _sync_calls
+from temporalio.strands_agents._heartbeat_decorator import auto_heartbeater
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.strands_agents._sync_calls import _MESSAGE
 from temporalio.testing import ActivityEnvironment
@@ -101,6 +102,24 @@ def test_slow_model_factory_logs_a_warning(
     with caplog.at_level(logging.WARNING):
         env.run(model_activity._get_model, "slow")
     assert ("Building model 'slow' took" in caplog.text) == warns
+
+
+# The heartbeat timer counts from the start of the activity, so a factory that
+# blocks the event loop for less than the timeout only delays the first beat. A
+# timer that started at the first await would beat 1.2 seconds in, too late.
+async def test_heartbeat_timer_counts_from_the_start():
+    @auto_heartbeater
+    async def blocking_start() -> None:
+        time.sleep(0.7)
+        await asyncio.sleep(0.1)
+
+    beats: list[float] = []
+    start = time.monotonic()
+    env = ActivityEnvironment()
+    env.info = replace(env.info, heartbeat_timeout=timedelta(seconds=1))
+    env.on_heartbeat = lambda *_: beats.append(time.monotonic() - start)
+    await env.run(blocking_start)
+    assert beats and beats[0] < 1.0
 
 
 @tool
