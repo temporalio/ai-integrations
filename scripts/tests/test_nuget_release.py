@@ -137,7 +137,7 @@ def test_only_registry_404_means_new_coordinate(monkeypatch: pytest.MonkeyPatch)
 
 
 def nupkg(*, version: str = VERSION, package_id: str = COORDINATE, dll: bytes = b"MZ", signature: bytes | None = None,
-          stored: bool = True, signature_first: bool = False) -> bytes:
+          stored: bool = True, signature_first: bool = False, extra: bytes | None = None) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         def sign() -> None:
@@ -151,6 +151,8 @@ def nupkg(*, version: str = VERSION, package_id: str = COORDINATE, dll: bytes = 
             '<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"><metadata>'
             f"<id>{package_id}</id><version>{version}</version></metadata></package>"))
         archive.writestr(f"lib/net10.0/{COORDINATE}.dll", dll)
+        if extra is not None:
+            archive.writestr("extra/README.txt", extra)
         if signature is not None and not signature_first:
             sign()
     return buffer.getvalue()
@@ -184,6 +186,9 @@ def test_unsigned_entries_strip_only_the_trailing_stored_signature() -> None:
     assert [name for name, *_ in plain] == [f"{COORDINATE}.nuspec", f"lib/net10.0/{COORDINATE}.dll"]
     assert nuget_release.served_matches(nupkg(signature=b"repository signature"), nupkg())
     assert not nuget_release.served_matches(nupkg(dll=b"MZ-other", signature=b"sig"), nupkg())
+    # A served package with one entry more than the tested one is not the tested package either.
+    assert not nuget_release.served_matches(nupkg(extra=b"added by someone", signature=b"sig"), nupkg())
+    assert not nuget_release.served_matches(nupkg(signature=b"sig"), nupkg(extra=b"in the tested package"))
     for payload in (nupkg(signature=b"sig", stored=False), nupkg(signature=b"sig", signature_first=True)):
         # Permanent: a signature in the wrong place or compressed never changes on retry.
         with pytest.raises(nuget_release.NuGetMismatchError, match="trailing stored repository signature"):

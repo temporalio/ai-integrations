@@ -292,29 +292,48 @@ def test_releases_check_the_nightly_run_after_the_version_policy(language: str, 
     assert step["run"].endswith('release_tool.py check-nightly --tag "$TAG"')
 
 
-def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
-    doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
-    for job in ("publish-testpypi", "publish-pypi"):
+# The publish jobs of each release workflow: the ones with an OIDC token, the action that uses it and the
+# job whose `if` carries the tests-or-recovery gate (for .NET that is the token-free check before the push).
+RELEASE_PUBLISHERS = {
+    "python": {"jobs": ("publish-testpypi", "publish-pypi"), "action": "pypa/gh-action-pypi-publish@", "gated": "publish-testpypi",
+               "environments": {"publish-testpypi": "testpypi", "publish-pypi": {"name": "pypi", "url": "${{ needs.prepare.outputs.release_url }}"}},
+               "final": "publish-pypi", "final_if": "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'",
+               "tag_step": "Parse tag", "final_needs": {"prepare", "smoke-testpypi"}},
+    "dotnet": {"jobs": ("publish",), "action": "NuGet/login@", "gated": "existing",
+               "environments": {"publish": {"name": "nuget", "url": "${{ needs.prepare.outputs.release_url }}"}},
+               "final": "publish", "final_if": "needs.existing.result == 'success' && needs.prepare.outputs.publish == 'true'",
+               "tag_step": "Parse .NET tag", "final_needs": {"prepare", "test", "existing"}},
+}
+
+
+@pytest.mark.parametrize("language", sorted(RELEASE_PUBLISHERS))
+def test_release_publish_jobs_are_inline_and_oidc_only(language: str) -> None:
+    spec = RELEASE_PUBLISHERS[language]
+    doc = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())
+    for job in spec["jobs"]:
         j = doc["jobs"][job]
         assert j["permissions"] == {"id-token": "write", "actions": "read"}
         assert "uses" not in j, "publish jobs must be inline (PyPI rejects reusable workflows as trusted publishers)"
         steps = [s.get("uses", "") for s in j["steps"]]
         assert not any("checkout" in s for s in steps), "publish jobs download artifacts only"
-        assert any(s.startswith("pypa/gh-action-pypi-publish@") for s in steps)
-    assert doc["jobs"]["publish-testpypi"]["environment"] == "testpypi"
-    assert doc["jobs"]["publish-pypi"]["environment"]["name"] == "pypi"
-    # Uploads require a tagged run's tests or validated artifact recovery; PyPI needs its policy gate.
-    assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
-    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
-    assert "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'" in doc["jobs"]["publish-pypi"]["if"]
+        assert any(s.startswith(spec["action"]) for s in steps)
+        assert j["environment"] == spec["environments"][job]
+    for name, job in doc["jobs"].items():
+        if name not in spec["jobs"]:
+            assert "id-token" not in job.get("permissions", {}), f"{name}: only the publish jobs hold an OIDC token"
+    # Uploads require a tagged run's tests or validated artifact recovery; the final registry needs its policy gate.
+    gated = doc["jobs"][spec["gated"]]
+    assert "needs.prepare.outputs.publish == 'true'" in gated["if"]
+    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in gated["if"]
+    assert spec["final_if"] in doc["jobs"][spec["final"]]["if"]
     assert doc[True]["release"]["types"] == ["published"]  # PyYAML parses the `on` key as boolean True
     assert "push" not in doc[True], "tag creation must not publish before release notes are reviewed"
-    assert doc["jobs"]["prepare"]["if"] == "github.event_name != 'release' || startsWith(github.event.release.tag_name, 'python/')"
+    assert doc["jobs"]["prepare"]["if"] == f"github.event_name != 'release' || startsWith(github.event.release.tag_name, '{language}/')"
     inputs = doc[True]["workflow_dispatch"]["inputs"]
     assert inputs["skip-publish"]["type"] == "boolean" and inputs["tag"]["type"] == "string"
     # A dispatch on a tag ref with a different tag input must be rejected before anything runs.
     prepare_steps = [s.get("name", "") for s in doc["jobs"]["prepare"]["steps"]]
-    assert prepare_steps.index("Dispatch inputs are consistent with the ref") < prepare_steps.index("Parse tag")
+    assert prepare_steps.index("Dispatch inputs are consistent with the ref") < prepare_steps.index(spec["tag_step"])
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     assert '[ "$SKIP_PUBLISH" = "false" ]' in gate["run"], "publish only on the literal false"
     tag = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "tag")
@@ -329,11 +348,13 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     assert doc["concurrency"]["group"] == "${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
 
 
-def test_published_release_is_verified_before_uploads_and_linked_from_deployment() -> None:
-    jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+@pytest.mark.parametrize("language", sorted(RELEASE_PUBLISHERS))
+def test_published_release_is_verified_before_uploads_and_linked_from_deployment(language: str) -> None:
+    spec = RELEASE_PUBLISHERS[language]
+    jobs = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]
     prepare = jobs["prepare"]
-    publish = jobs["publish-pypi"]
-    assert set(publish["needs"]) == {"prepare", "smoke-testpypi"}
+    publish = jobs[spec["final"]]
+    assert set(publish["needs"]) == spec["final_needs"]
     assert publish["environment"]["url"] == "${{ needs.prepare.outputs.release_url }}"
     assert prepare["outputs"]["release_url"] == "${{ steps.release.outputs.url }}"
     verify = next(step for step in prepare["steps"] if step.get("id") == "release")
