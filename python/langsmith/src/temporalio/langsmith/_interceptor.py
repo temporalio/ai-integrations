@@ -42,8 +42,8 @@ if TYPE_CHECKING:
 def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
     """Return the destination LangSmith's env defaults name, or None.
 
-    The env defaults are ``LANGSMITH_PROJECT``, and on LangSmith versions with
-    agent addresses, ``LANGSMITH_AGENT_ID`` and ``LANGSMITH_AGENT_ENVIRONMENT``.
+    The env defaults are ``LANGSMITH_PROJECT``, ``LANGSMITH_AGENT_ID`` and
+    ``LANGSMITH_AGENT_ENVIRONMENT``.
     The probe is a LangSmith ``RunTree`` that names no destination, so the
     installed version's own rules pick one; it is never posted. LangSmith
     raises ``EnvAddressError``, a ``LangSmithUserError``, for an env it can't
@@ -55,8 +55,7 @@ def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
         return None
     if probe.session_name:
         return {"project_name": probe.session_name}
-    address = getattr(probe, "address", None)
-    return {"address": address} if address is not None else None
+    return {"address": probe.address} if probe.address is not None else None
 
 
 # Used by _end_run_on_exception outside workflows. Workflow code logs through
@@ -357,7 +356,7 @@ def _maybe_run(
     if parent is not None:
         # RunTree(parent_run=...) inherits IDs but not the destination.
         run_tree_args["project_name"] = parent.session_name
-        run_tree_args["address"] = getattr(parent, "address", None)
+        run_tree_args["address"] = parent.address
         run_tree_args["parent_run"] = parent
         run_tree_args["replicas"] = parent.replicas
     elif destination is not None:
