@@ -69,6 +69,8 @@ Model calls are intercepted and executed as Temporal activities with configurabl
 - Cancellation behavior
 - Priority levels
 
+Model calls heartbeat on a timer at half the `heartbeat_timeout`, which defaults to 10 seconds. So a cancel reaches a running model call, and a lost worker is noticed, within about 10 seconds. In Temporal Cloud each heartbeat that reaches the service is an Action: with the default, at most one every 8 seconds of a running call, and none for a call shorter than 5 seconds. Set `heartbeat_timeout` to `None` in `activity_config` to turn heartbeats off. The timer runs on the worker's event loop, so a model that blocks the loop for longer than the timeout fails the call with a heartbeat timeout.
+
 #### 3. Sandbox Compatibility
 - Automatic passthrough for `google.adk`, `google.genai`, `mcp`, and `opentelemetry` modules
 - Works with both sandboxed and unsandboxed workflow runners
