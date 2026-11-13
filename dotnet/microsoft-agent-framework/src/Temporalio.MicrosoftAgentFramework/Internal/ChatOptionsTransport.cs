@@ -7,9 +7,12 @@ namespace Temporalio.MicrosoftAgentFramework.Internal;
 
 /// <summary>
 /// Moves <see cref="ChatOptions"/> across the Activity boundary. Function tools travel as
-/// <see cref="ToolDeclaration"/>s and provider-executed tools as <see cref="HostedToolDeclaration"/>s;
-/// <c>RawRepresentationFactory</c> and <c>ContinuationToken</c> are dropped with a warning. The
-/// drop list follows Cecil Phillip's draft at https://github.com/temporal-community/temporal-dotnet-agents.
+/// <see cref="ToolDeclaration"/>s, with their additional properties, and provider-executed tools as
+/// <see cref="HostedToolDeclaration"/>s. <c>RawRepresentationFactory</c> is dropped with a warning;
+/// <c>AllowBackgroundResponses</c>, <c>ConversationId</c> and <c>ContinuationToken</c> fail the run,
+/// as they do on <c>AgentRunOptions</c>, because the Workflow holds the conversation and waits for
+/// each complete response. The drop list follows Cecil Phillip's draft at
+/// https://github.com/temporal-community/temporal-dotnet-agents.
 /// The HTTP headers of a <see cref="HostedMcpServerTool"/> never cross: a tool that carries them on
 /// the Workflow side fails the run, and the worker adds the headers registered under
 /// <see cref="MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders"/> when it rebuilds the tool.
@@ -36,19 +39,29 @@ internal static class ChatOptionsTransport
 
         var transport = options.Clone();
         RejectSecrets(transport.AdditionalProperties, "ChatOptions.AdditionalProperties");
+        if (transport.AllowBackgroundResponses is true)
+        {
+            throw new MicrosoftAgentFrameworkWorkflowException("ChatOptions.AllowBackgroundResponses is not supported; the model Activity waits for the complete response.");
+        }
+
+        if (transport.ConversationId is not null)
+        {
+            throw new MicrosoftAgentFrameworkWorkflowException(
+                "ChatOptions.ConversationId is not supported: the Workflow holds the conversation and sends it on every call, so a service-managed conversation would make the model see every turn twice. Leave ConversationId unset.");
+        }
+
+#pragma warning disable MEAI001 // ContinuationToken is experimental; the plugin only rejects it.
+        if (transport.ContinuationToken is not null)
+        {
+            throw new MicrosoftAgentFrameworkWorkflowException("ChatOptions.ContinuationToken is not supported; background responses do not cross the Activity boundary.");
+        }
+#pragma warning restore MEAI001
+
         if (transport.RawRepresentationFactory is not null)
         {
             logger.LogWarning("ChatOptions.RawRepresentationFactory is not serializable and is dropped before the model Activity. Configure the provider request in the chat client factory instead.");
             transport.RawRepresentationFactory = null;
         }
-
-#pragma warning disable MEAI001 // ContinuationToken is experimental; the plugin only clears it.
-        if (transport.ContinuationToken is not null)
-        {
-            logger.LogWarning("ChatOptions.ContinuationToken is dropped before the model Activity. Background responses are not supported.");
-            transport.ContinuationToken = null;
-        }
-#pragma warning restore MEAI001
 
         List<ToolDeclaration>? tools = null;
         List<HostedToolDeclaration>? hosted = null;

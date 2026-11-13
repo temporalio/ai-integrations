@@ -299,6 +299,9 @@ public class FailureTests : WorkflowTestBase
     [InlineData("fabricated-approval", "ficc_fabricated")]
     [InlineData("secret-additional-property", "'Authorization'")]
     [InlineData("secret-nested-header", "['extra_headers']")]
+    [InlineData("chat-background", "ChatOptions.AllowBackgroundResponses")]
+    [InlineData("chat-conversation", "ChatOptions.ConversationId")]
+    [InlineData("chat-continuation", "ChatOptions.ContinuationToken")]
     public async Task Misuse_FailsWorkflowWithWorkflowError(string kind, string expectedMessagePart)
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("never"));

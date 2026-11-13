@@ -170,6 +170,26 @@ public class FailureWorkflow
                     return (await agent.RunAsync(input.Prompt)).Text;
                 }
 
+            case "chat-background":
+                {
+                    var agent = new TemporalAgent(input.Model, new TemporalAgentOptions { ChatOptions = new ChatOptions { AllowBackgroundResponses = true } });
+                    return (await agent.RunAsync(input.Prompt)).Text;
+                }
+
+            case "chat-conversation":
+                {
+                    var agent = new TemporalAgent(input.Model, new TemporalAgentOptions { ChatOptions = new ChatOptions { ConversationId = "conv_123" } });
+                    return (await agent.RunAsync(input.Prompt)).Text;
+                }
+
+            case "chat-continuation":
+                {
+#pragma warning disable MEAI001 // Continuation tokens are experimental; the plugin only rejects them.
+                    var agent = new TemporalAgent(input.Model, new TemporalAgentOptions { ChatOptions = new ChatOptions { ContinuationToken = ResponseContinuationToken.FromBytes(new byte[] { 1 }) } });
+#pragma warning restore MEAI001
+                    return (await agent.RunAsync(input.Prompt)).Text;
+                }
+
             case "declaration-only":
                 {
                     var schema = JsonSerializer.Deserialize<JsonElement>("""{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""");
