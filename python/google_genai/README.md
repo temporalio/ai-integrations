@@ -207,16 +207,11 @@ carries the server name. Tool discovery and calls run as `{name}-list-tools` /
 model. Set `cache_tools=True` to list a server's tools once per workflow instead
 of per turn.
 
-An MCP factory must return an async context manager that yields a session with
-callable `list_tools` and `call_tool` methods. Invalid results fail the Activity
-with a non-retryable `MCPServerFactoryTypeError` that names the factory and the
-returned or yielded type. Compatible session objects are accepted without
-requiring a `ClientSession` subclass. A partial session that previously worked
-for one operation must now provide both methods. Fix invalid factories before
-upgrading Workers: these errors could previously retry, but deploying a
-corrected Worker will not automatically resume an Activity that has already
-failed. Exceptions raised by the factory or a valid session keep their existing
-handling.
+MCP factories must return an async context manager. Other return types now fail
+the Activity without retries with type `MCPServerFactoryTypeError`, naming the
+factory and returned type. Fix these factories before upgrading: the next
+attempt of an in-flight Activity also runs this check. Deploying a corrected
+Worker will not automatically resume an Activity that has already failed.
 
 ## Streaming
 
