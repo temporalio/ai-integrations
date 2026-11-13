@@ -3,6 +3,7 @@ import { SimplePlugin } from '@temporalio/plugin';
 import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import type { Duration } from '@temporalio/common/lib/time';
 import { createActivities, _evictMcpConnectionsForServer } from './activities';
+import type { CreateActivitiesOptions } from './activities';
 import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
 import type { McpClientFactories } from './mcp';
 
@@ -27,6 +28,22 @@ export interface AiSdkPluginOptions {
    * for MCP servers/transports that don't tolerate a reused or concurrent session.
    */
   mcpConnectionIdleTimeout?: Duration;
+
+  /**
+   * Downloads a prompt file or image URL that the model does not support, before the
+   * model activity calls the model. Defaults to `createDownload()` from `ai`.
+   */
+  download?: CreateActivitiesOptions['download'];
+}
+
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -37,13 +54,20 @@ export interface AiSdkPluginOptions {
  * workflow bundle doesn't pull in the worker-side activities and their disallowed imports.
  */
 export class AiSdkPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
+  private readonly activities: object;
+
   constructor(options: AiSdkPluginOptions) {
     const mcpServerNames = Object.keys(options.mcpClientFactories ?? {});
+    const activities = createActivities(options.modelProvider, options.mcpClientFactories, {
+      mcpConnectionIdleTimeout: options.mcpConnectionIdleTimeout,
+      download: options.download,
+    });
     super({
       name: 'AiSDKPlugin',
-      activities: createActivities(options.modelProvider, options.mcpClientFactories, {
-        mcpConnectionIdleTimeout: options.mcpConnectionIdleTimeout,
-      }),
+      activities,
       runContext: async (next) => {
         try {
           await next();
@@ -55,6 +79,7 @@ export class AiSdkPlugin extends SimplePlugin {
         }
       },
     });
+    this.activities = activities;
   }
 
   /**
@@ -62,11 +87,11 @@ export class AiSdkPlugin extends SimplePlugin {
    *
    * @throws TypeError if the Worker already has a different Activity with one
    * of these names: a caller Activity, another integration's Activity, or an
-   * `AiSdkPlugin` with a different `modelProvider`, MCP client factory or
-   * `mcpConnectionIdleTimeout`.
+   * `AiSdkPlugin` with a different `modelProvider`, `download`, MCP client
+   * factory or `mcpConnectionIdleTimeout`.
    */
   override configureWorker(options: WorkerOptions): WorkerOptions {
-    refuseReplacedActivities('AiSdkPlugin', options.activities, this.options.activities as object);
+    refuseReplacedActivities('AiSdkPlugin', options.activities, this.activities);
     return super.configureWorker(options);
   }
 
@@ -81,7 +106,7 @@ export class AiSdkPlugin extends SimplePlugin {
     // Not async: when the check passes, the Worker starts in this tick, as
     // `Worker.runUntil` needs (see `refuseLaterReplacement`).
     return (
-      refuseLaterReplacement('AiSdkPlugin', worker, this.options.activities as object, next) ??
+      refuseLaterReplacement('AiSdkPlugin', worker, this.activities, next) ??
       super.runWorker(worker, next)
     );
   }
@@ -107,6 +132,8 @@ export class AiSdkPlugin extends SimplePlugin {
           : existingEntry !== undefined
             ? [existingEntry as string]
             : [];
+        // Webpack refuses a repeated entry, and another AiSdkPlugin may have added it.
+        if (entries.includes(polyfillPath)) return cfg;
         return { ...cfg, entry: [polyfillPath, ...entries] };
       },
     };

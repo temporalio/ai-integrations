@@ -145,7 +145,7 @@ Passing `retry_strategy=...` to `TemporalAgent(...)` raises `ValueError`; remove
 
 ## Structured Output
 
-Like Strands `Agent`, `TemporalAgent` supports structured output with `structured_output_model`. The plugin defaults to [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/pydantic), so Pydantic types easily serialize across the activity and workflow boundary.
+Like Strands `Agent`, `TemporalAgent` supports structured output with `structured_output_model`. The plugin defaults to [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/pydantic.py), so Pydantic types easily serialize across the activity and workflow boundary.
 
 ```python
 from pydantic import BaseModel
@@ -419,10 +419,23 @@ Worker(
 )
 ```
 
+`activity_as_tool` also takes a method passed as `Class.method`, with the bound method registered on the worker, and a callable-class activity passed as its class, with an instance registered. The tool offers the parameters the activity is called with: a method's without `self`, and a class's `__call__` parameters. An instance, or a `__call__` that takes `*args`, keyword-only arguments or `**kwargs`, raises `ValueError`, and parameters named `agent` or `cls` are not offered, as in Strands' own tools. Runs from versions before this behavior whose model called a method tool, a class tool whose constructor parameters differ from `__call__`'s, or a function tool with a positional-only parameter, fail replay with it: let them finish before upgrading, or use Worker Versioning.
+
 If a tool's activity fails, the agent receives a failed tool result containing
 the activity's error message, and `AfterToolCallEvent.exception` contains the
 underlying exception. This also applies when an MCP tool's call-tool activity
 fails.
+
+When a workflow or tool task is cancelled, cancellation of its activity or MCP
+call propagates as `asyncio.CancelledError` instead of a failed tool result, so
+cancelling the workflow ends it as `CANCELED`. The tool's `cancellation_type`
+controls whether it waits for activity cleanup. An activity that reports
+cancellation independently still produces a failed tool result for the agent.
+
+**Breaking change:** histories that previously processed a cancelled tool as an
+error result can fail replay on this version. Keep those runs on their original
+workers with Worker Versioning. To recover a run stuck during tool cancellation,
+reset it to before the affected tool call and run it on upgraded workers.
 
 ## Hooks
 
@@ -551,7 +564,7 @@ class MyWorkflow:
         )
 ```
 
-This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically. If your data converter uses the default payload converter with `DefaultFailureConverterWithEncodedAttributes` or a subclass of it, the plugin replaces it with its own failure converter but keeps the encoding, so failure messages and stack traces still go through your codec. Methods your class overrides are not used.
+This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically. If your data converter uses the default payload converter with `DefaultFailureConverterWithEncodedAttributes` or a subclass of it, the plugin replaces it with its own failure converter but keeps the encoding, so failure messages and stack traces still go through your codec. Methods your class overrides are not used. A data converter with a non-default payload converter, such as `pydantic_data_converter`, keeps that payload converter and its own failure converter: the plugin adds the Strands exception handling on top, and your `from_failure` still decodes recorded failures. A failure converter that does not subclass `DefaultFailureConverter` is kept unchanged, without the Strands handling.
 
 ```python
 client = await Client.connect("localhost:7233", plugins=[StrandsPlugin(models=MODELS)])
@@ -670,6 +683,12 @@ echo = TemporalMCPClient(
 
 A call-tool activity that runs out of attempts returns a failed tool result to the agent, which can go on without the tool. A list-tools activity that runs out of attempts does not reach the agent. It runs before every model call, and the result depends on which Strands event-loop cycle makes that call, not on how many model calls came before it. In the first cycle of an `invoke_async()`, the `ActivityError` propagates from the call and, if the workflow does not catch it, fails the workflow. That covers the first model call of every invocation, including one on an agent whose earlier invocations completed, and a model call that an `AfterModelCallEvent` hook repeats in that cycle by setting `retry = True`. Strands starts a new cycle after the agent runs tools, and when it asks the model again for a `structured_output_model` result that the model answered in plain text, so no tool needs to have run. In such a cycle, including a model call a hook repeats there, Strands wraps the `ActivityError` in an `EventLoopException`: the workflow task fails on every retry, and the workflow stays open until it is reset or terminated. With `cache_tools=True`, a `TemporalMCPClient` stops listing after its first successful listing, so only that first listing can fail.
 
+Tool names must be unique on one agent. Two tools may not have the same name, or names that differ only by `-` or `_`: for example two servers that both list `search`, a server that lists a name twice, or a server tool named like a tool in `tools=[...]`, a `TemporalSandbox` tool or a tool a Signal handler adds while the servers list. `TemporalAgent` learns its MCP tools only when it lists them, so the model call after that listing raises `MCPToolNameConflictError`, a `ValueError` and a non-retryable `ApplicationError`: the first one, or, with `cache_tools=False`, a later one if a server starts listing such a name. It is raised again at every later model call while the duplicate lasts; between `cache_tools=True` listings, that is the rest of the run. This holds for an agent built before or after its clients listed. Give one `TemporalMCPClient` a different `prefix`, or drop the tool with its `tool_filters`. While a server lists a name, the name is the server's: a tool you put under it is replaced at the next model call, and a tool you remove comes back, also with `cache_tools=True`. A `structured_output_model` named like an MCP tool the agent already has gets Strands' own `ValueError` when the call starts, as in Strands.
+
+The error fails the Workflow when it escapes the Workflow's run method or a Signal handler, with `StrandsPlugin` on the client or only on the Worker, because replay would raise it again. Escaping an Update handler, it fails only that Update, and the run stays open. Strands' `Swarm` records it as a failed node, and an agent used as a tool returns it as an error result, so neither fails the Workflow. If Workflow code catches it, or an Update failed, and calls the agent again, first remove the messages that Strands added to `agent.messages` during that call (the prompt, and any tool calls and results), as for any error during an agent call. A new `prefix` renames that server's tools, and new `tool_filters` can drop some, in every replay: an open run fails to replay if its model called a renamed or dropped tool, if its Workflow code acted on one among the agent's tools (for example on `'x' in agent.tool_names`), or if it met the error and went on, since the refused turn now proceeds. So deploy such a change with Worker Versioning. To recover a run that met the error, reset it to before the first listing that returned a tool the change renames or drops. A later reset point, such as just before the first refused listing, recovers it only if the run had not met the error before that point and neither the model nor Workflow code used those tools before it.
+
+Earlier versions let the later tool replace the earlier one in most of these cases. A run that started before you deploy this version can fail to replay on it if one of its agents met such a duplicate, including two handles of one server and names that differ only by `-` or `_`. It can also fail if a server's tools changed during the run: a tool that moves from one server to another in one turn now stays, where earlier versions could lose it, and an agent that shares an uncached client with another agent now drops the tools the server stopped listing, where earlier versions kept them. And an agent built after another agent listed a client they share has none of that client's tools until its first model call, where earlier versions gave it the last listing at construction. A call to one of them that its initial `messages` end with, which Strands runs before that model call, now finds no such tool, and Workflow code that reads its `tool_names` or `tool_registry` before then can take another path, though no names clashed and the servers kept their tools. So can Strands' estimate of that model call's input tokens, which now leaves those tools out, so proactive context compression can run at a different model call. An agent that shares a `cache_tools=True` client with another agent and was built before that agent's first listing now gets the client's tools at its first model call; earlier versions never gave it those tools. Workflow code that reads its tools can take another path, and runs in which it calls them fail to replay on earlier versions. An agent whose `cache_tools=True` client's tool Workflow code replaced or removed now gets the server's tool back at the next model call; earlier versions kept the change. Last, an agent now applies a turn's listings together, once every server due that turn has listed, where earlier versions added each server's tools as soon as it listed. Until then the agent's tools stay as they were before that turn, and they stay so if a listing fails. Workflow code that reads the agent's tools before the turn's listings are applied can take another path, though no names clashed and the servers kept their tools: for example a Signal or Update handler that runs while a later server lists, even if every listing then succeeds, or code that catches a failed listing. Let those runs finish first, or use Worker Versioning.
+
 By default, `TemporalMCPClient` re-lists the server's tools (via `list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
 
 ```python
@@ -689,14 +708,30 @@ StrandsPlugin(
 
 Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools` and `{name}-call-tool` activities. To upgrade:
 
-- Return an `mcp.Client` from each factory, and move `prefix` and `tool_filters` from the factory to `TemporalMCPClient`. `mcp.Client` doesn't take them: a factory that still passes `prefix=` fails every MCP activity with a `TypeError`, which is retried. A factory that still returns Strands' `MCPClient` fails every MCP activity with an error that says so, also retried until the worker is fixed. Without a `prefix`, same-named tools from different servers replace each other.
+- Return an `mcp.Client` from each factory, and move `prefix` and `tool_filters` from the factory to `TemporalMCPClient`. `mcp.Client` doesn't take them: a factory that still passes `prefix=` fails every MCP activity with a `TypeError`, which is retried. A factory that still returns Strands' `MCPClient` fails every MCP activity with an error that says so, also retried until the worker is fixed. Without distinct prefixes, same-named tools from different servers are refused (see above).
 - Callable `tool_filters` now run in the workflow, so they must be deterministic.
 - Set connection options on `mcp.Client`. Strands `MCPClient` options without an `mcp.Client` counterpart, such as `startup_timeout`, no longer apply.
 - Workflows started on earlier versions that use MCP tools must finish on workers running them before those workers are upgraded.
 
 ## Observability
 
-`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:
+Strands' agent cycle, tool, and trace durations use Temporal's Workflow
+clock inside Workflows, so replay reconstructs the original elapsed time. These
+durations include Activity scheduling, retries, and waits; provider-reported
+latency and token usage still come from the recorded model response. Activities
+and ordinary Strands calls outside Workflows keep their native clocks.
+
+Graph and Swarm orchestration-level `execution_time` and `execution_timeout`
+still use native wall clocks and are not replay-safe. Their agents' cycle and
+tool metrics use the Workflow clock as described above.
+
+This changes the values returned by earlier versions, which measured replay
+execution time after a cache eviction or Worker restart. It can break replay if
+Workflow code uses those durations to choose what to do next. Let existing runs
+finish on their original Workers, or use Worker Versioning to keep them there
+before deploying this change.
+
+`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:
 
 ```python
 import opentelemetry.trace
@@ -714,4 +749,4 @@ Worker(
 )
 ```
 
-Set the tracer provider before connecting the client. See the [OpenTelemetry plugin README](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/opentelemetry) for exporter setup.
+Set the tracer provider before connecting the client. See the [OpenTelemetry plugin README](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/opentelemetry) for exporter setup.

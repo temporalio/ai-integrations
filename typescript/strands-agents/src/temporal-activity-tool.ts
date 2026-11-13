@@ -19,11 +19,11 @@ import { toJsonSchema } from './json-schema';
 /**
  * Options accepted by {@link activityAsTool}.
  *
- * `name` defaults to the activity function's `.name`. `description` defaults
- * to an empty string and SHOULD be supplied so the model has signal about
- * when to call the tool. `inputSchema` describes the activity's single
- * argument; pass either a literal JSON Schema object or a Zod schema, which
- * is converted to JSON Schema for you.
+ * `name` defaults to the registered activity name. `description` is omitted
+ * when not supplied; supply one to help the model decide when to call the
+ * tool. `inputSchema` describes the activity's single argument; pass either a
+ * literal JSON Schema object or a Zod schema, which is converted to JSON
+ * Schema for you.
  */
 export interface ActivityAsToolOptions {
   name?: string;
@@ -46,7 +46,8 @@ export interface ActivityAsToolOptions {
  */
 export class TemporalActivityTool extends Tool {
   readonly name: string;
-  readonly description: string;
+  // Strands accepts an omitted description at runtime, though Tool and ToolSpec require it in their types.
+  declare readonly description: string;
   readonly toolSpec: ToolSpec;
   private readonly activityName: string;
   private readonly activityOptions: ActivityOptions;
@@ -63,12 +64,14 @@ export class TemporalActivityTool extends Tool {
     super();
     this.activityName = activityName;
     this.name = options.name ?? activityName;
-    this.description = options.description ?? '';
     this.toolSpec = {
       name: this.name,
-      description: this.description,
       inputSchema: toJsonSchema(options.inputSchema) ?? { type: 'object', properties: {} },
-    };
+    } as ToolSpec;
+    if (options.description !== undefined) {
+      this.description = options.description;
+      this.toolSpec.description = this.description;
+    }
     this.activityOptions = options.activityOptions ?? {};
   }
 

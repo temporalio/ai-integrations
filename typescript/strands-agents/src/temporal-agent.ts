@@ -6,20 +6,14 @@ import { TemporalModel } from './temporal-model';
 import { TemporalMCPClient } from './temporal-mcp-client';
 import { workflowErrorFor } from './strands-errors';
 
-const SNAPSHOT_DISABLED =
-  'TemporalAgent disables takeSnapshot()/loadSnapshot(). Temporal workflows ' +
-  'already persist agent state durably via the event history at a finer ' +
-  'granularity than Strands snapshots. Remove the snapshot call and rely on ' +
-  "Temporal's durable execution instead.";
-
 // Strands' own message, which its Agent throws at construction for a stateful model.
 const STATEFUL_MANAGER_REFUSED =
   'contextManager and conversationManager cannot be used with a stateful model. ' +
   'The model manages conversation state server-side.';
 
 const RETRY_STRATEGY_DISABLED =
-  'TemporalAgent disables Strands retries; configure retries via retryPolicy ' +
-  'in the model activity options on TemporalAgent, and on the activity options ' +
+  'TemporalAgent disables Strands retries; configure retries via activityOptions.retry ' +
+  'on TemporalAgent, and on the activity options ' +
   'passed to workflow.activityAsTool, workflow.activityAsHook, or TemporalMCPClient. ' +
   'Remove retryStrategy from TemporalAgent(...) or pass retryStrategy: null.';
 
@@ -28,7 +22,7 @@ const RETRY_STRATEGY_DISABLED =
  *
  * Accepts everything {@link AgentConfig} accepts except `model` (which is a
  * factory name selecting a worker-side {@link Model}, not an instance) and
- * `retryStrategy` (always disabled — Temporal handles retries via
+ * `retryStrategy` (only `null` is accepted — Temporal handles retries via
  * `activityOptions.retry`).
  *
  * The {@link ActivityOptions} apply to every model invocation this agent
@@ -37,6 +31,8 @@ const RETRY_STRATEGY_DISABLED =
  */
 export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retryStrategy'> {
   model?: string;
+  /** Disable Strands retries explicitly; Temporal manages retries via `activityOptions.retry`. */
+  retryStrategy?: null;
   activityOptions?: ActivityOptions;
   streamingTopic?: string;
   streamingBatchInterval?: Duration;
@@ -55,13 +51,25 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  * Strands' `retryStrategy` is disabled; configure retries via
  * `activityOptions.retry` here and on the activity options accepted by
  * {@link activityAsTool}, {@link activityAsHook}, and {@link TemporalMCPClient}.
+ *
+ * `activityOptions.heartbeatTimeout` defaults to 10 seconds, and the model
+ * activities heartbeat at half of it; `heartbeatTimeout: 0` turns them off.
+ * Cancelling a model activity aborts the model call only when the activity
+ * heartbeats, since the worker learns of the cancellation through its
+ * heartbeats, and only when the model passes `cancelSignal` to its client
+ * (Strands' `AnthropicModel` does not). A model that ignores it keeps running
+ * and its activity can still complete with the model's result. A workflow
+ * cancel during a model call cancels the model activity. With `TRY_CANCEL` the
+ * run ends as cancelled at once. With `WAIT_CANCELLATION_COMPLETED` it ends as
+ * cancelled only if the activity does; if the activity completes, the turn
+ * continues with the model's result.
  */
 export class TemporalAgent extends Agent {
   private readonly managerGiven: boolean;
 
   constructor(options: TemporalAgentOptions = {}) {
-    const { model, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
-    if ((rest as { retryStrategy?: unknown }).retryStrategy !== undefined) {
+    const { model, retryStrategy, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
+    if (retryStrategy !== undefined && retryStrategy !== null) {
       throw new Error(RETRY_STRATEGY_DISABLED);
     }
     const temporalModel = new TemporalModel({
@@ -82,11 +90,17 @@ export class TemporalAgent extends Agent {
     // re-list on each turn so a mid-workflow MCP-server restart is picked up.
     // `AfterToolsEvent` fires after a tool round completes, before the next
     // model call reads the tool registry — so the refresh lands on that call.
-    for (const client of collectMcpClients(rest.tools)) {
-      if (!client.cacheTools) {
-        this.addHook(AfterToolsEvent, (event) => client.refreshTools(event.agent.toolRegistry));
-      }
+    // One hook per client, as each lists its server. Strands runs them last to
+    // first, so the first client's hook runs last: it checks the round's
+    // listings together and applies them, so a name can move from one server
+    // to another.
+    const mcpClients = collectMcpClients(rest.tools);
+    for (const hook of TemporalMCPClient.refreshHooks(mcpClients.filter((client) => !client.cacheTools))) {
+      this.addHook(AfterToolsEvent, hook);
     }
+    // A name that Strands adds a client's tool under is that client's until a
+    // re-listing of that client drops it.
+    TemporalMCPClient.holdAdded(mcpClients, this.toolRegistry);
   }
 
   /**
@@ -130,14 +144,6 @@ export class TemporalAgent extends Agent {
     } catch (err) {
       throw workflowErrorFor(err);
     }
-  }
-
-  override takeSnapshot(): never {
-    throw new Error(SNAPSHOT_DISABLED);
-  }
-
-  override loadSnapshot(): never {
-    throw new Error(SNAPSHOT_DISABLED);
   }
 }
 

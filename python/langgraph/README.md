@@ -24,6 +24,20 @@ g.add_node("my_node", my_node, metadata={"execute_in": "activity"})
 plugin = LangGraphPlugin(graphs={"my-graph": g})
 ```
 
+Graph API node functions may be closures or local functions — e.g. built by a node factory as the worker constructs the graph — because each node's activity is named `<graph>.<node>`:
+
+```python
+def make_adder(step: int):
+    def add(state: State) -> dict[str, int]:
+        return {"value": state["value"] + step}
+
+    return add
+
+g.add_node("add_one", make_adder(1), metadata={"execute_in": "activity"})
+```
+
+Functional API `@task` functions must be defined at module level — their `module.qualname` is the activity name registered with the worker — so a task defined inside a function raises `ValueError` when the plugin is created. Node functions defined at module level in `__main__` are likewise rejected; put the graph in an importable module. A closure from `__main__` is accepted like any other closure.
+
 ### Functional API
 
 ```python
@@ -77,6 +91,8 @@ plugin = LangGraphPlugin(
     },
 )
 ```
+
+Routing functions given to `add_conditional_edges` always run in the Workflow, so they must be deterministic. They can be `def` or `async def`.
 
 ## Activity Options
 
@@ -208,7 +224,7 @@ plugin = LangGraphPlugin(
 
 ## Streaming
 
-When `streaming_topic` is set on `LangGraphPlugin`, calls to `langgraph.config.get_stream_writer()` inside a node publish to the named topic on the workflow's [`WorkflowStream`](https://github.com/temporalio/sdk-python/tree/main/temporalio/contrib/workflow_streams). Activity-side nodes publish via `WorkflowStreamClient` (a signal carrying batched items, controlled by `streaming_batch_interval`); workflow-side nodes publish synchronously to the in-workflow stream (no signal). External subscribers consume the stream with `WorkflowStreamClient.create(...).topic(...).subscribe(...)`.
+When `streaming_topic` is set on `LangGraphPlugin`, calls to `langgraph.config.get_stream_writer()` inside a node publish to the named topic on the workflow's [`WorkflowStream`](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/workflow_streams). Activity-side nodes publish via `WorkflowStreamClient` (a signal carrying batched items, controlled by `streaming_batch_interval`); workflow-side nodes publish synchronously to the in-workflow stream (no signal). External subscribers consume the stream with `WorkflowStreamClient.create(...).topic(...).subscribe(...)`.
 
 The workflow **must** construct `WorkflowStream()` in its `@workflow.init` (i.e. `__init__`)
 
