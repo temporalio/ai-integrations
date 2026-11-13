@@ -105,12 +105,14 @@ class TemporalMCPToolProvider(ContextProvider):
                 "TemporalMCPToolProvider requires the 'mcp' extra and MCP Python SDK v2; "
                 "install temporalio-microsoft-agent-framework[mcp]"
             ) from err
-        if approval_mode is not None and approval_mode not in (
+        # Checked through Any: the annotation is a Literal, but MCPTool also
+        # takes a per-tool mapping here, which FunctionTool would keep as is
+        # with no tool asking for approval, so a dict is refused at runtime.
+        given_mode: Any = approval_mode
+        if given_mode is not None and given_mode not in (
             "always_require",
             "never_require",
         ):
-            # MCPTool also takes a per-tool mapping; FunctionTool keeps such a
-            # dict as is and no tool asks for approval, so refuse it here.
             raise MicrosoftAgentFrameworkWorkflowError(
                 f"TemporalMCPToolProvider({server!r}) got approval_mode="
                 f"{approval_mode!r}; it takes 'always_require' or 'never_require' "

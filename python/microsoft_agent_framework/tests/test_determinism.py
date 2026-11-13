@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import logging
 import threading
 import time
@@ -168,7 +169,7 @@ class PausedBudgetWorkflow:
                     role="tool",
                     contents=[
                         Content.from_function_result(
-                            call_id=call.call_id, result="chart shown"
+                            call_id=call.call_id or "", result="chart shown"
                         )
                     ],
                 )
@@ -393,7 +394,7 @@ def test_sync_tool_seam_check_warns_without_source(
 
     # An install with only .pyc files: the check cannot run, the rebind still
     # works, so it warns and the worker starts.
-    monkeypatch.setattr(_workflow_runtime.inspect, "getsource", no_source)
+    monkeypatch.setattr(inspect, "getsource", no_source)
     with caplog.at_level(logging.WARNING):
         _workflow_runtime.check_sync_tool_seam()
     assert any(

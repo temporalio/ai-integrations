@@ -145,14 +145,19 @@ class DirectClientWorkflow:
     @workflow.run
     async def run(self, stream: bool) -> Person:
         client = TemporalChatClient("model")
-        options: dict[str, Any] = {"response_format": Person}
+        # Typed as Any: the client's options parameter is the framework's
+        # ChatOptions TypedDict, which a plain dict literal does not satisfy.
+        options: Any = {"response_format": Person}
+        messages = [Message(role="user", contents=["Who?"])]
         if stream:
-            response_stream = client.get_response("Who?", stream=True, options=options)
+            response_stream = client.get_response(
+                messages, stream=True, options=options
+            )
             async for _ in response_stream:
                 pass
             response = await response_stream.get_final_response()
         else:
-            response = await client.get_response("Who?", options=options)
+            response = await client.get_response(messages, options=options)
         value = response.value
         if not isinstance(value, Person):
             raise ApplicationError(
@@ -312,6 +317,7 @@ async def test_chat_client_factory_failure_is_retried(
         raise KeyError("OPENAI_API_KEY")
 
     plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": flaky_factory})
+    error: WorkflowFailureError | None = None
     async with new_worker(client, BoundedRetryWorkflow, plugin=plugin) as worker:
         handle = await client.start_workflow(
             BoundedRetryWorkflow.run,
@@ -325,6 +331,7 @@ async def test_chat_client_factory_failure_is_retried(
             else:
                 with pytest.raises(WorkflowFailureError) as excinfo:
                     await handle.result()
+                error = excinfo.value
     # A factory that raises fails the attempt retryably, logged at ERROR, so
     # the call's retry policy bounds the wait: a second attempt runs.
     (started,) = await started_activities(handle)
@@ -335,7 +342,8 @@ async def test_chat_client_factory_failure_is_retried(
         for record in caplog.records
     )
     if not recovers:
-        cause = excinfo.value.cause
+        assert error is not None
+        cause = error.cause
         assert isinstance(cause, ActivityError)
         failure = cause.__cause__
         assert isinstance(failure, ApplicationError)
