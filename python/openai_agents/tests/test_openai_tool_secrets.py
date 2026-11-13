@@ -564,6 +564,61 @@ _UnwrappedMessageOrInts: Any = (
 )
 
 
+class _Carrier(pydantic.BaseModel):
+    message: ResponseOutputMessage
+
+    @pydantic.model_serializer(mode="wrap")
+    def _to_wire(self, handler: Any) -> Any:
+        data = handler(self)
+        return {"wire_message": data.pop("message"), **data}
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _from_wire(cls, value: Any) -> Any:
+        # Consumes the wire field of the mapping it reads.
+        if isinstance(value, dict) and not isinstance(
+            value.get("message"), pydantic.BaseModel
+        ):
+            value["message"] = value.pop("wire_message")
+        return value
+
+
+class _CarrierEnvelope(pydantic.BaseModel):
+    item: _Carrier | int
+
+
+class _TupleRoot(pydantic.RootModel[tuple[ModelResponse]]):
+    pass
+
+
+class _CheckedMessage(ResponseOutputMessage):
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _check(cls, value: Any) -> Any:
+        return value
+
+
+class _CheckedMessageResult(pydantic.BaseModel):
+    item: _CheckedMessage | _TaggedB
+
+
+class _LoweredMessage(ResponseOutputMessage):
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _lower(cls, value: Any) -> Any:
+        return _lower_type(value)
+
+
+class _LoweredOwnMessageResult(pydantic.BaseModel):
+    item: _LoweredMessage | _TaggedB
+
+    @pydantic.model_serializer(mode="wrap")
+    def _upper_type(self, handler: Any) -> Any:
+        # Sends the message's type in upper case.
+        data = handler(self)
+        return {**data, "item": {**data["item"], "type": "MESSAGE"}}
+
+
 def _extra_side() -> _ExtraSide:
     side = _ExtraSide(name="n")
     cast(Any, side).sentinel = "keep-me"
@@ -902,6 +957,48 @@ def _is_response(value: Any) -> bool:
             [0, "content", 0, "annotations"],
             _is_message,
         ),
+        (
+            _CarrierEnvelope(item=_Carrier(message=_message())),
+            _CarrierEnvelope,
+            ["item", "wire_message", "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _Carrier) and _is_message(got.item.message)
+            ),
+        ),
+        (
+            _TupleRoot((_response(),)),
+            _TupleRoot | list[int],
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _TupleRoot) and _is_response(got.root[0]),
+        ),
+        (
+            (_response(),),
+            tuple[ModelResponse] | list[int],
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, tuple) and _is_response(got[0]),
+        ),
+        (
+            (_response(),),
+            tuple[ModelResponse] | None,
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, tuple) and _is_response(got[0]),
+        ),
+        (
+            _CheckedMessageResult(item=_TaggedB(kind="b", record=_response())),
+            _CheckedMessageResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _TaggedB) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _LoweredOwnMessageResult(
+                item=_LoweredMessage.model_validate(_message().model_dump())
+            ),
+            _LoweredOwnMessageResult,
+            ["item", "content", 0, "annotations"],
+            lambda got: isinstance(got.item, _LoweredMessage) and _is_message(got.item),
+        ),
     ],
     ids=[
         "extra",
@@ -941,6 +1038,12 @@ def _is_response(value: Any) -> bool:
         "model-returned-by-a-validator-beside-a-response",
         "revalidated-dataclass-returned-by-a-validator-beside-a-response",
         "declared-openai-variant-unwrapping-a-list",
+        "union-variant-consuming-its-wire-field",
+        "declared-union-with-tuple-root-model",
+        "declared-union-with-tuple",
+        "declared-optional-tuple",
+        "openai-variant-behind-its-own-model-validator",
+        "openai-variant-normalized-by-its-own-model-validator",
     ],
 )
 def test_lenient_caller_model_shapes(
