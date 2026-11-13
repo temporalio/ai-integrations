@@ -37,7 +37,8 @@ public sealed class TemporalAgentOptions
 
     /// <summary>
     /// Gets or sets context providers. They run in the Workflow around each run and must complete
-    /// synchronously and deterministically; I/O belongs in an Activity.
+    /// synchronously and deterministically; I/O belongs in an Activity the Workflow runs before
+    /// the agent, with its result added to the prompt or the provider's state.
     /// </summary>
     public IEnumerable<AIContextProvider>? AIContextProviders { get; set; }
 

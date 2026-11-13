@@ -2,12 +2,16 @@ using Microsoft.Agents.AI;
 
 namespace Temporalio.MicrosoftAgentFramework.Tests.Workflows;
 
-/// <summary>A context provider that awaits a timer, which a Workflow cannot allow.</summary>
+/// <summary>A context provider that waits in a way a Workflow cannot allow: a timer, a Workflow timer or an Activity.</summary>
 public sealed class DelayingContextProvider : AIContextProvider
 {
+    private readonly string wait;
+
+    public DelayingContextProvider(string wait = ProviderWaits.TaskDelay) => this.wait = wait;
+
     protected override async ValueTask<AIContext> ProvideAIContextAsync(InvokingContext context, CancellationToken cancellationToken = default)
     {
-        await Task.Delay(50, cancellationToken);
+        await ProviderWaits.WaitAsync(wait, cancellationToken);
         return new AIContext();
     }
 }

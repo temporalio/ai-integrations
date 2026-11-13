@@ -24,11 +24,13 @@ public static class MicrosoftAgentFrameworkErrorTypes
     public const string ConfigurationError = "MicrosoftAgentFrameworkConfigurationError";
 
     /// <summary>
-    /// <see cref="TemporalAgent"/> found a problem on the Workflow side: an unanswered approval
-    /// request, unsupported run options, a session of another type, a chat history or context
-    /// provider whose <c>InvokingAsync</c> or <c>InvokedAsync</c> returned an incomplete
-    /// <c>ValueTask</c>, a fourth consecutive round of failing tools, or a call through the
-    /// <see cref="Microsoft.Agents.AI.AIAgent"/> base entry points. Fails the Workflow.
+    /// <see cref="TemporalAgent"/> found a problem on the Workflow side: an approval request the
+    /// next run did not answer, an approval response for a request the session never surfaced,
+    /// unsupported run options, a session of another type, a chat history or context provider
+    /// whose <c>InvokingAsync</c> or <c>InvokedAsync</c> returned an incomplete <c>ValueTask</c>
+    /// or scheduled an Activity, a timer or a child Workflow, a fourth consecutive round of
+    /// failing tools, or a call through the <see cref="Microsoft.Agents.AI.AIAgent"/> base entry
+    /// points. Fails the Workflow.
     /// </summary>
     public const string WorkflowError = "MicrosoftAgentFrameworkWorkflowError";
 }

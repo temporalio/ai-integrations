@@ -94,19 +94,26 @@ public class SessionTests : WorkflowTestBase
     }
 
     [Theory]
-    [InlineData("delaying", null, nameof(DelayingChatHistoryProvider))]
-    [InlineData("memory", "delaying", nameof(DelayingContextProvider))]
-    public async Task ProviderThatAwaitsTimer_FailsRunWithWorkflowError(string historyProvider, string? contextProvider, string providerName)
+    [InlineData("delaying", null, ProviderWaits.TaskDelay, nameof(DelayingChatHistoryProvider), "did not complete synchronously")]
+    [InlineData("memory", "delaying", ProviderWaits.TaskDelay, nameof(DelayingContextProvider), "did not complete synchronously")]
+    [InlineData("delaying", null, ProviderWaits.WorkflowTimer, nameof(DelayingChatHistoryProvider), "scheduled Workflow work")]
+    [InlineData("memory", "delaying", ProviderWaits.WorkflowTimer, nameof(DelayingContextProvider), "scheduled Workflow work")]
+    [InlineData("delaying", null, ProviderWaits.WorkflowActivity, nameof(DelayingChatHistoryProvider), "scheduled Workflow work")]
+    [InlineData("memory", "delaying", ProviderWaits.WorkflowActivity, nameof(DelayingContextProvider), "scheduled Workflow work")]
+    public async Task ProviderThatWaits_FailsRunWithWorkflowError(string historyProvider, string? contextProvider, string wait, string providerName, string expectedPhrase)
     {
         var fake = EchoFake();
-        var input = new SessionInput(["first"], HistoryProvider: historyProvider, ContextProvider: contextProvider);
+        var input = new SessionInput(["first"], HistoryProvider: historyProvider, ContextProvider: contextProvider, ProviderWait: wait);
         var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (SessionWorkflow wf) => wf.RunAsync(input));
         var failure = AppFailure(error);
         Assert.NotNull(failure);
         Assert.Equal(MicrosoftAgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);
-        Assert.Contains($"{providerName}.InvokingAsync did not complete synchronously", failure.Message, StringComparison.Ordinal);
+        Assert.StartsWith($"{providerName}.InvokingAsync", failure.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedPhrase, failure.Message, StringComparison.Ordinal);
         Assert.Equal(0, fake.CallCount);
-        Assert.Equal(0, HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.WorkflowTaskFailed));
+        var history = await handle.FetchHistoryAsync();
+        Assert.Equal(0, HistoryAssert.Count(history, EventType.WorkflowTaskFailed));
+        Assert.Equal(1, HistoryAssert.Count(history, EventType.WorkflowExecutionFailed));
     }
 
     [Fact]

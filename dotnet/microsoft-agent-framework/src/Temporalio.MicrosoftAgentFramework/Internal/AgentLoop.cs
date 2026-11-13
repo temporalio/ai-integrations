@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
@@ -199,11 +200,7 @@ internal sealed class AgentLoop
 
     private static T RunSynchronously<T>(Func<ValueTask<T>> start, string what)
     {
-        // Scheduler tracing is off while the provider's synchronous part runs, so an incomplete
-        // ValueTask is reported here as a Workflow failure instead of the SDK failing the Workflow
-        // Task on the first timer the provider arms. Nothing is awaited in between, and the SDK still
-        // checks that the provider created no commands.
-        var task = Workflow.Unsafe.WithTracingEventListenerDisabled(start);
+        var task = RunGuarded(start, what);
         if (!task.IsCompleted)
         {
             throw new MicrosoftAgentFrameworkWorkflowException(SynchronousRule(what));
@@ -214,7 +211,7 @@ internal sealed class AgentLoop
 
     private static void RunSynchronously(Func<ValueTask> start, string what)
     {
-        var task = Workflow.Unsafe.WithTracingEventListenerDisabled(start);
+        var task = RunGuarded(start, what);
         if (!task.IsCompleted)
         {
             throw new MicrosoftAgentFrameworkWorkflowException(SynchronousRule(what));
@@ -223,8 +220,46 @@ internal sealed class AgentLoop
         task.GetAwaiter().GetResult();
     }
 
+    private static TTask RunGuarded<TTask>(Func<TTask> start, string what)
+        where TTask : struct
+    {
+        // Scheduler tracing is off while the provider's synchronous part runs, so the callers can
+        // report an incomplete ValueTask as a Workflow failure instead of the SDK failing the
+        // Workflow Task on the first timer the provider arms. The provider's own exception is kept
+        // aside, so the only exception the SDK helper itself can raise is its check that the
+        // provider created no commands: an Activity, a timer or a child Workflow started inside it.
+        TTask task = default;
+        ExceptionDispatchInfo? failure = null;
+        try
+        {
+            Workflow.Unsafe.WithTracingEventListenerDisabled(() =>
+            {
+                try
+                {
+                    task = start();
+                }
+#pragma warning disable CA1031 // Rethrown below, once the SDK's command check has run.
+                catch (Exception exception)
+                {
+                    failure = ExceptionDispatchInfo.Capture(exception);
+                }
+#pragma warning restore CA1031
+            });
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new MicrosoftAgentFrameworkWorkflowException(ScheduledWorkflowWork(what), failure?.SourceException ?? exception);
+        }
+
+        failure?.Throw();
+        return task;
+    }
+
     private static string SynchronousRule(string what) =>
-        $"{what} did not complete synchronously. Chat history and context providers run inside the Workflow and must return a completed ValueTask: no I/O, timers or thread hops. Move that work into an Activity and add its result to the prompt.";
+        $"{what} did not complete synchronously. Chat history and context providers run inside the Workflow and must return a completed ValueTask: no I/O, timers or thread hops. Run that work as an Activity before calling the agent and add its result to the prompt.";
+
+    private static string ScheduledWorkflowWork(string what) =>
+        $"{what} scheduled Workflow work (an Activity, a timer or a child Workflow) instead of returning a completed ValueTask. Chat history and context providers run inside the Workflow and cannot wait there. Run that work in the Workflow before calling the agent and add its result to the prompt or the provider's state.";
 
     private static UsageDetails? Add(UsageDetails? total, UsageDetails? usage)
     {

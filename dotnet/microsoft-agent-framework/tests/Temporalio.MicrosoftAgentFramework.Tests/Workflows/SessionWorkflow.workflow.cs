@@ -23,13 +23,13 @@ public class SessionWorkflow
         options.ChatHistoryProvider = input.HistoryProvider switch
         {
             "custom" => new RecordingChatHistoryProvider(),
-            "delaying" => new DelayingChatHistoryProvider(),
+            "delaying" => new DelayingChatHistoryProvider(input.ProviderWait),
             _ => null,
         };
         options.AIContextProviders = input.ContextProvider switch
         {
             "prefix" => [new PrefixContextProvider()],
-            "delaying" => [new DelayingContextProvider()],
+            "delaying" => [new DelayingContextProvider(input.ProviderWait)],
             _ => null,
         };
 
