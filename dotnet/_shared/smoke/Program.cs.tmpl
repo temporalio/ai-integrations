@@ -6,9 +6,17 @@ var coordinate = "__COORDINATE__";
 var version = "__VERSION__";
 var packages = Environment.GetEnvironmentVariable("NUGET_PACKAGES")
     ?? throw new InvalidOperationException("NUGET_PACKAGES must point at the isolated packages folder");
-var packaged = Path.Combine(
-    packages, coordinate.ToLowerInvariant(), version.ToLowerInvariant(), "lib", "__TFM__", coordinate + ".dll");
-var packagedBytes = File.ReadAllBytes(packaged);
+var packageRoot = Path.Combine(packages, coordinate.ToLowerInvariant(), version.ToLowerInvariant());
+// NuGet picks the lib/<tfm>/ folder nearest the consumer's framework; the loaded assembly must be one of them.
+var packaged = Directory.GetDirectories(Path.Combine(packageRoot, "lib"))
+    .Select(folder => Path.Combine(folder, coordinate + ".dll"))
+    .Where(File.Exists)
+    .ToDictionary(path => path, File.ReadAllBytes);
+if (packaged.Count == 0)
+{
+    throw new InvalidOperationException($"{packageRoot} holds no lib/<tfm>/{coordinate}.dll");
+}
+
 foreach (var name in new[] { __TYPES__ })
 {
     var type = Type.GetType(name + ", " + coordinate, throwOnError: true)!;
@@ -18,9 +26,20 @@ foreach (var name in new[] { __TYPES__ })
         throw new InvalidOperationException($"{name} is defined in {assembly.GetName().Name}, not {coordinate}");
     }
 
-    if (!File.ReadAllBytes(assembly.Location).AsSpan().SequenceEqual(packagedBytes))
+    var loaded = File.ReadAllBytes(assembly.Location);
+    string? origin = null;
+    foreach (var entry in packaged)
     {
-        throw new InvalidOperationException($"{assembly.Location} differs from the restored package assembly {packaged}");
+        if (loaded.AsSpan().SequenceEqual(entry.Value))
+        {
+            origin = entry.Key;
+            break;
+        }
+    }
+
+    if (origin is null)
+    {
+        throw new InvalidOperationException($"{assembly.Location} matches no lib/<tfm>/{coordinate}.dll in the restored package");
     }
 
     var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "";
@@ -29,7 +48,7 @@ foreach (var name in new[] { __TYPES__ })
         throw new InvalidOperationException($"{coordinate} informational version '{informational}' is not {version}");
     }
 
-    Console.WriteLine($"Loaded {name} from {coordinate} {informational}");
+    Console.WriteLine($"Loaded {name} from {origin} ({informational})");
 }
 
 Console.WriteLine($"OK: clean consumer loaded {coordinate} {version}");

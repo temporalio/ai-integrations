@@ -10,9 +10,11 @@ restored package must then equal the tested one in every entry except a trailing
 
 The consumer is rendered from dotnet/_shared/smoke/ into a temporary directory with its own
 NUGET_PACKAGES, NUGET_HTTP_CACHE_PATH and NUGET_PLUGINS_CACHE_PATH, so nothing cached on the machine
-can satisfy the restore. Program.cs loads every `[smoke] imports` type with Type.GetType, requires
-the loaded assembly to be byte-identical to the one in the restored package and its informational
-version to be the version under test. Same role as smoke_java.py and typescript/_shared/smoke.mjs.
+can satisfy the restore, and with a global.json that pins the plugin's SDK channel so the newest
+SDK on the machine is not the one under test. Program.cs loads every `[smoke] imports` type with
+Type.GetType, requires the loaded assembly to be byte-identical to a lib/<tfm>/ assembly in the
+restored package and its informational version to be the version under test. Same role as
+smoke_java.py and typescript/_shared/smoke.mjs.
 """
 
 from __future__ import annotations
@@ -56,8 +58,9 @@ def _attribute(value: str) -> str:
     return escape(value, {'"': "&quot;"})
 
 
-def render(consumer: Path, coordinate: str, version: str, tfm: str, imports: list[str], dist: Path, source: str | None) -> None:
-    """Write Consumer.csproj, Program.cs and nuget.config from the shared templates."""
+def render(consumer: Path, coordinate: str, version: str, channel: str, imports: list[str], dist: Path, source: str | None) -> None:
+    """Write global.json, Consumer.csproj, Program.cs and nuget.config from the shared templates."""
+    tfm = f"net{channel}"
     def template(name: str) -> str:
         return (TEMPLATES / name).read_text(encoding="utf-8")
 
@@ -72,13 +75,13 @@ def render(consumer: Path, coordinate: str, version: str, tfm: str, imports: lis
     (consumer / "nuget.config").write_text(
         template("nuget.config.tmpl").replace("__PACKAGE_SOURCES__", sources).replace("__PACKAGE_SOURCE_MAPPING__", mapping),
         encoding="utf-8")
+    (consumer / "global.json").write_text(template("global.json.tmpl").replace("__CHANNEL__", channel), encoding="utf-8")
     (consumer / "Consumer.csproj").write_text(
         template("Consumer.csproj.tmpl").replace("__TFM__", tfm).replace("__COORDINATE__", coordinate).replace("__VERSION__", version),
         encoding="utf-8")
     types = ", ".join(json.dumps(name) for name in imports)
     (consumer / "Program.cs").write_text(
-        template("Program.cs.tmpl").replace("__COORDINATE__", coordinate).replace("__VERSION__", version)
-        .replace("__TFM__", tfm).replace("__TYPES__", types),
+        template("Program.cs.tmpl").replace("__COORDINATE__", coordinate).replace("__VERSION__", version).replace("__TYPES__", types),
         encoding="utf-8")
 
 
@@ -90,7 +93,7 @@ def smoke(plugin_dir: Path, version: str, dist: Path | None = None, source: str 
     imports = [str(name) for name in meta.get("smoke", {}).get("imports", [])]
     if not imports:
         raise ValueError("plugin.toml [smoke] imports must name at least one type")
-    tfm = f"net{meta['ci']['runtime-versions'][-1]}"
+    channel = str(meta["ci"]["runtime-versions"][-1])
     dist = (dist or plugin_dir / "dist").resolve()
     tested = dist / f"{coordinate}.{version}.nupkg"
     if not tested.is_file():
@@ -102,7 +105,7 @@ def smoke(plugin_dir: Path, version: str, dist: Path | None = None, source: str 
         root = Path(directory)
         consumer = root / "consumer"
         consumer.mkdir()
-        render(consumer, coordinate, version, tfm, imports, dist, source)
+        render(consumer, coordinate, version, channel, imports, dist, source)
         packages = root / "packages"
         http_cache = root / "http-cache"
         # The plugin's make targets export locked-mode restores; the consumer has no lock of its own.
