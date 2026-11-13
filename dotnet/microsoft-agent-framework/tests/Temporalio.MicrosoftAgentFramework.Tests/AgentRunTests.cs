@@ -245,6 +245,16 @@ public class AgentRunTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task FunctionAdditionalProperties_ReachTheProviderClient()
+    {
+        var fake = new FakeChatClient(ScriptedResponse.Text("ok"));
+        await RunAsync(TestPlugin.For(fake), (ToolsWorkflow wf) => wf.RunAsync(new ToolsInput("Weather?", "in-workflow-strict")));
+        var declaration = Assert.IsAssignableFrom<AIFunctionDeclaration>(Assert.Single(fake.Calls[0].Options!.Tools!));
+        Assert.Equal("get_weather", declaration.Name);
+        Assert.Equal(true, declaration.AdditionalProperties["strict"]);
+    }
+
+    [Fact]
     public async Task HostedMcpServerTool_WithHeadersInTheWorkflow_FailsTheRunBeforeAnyActivity()
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("never"));

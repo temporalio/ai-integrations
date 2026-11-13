@@ -59,7 +59,12 @@ internal static class ChatOptionsTransport
                 switch (tool)
                 {
                     case AIFunctionDeclaration function:
-                        (tools ??= []).Add(new ToolDeclaration(function.Name, function.Description, function.JsonSchema, function.ReturnJsonSchema));
+                        (tools ??= []).Add(new ToolDeclaration(
+                            function.Name,
+                            function.Description,
+                            function.JsonSchema,
+                            function.ReturnJsonSchema,
+                            function.AdditionalProperties.Count == 0 ? null : JsonSerializer.SerializeToElement(function.AdditionalProperties, AIJsonUtilities.DefaultOptions)));
                         break;
                     case HostedMcpServerTool { Headers: { Count: > 0 } headers } mcp:
                         throw new MicrosoftAgentFrameworkWorkflowException(
@@ -106,8 +111,7 @@ internal static class ChatOptionsTransport
         List<AITool>? tools = null;
         foreach (var declaration in input.Tools ?? [])
         {
-            (tools ??= []).Add(AIFunctionFactory.CreateDeclaration(
-                declaration.Name, declaration.Description, declaration.JsonSchema, declaration.ReturnJsonSchema));
+            (tools ??= []).Add(new TransportedFunctionDeclaration(declaration));
         }
 
         foreach (var hosted in input.HostedTools ?? [])
@@ -123,6 +127,20 @@ internal static class ChatOptionsTransport
 
         return options;
     }
+
+    /// <summary>Turns a JSON primitive back into the CLR value a provider client checks for; other kinds stay <see cref="JsonElement"/>.</summary>
+    /// <param name="element">The element.</param>
+    /// <returns>The value.</returns>
+    internal static object? FromJson(JsonElement element) => element.ValueKind switch
+    {
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null or JsonValueKind.Undefined => null,
+        JsonValueKind.String => element.GetString(),
+        JsonValueKind.Number when element.TryGetInt64(out var integer) => integer,
+        JsonValueKind.Number => element.GetDouble(),
+        _ => element,
+    };
 
     // Credentials belong in the worker factory: everything here is recorded in Event History with the
     // model Activity's input. The check covers the top level and one nested headers dictionary, the
@@ -156,17 +174,6 @@ internal static class ChatOptionsTransport
             }
         }
     }
-
-    private static object? FromJson(JsonElement element) => element.ValueKind switch
-    {
-        JsonValueKind.True => true,
-        JsonValueKind.False => false,
-        JsonValueKind.Null or JsonValueKind.Undefined => null,
-        JsonValueKind.String => element.GetString(),
-        JsonValueKind.Number when element.TryGetInt64(out var integer) => integer,
-        JsonValueKind.Number => element.GetDouble(),
-        _ => element,
-    };
 
     private static HostedToolDeclaration ToDeclaration(AITool tool)
     {

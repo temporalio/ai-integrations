@@ -21,6 +21,7 @@ public class ToolsWorkflow
             "activity-methodinfo" => [ActivityAsTool.Create(typeof(WeatherActivities).GetMethod(nameof(WeatherActivities.GetWeatherAsync))!, toolOptions, "get_weather")],
             "activity-report" => [ActivityAsTool.Create((WeatherActivities a) => a.GetReportAsync(default!, default), toolOptions, "get_report")],
             "activity-token" => [ActivityAsTool.Create((WeatherActivities a) => a.GetAlertsAsync(default!, default), toolOptions, "get_weather")],
+            "in-workflow-strict" => [AIFunctionFactory.Create((string city) => $"sunny in {city} (workflow)", new AIFunctionFactoryOptions { Name = "get_weather", Description = "Gets the weather for a city", AdditionalProperties = new Dictionary<string, object?> { ["strict"] = true } })],
             _ => throw new ApplicationFailureException($"Unknown tool kind {input.ToolKind}"),
         };
         var agent = new TemporalAgent(input.Model, new TemporalAgentOptions

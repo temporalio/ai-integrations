@@ -12,8 +12,13 @@ namespace Temporalio.MicrosoftAgentFramework.Activities;
 /// <param name="Description">Tool description, or null when the tool has none.</param>
 /// <param name="JsonSchema">JSON schema of the tool's parameters.</param>
 /// <param name="ReturnJsonSchema">JSON schema of the tool's return value, when the tool declares one.</param>
+/// <param name="AdditionalProperties">
+/// The tool's <c>AdditionalProperties</c> as a JSON object, when it has any; provider clients read
+/// settings such as <c>strict</c> from them. Null for MCP tools and tools without any.
+/// </param>
 public sealed record ToolDeclaration(
     string Name,
     string? Description,
     JsonElement JsonSchema,
-    JsonElement? ReturnJsonSchema = null);
+    JsonElement? ReturnJsonSchema = null,
+    JsonElement? AdditionalProperties = null);
