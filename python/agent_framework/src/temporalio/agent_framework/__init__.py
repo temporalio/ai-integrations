@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(__all__))
+    return sorted(set(__all__) | {name for name in globals() if name.startswith("__")})
 
 
 def __getattr__(name: str) -> Any:
