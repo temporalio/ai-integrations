@@ -1,6 +1,7 @@
 # Temporal AI Integrations
 
 [![Go: 1.26 and 1.27](https://img.shields.io/badge/go-1.26%20%7C%201.27-blue.svg)](https://go.dev/dl/)
+[![.NET: 10](https://img.shields.io/badge/.NET-10-blue.svg)](dotnet/)
 [![Java: 17, 21, and 25](https://img.shields.io/badge/java-17%20%7C%2021%20%7C%2025-blue.svg)](https://dev.java/)
 [![Python: 3.11 through 3.15](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14%20%7C%203.15-blue.svg)](https://www.python.org/downloads/)
 [![Node: 22 and 24](https://img.shields.io/badge/node-22%20%7C%2024-blue.svg)](typescript/)
