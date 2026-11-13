@@ -120,13 +120,26 @@ class StreamRecorder:
     a continuation chunk carries no id). A ``replace`` update with the full
     arguments stays its own entry. ``ChatResponse.from_updates`` rebuilds the
     same response either way. ``add`` returns the serialized update to publish,
-    before merging, or ``None`` for a dropped copy.
+    before merging, or ``None`` for a dropped copy; ``updates`` is the record.
     """
 
     def __init__(self) -> None:
         """Start an empty record."""
-        self.updates: list[dict[str, Any]] = []
+        self._updates: list[dict[str, Any]] = []
         self._streamed_calls: set[str] = set()
+        # The open run of deltas: the content dict of the last entry that
+        # receives them, the key under it, and the pieces so far. They are
+        # joined once when the run ends; appending to the string on every
+        # delta would copy it each time, quadratic in the length of the stream.
+        self._run_content: dict[str, Any] | None = None
+        self._run_key = ""
+        self._run_pieces: list[str] = []
+
+    @property
+    def updates(self) -> list[dict[str, Any]]:
+        """The recorded entries, with the open run of deltas joined."""
+        self._close_run()
+        return self._updates
 
     def add(self, update: ChatResponseUpdate) -> dict[str, Any] | None:
         """Record ``update``; return its serialized form, or ``None`` if dropped."""
@@ -136,25 +149,42 @@ class StreamRecorder:
             if content.type == "function_call" and content.call_id:
                 self._streamed_calls.add(content.call_id)
         serialized = dump_update(update)
-        previous = self.updates[-1] if self.updates else None
+        previous = self._updates[-1] if self._updates else None
         delta = _argument_delta(serialized)
         if previous is not None and same_envelope(previous, serialized):
             if _mergeable_text(serialized) and _mergeable_text(previous):
-                previous["contents"][0]["text"] += serialized["contents"][0]["text"]
+                self._extend_run(
+                    previous["contents"][0], "text", serialized["contents"][0]["text"]
+                )
                 return serialized
             earlier = _argument_delta(previous)
             if delta is not None and earlier is not None and _same_call(earlier, delta):
-                earlier["arguments"] += delta["arguments"]
+                self._extend_run(earlier, "arguments", delta["arguments"])
                 return serialized
+        self._close_run()
         if _mergeable_text(serialized) or delta is not None:
             # The caller publishes ``serialized`` as is; the record gets its own
             # copy, which later deltas may be merged into.
-            self.updates.append(
+            self._updates.append(
                 {**serialized, "contents": [dict(c) for c in serialized["contents"]]}
             )
         else:
-            self.updates.append(serialized)
+            self._updates.append(serialized)
         return serialized
+
+    def _extend_run(self, content: dict[str, Any], key: str, piece: str) -> None:
+        if self._run_content is not content or self._run_key != key:
+            self._close_run()
+            self._run_content = content
+            self._run_key = key
+            self._run_pieces = [content[key]]
+        self._run_pieces.append(piece)
+
+    def _close_run(self) -> None:
+        if self._run_content is not None:
+            self._run_content[self._run_key] = "".join(self._run_pieces)
+            self._run_content = None
+            self._run_pieces = []
 
     def _is_pause_copy(self, update: ChatResponseUpdate) -> bool:
         if not update.contents:
