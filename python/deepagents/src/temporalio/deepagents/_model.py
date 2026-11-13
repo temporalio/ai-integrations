@@ -116,6 +116,11 @@ def _resolve_activity_options(
     if instance_options:
         opts.update(instance_options)
     opts.setdefault("start_to_close_timeout", _DEFAULT_MODEL_TIMEOUT)
+    # Keep the auto-heartbeater active without making users opt in; see
+    # _activity.DEFAULT_HEARTBEAT_TIMEOUT. An explicit per-model or
+    # plugin-wide ``heartbeat_timeout`` (including ``None``) still controls
+    # the schedule.
+    _activity.apply_default_heartbeat_timeout(opts)
     return opts
 
 

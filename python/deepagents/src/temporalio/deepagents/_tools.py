@@ -478,6 +478,10 @@ def tool_as_activity(
     tool_name = base_tool.name
     opts = _resolve_tool_options(tool_name, activity_options)
     opts.setdefault("start_to_close_timeout", start_to_close_timeout)
+    # No default heartbeat timeout: a tool runs arbitrary application code, so
+    # background heartbeats are opt-in. ``deepagents.invoke_tool`` still
+    # auto-heartbeats whenever ``heartbeat_timeout`` is set through per-call
+    # ``activity_options`` or the plugin's ``tool_activity_options``.
 
     async def _run(**kwargs: Any) -> Any:
         from temporalio.deepagents.workflow import call_tool
@@ -763,6 +767,9 @@ class TemporalBackend:
             self._ref = f"backend:{_uuid.uuid4().hex}"
         self._opts: dict[str, Any] = dict(activity_options or {})
         self._opts.setdefault("start_to_close_timeout", timedelta(minutes=1))
+        # No default heartbeat timeout: backend operations are opt-in, like
+        # tools. ``backend_op`` auto-heartbeats once ``heartbeat_timeout`` is
+        # set in ``activity_options``.
 
     async def _dispatch(self, op: str, *args: Any, **kwargs: Any) -> Any:
         from temporalio.deepagents.workflow import call_backend_op
