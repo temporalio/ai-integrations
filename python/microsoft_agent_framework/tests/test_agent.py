@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+import warnings
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -640,3 +641,31 @@ async def test_chat_client_factory_returns_none(client: Client) -> None:
     assert "'model'" in failure.message and "None" in failure.message
     (started,) = await started_activities(handle)
     assert started.attempt == 1
+
+
+async def test_response_format_with_plugin_on_client(client: Client) -> None:
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={"model": fake_chat_client(['{"name": "Ada", "age": 36}'])}
+    )
+    config = client.config()
+    config["plugins"] = [plugin]
+    plugged = Client(**config)
+    task_queue = workflow_id("structured-client-plugin")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        async with Worker(
+            plugged,
+            task_queue=task_queue,
+            workflows=[StructuredOutputWorkflow],
+            max_cached_workflows=0,
+        ):
+            result = await plugged.execute_workflow(
+                StructuredOutputWorkflow.run,
+                "Who was the first programmer?",
+                id=workflow_id("structured-client"),
+                task_queue=task_queue,
+            )
+    assert result == Person(name="Ada", age=36)
+    # The Worker took the Pydantic converter from its Client, so the SDK's
+    # hint about pydantic_data_converter never fired.
+    assert not [w for w in caught if "pydantic_data_converter" in str(w.message)]

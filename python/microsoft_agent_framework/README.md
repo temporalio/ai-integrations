@@ -14,19 +14,14 @@ The plugin depends on `agent-framework-core` (1.23.0 or newer, below 2; tested w
 
 ## Quickstart
 
-`workflow.py` defines the workflow and runs the worker:
+`workflow.py` holds the workflow. It imports nothing from the provider: the sandbox loads this file for every workflow run, and the OpenAI SDK's import tree trips its restrictions, so a provider import here fails the worker at start.
 
 ```python
-import asyncio
 from datetime import timedelta
 
 from agent_framework import Agent
-from agent_framework.openai import OpenAIChatClient
-from openai import AsyncOpenAI
 from temporalio import workflow
-from temporalio.microsoft_agent_framework import MicrosoftAgentFrameworkPlugin, TemporalChatClient
-from temporalio.client import Client
-from temporalio.worker import Worker
+from temporalio.microsoft_agent_framework import TemporalChatClient
 
 
 @workflow.defn
@@ -39,24 +34,32 @@ class HelloWorkflow:
         )
         response = await agent.run(prompt)
         return response.text
+```
+
+`worker.py` builds the provider client in a factory and runs the worker. The plugin goes on `Client.connect(...)`: the Worker inherits it, and the Client gets the plugin's data converter, which a plugin on the Worker alone cannot set.
+
+```python
+import asyncio
+
+from agent_framework.openai import OpenAIChatClient
+from openai import AsyncOpenAI
+from temporalio.client import Client
+from temporalio.microsoft_agent_framework import MicrosoftAgentFrameworkPlugin
+from temporalio.worker import Worker
+
+from workflow import HelloWorkflow
+
+
+def gpt_4o() -> OpenAIChatClient:
+    return OpenAIChatClient(model="gpt-4o", async_client=AsyncOpenAI(max_retries=0))
+
+
+plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"gpt-4o": gpt_4o})
 
 
 async def main() -> None:
-    client = await Client.connect("localhost:7233")
-    worker = Worker(
-        client,
-        task_queue="microsoft-agent-framework",
-        workflows=[HelloWorkflow],
-        plugins=[
-            MicrosoftAgentFrameworkPlugin(
-                chat_clients={
-                    "gpt-4o": lambda: OpenAIChatClient(
-                        model="gpt-4o", async_client=AsyncOpenAI(max_retries=0)
-                    ),
-                }
-            )
-        ],
-    )
+    client = await Client.connect("localhost:7233", plugins=[plugin])
+    worker = Worker(client, task_queue="microsoft-agent-framework", workflows=[HelloWorkflow])
     await worker.run()
 
 
@@ -64,18 +67,19 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`client.py` starts the workflow:
+`client.py` starts the workflow. The starter's Client carries the plugin too, so its data converter matches the worker's.
 
 ```python
 import asyncio
 
 from temporalio.client import Client
+from temporalio.microsoft_agent_framework import MicrosoftAgentFrameworkPlugin
 
 from workflow import HelloWorkflow
 
 
 async def main() -> None:
-    client = await Client.connect("localhost:7233")
+    client = await Client.connect("localhost:7233", plugins=[MicrosoftAgentFrameworkPlugin()])
     result = await client.execute_workflow(
         HelloWorkflow.run,
         "Hello",
@@ -183,13 +187,13 @@ class ToolsWorkflow:
         return (await agent.run(prompt)).text
 
 
-async def run_worker(client: Client) -> None:
+async def run_worker() -> None:
+    client = await Client.connect("localhost:7233", plugins=[plugin])
     worker = Worker(
         client,
         task_queue="microsoft-agent-framework",
         workflows=[ToolsWorkflow],
         activities=[fetch_user],
-        plugins=[plugin],
     )
     await worker.run()
 ```
@@ -431,7 +435,7 @@ class StructuredWorkflow:
         return response.value
 ```
 
-The plugin sets [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/pydantic.py) as the data converter unless your client already has a payload converter of its own, so Pydantic models cross the workflow boundary. `response.value` parses with the run's `response_format`, from an `Agent` run or from `client.get_response(...)` on the `TemporalChatClient` itself.
+With the plugin on the Client, it sets [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/pydantic.py) as the data converter unless the client already has a payload converter of its own, so Pydantic models cross the workflow boundary; a `Replayer` with the plugin gets the same converter. A Worker takes its converter from its Client, so a plugin passed to the Worker alone does not change it, which is why the quickstart registers the plugin on `Client.connect(...)`. `response.value` parses with the run's `response_format`, from an `Agent` run or from `client.get_response(...)` on the `TemporalChatClient` itself.
 
 ## Middleware and context providers
 
@@ -451,7 +455,7 @@ Agent Framework's own exceptions raised in workflow code, such as `MiddlewareFai
 
 ## Composing with other plugins
 
-Pass `MicrosoftAgentFrameworkPlugin` to the Client or to the Worker, not both: the worker inherits a client's plugins, and a second copy registers the Activities twice. `OpenTelemetryPlugin` composes on the client; set the tracer provider before connecting:
+Pass `MicrosoftAgentFrameworkPlugin` to the Client, as the quickstart does: the Worker inherits it, and only a plugin on the Client sets the data converter (a Worker takes its converter from its Client, so a plugin on the Worker alone leaves Pydantic models in Workflow inputs and outputs to the default converter). Do not pass it to both: the second copy registers the Activities twice and the Worker refuses to start. `OpenTelemetryPlugin` composes on the same Client; set the tracer provider before connecting:
 
 ```python
 import opentelemetry.trace
@@ -460,13 +464,11 @@ from temporalio.contrib.opentelemetry import OpenTelemetryPlugin, create_tracer_
 
 async def start_worker() -> None:
     opentelemetry.trace.set_tracer_provider(create_tracer_provider())
-    client = await Client.connect("localhost:7233", plugins=[OpenTelemetryPlugin()])
-    worker = Worker(
-        client,
-        task_queue="microsoft-agent-framework",
-        workflows=[HelloWorkflow],
-        plugins=[MicrosoftAgentFrameworkPlugin(chat_clients=CHAT_CLIENTS)],
+    client = await Client.connect(
+        "localhost:7233",
+        plugins=[OpenTelemetryPlugin(), MicrosoftAgentFrameworkPlugin(chat_clients=CHAT_CLIENTS)],
     )
+    worker = Worker(client, task_queue="microsoft-agent-framework", workflows=[HelloWorkflow])
     await worker.run()
 ```
 

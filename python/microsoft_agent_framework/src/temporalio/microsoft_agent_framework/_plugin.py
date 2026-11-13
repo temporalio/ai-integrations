@@ -66,7 +66,8 @@ _PASSTHROUGH_MODULES = (
 class MicrosoftAgentFrameworkPlugin(SimplePlugin):
     """Temporal plugin for Microsoft Agent Framework agents.
 
-    Add it to a ``Client`` or a ``Worker`` (not both). ``chat_clients`` maps a
+    Add it to the ``Client`` (the Worker inherits it, and only there does the
+    plugin set the data converter), not to both. ``chat_clients`` maps a
     model name to a worker-side factory that builds the provider's chat
     client, for example ``{"gpt-4o": lambda: OpenAIChatClient(model="gpt-4o",
     async_client=AsyncOpenAI(max_retries=0))}``; a workflow selects it with

@@ -7,14 +7,26 @@ import builtins
 import importlib
 import re
 import symtable
+import sys
+import uuid
 from pathlib import Path
+
+import pytest
+
+from temporalio.client import Client
+from temporalio.microsoft_agent_framework import MicrosoftAgentFrameworkPlugin
+from temporalio.microsoft_agent_framework.testing import fake_chat_client
+from temporalio.worker import Worker
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 
 _BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
+# A python block introduced by a line that names its file, as the quickstart's are.
+_NAMED_BLOCK = re.compile(r"`(\w+\.py)`[^\n]*\n\n```python\n(.*?)```", re.DOTALL)
 
-# The quickstart's own file, which its client.py imports.
+# The quickstart's own module, which its worker.py and client.py import.
 _LOCAL_MODULES = {"workflow"}
+_QUICKSTART_FILES = ("workflow.py", "worker.py", "client.py")
 
 
 def _python_blocks() -> list[str]:
@@ -95,3 +107,60 @@ def _referenced_globals(table: symtable.SymbolTable) -> set[str]:
     for child in table.get_children():
         names |= _referenced_globals(child)
     return names
+
+
+def _quickstart_files() -> dict[str, str]:
+    files: dict[str, str] = {}
+    for match in _NAMED_BLOCK.finditer(README.read_text(encoding="utf-8")):
+        name, block = match.group(1), match.group(2)
+        if name in _QUICKSTART_FILES and name not in files:
+            files[name] = block
+    return files
+
+
+async def test_quickstart_runs(
+    client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quickstart files start a Worker and run the Workflow as written.
+
+    Compiling the blocks does not catch a provider import in ``workflow.py``:
+    the sandbox re-imports that file per run, and the OpenAI SDK's import tree
+    trips its restrictions, so ``Worker(...)`` raises at validation.
+    """
+    files = _quickstart_files()
+    assert set(files) == set(_QUICKSTART_FILES)
+    package = tmp_path / "quickstart"
+    package.mkdir()
+    for name, block in files.items():
+        (package / name).write_text(block, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(package))
+    names = [name.removesuffix(".py") for name in _QUICKSTART_FILES]
+    try:
+        quickstart = importlib.import_module("workflow")
+        # The provider imports and the factory live in worker.py; client.py
+        # imports the workflow module like the worker does.
+        importlib.import_module("worker")
+        importlib.import_module("client")
+        plugin = MicrosoftAgentFrameworkPlugin(
+            chat_clients={"gpt-4o": fake_chat_client(["Hi."])}
+        )
+        config = client.config()
+        config["plugins"] = [plugin]
+        plugged = Client(**config)
+        task_queue = f"quickstart-{uuid.uuid4()}"
+        async with Worker(
+            plugged,
+            task_queue=task_queue,
+            workflows=[quickstart.HelloWorkflow],
+            max_cached_workflows=0,
+        ):
+            result = await plugged.execute_workflow(
+                quickstart.HelloWorkflow.run,
+                "Hello",
+                id=f"quickstart-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+    finally:
+        for name in names:
+            sys.modules.pop(name, None)
+    assert result == "Hi."
