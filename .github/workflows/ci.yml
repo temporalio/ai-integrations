@@ -80,6 +80,9 @@ jobs:
           cache-dependency-glob: scripts/uv.lock
       - name: Check repository conventions
         run: uv run --project scripts --locked python scripts/ci/check_conventions.py
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.27.0
       - name: Tooling unit tests
         run: uv run --project scripts --locked pytest scripts/tests -q
 
@@ -152,16 +155,17 @@ jobs:
       contents: read
       issues: write
       actions: read
+      vulnerability-alerts: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Open, update, or close nightly issues
+      - name: Report nightly checks and Dependabot failures
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/ci/nightly_report.py
+        run: python3 scripts/ci/nightly_report.py --dependabot
 
   ci-status:
     name: ci-status

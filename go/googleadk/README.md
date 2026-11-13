@@ -42,11 +42,9 @@ This package depends on the deterministic ADK `platform` seams
 (`WithTimeProvider`, `WithUUIDProvider`, `WithTaskRunner`), `tool/toolutils.PackTool`,
 and the `model.NewLLM` registry lookup from upstream `google.golang.org/adk/v2`
 (the registry itself stays application-owned; this package never registers into it).
-Those seams have been in tagged ADK releases since v2.1.0; `go.mod` requires
-v2.3.0 for compatibility with OpenTelemetry log SDK v0.21.0. Request-order
-confirmation resume (google/adk-go#1169), available since v2.2.0, makes
-multi-decision confirmation resumes replay-stable. ADK sets the Go floor:
-1.26.6+. The replay-safe telemetry gate composes `workflow.IsReadOnly`.
+The minimum supported ADK version is v2.6.0. This package requires Go 1.26.10+
+so the latest-dependency checks can also run ADK v2.7.0. The replay-safe telemetry
+gate composes `workflow.IsReadOnly`.
 
 ## Samples
 
@@ -215,24 +213,23 @@ outside Temporal. To use another model, build the agent with
   handler retried, wrap its cause with `%w` or return a retryable
   `temporal.ApplicationError`.
 
-  - The toolset lists its tools once per model step, at the same point with
-    every ADK release, so its Histories replay from ADK v2.3.0 to v2.7.0. A
-    toolset wrapped in another that does not forward `ProcessRequest`, such as
-    `tool.FilterToolset` or `tool.WithConfirmation`, lists each time ADK asks
-    for its tools: in every model step with ADK v2.6.0 and later, and only in
-    the first step of an agent run before. So a History in which an agent with
-    such a toolset took a second model step in one run does not replay across
-    ADK v2.6.0; one-step runs do. Use `MCPToolsetOptions.ToolFilter` instead of
-    `tool.FilterToolset`, and `mcptoolset`'s `RequireConfirmation` option
-    instead of `tool.WithConfirmation`.
+  - The toolset lists its tools once per model step and preserves the command
+    order and UUID consumption of Histories recorded with earlier ADK releases.
+    A toolset wrapped in another that does not forward `ProcessRequest`, such
+    as `tool.FilterToolset` or `tool.WithConfirmation`, lists each time ADK asks
+    for its tools, in every model step. Before ADK v2.6.0, such a toolset listed
+    only in the first step of an agent run. A History recorded before v2.6.0 in
+    which an agent with such a toolset took a second model step in one run does
+    not replay on v2.6.0 or later; one-step runs do. Use
+    `MCPToolsetOptions.ToolFilter` instead of `tool.FilterToolset`, and
+    `mcptoolset`'s `RequireConfirmation` option instead of `tool.WithConfirmation`.
   - From the second model step of an agent run, a toolset in the agent's
     `Toolsets` declares only the tools the server lists, and `ToolFilter`
     allows, for that step. A model call to an MCP tool it no longer declares
     gets ADK's tool-not-found error: no `CallMcpTool` Activity and no before-
     or after-tool callbacks run, but on-tool-error callbacks do. In the first
-    step, and with a wrapped toolset on ADK v2.5.0 and earlier, such a call
-    still runs `CallMcpTool`; for a tool the server no longer lists, it fails
-    with a non-retryable `McpError`.
+    step, such a call still runs `CallMcpTool`; for a tool the server no longer
+    lists, it fails with a non-retryable `McpError`.
   - From the second model step, your own `Tools` calls on such a toolset, for
     example from an `InstructionProvider`, return the agent run's first list,
     so they don't see changes the server or `ToolFilter` makes during the run.
@@ -334,6 +331,37 @@ outside Temporal. To use another model, build the agent with
 > deterministic and replay-safe — no direct network, clock, randomness, or
 > goroutines. Anything that isn't belongs in an `ActivityAsTool` (or an MCP tool),
 > where it runs worker-side under Temporal's retry/timeout policy.
+
+## Heartbeats
+
+The plugin's own Activities heartbeat while they run: `InvokeModel`,
+`ListMcpTools`, `CallMcpTool`, `ResolveA2AAgentCard`, `SendA2AMessage` and
+`CancelA2ATask`. That's how a cancel reaches a running call, and how a lost
+Worker is noticed within about 10 seconds instead of at the
+`StartToCloseTimeout`.
+
+- A zero `HeartbeatTimeout` in their Activity options defaults to 10 seconds:
+  `WithModelActivityOptions`, `MCPToolsetOptions.ActivityOptions`,
+  `NewA2AAgentCardProvider` and `NewA2AClientProvider`. A timeout you set wins.
+- A negative `HeartbeatTimeout` turns heartbeats off. A cancel then doesn't
+  reach a running call.
+- They heartbeat on a timer, half the timeout apart, not on progress. So
+  a slow model or MCP server isn't mistaken for a lost Worker, and a stuck one
+  still runs until the `StartToCloseTimeout`.
+- In Temporal Cloud, each heartbeat that reaches the server is an
+  [Action](https://docs.temporal.io/cloud/actions). The first one comes half
+  the timeout into a call, so a call shorter than that, 5 seconds by default,
+  sends none. After that, the SDK holds heartbeats back to one every 0.8 times
+  the timeout (8 seconds by default), or every `MaxHeartbeatThrottleInterval`
+  of the Worker if that's shorter. So with the default Worker options, a
+  30-second call sends four. Each retry is a new attempt, and heartbeats
+  again.
+- `CancelA2ATask` gets the same default, but the server caps its heartbeat
+  timeout at the cancellation's 5-second `StartToCloseTimeout`. Nothing cancels
+  a cancellation, so its heartbeats only notice a lost Worker, and only a
+  cancellation slower than about 2.5 seconds sends one.
+- `ActivityAsTool` runs your own Activity with the options you give it, so it
+  gets no default.
 
 ## Human-in-the-loop (HITL) tool confirmation
 
@@ -611,12 +639,24 @@ an upgrade would newly pass through ungated.
   agent from the deprecated `agent/remoteagent` package. They fetch their agent
   card and send messages from Workflow code, so every replay would send them
   again. A model call from an agent with such a remote agent below it returns an
-  error and schedules no Activity. That check misses a remote agent that is not
-  below an agent making a model call: a remote root agent, one under a
-  sequential, loop or parallel agent, and one reached by transfer. To catch
-  those, add `googleadk.NewRunnerPlugin(root)` to the runner's plugins: it fails
-  every run, before any agent runs, while the tree under `root` holds such an
-  agent. Neither check sees a remote agent wrapped as a tool with `agenttool`.
+  error and schedules no Activity. Below means among its sub-agents, at any
+  depth, or wrapped with `agenttool` by one of their tools or the call's own.
+  That check misses a remote agent that is not below an agent making a model
+  call: a remote root agent, one under a sequential, loop or parallel agent,
+  and one reached by transfer. Model callbacks can also get past it: a
+  `BeforeModelCallbacks` entry that answers instead of the model skips the
+  check, and an `OnModelErrorCallbacks` entry can turn the refusal into a
+  transfer to the remote agent. Only `googleadk.NewRunnerPlugin(root)` catches
+  these: add it to the runner's plugins, and it fails every run, before any
+  agent runs, while the tree under `root` holds such an agent. It sees an
+  agent wrapped with `agenttool` in an agent's `Tools`, but not in its
+  `Toolsets`. Neither check sees a remote agent further inside an agent that
+  `agenttool` wraps, such as one under a sequential, loop or parallel agent
+  there: ADK gives no way to reach the wrapped agent's own sub-agents. An agent
+  on `NewModel` inside it still checks the agents below it at its own model
+  calls. For the requests that still go out, `NewContext` logs one warning,
+  outside replay, the first time an HTTP request carries its context. It only
+  warns: the request still goes out.
 
   An open run that made such a model call on an earlier version fails to replay
   on this one with a non-determinism error. Let those runs finish before you

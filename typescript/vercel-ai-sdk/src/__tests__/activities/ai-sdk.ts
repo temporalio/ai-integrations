@@ -1,3 +1,8 @@
+export async function downloadNotes(url: string): Promise<string> {
+  const response = await fetch(url);
+  return await response.text();
+}
+
 export async function getWeather(input: {
   location: string;
 }): Promise<{ city: string; temperatureRange: string; conditions: string }> {

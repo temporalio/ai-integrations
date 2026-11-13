@@ -247,7 +247,10 @@ def _generated_class_doc(cls: type) -> str | None:
                 # generated unevaluated, and the field keeps the reference from
                 # that time.
                 annotate = getattr(cls.__init__, "__annotate__", None)
-                if getattr(annotate, "__generated_by_dataclasses__", False):
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
                     field_types = {
                         n: f.type for n, f in cls.__dataclass_fields__.items()
                     }
@@ -563,8 +566,7 @@ def install_backend_async_patch() -> None:
     method natively are unaffected; only the protocol defaults are replaced.
     Idempotent.
     """
-    # importlib: `deepagents` is absent on Python 3.10 environments (its floor
-    # is 3.11), so a static import here fails type-checking there.
+    # Resolve the framework's top-level package explicitly.
     BackendProtocol = importlib.import_module(
         "deepagents.backends.protocol"
     ).BackendProtocol

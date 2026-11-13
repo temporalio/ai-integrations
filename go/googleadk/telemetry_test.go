@@ -66,6 +66,15 @@ import (
 
 const telemetryReplays = 5
 
+// ADK v2.7's default schema emits one inference-details event per model turn;
+// earlier releases (and v2.7's legacy schema) emit separate message events.
+func modelLogEventName(events map[string]int) string {
+	if events["gen_ai.choice"] > 0 {
+		return "gen_ai.choice"
+	}
+	return "gen_ai.client.inference.operation.details"
+}
+
 // ----------------------------------------------------------------------------
 // Switchable global providers. ADK caches the global proxy tracer/logger at
 // package init and the OTel global proxy binds its delegate on the FIRST
@@ -750,16 +759,23 @@ func TestReplayTelemetry(t *testing.T) {
 		// copy of every signal from the single real run.
 		baseline := capture.snapshot(t)
 		require.EqualValues(t, 2, cm.calls.Load(), "the scripted conversation is exactly 2 model turns")
-		require.Equal(t, map[string]int{
+		wantSpans := map[string]int{
 			"generate_content fake-model": 2,
 			"execute_tool get_weather":    1,
 			"invoke_agent assistant":      1,
-		}, baseline.spansByName)
+		}
+		// ADK v2.7's default schema adds a runner-level invocation span.
+		if _, ok := baseline.spansByName["invoke_workflow assistant"]; ok {
+			wantSpans["invoke_workflow assistant"] = 1
+		}
+		require.Equal(t, wantSpans, baseline.spansByName)
 		require.Equal(t, 2, baseline.tokenUsageSpans, "each model turn records token usage once")
 		require.EqualValues(t, 250, baseline.inputTokens)
 		require.EqualValues(t, 37, baseline.outputTokens)
-		require.Equal(t, 2, baseline.logEvents["gen_ai.choice"])
-		require.NotEmpty(t, baseline.logEvents["gen_ai.user.message"])
+		require.Equal(t, 2, baseline.logEvents[modelLogEventName(baseline.logEvents)])
+		if modelLogEventName(baseline.logEvents) == "gen_ai.choice" {
+			require.NotEmpty(t, baseline.logEvents["gen_ai.user.message"])
+		}
 		require.EqualValues(t, 100, baseline.counterValue,
 			"the workflow-side global-meter recording must survive the gate on first execution")
 
@@ -791,6 +807,7 @@ func TestReplayTelemetry(t *testing.T) {
 		cm, wfID, runID := runTelemetryScenario(t, c, testTaskQueue(t))
 		baseline := capture.snapshot(t)
 		require.GreaterOrEqual(t, baseline.spansByName["generate_content fake-model"], 2)
+		require.GreaterOrEqual(t, baseline.logEvents[modelLogEventName(baseline.logEvents)], 2)
 		require.GreaterOrEqual(t, baseline.counterValue, int64(100))
 
 		replayTelemetryHistory(t, c, telemetryAgentWorkflow, wfID, runID)
@@ -801,6 +818,9 @@ func TestReplayTelemetry(t *testing.T) {
 			"execute_tool get_weather":    1,
 			"invoke_agent assistant":      1,
 		}
+		if _, ok := baseline.spansByName["invoke_workflow assistant"]; ok {
+			perReplay["invoke_workflow assistant"] = 1
+		}
 		for name, per := range perReplay {
 			require.Equalf(t, telemetryReplays*per, final.spansByName[name]-baseline.spansByName[name],
 				"span %q must re-emit on every replay without the wrappers", name)
@@ -808,7 +828,8 @@ func TestReplayTelemetry(t *testing.T) {
 		require.Equal(t, telemetryReplays*2, final.tokenUsageSpans-baseline.tokenUsageSpans)
 		require.EqualValues(t, int64(telemetryReplays)*250, final.inputTokens-baseline.inputTokens)
 		require.EqualValues(t, int64(telemetryReplays)*37, final.outputTokens-baseline.outputTokens)
-		require.Equal(t, telemetryReplays*2, final.logEvents["gen_ai.choice"]-baseline.logEvents["gen_ai.choice"])
+		modelEvent := modelLogEventName(baseline.logEvents)
+		require.Equal(t, telemetryReplays*2, final.logEvents[modelEvent]-baseline.logEvents[modelEvent])
 		for name, base := range baseline.logEvents {
 			require.Greaterf(t, final.logEvents[name], base,
 				"log event %q must re-emit on replay without the wrappers", name)

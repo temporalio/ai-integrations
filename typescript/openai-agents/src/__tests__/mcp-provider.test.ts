@@ -25,6 +25,31 @@ function fakeServer(toolFilter: MCPServer['toolFilter'], onConnect = () => {}): 
   };
 }
 
+test('StatelessMCPServerProvider rejects invalid factory results before connecting or closing', async (t) => {
+  let connects = 0;
+  let closes = 0;
+  const incompleteServer = {
+    ...fakeServer(undefined, () => connects++),
+    async close() {
+      closes++;
+    },
+    callTool: undefined,
+  };
+  for (const value of [undefined, null, 42, {}, Promise.resolve(fakeServer(undefined)), incompleteServer]) {
+    const activities = new StatelessMCPServerProvider('files', () => value as MCPServer)._getActivities();
+    for (const name of ['files-stateless-list-tools', 'files-stateless-call-tool']) {
+      const err = await t.throwsAsync(activities[name]!({ toolName: 'read', args: {} }), {
+        instanceOf: ApplicationFailure,
+      });
+      t.is(err?.type, 'MCPServerFactoryTypeError');
+      t.true(err?.nonRetryable);
+      t.regex(err!.message, /MCP server factory 'files'/);
+    }
+  }
+  t.is(connects, 0);
+  t.is(closes, 0);
+});
+
 test('filterListedTools applies a static filter with the agent SDK rules', (t) => {
   const tools = ['read', 'read_all', 'delete'].map((name) => ({ name }));
   const names = (toolFilter: MCPServer['toolFilter']) =>

@@ -42,7 +42,8 @@ export LANGSMITH_API_KEY="<your key>"
 
 The plugin reads the same flags LangSmith itself uses (`LANGSMITH_TRACING` /
 `LANGSMITH_TRACING_V2` and their `LANGCHAIN_` aliases); with none set to `true`,
-tracing stays off and the plugin is a no-op.
+the plugin starts no new traces. As in LangSmith, a trace that arrives in
+Temporal headers from a traced caller continues either way.
 
 ## Hello world
 
@@ -152,14 +153,74 @@ user_pipeline
 | ----------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `client`          | `new Client()`    | The LangSmith client runs are emitted to. Lives only in the worker/client process — it is never serialized or sent across a Temporal boundary. |
 | `addTemporalRuns` | `false`           | Emit first-class runs for Temporal operations (`StartWorkflow:`, `RunActivity:`, `HandleSignal:`, …) in addition to your `traceable` runs.     |
-| `projectName`     | LangSmith default | Target LangSmith project for emitted runs.                                                                                                     |
+| `projectName`     | LangSmith default | Default LangSmith project for new root traces. An inherited destination takes precedence.                                                       |
+| `address`         | —                 | Agent/environment destination, mutually exclusive with `projectName`. Requires LangSmith's workspace-enabled beta feature.                    |
 | `tags`            | —                 | Tags attached to every run the plugin emits.                                                                                                   |
-| `metadata`        | —                 | Metadata merged into every run the plugin emits. Credential-looking keys are scrubbed before emission.                                         |
+| `metadata`        | —                 | Metadata merged into every run the plugin emits. It is sent unchanged and travels in Temporal headers, so keep secrets out of it.              |
 
 The LangSmith API key is never accepted as a plugin option and never crosses a
 Temporal boundary. Supply a pre-constructed `Client` (which reads
 `LANGSMITH_API_KEY` from the process environment) or let the plugin build a
 default client from the environment.
+
+## Agent and environment destinations
+
+With LangSmith 0.10.13 or later, send traces to an agent's environment:
+
+```typescript
+import { AgentAddress } from 'langsmith';
+import { LangSmithPlugin } from '@temporalio/langsmith';
+
+const plugin = new LangSmithPlugin({
+  address: new AgentAddress('support', 'staging'),
+});
+```
+
+Register the plugin on the Client and Worker as in the quick start. `address`
+and `projectName` are mutually exclusive. Agent addressing is a LangSmith beta
+feature that must be enabled for the workspace.
+
+When upgrading from LangSmith 0.10.8, replace `address.agent(...)` with
+`new AgentAddress(...)`. Addresses are objects in application code; tracing
+headers retain their LRN string format, including headers in existing histories.
+This is a breaking change for Workflows that pass address strings as recorded
+inputs to LangSmith calls. Let those executions finish on the previous plugin
+and LangSmith versions, or keep them on their previous Worker Deployment Version
+when deploying the upgrade.
+
+Native `traceable(fn, { address: ... })` and runtime traceable configuration
+also select destinations for new root traces in Workflows, Activities, and
+Nexus handlers. Child runs
+inherit their parent's destination, following LangSmith's native rules. Plugin
+defaults apply when a new root names no destination.
+Destinations follow the trace through Activities, child Workflows, and Nexus,
+including with `addTemporalRuns: false`.
+
+## Write replicas
+
+LangSmith write replicas configured on `traceable` or through
+`LANGSMITH_RUNS_ENDPOINTS` follow the trace across Temporal boundaries:
+
+```typescript
+const pipeline = traceable(runWorkflow, {
+  replicas: [
+    { projectName: 'primary', primary: true },
+    { projectName: 'audit' },
+    { address: new AgentAddress('support', 'production') },
+  ],
+});
+```
+
+A primary replica retains the original run IDs. Secondary replicas use
+LangSmith's deterministic destination-specific IDs, with corresponding parent
+links and completion updates. Replaying Workflow history publishes no extra
+copies.
+
+Only destination identifiers, routing flags, and sanitized replica updates
+cross Temporal boundaries. Each client/worker configures its own credentials;
+matching project destinations in its local `LANGSMITH_RUNS_ENDPOINTS` supply
+their own connection settings. API keys, ingestion URLs, and client objects
+stay outside persisted trace headers.
 
 ## Where `traceable` works
 
@@ -178,6 +239,13 @@ the worker injects onto the workflow-sandbox global, so context propagates
 across `await` boundaries and `Promise.all(...)` fan-out exactly as it does
 outside the isolate — the same deterministic run tree replays identically.
 
+Native `RunTree` instances work in Workflow code too:
+
+- Run IDs are the same on replay.
+- End times come from the Worker's clock. Start times do too, unless the run
+  was rebuilt by a replay before it ended; then they come from Workflow time.
+- A run's end is never sent twice.
+
 ## Process-wide effects to be aware of
 
 - **Workflow context provider.** Loading the plugin's workflow interceptor
@@ -186,6 +254,12 @@ outside the isolate — the same deterministic run tree replays identically.
   backed by the SDK-provided `AsyncLocalStorage`. This is what lets unchanged
   `traceable` calls find their parent inside a Workflow. It is scoped to the
   workflow bundle and does not affect your client/worker process context.
+- **Worker routing defaults.** The plugin wraps LangSmith's destination and
+  shared-client hooks. Defaults apply only within parentless Activity and
+  Nexus handlers when `addTemporalRuns: false`; each call carries its own
+  destination, client, and replicas in async context. No placeholder run is
+  installed. Explicit run configuration and native child inheritance take
+  precedence.
 
 ## Composing with other plugins
 

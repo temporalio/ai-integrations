@@ -1,6 +1,6 @@
 # Google Gemini SDK Integration for Temporal
 
-> Release stage: [Public Preview](https://docs.temporal.io/develop/python/integrations/google-genai).
+> Release stage: [Generally Available](https://docs.temporal.io/develop/python/integrations/google-genai).
 
 ## Overview
 
@@ -140,9 +140,18 @@ Install the optional dependency for client-side MCP:
 uv add "temporalio-google-genai[mcp]"
 ```
 
-This adapter requires MCP Python SDK v1. The base package does not require MCP
-and can be installed alongside MCP v2 integrations. Server-side MCP on Vertex AI
+This adapter works with MCP Python SDK v1 or v2. The base package does not
+require MCP. Server-side MCP on Vertex AI
 and the Interactions API do not require this extra.
+
+Workflow histories replay across MCP v1 and v2 workers in both directions, with
+one exception: tool results that MCP v2 accepts but MCP v1 rejects. MCP v2 lets
+a tool return `structuredContent` that is an array or a scalar, and resource
+URIs that aren't full URLs, such as `notes.txt`. MCP v1 accepts only an object
+and a full URL there. Once a history records such a result, only v2 workers can
+replay it: a v1 worker fails the Workflow Task with "Failed decoding arguments".
+If your MCP servers return such results, keep v1 off the Task Queue while you
+upgrade, and don't roll back to v1 while those Workflows are running.
 
 Client-side MCP (Gemini Developer API) is wired through the plugin: register the
 server on the worker and reference it by name in the workflow.
@@ -203,7 +212,7 @@ of per turn.
 `generate_content_stream` works as usual — the workflow iterates chunks (batched
 from the activity). To let an **external** consumer (a chat UI) observe chunks in
 real time while the workflow runs durably, set `streaming_topic` on the client
-and host a [`WorkflowStream`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/workflow_streams/) in the workflow. Each
+and host a [`WorkflowStream`](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/workflow_streams/) in the workflow. Each
 streamed `GenerateContentResponse` is published to that topic as it arrives:
 
 ```python
