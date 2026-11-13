@@ -627,12 +627,34 @@ async def test_single_agent_telemetry(
         "              StartActivity:invoke_model",
         "                RunActivity:invoke_model",
     ]
-    # ADK 2.12 introduces workflow spans before the inference format migrates.
-    # ADK 2.13 enables both changes by default.
+    openinference_version = tuple(
+        int(part)
+        for part in importlib.metadata.version(
+            "openinference-instrumentation-google-adk"
+        ).split(".")[:2]
+    )
     schema_v2 = resolve_schema_version() >= 2
-    if schema_v2:
-        expected_spans[3] = "      invoke_workflow test_agent"
-    if schema_v2 and TelemetryConfig().should_use_experimental_genai_semconv:
+    if openinference_version >= (1, 1):
+        # OpenInference 1.1 suppresses duplicate ADK invocation/agent spans
+        # and creates call_llm spans even when ADK's schema v2 omits them.
+        expected_spans = [
+            "StartWorkflow:WeatherAgent",
+            "  RunWorkflow:WeatherAgent",
+            "    invocation [test_app]",
+            "      agent_run [test_agent]",
+            "        execute_tool get_weather",
+            "          StartActivity:get_weather",
+            "            RunActivity:get_weather",
+            "        call_llm",
+            "          StartActivity:invoke_model",
+            "            RunActivity:invoke_model",
+            "        call_llm",
+            "          StartActivity:invoke_model",
+            "            RunActivity:invoke_model",
+        ]
+    elif schema_v2 and TelemetryConfig().should_use_experimental_genai_semconv:
+        # OpenInference 1.0 leaves ADK's native spans in the trace. ADK 2.13
+        # enables schema v2 and the experimental inference format by default.
         expected_spans = [
             "StartWorkflow:WeatherAgent",
             "  RunWorkflow:WeatherAgent",
@@ -648,6 +670,9 @@ async def test_single_agent_telemetry(
             "            StartActivity:invoke_model",
             "              RunActivity:invoke_model",
         ]
+    elif schema_v2:
+        # ADK 2.12 introduces workflow spans before the inference format migrates.
+        expected_spans[3] = "      invoke_workflow test_agent"
     assert spans == expected_spans
 
 
