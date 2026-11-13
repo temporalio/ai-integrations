@@ -127,7 +127,7 @@ A name the worker does not know fails the Activity with a non-retryable `Applica
 
 `TemporalChatClient("gpt-4o").as_agent(instructions=..., tools=...)` is the short form of `Agent(client=TemporalChatClient("gpt-4o"), ...)`. Calling a `TemporalChatClient` outside a workflow raises `RuntimeError`; use the provider's client there.
 
-A run's `client_kwargs`, such as `extra_headers` for the OpenAI client, cross to the Activity and reach the provider client. A value that is not JSON-compatible fails the workflow with `MicrosoftAgentFrameworkWorkflowError`.
+A run's `client_kwargs`, such as `extra_headers` for the OpenAI client, cross to the Activity and reach the provider client. They are recorded in Event History, so secrets stay in the factory: an `extra_headers` entry named `authorization`, `x-api-key` or `api-key` (in any case) fails the workflow with `MicrosoftAgentFrameworkWorkflowError`, the same rule as for hosted MCP headers; put such a header on the provider client, for example `AsyncOpenAI(default_headers=...)`. A value that is not JSON-compatible fails the workflow the same way.
 
 ## Retries and timeouts
 

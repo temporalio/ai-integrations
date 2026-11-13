@@ -54,8 +54,11 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
     defaults to the model name; the default timeouts are a 5 minute
     start-to-close and a 10 second heartbeat, and the Activity heartbeats on
     its own at half the heartbeat timeout. A run's ``client_kwargs`` (such as
-    ``extra_headers``) cross to the Activity and reach the provider client.
-    Unless the caller sets ``store``, the options reach the provider with
+    ``extra_headers``) cross to the Activity and reach the provider client;
+    they are recorded in Event History, so credentials stay in the factory,
+    and an ``extra_headers`` entry named ``authorization``, ``x-api-key`` or
+    ``api-key`` (in any case) fails the run with
+    ``MicrosoftAgentFrameworkWorkflowError``. Unless the caller sets ``store``, the options reach the provider with
     ``store=False``, so the provider keeps no conversation of its own and the
     session's in-memory history is the one transcript; ``store=True`` in the
     agent's or the run's options keeps the service-side conversation path.

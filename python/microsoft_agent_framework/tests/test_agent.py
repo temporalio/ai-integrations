@@ -498,11 +498,14 @@ class ClientKwargsWorkflow:
     @workflow.run
     async def run(self, kind: str) -> str:
         agent = Agent(client=TemporalChatClient("model"))
-        kwargs: dict[str, Any] = (
-            {"callback": print}
-            if kind == "not_json"
-            else {"extra_headers": {"x-tenant": "acme"}}
-        )
+        kwargs: dict[str, Any]
+        if kind == "not_json":
+            kwargs = {"callback": print}
+        elif kind.startswith("secret:"):
+            header = kind.removeprefix("secret:")
+            kwargs = {"extra_headers": {header: "workflow-secret"}}
+        else:
+            kwargs = {"extra_headers": {"x-tenant": "acme"}}
         if kind == "stream":
             stream = agent.run("hello", stream=True, client_kwargs=kwargs)
             async for _ in stream:
@@ -546,6 +549,32 @@ async def test_non_json_client_kwarg_fails_workflow(client: Client) -> None:
     assert cause.type == "MicrosoftAgentFrameworkWorkflowError"
     assert "client_kwargs" in cause.message
     assert await count_scheduled_activities(handle) == {}
+
+
+@pytest.mark.parametrize("header", ["Authorization", "X-Api-Key", "api-key"])
+async def test_credential_header_in_client_kwargs_refused(
+    client: Client, header: str
+) -> None:
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={"model": fake_chat_client(["unused"])}
+    )
+    async with new_worker(client, ClientKwargsWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ClientKwargsWorkflow.run,
+            f"secret:{header}",
+            id=workflow_id("client-kwargs-secret"),
+            task_queue=worker.task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    cause = excinfo.value.cause
+    assert isinstance(cause, ApplicationError)
+    # The same rule as for hosted MCP headers: client_kwargs are recorded in
+    # history, so a credential header is refused before any Activity runs.
+    assert cause.type == "MicrosoftAgentFrameworkWorkflowError"
+    assert header in cause.message and "client_kwargs" in cause.message
+    assert await count_scheduled_activities(handle) == {}
+    assert "workflow-secret" not in (await handle.fetch_history()).to_json()
 
 
 async def test_chat_client_factory_returns_none(client: Client) -> None:

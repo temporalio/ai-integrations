@@ -77,15 +77,45 @@ def load_options(
     return loaded
 
 
+# Header names that carry credentials. ``client_kwargs`` are recorded in
+# workflow history, so an ``extra_headers`` entry with one of these names is
+# refused; the header belongs on the provider client built in the factory.
+_CREDENTIAL_HEADER_NAMES = frozenset({"authorization", "x-api-key", "api-key"})
+
+
 def dump_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Serialize the ``client_kwargs`` of one model call.
 
     Raises:
         MicrosoftAgentFrameworkWorkflowError: If a value cannot be recorded in workflow
-            history.
+            history, or ``extra_headers`` carries a credential header
+            (``authorization``, ``x-api-key`` or ``api-key``, in any case).
     """
     _require_json("client_kwargs", kwargs)
+    headers = kwargs.get("extra_headers")
+    if isinstance(headers, Mapping):
+        present = [
+            key
+            for key in headers
+            if isinstance(key, str) and key.lower() in _CREDENTIAL_HEADER_NAMES
+        ]
+        if present:
+            raise _credentials_in_workflow_error(
+                "client_kwargs extra_headers",
+                present,
+                "Set the header on the provider client built in the chat client "
+                "factory instead.",
+            )
     return dict(kwargs)
+
+
+def _credentials_in_workflow_error(
+    what: str, keys: Sequence[str], fix: str
+) -> MicrosoftAgentFrameworkWorkflowError:
+    return MicrosoftAgentFrameworkWorkflowError(
+        f"{what} sets {', '.join(keys)} in workflow code, which would record the "
+        f"credentials in workflow history; credentials stay on the worker. {fix}"
+    )
 
 
 def dump_response(response: ChatResponse) -> dict[str, Any]:
@@ -276,12 +306,12 @@ def _dump_tool(tool: Any) -> dict[str, Any]:
         if tool.get("type") == "mcp":
             present = [key for key in _HOSTED_MCP_CREDENTIAL_KEYS if tool.get(key)]
             if present:
-                raise MicrosoftAgentFrameworkWorkflowError(
-                    f"Hosted MCP tool {_hosted_mcp_name(tool)!r} sets {', '.join(present)} "
-                    "in workflow code, which would record the credentials in workflow "
-                    "history; credentials stay on the worker. Remove them from the tool "
-                    "and pass them with MicrosoftAgentFrameworkPlugin(hosted_mcp_headers=...) "
-                    "keyed by the server label or URL."
+                raise _credentials_in_workflow_error(
+                    f"Hosted MCP tool {_hosted_mcp_name(tool)!r}",
+                    present,
+                    "Remove them from the tool and pass them with "
+                    "MicrosoftAgentFrameworkPlugin(hosted_mcp_headers=...) keyed by "
+                    "the server label or URL.",
                 )
         return dict(tool)
     raise MicrosoftAgentFrameworkWorkflowError(
