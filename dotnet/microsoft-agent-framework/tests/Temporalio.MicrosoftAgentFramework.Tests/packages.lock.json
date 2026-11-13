@@ -413,7 +413,7 @@
       "temporalio.microsoftagentframework": {
         "type": "Project",
         "dependencies": {
-          "Microsoft.Agents.AI": "[1.26.0, )",
+          "Microsoft.Agents.AI": "[1.26.0, 2.0.0)",
           "ModelContextProtocol.Core": "[2.2.0, )",
           "Temporalio": "[1.22.0, )",
           "Temporalio.Extensions.WorkflowStreams": "[1.22.0, )"

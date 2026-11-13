@@ -143,6 +143,19 @@ public class PluginTests : WorkflowTestBase
         Assert.Null(replayer.Options.WorkflowFailureExceptionTypes);
     }
 
+    [Fact]
+    public void AgentFrameworkApiGuard_PassesForTheInstalledVersion_AndNamesTheTestedOneOtherwise()
+    {
+        Internal.AgentFrameworkApiGuard.Check();
+        var error = Assert.Throws<Temporalio.Exceptions.ApplicationFailureException>(
+            () => Internal.AgentFrameworkApiGuard.Check([(typeof(object), new[] { typeof(string) })]));
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ConfigurationError, error.ErrorType);
+        Assert.True(error.NonRetryable);
+        Assert.Contains("System.Object(String)", error.Message, StringComparison.Ordinal);
+        Assert.Contains("tested with 1.26.0", error.Message, StringComparison.Ordinal);
+        Assert.Contains("Microsoft.Agents.AI 1.26.0 does not have", error.Message, StringComparison.Ordinal);
+    }
+
     private TemporalClient ClientWithPlugin(MicrosoftAgentFrameworkPlugin plugin) => new(
         Client.Connection,
         new TemporalClientOptions { Namespace = Client.Options.Namespace, Plugins = [plugin] });

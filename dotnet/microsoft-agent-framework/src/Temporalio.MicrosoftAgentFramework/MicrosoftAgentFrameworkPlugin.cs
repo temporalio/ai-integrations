@@ -10,7 +10,8 @@ namespace Temporalio.MicrosoftAgentFramework;
 /// <c>TemporalClientConnectOptions.Plugins</c> or <c>TemporalWorkerOptions.Plugins</c>. It
 /// registers the model and MCP Activities and closes MCP connections when the last worker or
 /// replayer running with the instance stops. Workers that share one instance share its MCP
-/// connections.
+/// connections. Construction checks that the installed <c>Microsoft.Agents.AI</c> still has the
+/// experimental constructors the loop calls.
 /// </summary>
 public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
 {
@@ -122,6 +123,7 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
 
     private static SimplePluginOptions BuildOptions(MicrosoftAgentFrameworkPluginOptions options)
     {
+        AgentFrameworkApiGuard.Check();
 #pragma warning disable CA2000 // The cache lives as long as the plugin; the last ReleaseAsync closes its connections.
         var connections = new McpConnectionCache(options.McpServers, options.McpConnectionIdleTimeout);
 #pragma warning restore CA2000

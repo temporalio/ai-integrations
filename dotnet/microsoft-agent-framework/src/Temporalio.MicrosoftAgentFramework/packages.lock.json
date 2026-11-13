@@ -4,7 +4,7 @@
     "net10.0": {
       "Microsoft.Agents.AI": {
         "type": "Direct",
-        "requested": "[1.26.0, )",
+        "requested": "[1.26.0, 2.0.0)",
         "resolved": "1.26.0",
         "contentHash": "nnNZXNyuGjj4r4SdJilkeKwmddJfdWboojYk3r0J02ZOMYwsy3/hpvy9C0Pfe96Cl1md7yQZW6rjdCv/kJ8c9g==",
         "dependencies": {
