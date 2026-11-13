@@ -6,7 +6,7 @@ import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, helpers } from '@temporalio/test-helpers';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { StrandsPlugin } from '..';
-import { setupTestEnv, StubModel, textTurn } from './helpers/strands';
+import { heartbeatTimeouts, setupTestEnv, StubModel, textTurn } from './helpers/strands';
 import { compressionAgent, defaultModelAgent, helloAgent, retryConfigAgent, streamingAgent } from './workflows/strands';
 
 const test = anyTest as TestFn<BaseContext>;
@@ -15,7 +15,7 @@ setupTestEnv(test);
 
 test('TemporalAgent dispatches model.stream() through invokeModel activity', async (t) => {
   t.timeout(60_000);
-  const { createWorker, executeWorkflow } = helpers(t);
+  const { createWorker, startWorkflow } = helpers(t);
 
   const worker = await createWorker({
     plugins: [
@@ -26,11 +26,18 @@ test('TemporalAgent dispatches model.stream() through invokeModel activity', asy
   });
 
   await worker.runUntil(async () => {
-    const result = await executeWorkflow(helloAgent, {
+    const handle = await startWorkflow(helloAgent, {
       args: ['say hi'],
       workflowExecutionTimeout: '30 seconds',
     });
-    t.is(result, 'hello from stub');
+    t.is(await handle.result(), 'hello from stub');
+    // The model call heartbeats by default. The config read runs synchronously, so it can't
+    // heartbeat and gets no heartbeat timeout.
+    const { events } = await handle.fetchHistory();
+    t.deepEqual(heartbeatTimeouts(events), [
+      ['strandsGetModelConfig', 0],
+      ['invokeModel', 10_000],
+    ]);
   });
 });
 

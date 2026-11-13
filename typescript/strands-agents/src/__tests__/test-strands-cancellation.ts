@@ -7,7 +7,7 @@ import { test as anyTest, helpers } from '@temporalio/test-helpers';
 import { Worker } from '@temporalio/worker';
 import { ActivityCancellationType } from '@temporalio/workflow';
 import { StrandsPlugin } from '..';
-import { setupTestEnv, StubModel, textTurn } from './helpers/strands';
+import { heartbeatTimeouts, setupTestEnv, StubModel, textTurn } from './helpers/strands';
 import {
   abortSignalTimeout,
   agentWithCancelSignal,
@@ -153,6 +153,11 @@ for (const cancellationType of [
       // The model's signal aborts while the worker runs, not because it shuts down.
       await aborted;
       const { events } = await handle.fetchHistory();
+      // The heartbeat timeout set on the agent wins. The config read can't heartbeat, so it gets none.
+      t.deepEqual(heartbeatTimeouts(events), [
+        ['strandsGetModelConfig', 0],
+        ['invokeModel', 5_000],
+      ]);
       t.true(events!.some((e) => e.activityTaskCancelRequestedEventAttributes), 'expected ActivityTaskCancelRequested');
       t.false(events!.some((e) => e.workflowTaskFailedEventAttributes), 'expected no WorkflowTaskFailed');
       t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');

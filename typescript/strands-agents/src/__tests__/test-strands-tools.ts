@@ -1,4 +1,4 @@
-import type { Message, ModelStreamEvent, StreamOptions } from '@strands-agents/sdk';
+import type { Message, ModelStreamEvent, StreamOptions, ToolSpec } from '@strands-agents/sdk';
 import type { TestFn } from 'ava';
 import { ApplicationFailure } from '@temporalio/common';
 import type { BaseContext } from '@temporalio/test-helpers';
@@ -104,6 +104,47 @@ test('activityAsTool dispatches a registered activity from the agent loop', asyn
   t.deepEqual(
     getWeatherCalls.filter((c) => c.location === 'Tokyo'),
     [{ location: 'Tokyo' }]
+  );
+});
+
+test('activityAsTool without a description exposes a valid spec and dispatches the registered activity', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  let offeredTools: ToolSpec[] | undefined;
+  class CapturingStub extends StubModel {
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      offeredTools ??= options?.toolSpecs;
+      yield* super.stream(messages, options);
+    }
+  }
+
+  const worker = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: {
+          test: () =>
+            new CapturingStub([
+              toolCallTurn('weather', 'call_1', { location: 'Berlin' }),
+              textTurn('the weather is sunny'),
+            ]),
+        },
+      }),
+    ],
+    activities: { getWeather },
+  });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(activityToolAgent, {
+      args: ['weather in Berlin?', { name: 'weather' }],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(result, 'the weather is sunny');
+  });
+
+  t.like(offeredTools, [{ name: 'weather' }]);
+  t.false(Object.hasOwn(offeredTools![0]!, 'description'));
+  t.deepEqual(
+    getWeatherCalls.filter((c) => c.location === 'Berlin'),
+    [{ location: 'Berlin' }]
   );
 });
 

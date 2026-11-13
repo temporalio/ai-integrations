@@ -12,8 +12,8 @@ const STATEFUL_MANAGER_REFUSED =
   'The model manages conversation state server-side.';
 
 const RETRY_STRATEGY_DISABLED =
-  'TemporalAgent disables Strands retries; configure retries via retryPolicy ' +
-  'in the model activity options on TemporalAgent, and on the activity options ' +
+  'TemporalAgent disables Strands retries; configure retries via activityOptions.retry ' +
+  'on TemporalAgent, and on the activity options ' +
   'passed to workflow.activityAsTool, workflow.activityAsHook, or TemporalMCPClient. ' +
   'Remove retryStrategy from TemporalAgent(...) or pass retryStrategy: null.';
 
@@ -22,7 +22,7 @@ const RETRY_STRATEGY_DISABLED =
  *
  * Accepts everything {@link AgentConfig} accepts except `model` (which is a
  * factory name selecting a worker-side {@link Model}, not an instance) and
- * `retryStrategy` (always disabled — Temporal handles retries via
+ * `retryStrategy` (only `null` is accepted — Temporal handles retries via
  * `activityOptions.retry`).
  *
  * The {@link ActivityOptions} apply to every model invocation this agent
@@ -31,6 +31,8 @@ const RETRY_STRATEGY_DISABLED =
  */
 export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retryStrategy'> {
   model?: string;
+  /** Disable Strands retries explicitly; Temporal manages retries via `activityOptions.retry`. */
+  retryStrategy?: null;
   activityOptions?: ActivityOptions;
   streamingTopic?: string;
   streamingBatchInterval?: Duration;
@@ -50,22 +52,24 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  * `activityOptions.retry` here and on the activity options accepted by
  * {@link activityAsTool}, {@link activityAsHook}, and {@link TemporalMCPClient}.
  *
- * Cancelling a model activity aborts the model call only when
- * `activityOptions.heartbeatTimeout` is set, since the worker learns of the
- * cancellation through the activity's heartbeats, and only when the model
- * passes `cancelSignal` to its client (Strands' `AnthropicModel` does not). A
- * model that ignores it keeps running and its activity can still complete with
- * the model's result. A workflow cancel during a model call cancels the model
- * activity. With `TRY_CANCEL` the run ends as cancelled at once. With
- * `WAIT_CANCELLATION_COMPLETED` it ends as cancelled only if the activity
- * does; if the activity completes, the turn continues with the model's result.
+ * `activityOptions.heartbeatTimeout` defaults to 10 seconds, and the model
+ * activities heartbeat at half of it; `heartbeatTimeout: 0` turns them off.
+ * Cancelling a model activity aborts the model call only when the activity
+ * heartbeats, since the worker learns of the cancellation through its
+ * heartbeats, and only when the model passes `cancelSignal` to its client
+ * (Strands' `AnthropicModel` does not). A model that ignores it keeps running
+ * and its activity can still complete with the model's result. A workflow
+ * cancel during a model call cancels the model activity. With `TRY_CANCEL` the
+ * run ends as cancelled at once. With `WAIT_CANCELLATION_COMPLETED` it ends as
+ * cancelled only if the activity does; if the activity completes, the turn
+ * continues with the model's result.
  */
 export class TemporalAgent extends Agent {
   private readonly managerGiven: boolean;
 
   constructor(options: TemporalAgentOptions = {}) {
-    const { model, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
-    if ((rest as { retryStrategy?: unknown }).retryStrategy !== undefined) {
+    const { model, retryStrategy, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
+    if (retryStrategy !== undefined && retryStrategy !== null) {
       throw new Error(RETRY_STRATEGY_DISABLED);
     }
     const temporalModel = new TemporalModel({

@@ -639,9 +639,8 @@ def cmd_check_published_release(args: argparse.Namespace) -> int:
 
 
 def nightly_issue_title(language: str, plugin: str) -> str:
-    """Title scripts/ci/nightly_report.py gives the plugin's issue; Python and Java names are unqualified."""
-    key = plugin if language in ("python", "java") else f"{language}/{plugin}"
-    return f"nightly: {key} failing (latest)"
+    """Language-qualified title scripts/ci/nightly_report.py gives the plugin's issue."""
+    return f"nightly: {language}/{plugin} failing (latest)"
 
 
 def cmd_check_nightly(args: argparse.Namespace) -> int:

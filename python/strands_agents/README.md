@@ -426,6 +426,17 @@ the activity's error message, and `AfterToolCallEvent.exception` contains the
 underlying exception. This also applies when an MCP tool's call-tool activity
 fails.
 
+When a workflow or tool task is cancelled, cancellation of its activity or MCP
+call propagates as `asyncio.CancelledError` instead of a failed tool result, so
+cancelling the workflow ends it as `CANCELED`. The tool's `cancellation_type`
+controls whether it waits for activity cleanup. An activity that reports
+cancellation independently still produces a failed tool result for the agent.
+
+**Breaking change:** histories that previously processed a cancelled tool as an
+error result can fail replay on this version. Keep those runs on their original
+workers with Worker Versioning. To recover a run stuck during tool cancellation,
+reset it to before the affected tool call and run it on upgraded workers.
+
 ## Hooks
 
 Strands' [hook system](https://strandsagents.com/) (`strands.hooks`) lets you subscribe callbacks to events in the agent lifecycle — invocation start/end, model call before/after, tool call before/after, message added. Pass `hooks=[MyHookProvider()]` to `TemporalAgent`: every single-agent hook event fires in workflow context, so deterministic callbacks just work.

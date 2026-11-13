@@ -13,6 +13,11 @@ import {
   type JSONValue,
   type Message,
 } from '@strands-agents/sdk';
+import { InMemoryStorage } from '@strands-agents/sdk/storage';
+import {
+  ContextOffloader,
+  InMemoryStorage as LegacyInMemoryStorage,
+} from '@strands-agents/sdk/vended-plugins/context-offloader';
 import {
   ActivityCancellationType,
   ActivityFailure,
@@ -33,6 +38,7 @@ import {
   TemporalAgent,
   TemporalMCPClient,
   TemporalModel,
+  type ActivityAsToolOptions,
   type TemporalAgentOptions,
   workflow as strandsWorkflow,
 } from '../..';
@@ -70,6 +76,38 @@ export async function abortSignalTimeout(): Promise<string> {
     return error.message;
   }
   return 'AbortSignal.timeout() did not throw';
+}
+
+/** Exercise Strands' own offloader and storage inside the Workflow isolate. */
+export async function contextOffloaderAgent(
+  storageKind: 'memory' | 'default' | 'legacy',
+  evictAfterCycles: number | null
+): Promise<{ replies: string[]; keys?: string[]; error?: { name: string; message: string } }> {
+  const storage = storageKind === 'memory' ? new InMemoryStorage() : undefined;
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } },
+    tools: [strandsWorkflow.activityAsTool('loadDocument', { description: 'Load a large document' })],
+    plugins: [
+      new ContextOffloader({
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- Exercise the unsupported legacy backend.
+        ...(storageKind === 'legacy' ? { storage: new LegacyInMemoryStorage() } : storage ? { storage } : {}),
+        maxResultTokens: 100,
+        previewTokens: 10,
+        evictAfterCycles,
+      }),
+    ],
+  });
+  const replies: string[] = [];
+  try {
+    replies.push((await agent.invoke('load the document and retrieve its full content')).toString());
+    replies.push((await agent.invoke('next turn')).toString());
+  } catch (err) {
+    const { name, message } = err as Error;
+    return { replies, error: { name, message } };
+  }
+  return { replies, ...(storage ? { keys: await storage.list('') } : {}) };
 }
 
 /**
@@ -200,13 +238,16 @@ export async function defaultModelAgent(prompt: string): Promise<string> {
   return result.toString();
 }
 
-export async function activityToolAgent(prompt: string): Promise<string> {
+export async function activityToolAgent(
+  prompt: string,
+  toolOptions: ActivityAsToolOptions = { description: 'Get the weather for a city' }
+): Promise<string> {
   const agent = new TemporalAgent({
     model: 'test',
     printer: false,
     tools: [
       strandsWorkflow.activityAsTool('getWeather', {
-        description: 'Get the weather for a city',
+        ...toolOptions,
         inputSchema: {
           type: 'object',
           properties: {

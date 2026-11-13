@@ -105,13 +105,17 @@ export async function countModelCalls(n: number): Promise<number> {
   return responses;
 }
 
-/** A model call with a very short timeout against a deliberately slow model. */
+/**
+ * A model call with a very short timeout against a deliberately slow model, with
+ * `heartbeatTimeout: 0` turning the default heartbeat timeout off.
+ */
 export async function modelCallWithTimeout(): Promise<string> {
   // `maximumAttempts: 1` so the start-to-close timeout fails the Workflow on the
   // first attempt instead of retrying forever.
   const llm = new TemporalModel('slow-model', {
     activity: {
       startToCloseTimeout: '1 second',
+      heartbeatTimeout: 0,
       retry: { maximumAttempts: 1 },
     },
   });

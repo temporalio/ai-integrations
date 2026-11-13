@@ -39,10 +39,10 @@ function rebuildMessages(messages: unknown): Message[] {
  * Once the activity's cancellation reaches the worker, the signal is aborted. That stops the model
  * call only if the model passes `cancelSignal` to its client (Strands 1.19.0's `AnthropicModel`
  * does not); otherwise the call runs on and the activity can complete with its result. A remote
- * activity learns of cancellation only through heartbeats, so this needs a `heartbeatTimeout` in
- * the activity options. Model clients abort with their own errors (OpenAI's is named `Error`),
- * which Temporal would record as a failure, so after cancellation the activity throws the signal's
- * `CancelledFailure` instead.
+ * activity learns of cancellation only through heartbeats, so this needs a `heartbeatTimeout`,
+ * which `TemporalModel` sets to 10 seconds unless the activity options set their own. Model
+ * clients abort with their own errors (OpenAI's is named `Error`), which Temporal would record as a
+ * failure, so after cancellation the activity throws the signal's `CancelledFailure` instead.
  */
 async function* streamWithActivityCancellation(
   model: Model,

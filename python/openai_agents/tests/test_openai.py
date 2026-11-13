@@ -3343,15 +3343,32 @@ async def test_alternative_model(client: Client):
             await workflow_handle.result()
 
 
-async def test_heartbeat(client: Client, env: WorkflowEnvironment):
+# WaitModel takes a second, so a 0.5-second heartbeat timeout passes only if the
+# model activity heartbeats. With nothing set, the default is 10 seconds.
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        (
+            ModelActivityParameters(heartbeat_timeout=timedelta(seconds=0.5)),
+            timedelta(seconds=0.5),
+        ),
+        (ModelActivityParameters(), timedelta(seconds=10)),
+        (ModelActivityParameters(heartbeat_timeout=None), None),
+    ],
+    ids=["set", "default", "off"],
+)
+async def test_heartbeat(
+    client: Client,
+    env: WorkflowEnvironment,
+    params: ModelActivityParameters,
+    expected: timedelta | None,
+):
     if env.supports_time_skipping:
         pytest.skip("Relies on real timing, skip.")
 
     async with AgentEnvironment(
         model=WaitModel(),
-        model_params=ModelActivityParameters(
-            heartbeat_timeout=timedelta(seconds=0.5),
-        ),
+        model_params=params,
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -3366,6 +3383,13 @@ async def test_heartbeat(client: Client, env: WorkflowEnvironment):
                 task_queue=worker.task_queue,
             )
             await workflow_handle.result()
+            heartbeat_timeouts = [
+                e.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+                or None
+                async for e in workflow_handle.fetch_history_events()
+                if e.HasField("activity_task_scheduled_event_attributes")
+            ]
+    assert heartbeat_timeouts == [expected]
 
 
 @workflow.defn
