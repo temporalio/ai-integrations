@@ -422,13 +422,21 @@ def _with_hosted_mcp_headers(
             resolved = dict(headers() if callable(headers) else headers)
             if spec.get("connector_id"):
                 # An OpenAI connector takes its OAuth token in the tool's
-                # authorization field, not in a header.
+                # authorization field, not in a header, and as the bare token.
                 for name in [n for n in resolved if n.lower() == "authorization"]:
-                    tool["authorization"] = resolved.pop(name)
+                    tool["authorization"] = _bare_token(resolved.pop(name))
             if resolved:
                 tool["headers"] = resolved
             return tool
     return tool
+
+
+def _bare_token(value: str) -> str:
+    """Drop a leading ``Bearer`` (any case) from a header-style credential value."""
+    scheme, _, token = value.strip().partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return value
 
 
 def _load_tool(

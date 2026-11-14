@@ -814,8 +814,11 @@ def test_activity_as_tool_requires_timeout() -> None:
             {"authorization": "ya29.token", "headers": {"X-Trace": "t1"}},
         ),
         ({"authorization": "ya29.token"}, {"authorization": "ya29.token"}),
+        # A header-style value: the Responses API takes the bare token here.
+        ({"Authorization": "Bearer ya29.token"}, {"authorization": "ya29.token"}),
+        ({"Authorization": "bearer ya29.token"}, {"authorization": "ya29.token"}),
     ],
-    ids=["with-headers", "token-only"],
+    ids=["with-headers", "token-only", "bearer-prefix", "bearer-lower"],
 )
 async def test_hosted_mcp_authorization_for_connector(
     client: Client, configured: dict[str, str], expected: dict[str, Any]
