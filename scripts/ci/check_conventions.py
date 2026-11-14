@@ -21,7 +21,7 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * every .NET plugin follows the dotnet/<name>/ contract (AGENTS.md, ".NET conventions"): a
     Directory.Build.props that starts by importing dotnet/_shared/dotnet.props and whose body keeps
     the shared policy, no other MSBuild directory file anywhere in the plugin, one <Coordinate>.slnx,
-    one SDK channel, global.json and nuget.config policy, the canonical .editorconfig, the library and
+    the runtimes the tests run on with the SDK channel last, global.json and nuget.config policy, the canonical .editorconfig, the library and
     MTP test csproj rules, a committed packages.lock.json beside each csproj
   * no Directory.Build.props, Directory.Build.targets, Directory.Packages.props, global.json or
     nuget.config at dotnet/ itself (MSBuild would apply them to every plugin silently)
@@ -85,7 +85,8 @@ DOTNET_DEVELOPMENT_VERSION = "0.0.0"
 DOTNET_PREFIX = "Temporalio.Extensions."
 DOTNET_SHARED_IMPORT_PATH = "$(MSBuildThisFileDirectory)../_shared/dotnet.props"
 DOTNET_SHARED_IMPORT = f'<Project>\n  <Import Project="{DOTNET_SHARED_IMPORT_PATH}" />\n'
-# Keep equal to dotnet/_shared/dotnet.props and the plugins' global.json floor channel.
+# Keep equal to dotnet/_shared/dotnet.props and the SDK channel the plugins' global.json pins (the newest
+# listed runtime; the floor is the oldest).
 DOTNET_ANALYSIS_LEVEL = "10.0"
 DOTNET_REPOSITORY_TREE = "https://github.com/temporalio/ai-integrations/tree/main"
 # MSBuild composes every project from these files along the directory chain: a nearer Directory.Build.props
@@ -613,6 +614,9 @@ class Checker:
             return
         sdk = settings.get("sdk", {}) if isinstance(settings, dict) else {}
         version = str(sdk.get("version", ""))
+        # release_tool.py's dotnet_runtime and smoke_dotnet.py's clean consumer take the last entry as the SDK
+        # channel (the publish and verify jobs install only that SDK; the consumer targets net<last>), so the
+        # last entry must be the channel global.json pins.
         if runtimes and ".".join(version.split(".")[:2]) != runtimes[-1]:
             self.fail(f"{rel}: sdk.version {version!r} must be in the SDK channel {runtimes[-1]} (last [ci] runtime-versions entry)")
         if sdk.get("rollForward") != "latestFeature":

@@ -11,8 +11,8 @@
          pull requests. -->
     <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1900;NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
-    <!-- Pinned to the floor channel, not `latest`: the rule set must not follow the runner's newest
-         feature band. Move it together with the plugins' global.json floor. -->
+    <!-- Pinned to the SDK channel the plugins' global.json pins (the newest listed runtime), not `latest`:
+         the rule set must not follow the runner's newest feature band. Move it together with global.json. -->
     <AnalysisLevel>10.0</AnalysisLevel>
     <AnalysisMode>AllEnabledByDefault</AnalysisMode>
     <!-- Style rules stay out of the build until dotnet/format#1800 is fixed; `make lint` covers them. -->

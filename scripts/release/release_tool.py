@@ -199,7 +199,9 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
             if (plugin.get("language") != "dotnet" or plugin.get("name") != out["plugin"] or plugin.get("registry") != "nuget"
                     or str(out["coordinate"]).lower() != expected.lower() or out["root_api"] != out["coordinate"]):
                 raise PolicyError(".NET tag, plugin metadata, coordinate and root API must match")
-            # The publish job installs this SDK channel and the clean consumer targets its framework.
+            # The last entry is the SDK channel global.json pins (check_conventions.py checks that): the publish
+            # and verify jobs install only this SDK and the clean consumer targets net<channel>, so a newest
+            # runtime that is not the SDK channel would break both.
             out["dotnet_runtime"] = str(meta["ci"]["runtime-versions"][-1])
     _write_outputs(args.github_output, out)
     return 0

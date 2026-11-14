@@ -185,7 +185,8 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   real version.
 - Each project opts into `RestorePackagesWithLockFile`; `dotnet/_shared/dotnet.mk` exports
   `RestoreLockedMode=true`, so when a csproj drifts from its lock `make build` and `make test` fail with
-  NU1004 and `make lint` fails to restore. Edit dependencies, then run `make lock`. `global.json` pins the SDK channel floor with
+  NU1004 and `make lint` fails to restore. Edit dependencies, then run `make lock`. `global.json` pins the SDK channel
+  (the newest `runtime-versions` entry; the floor is the oldest) with
   `rollForward: latestFeature` and `allowPrerelease: false`; `IsAotCompatible`, `PublishAot`,
   `PublishTrimmed` and `IsTrimmable` are not allowed because they add SDK-pinned implicit package
   references that break locked restores across SDK patches.

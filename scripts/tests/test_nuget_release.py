@@ -57,6 +57,8 @@ def test_dotnet_tags_parse_with_the_prerelease_flag() -> None:
     assert release_tool.parse_tag("dotnet/microsoft-agent-framework/v0.0.1")["prerelease"] == "false"
 
 
+# dotnet_runtime is the last runtime-versions entry, the SDK channel global.json pins: release-dotnet.yml installs
+# only that SDK in the publish and verify jobs and the clean consumer targets its framework.
 def test_cli_parse_dotnet_tag_emits_the_sdk_channel(dotnet_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert release_tool.main(["--repo-root", str(dotnet_repo), "parse-tag", f"dotnet/fakedotnet/v{VERSION}"]) == 0
     outputs = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
