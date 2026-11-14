@@ -159,7 +159,7 @@ def test_no_secrets_or_owners_in_plugin_toml(plugin_repo: Path) -> None:
 
 def test_path_sources_and_required_version(plugin_repo: Path) -> None:
     pp = plugin_repo / "python/fakeplug/pyproject.toml"
-    pp.write_text(pp.read_text().replace('required-version = ">=0.12.5,<0.13"', 'required-version = ">=0.11"')
+    pp.write_text(pp.read_text().replace('required-version = ">=0.13.0,<0.14"', 'required-version = ">=0.11"')
                   + '\n[tool.uv.sources]\ntemporalio-mcp = { path = "../mcp" }\n')
     v = run(plugin_repo)
     assert any("path/workspace source" in x for x in v) and any("required-version" in x for x in v)

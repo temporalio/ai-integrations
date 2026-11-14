@@ -6,8 +6,8 @@
  */
 
 import { randomUUID } from 'crypto';
-import type { TestFn } from 'ava';
-import type { Client as LangSmithClient } from 'langsmith';
+import type { ExecutionContext, TestFn } from 'ava';
+import type { AgentAddress, Client as LangSmithClient } from 'langsmith';
 import { Client } from '@temporalio/client';
 import { TestWorkflowEnvironment } from '@temporalio/testing';
 import { Worker, bundleWorkflowCode, type WorkerOptions, type WorkflowBundle } from '@temporalio/worker';
@@ -43,11 +43,19 @@ export interface CollectedRun {
   extra?: Record<string, unknown>;
   project_name?: string;
   session_name?: string;
-  address?: string;
+  address?: AgentAddress;
   events?: unknown[];
 }
 
 /** In-memory stand-in for a LangSmith `Client`; records `createRun`s in order and merges `updateRun`s by id. */
+/**
+ * The run IDs in a dotted order, root first, without start times. Start times can differ across replay: live runs use
+ * the Worker's clock and replayed runs use Workflow time. IDs and ancestry stay the same.
+ */
+export function idPath(dottedOrder: string): string[] {
+  return dottedOrder.split('.').map((segment) => segment.slice(-36));
+}
+
 export class InMemoryRunCollector {
   /** Run ids in first-seen (createRun) order. */
   readonly createOrder: string[] = [];
@@ -195,13 +203,17 @@ export function useSharedEnv(test: TestFn<unknown>): void {
 
 const bundleCache = new Map<string, Promise<WorkflowBundle>>();
 
-/** The env vars LangSmith's default destination reads; the bundle bakes in what they name, so they key the cache. */
+/** The env vars LangSmith's default destination and tracing gate read; the bundle bakes them in, so they key the cache. */
 const DESTINATION_ENV_VARS = [
   'LANGSMITH_PROJECT',
   'LANGCHAIN_PROJECT',
   'LANGCHAIN_SESSION',
   'LANGSMITH_AGENT_ID',
   'LANGSMITH_AGENT_ENVIRONMENT',
+  'LANGSMITH_TRACING',
+  'LANGSMITH_TRACING_V2',
+  'LANGCHAIN_TRACING_V2',
+  'LANGCHAIN_TRACING',
 ];
 
 function getBundle(plugin: LangSmithPlugin, workflowsPath: string, optionsKey: string): Promise<WorkflowBundle> {
@@ -251,4 +263,53 @@ export async function withTracingWorker<T>(args: HarnessArgs<T>): Promise<T> {
   } finally {
     if (privateEnv) await privateEnv.teardown();
   }
+}
+
+/**
+ * Run `workflow` live, then replay its history with a fresh plugin, asserting the run ids it sends to its
+ * `runIds.capture` sink are the same both times and the replay writes nothing. Returns the live result and ids.
+ */
+export async function runAndReplay<R>(
+  t: ExecutionContext,
+  collector: InMemoryRunCollector,
+  workflowsPath: string,
+  workflow: () => Promise<R>
+): Promise<{ result: R; ids: string[] }> {
+  const captures: string[][] = [];
+  const sinks = {
+    runIds: {
+      capture: {
+        fn: (_info: unknown, ids: string[]) => {
+          captures.push(ids);
+        },
+        callDuringReplay: true,
+      },
+    },
+  };
+  const replay = new InMemoryRunCollector();
+  const result = await withTracingWorker({
+    collector,
+    options: { addTemporalRuns: false },
+    activities: {},
+    workerOptions: { workflowsPath, sinks },
+    body: async ({ client, taskQueue }) => {
+      const handle = await client.workflow.start(workflow, {
+        workflowId: `${workflow.name}-${randomUUID()}`, taskQueue,
+        // A Workflow Task error retries forever; time out so it fails the test instead.
+        workflowExecutionTimeout: '30s',
+      });
+      const result = await handle.result();
+      await Worker.runReplayHistory({
+        workflowsPath,
+        plugins: [new LangSmithPlugin({ client: replay.asClient() })],
+        sinks,
+      }, await handle.fetchHistory());
+      return result;
+    },
+  });
+  t.is(captures.length, 2, 'capture the live execution and the replay');
+  const [ids, replayed] = captures as [string[], string[]];
+  t.deepEqual(replayed, ids);
+  t.deepEqual(replay.records, [], 'replay writes nothing');
+  return { result, ids };
 }

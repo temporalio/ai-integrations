@@ -1,112 +1,127 @@
 /** Native LangSmith lifecycle overrides, scoped to this plugin's workflow handlers. */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Client } from 'langsmith';
-import { RunTree, type RunTreeConfig } from 'langsmith/run_trees';
+import type { KVMap } from 'langsmith/schemas';
+import type { RunTree, RunTreeConfig } from 'langsmith/run_trees';
+import { v7 as uuidv7 } from 'uuid';
 import { getRandomStream, proxySinks, workflowInfo } from '@temporalio/workflow';
-import { isUntraced, serializeRun, suppressRun } from './run-tree';
+import { isUntraced, patchRunTree, serializeRun, suppressRun, type RunTreeOverrides } from './run-tree';
 import { LANGSMITH_SINK_NAME, type LangSmithSinks } from './sinks';
 import type { WorkflowLangSmithConfig } from './workflow-interceptors';
 
-// Keep the existing stream name stable for replay compatibility.
 const LANGSMITH_RUN_TREE_STREAM = 'package-langsmith-tracing';
 
 interface WorkflowRunTreeContext {
   config: WorkflowLangSmithConfig;
-  generateNewUuid4?: () => string;
+  readOnly: boolean;
 }
 
-interface ContextStore {
-  getStore(): WorkflowRunTreeContext | undefined;
-  run<T>(context: WorkflowRunTreeContext, fn: () => T): T;
-}
-
-declare const globalThis: { AsyncLocalStorage: new () => ContextStore };
-const context = new globalThis.AsyncLocalStorage();
+// The bundle rewrites `node:async_hooks` to the AsyncLocalStorage the SDK injects into the sandbox.
+const context = new AsyncLocalStorage<WorkflowRunTreeContext>();
 
 export function workflowRunTreeContext<T>(
   config: WorkflowLangSmithConfig,
   fn: () => T,
-  generateNewUuid4: (() => string) | undefined = context.getStore()?.generateNewUuid4
+  readOnly = false
 ): T {
-  return context.run({ config, generateNewUuid4 }, fn);
+  return context.run({ config, readOnly }, fn);
+}
+
+function runId(readOnly: boolean): string {
+  const bytes = new Uint8Array(16);
+
+  if (readOnly) {
+    const { unsafe } = workflowInfo();
+    return uuidv7({ msecs: unsafe.now(), random: unsafe.random.fillRandom(bytes) });
+  }
+
+  return uuidv7({ msecs: Date.now(), random: getRandomStream(LANGSMITH_RUN_TREE_STREAM).fill(bytes) });
+}
+
+function workerOrServerTime(): number {
+  const { unsafe } = workflowInfo();
+  return unsafe.isReplayingHistoryEvents ? Date.now() : unsafe.now();
 }
 
 // Every write inside a workflow is routed through a sink instead of this client.
 const NOOP_CLIENT = {
-  createRun: async (): Promise<void> => {},
-  updateRun: async (): Promise<void> => {},
+  createRun: async (): Promise<void> => { },
+  updateRun: async (): Promise<void> => { },
 } as unknown as Client;
 
-// LangSmith calls these hooks from its constructor. Patching them also covers
+// LangSmith calls getDefaultConfig and _resolveAddressing from its constructor. Patching them also covers
 // RunTree aliases imported before installation, including its own createChild.
-interface ConstructorHooks {
-  getDefaultConfig(): RunTreeConfig;
-}
-interface AddressingHook {
-  _resolveAddressing(config: RunTreeConfig): void;
-}
+/** Preserve native root/child selection, ordering, and replica inheritance. */
+export const WORKFLOW_RUN_TREE_OVERRIDES: RunTreeOverrides = {
+  statics: {
+    getDefaultConfig: (original) =>
+      function (this: typeof RunTree, ...args: unknown[]): RunTreeConfig {
+        const defaults = original.apply(this, args);
+        const active = context.getStore();
+        if (!active) return defaults;
+        return {
+          ...defaults,
+          id: runId(active.readOnly),
+          start_time: workerOrServerTime(),
+          replicas: active.config.replicas,
+          // Keep traceable's awaits independent of the worker's destination env.
+          tracingEnabled: true,
+        };
+      },
+    getSharedClient: (original) =>
+      function (this: typeof RunTree, ...args: unknown[]): Client {
+        return context.getStore() ? NOOP_CLIENT : original.apply(this, args);
+      },
+  },
+  methods: {
+    _resolveAddressing: (original) =>
+      function (this: RunTree, config: RunTreeConfig, ...args: unknown[]): void {
+        const active = context.getStore();
+        if (!active) return original.call(this, config, ...args);
+        const selected = config.project_name || config.address ? config : { ...config, ...active.config.destination };
+        original.call(this, selected, ...args);
+        if (!selected.project_name && !selected.address) suppressRun(this);
+        // A run with no parent and no propagated trace starts a new trace, which LangSmith's env gates.
+        if (!config.parent_run && !config.trace_id && active.config.tracingEnabled === false) suppressRun(this);
+        // A child of an untraced run stays untraced, whether built by createChild or `new RunTree({ parent_run })`.
+        if (config.parent_run && isUntraced(config.parent_run)) suppressRun(this);
+      },
+    end: (original) =>
+      async function (this: RunTree, outputs?: KVMap, error?: string, endTime?: number, ...args: unknown[]): Promise<void> {
+        if (context.getStore() && endTime === undefined) endTime = workerOrServerTime();
+        return original.call(this, outputs, error, endTime, ...args);
+      },
+    postRun: (original) =>
+      async function (this: RunTree, excludeChildRuns = true, ...args: unknown[]): Promise<void> {
+        if (!context.getStore()) return original.call(this, excludeChildRuns, ...args);
+        // Native traceable can defer asynchronous input processing until postRun.
+        if ((this as RunTree & { _awaitInputsOnPost?: boolean })._awaitInputsOnPost) {
+          this.inputs = await this.inputs;
+        }
+        if (!workflowInfo().unsafe.isReplayingHistoryEvents && !isUntraced(this)) {
+          proxySinks<LangSmithSinks>()[LANGSMITH_SINK_NAME].createRun(serializeRun(this));
+        }
+        if (!excludeChildRuns) {
+          for (const child of this.child_runs) await child.postRun(false);
+        }
+        this.child_runs = [];
+      },
+    patchRun: (original) =>
+      async function (this: RunTree, options?: Parameters<RunTree['patchRun']>[0], ...args: unknown[]): Promise<void> {
+        if (!context.getStore()) return original.call(this, options, ...args);
+        if (!workflowInfo().unsafe.isReplayingHistoryEvents && !isUntraced(this)) {
+          proxySinks<LangSmithSinks>()[LANGSMITH_SINK_NAME].updateRun(serializeRun(this), options);
+        }
+        this.child_runs = [];
+      },
+  },
+};
 
 let installed = false;
 
-/** Preserve native root/child selection, ordering, and replica inheritance. */
 export function installRunTreeOverrides(): void {
   if (installed) return;
+  patchRunTree(WORKFLOW_RUN_TREE_OVERRIDES);
   installed = true;
-  const constructor = RunTree as unknown as ConstructorHooks;
-  const prototype = RunTree.prototype as unknown as AddressingHook;
-  const originalDefaults = constructor.getDefaultConfig;
-  const originalAddressing = prototype._resolveAddressing;
-  const originalClient = RunTree.getSharedClient;
-  const originalChild = RunTree.prototype.createChild;
-  const originalPost = RunTree.prototype.postRun;
-  const originalPatch = RunTree.prototype.patchRun;
-
-  constructor.getDefaultConfig = function () {
-    const defaults = originalDefaults.call(this);
-    const active = context.getStore();
-    if (!active) return defaults;
-    return {
-      ...defaults,
-      id: active.generateNewUuid4?.() ?? getRandomStream(LANGSMITH_RUN_TREE_STREAM).uuid4(),
-      replicas: active.config.replicas,
-      // Keep traceable's awaits independent of the worker's destination env.
-      tracingEnabled: true,
-    };
-  };
-  RunTree.getSharedClient = function () {
-    return context.getStore() ? NOOP_CLIENT : originalClient.call(this);
-  };
-  prototype._resolveAddressing = function (this: RunTree, config) {
-    const active = context.getStore();
-    if (!active) return originalAddressing.call(this, config);
-    const selected = config.project_name || config.address ? config : { ...config, ...active.config.destination };
-    originalAddressing.call(this, selected);
-    if (!selected.project_name && !selected.address) suppressRun(this);
-  };
-  RunTree.prototype.createChild = function (config) {
-    const child = originalChild.call(this, config);
-    if (context.getStore() && isUntraced(this)) suppressRun(child);
-    return child;
-  };
-  RunTree.prototype.postRun = async function (excludeChildRuns = true) {
-    if (!context.getStore()) return originalPost.call(this, excludeChildRuns);
-    // Native traceable can defer asynchronous input processing until postRun.
-    if ((this as RunTree & { _awaitInputsOnPost?: boolean })._awaitInputsOnPost) {
-      this.inputs = await this.inputs;
-    }
-    if (!workflowInfo().unsafe.isReplayingHistoryEvents && !isUntraced(this)) {
-      proxySinks<LangSmithSinks>()[LANGSMITH_SINK_NAME].createRun(serializeRun(this));
-    }
-    if (!excludeChildRuns) {
-      for (const child of this.child_runs) await child.postRun(false);
-    }
-    this.child_runs = [];
-  };
-  RunTree.prototype.patchRun = async function (options) {
-    if (!context.getStore()) return originalPatch.call(this, options);
-    if (!workflowInfo().unsafe.isReplayingHistoryEvents && !isUntraced(this)) {
-      proxySinks<LangSmithSinks>()[LANGSMITH_SINK_NAME].updateRun(serializeRun(this), options);
-    }
-    this.child_runs = [];
-  };
 }

@@ -155,16 +155,17 @@ jobs:
       contents: read
       issues: write
       actions: read
+      vulnerability-alerts: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Open, update, or close nightly issues
+      - name: Report nightly checks and Dependabot failures
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/ci/nightly_report.py
+        run: python3 scripts/ci/nightly_report.py --dependabot
 
   ci-status:
     name: ci-status

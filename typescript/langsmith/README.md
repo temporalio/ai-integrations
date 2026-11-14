@@ -42,7 +42,8 @@ export LANGSMITH_API_KEY="<your key>"
 
 The plugin reads the same flags LangSmith itself uses (`LANGSMITH_TRACING` /
 `LANGSMITH_TRACING_V2` and their `LANGCHAIN_` aliases); with none set to `true`,
-tracing stays off and the plugin is a no-op.
+the plugin starts no new traces. As in LangSmith, a trace that arrives in
+Temporal headers from a traced caller continues either way.
 
 ## Hello world
 
@@ -155,7 +156,7 @@ user_pipeline
 | `projectName`     | LangSmith default | Default LangSmith project for new root traces. An inherited destination takes precedence.                                                       |
 | `address`         | —                 | Agent/environment destination, mutually exclusive with `projectName`. Requires LangSmith's workspace-enabled beta feature.                    |
 | `tags`            | —                 | Tags attached to every run the plugin emits.                                                                                                   |
-| `metadata`        | —                 | Metadata merged into every run the plugin emits. Credential-looking keys are scrubbed before emission.                                         |
+| `metadata`        | —                 | Metadata merged into every run the plugin emits. It is sent unchanged and travels in Temporal headers, so keep secrets out of it.              |
 
 The LangSmith API key is never accepted as a plugin option and never crosses a
 Temporal boundary. Supply a pre-constructed `Client` (which reads
@@ -164,20 +165,28 @@ default client from the environment.
 
 ## Agent and environment destinations
 
-With LangSmith 0.10.8 or later, send traces to an agent's environment:
+With LangSmith 0.10.13 or later, send traces to an agent's environment:
 
 ```typescript
-import { address } from 'langsmith';
+import { AgentAddress } from 'langsmith';
 import { LangSmithPlugin } from '@temporalio/langsmith';
 
 const plugin = new LangSmithPlugin({
-  address: address.agent('support', 'staging'),
+  address: new AgentAddress('support', 'staging'),
 });
 ```
 
 Register the plugin on the Client and Worker as in the quick start. `address`
 and `projectName` are mutually exclusive. Agent addressing is a LangSmith beta
 feature that must be enabled for the workspace.
+
+When upgrading from LangSmith 0.10.8, replace `address.agent(...)` with
+`new AgentAddress(...)`. Addresses are objects in application code; tracing
+headers retain their LRN string format, including headers in existing histories.
+This is a breaking change for Workflows that pass address strings as recorded
+inputs to LangSmith calls. Let those executions finish on the previous plugin
+and LangSmith versions, or keep them on their previous Worker Deployment Version
+when deploying the upgrade.
 
 Native `traceable(fn, { address: ... })` and runtime traceable configuration
 also select destinations for new root traces in Workflows, Activities, and
@@ -197,7 +206,7 @@ const pipeline = traceable(runWorkflow, {
   replicas: [
     { projectName: 'primary', primary: true },
     { projectName: 'audit' },
-    { address: address.agent('support', 'production') },
+    { address: new AgentAddress('support', 'production') },
   ],
 });
 ```
@@ -230,12 +239,12 @@ the worker injects onto the workflow-sandbox global, so context propagates
 across `await` boundaries and `Promise.all(...)` fan-out exactly as it does
 outside the isolate — the same deterministic run tree replays identically.
 
-Native `RunTree` instances are replay-safe too. The plugin adapts LangSmith's
-constructor defaults and write methods within Workflow handlers: IDs use an
-independent deterministic random stream, timestamps use Workflow time, and
-writes go through the Worker sink and are suppressed during replay. Root runs
-remain real roots; LangSmith controls child creation and replica inheritance.
-Activities use LangSmith's native IDs and write methods.
+Native `RunTree` instances work in Workflow code too:
+
+- Run IDs are the same on replay.
+- End times come from the Worker's clock. Start times do too, unless the run
+  was rebuilt by a replay before it ended; then they come from Workflow time.
+- A run's end is never sent twice.
 
 ## Process-wide effects to be aware of
 
