@@ -7,7 +7,7 @@ import asyncio
 import contextlib
 import dataclasses
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -39,7 +39,7 @@ class Recording(TrialHooks):
         self.events: list[str] = []
 
     @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+    async def scope(self, context: TrialContext) -> AsyncGenerator[None, None]:
         self.events.append(f"enter {context.attempt}")
         try:
             yield

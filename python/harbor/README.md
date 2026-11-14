@@ -193,7 +193,7 @@ Activity:
 import asyncio
 import contextlib
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from datetime import timedelta
 from pathlib import Path
 
@@ -211,7 +211,7 @@ class EvalHooks(TrialHooks):
         self._api_key = os.environ["PROVIDER_API_KEY"]
 
     @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+    async def scope(self, context: TrialContext) -> AsyncGenerator[None, None]:
         try:
             yield
         finally:

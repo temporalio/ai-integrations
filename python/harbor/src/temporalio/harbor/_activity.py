@@ -12,7 +12,14 @@ import shutil
 import threading
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterator
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Generator,
+    Iterator,
+)
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -383,7 +390,7 @@ async def _on_own_loop(make: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
 
 
 @contextlib.contextmanager
-def _config_errors(*, lookups: bool = False) -> Iterator[None]:
+def _config_errors(*, lookups: bool = False) -> Generator[None, None, None]:
     """Fail without a retry when harbor rejects the job's configuration.
 
     With ``lookups``, a ``ValueError`` raised while handling another error is

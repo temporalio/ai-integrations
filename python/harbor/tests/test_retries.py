@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import sys
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -566,7 +566,7 @@ class RetryThenLoseCredentials(TrialHooks):
     """Send the first attempt back to Temporal; every later one cannot start."""
 
     @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+    async def scope(self, context: TrialContext) -> AsyncGenerator[None, None]:
         if context.attempt > 1:
             raise RuntimeError("the worker lost its credentials")
         yield

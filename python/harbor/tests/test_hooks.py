@@ -8,7 +8,7 @@ import dataclasses
 import re
 import sys
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -80,7 +80,7 @@ class Recording(TrialHooks):
         self.redacted: set[int] = set()
 
     @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+    async def scope(self, context: TrialContext) -> AsyncGenerator[None, None]:
         self.events.append(f"enter {context.attempt}")
         try:
             yield
@@ -251,7 +251,7 @@ def _cannot_start(trial_dir: Path) -> None:
 
 class FailInScope(Redacting):
     @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+    async def scope(self, context: TrialContext) -> AsyncGenerator[None, None]:
         _cannot_start(context.trial_dir)
         yield
 
@@ -449,7 +449,7 @@ class OverrunThenCleanUp(TrialHooks):
     """Runs out of extra time in output; the scope then has cleanup to await."""
 
     @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+    async def scope(self, context: TrialContext) -> AsyncGenerator[None, None]:
         try:
             yield
         finally:
@@ -682,7 +682,7 @@ async def test_scope_sees_cancellation(client: Client, tmp_path: Path) -> None:
 
 class Swallow(TrialHooks):
     @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+    async def scope(self, context: TrialContext) -> AsyncGenerator[None, None]:
         with contextlib.suppress(Exception):
             yield
 
