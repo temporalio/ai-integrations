@@ -3,6 +3,7 @@
 from collections import Counter
 
 from temporalio.api.enums.v1 import EventType
+from temporalio.api.history.v1 import ActivityTaskScheduledEventAttributes
 from temporalio.client import WorkflowHandle
 
 
@@ -14,3 +15,15 @@ async def count_scheduled_activities(handle: WorkflowHandle) -> Counter:
             name = event.activity_task_scheduled_event_attributes.activity_type.name
             counts[name] += 1
     return counts
+
+
+async def scheduled_activity_attrs(
+    handle: WorkflowHandle, name: str
+) -> ActivityTaskScheduledEventAttributes | None:
+    """Return the ``ActivityTaskScheduled`` attributes of activity ``name``."""
+    async for event in handle.fetch_history_events():
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            attrs = event.activity_task_scheduled_event_attributes
+            if attrs.activity_type.name == name:
+                return attrs
+    return None

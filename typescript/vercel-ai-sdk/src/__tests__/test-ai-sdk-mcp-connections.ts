@@ -1,8 +1,126 @@
 import { jsonSchema } from 'ai';
+import type { MCPClient } from '@ai-sdk/mcp';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import test from 'ava';
+import { ApplicationFailure } from '@temporalio/common';
 import { assertEventually } from '@temporalio/test-helpers';
-import { createActivities } from '..';
+import { createActivities, type McpClientFactory } from '..';
 import { helloWorkflowGenerator, TestProvider } from './stubs/ai-sdk';
+
+for (const idleMs of [0, 60_000]) {
+  for (const operation of ['listTools', 'callTool']) {
+    test(`${operation} rejects invalid MCP clients without retries (idle timeout ${idleMs})`, async (t) => {
+      let closeCalls = 0;
+      const close = async () => {
+        closeCalls++;
+      };
+      // A connected MCP SDK Client, which a factory can return in place of the AI SDK one.
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
+      const server = new Server({ name: 'test-server', version: '1.0.0' }, { capabilities: {} });
+      let serverClosed = false;
+      server.onclose = () => {
+        serverClosed = true;
+      };
+      await server.connect(serverTransport);
+      const sdkClient = new Client({ name: 'test-client', version: '1.0.0' });
+      await sdkClient.connect(clientTransport);
+
+      const invalidClients: [unknown, string][] = [
+        [undefined, 'undefined'],
+        [null, 'null'],
+        [42, 'number'],
+        [{}, 'Object'],
+        [{ tools: async () => ({}) }, 'Object'],
+        [{ close }, 'Object'],
+        [{ tools: 1, close }, 'Object'],
+        [{ tools: async () => ({}), close: 1 }, 'Object'],
+        // A failing close() must not replace the validation failure.
+        [
+          {
+            close: async () => {
+              closeCalls++;
+              throw new Error('close failed');
+            },
+          },
+          'Object',
+        ],
+        [
+          {
+            close: () => {
+              closeCalls++;
+              throw new Error('close failed');
+            },
+          },
+          'Object',
+        ],
+        [sdkClient, 'Client'],
+      ];
+      let client: unknown;
+      let factoryCalls = 0;
+      const name = `invalid-${operation}-${idleMs}`;
+      const provider = new TestProvider(helloWorkflowGenerator());
+      const activities = createActivities(
+        provider,
+        {
+          [name]: async () => {
+            factoryCalls++;
+            return client as MCPClient;
+          },
+        },
+        { mcpConnectionIdleTimeout: idleMs }
+      ) as Record<string, (args: unknown) => Promise<unknown>>;
+
+      for (const [value, kind] of invalidClients) {
+        // Passed in place of the factory, the value fails when the Worker is built.
+        t.throws(() => createActivities(provider, { [name]: value as McpClientFactory }), {
+          instanceOf: TypeError,
+          message: `MCP client factory '${name}' is ${kind}, not a function.`,
+        });
+
+        client = value;
+        const err = await t.throwsAsync(
+          activities[`${name}-${operation}`]!({ name: 'testTool', input: {}, options: {} }),
+          { instanceOf: ApplicationFailure }
+        );
+        t.true(err!.nonRetryable);
+        t.is(err!.type, 'MCPClientFactoryTypeError');
+        t.is(
+          err!.message,
+          `MCP client factory '${name}' returned ${kind}, not a client with tools() and close() methods.`
+        );
+      }
+      t.is(factoryCalls, invalidClients.length);
+      // Rejected clients with a callable close() are closed once each.
+      t.is(closeCalls, 4);
+      t.true(serverClosed);
+    });
+
+    test(`${operation} preserves MCP factory failures (idle timeout ${idleMs})`, async (t) => {
+      const failure = new Error('connection refused');
+      let factoryCalls = 0;
+      const name = `failed-${operation}-${idleMs}`;
+      const activities = createActivities(
+        new TestProvider(helloWorkflowGenerator()),
+        {
+          [name]: async () => {
+            factoryCalls++;
+            throw failure;
+          },
+        },
+        { mcpConnectionIdleTimeout: idleMs }
+      ) as Record<string, (args: unknown) => Promise<unknown>>;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const err = await t.throwsAsync(activities[`${name}-${operation}`]!({}));
+        t.is(err, failure);
+      }
+      t.is(factoryCalls, 2);
+    });
+  }
+}
 
 test('callToolActivity awaits tool.execute before closing MCP client', async (t) => {
   // Track the order of operations to verify close() is called AFTER execute() completes
