@@ -62,53 +62,27 @@ def install_addressing_override() -> None:
         return
 
     overrides: dict[str, Callable[..., Any]] = {}
-    original_resolve = getattr(run_helpers, "_resolve_traceable_addressing", None)
-    if original_resolve is not None:
-        overrides["_resolve_traceable_addressing"] = _with_container_defaults(
-            original_resolve
+    overrides["_resolve_traceable_addressing"] = _with_container_defaults(
+        run_helpers._resolve_traceable_addressing
+    )
+
+    original_tiers = run_helpers._addressing_tiers
+
+    @functools.wraps(original_tiers)
+    def tiers(*args: Any, **kwargs: Any) -> Any:
+        levels = original_tiers(*args, **kwargs)
+        destination = _destination.get()
+        if not destination:
+            return levels
+        # trace() has a separate resolver: its last explicit tier is
+        # configure(), followed by the environment inside native resolve().
+        return (
+            *levels[:-1],
+            (destination.get("project_name"), destination.get("address")),
+            levels[-1],
         )
-    else:
-        # Older LangSmith releases resolve project precedence inline. Only
-        # supply the decorator fallback; leave run selection and setup native.
-        overrides["_setup_run"] = _with_container_defaults(run_helpers._setup_run)
 
-    original_tiers = getattr(run_helpers, "_addressing_tiers", None)
-    if original_tiers is not None:
-
-        @functools.wraps(original_tiers)
-        def tiers(*args: Any, **kwargs: Any) -> Any:
-            levels = original_tiers(*args, **kwargs)
-            destination = _destination.get()
-            if not destination:
-                return levels
-            # trace() has a separate resolver: its last explicit tier is
-            # configure(), followed by the environment inside native resolve().
-            return (
-                *levels[:-1],
-                (destination.get("project_name"), destination.get("address")),
-                levels[-1],
-            )
-
-        overrides["_addressing_tiers"] = tiers
-    else:
-        original_project = run_helpers._get_project_name
-        project_signature = signature(original_project, "project_name")
-
-        @functools.wraps(original_project)
-        def project(*args: Any, **kwargs: Any) -> str | None:
-            destination = _destination.get()
-            if destination and (call := bind(project_signature, args, kwargs)):
-                context = run_helpers.get_tracing_context()
-                if (
-                    not call.arguments["project_name"]
-                    and not context.get("project_name")
-                    and context.get("parent") is None
-                ):
-                    call.arguments["project_name"] = destination.get("project_name")
-                    args, kwargs = call.args, call.kwargs
-            return original_project(*args, **kwargs)
-
-        overrides["_get_project_name"] = project
+    overrides["_addressing_tiers"] = tiers
 
     # Patch nothing until every signature check has passed.
     for name, override in overrides.items():

@@ -17,10 +17,11 @@
  * @internal
  */
 
+import { __version__ } from 'langsmith';
 import { RunTree, type RunTreeConfig } from 'langsmith/run_trees';
-import { ApplicationFailure, ApplicationFailureCategory } from '@temporalio/common';
+import { ApplicationFailure, ApplicationFailureCategory, CancelledFailure } from '@temporalio/common';
 
-import { scrubSensitive, type LangSmithTraceContext } from './propagation';
+import type { LangSmithTraceContext } from './propagation';
 import type { EmitterConfig, SerializedRun } from './sinks';
 import { destination, normalizeReplicaHeaders, replicaHeaders, replicaRouting } from './routing';
 
@@ -71,15 +72,55 @@ export const signalWithStartRunName = (workflowType: string): string => `SignalW
 export const queryWorkflowRunName = (queryName: string): string => `QueryWorkflow:${queryName}`;
 /** `StartWorkflowUpdate:<name>` — client update-start marker. */
 export const startWorkflowUpdateRunName = (updateName: string): string => `StartWorkflowUpdate:${updateName}`;
-/** `StartUpdateWithStartWorkflow:<name>` — client update-with-start marker. */
-export const startUpdateWithStartRunName = (updateName: string): string => `StartUpdateWithStartWorkflow:${updateName}`;
+/** `StartUpdateWithStartWorkflow:<type>` — client update-with-start marker. */
+export const startUpdateWithStartRunName = (workflowType: string): string =>
+  `StartUpdateWithStartWorkflow:${workflowType}`;
+
+type RunTreeMember = (this: any, ...args: any[]) => any;
+
+/** RunTree members to replace, each mapped to a function that builds the replacement from LangSmith's original. */
+export interface RunTreeOverrides {
+  statics: Record<string, (original: RunTreeMember) => RunTreeMember>;
+  methods: Record<string, (original: RunTreeMember) => RunTreeMember>;
+}
+
+const runTreeOwners = (overrides: RunTreeOverrides) =>
+  [
+    ['RunTree.', RunTree as unknown as Record<string, RunTreeMember>, overrides.statics],
+    ['RunTree.prototype.', RunTree.prototype as unknown as Record<string, RunTreeMember>, overrides.methods],
+  ] as const;
+
+/**
+ * Throw, naming each one, unless every member the overrides replace is a function. The Workflow bundle may carry a
+ * different LangSmith copy than the Worker, so both check.
+ */
+export function requireRunTreeMembers(...overrides: RunTreeOverrides[]): void {
+  const missing = new Set(
+    overrides.flatMap((override) =>
+      runTreeOwners(override).flatMap(([label, owner, members]) =>
+        Object.keys(members)
+          .filter((name) => typeof owner[name] !== 'function')
+          .map((name) => `${label}${name}`)
+      )
+    )
+  );
+  if (missing.size > 0) {
+    throw new Error(`@temporalio/langsmith does not support LangSmith ${__version__}: missing ${[...missing].join(', ')}`);
+  }
+}
+
+/** Replace the overridden RunTree members, or none if any is missing. */
+export function patchRunTree(overrides: RunTreeOverrides): void {
+  requireRunTreeMembers(overrides);
+  for (const [, owner, members] of runTreeOwners(overrides)) {
+    for (const [name, override] of Object.entries(members)) {
+      owner[name] = override(owner[name]!);
+    }
+  }
+}
 
 /** Flatten a {@link RunTree} into the plain wire shape consumed by the Sink. */
 export function serializeRun(run: RunTree): SerializedRun {
-  const extra = run.extra ? { ...run.extra } : undefined;
-  if (extra && extra.metadata && typeof extra.metadata === 'object') {
-    extra.metadata = scrubSensitive(extra.metadata as Record<string, unknown>);
-  }
   return {
     id: run.id,
     trace_id: run.trace_id,
@@ -92,7 +133,7 @@ export function serializeRun(run: RunTree): SerializedRun {
     inputs: run.inputs as Record<string, unknown> | undefined,
     outputs: run.outputs as Record<string, unknown> | undefined,
     error: run.error,
-    extra,
+    extra: run.extra ? { ...run.extra } : undefined,
     tags: run.tags,
     project_name: run.project_name,
     address: run.address,
@@ -111,11 +152,8 @@ export function serializeRun(run: RunTree): SerializedRun {
  * failures produce `"<type>: <message>"`.
  */
 export function describeError(err: unknown): string | undefined {
-  if (err instanceof ApplicationFailure) {
-    if (err.category === ApplicationFailureCategory.BENIGN) {
-      return undefined;
-    }
-    return `${err.type ?? 'ApplicationError'}: ${err.message}`;
+  if (err instanceof ApplicationFailure && err.category === ApplicationFailureCategory.BENIGN) {
+    return undefined;
   }
   if (err instanceof Error) {
     return `${err.name}: ${err.message}`;
@@ -123,15 +161,41 @@ export function describeError(err: unknown): string | undefined {
   return String(err);
 }
 
-/** Coerce an arbitrary operation result into a LangSmith outputs object. */
-export function asOutputs(result: unknown): Record<string, unknown> {
-  if (result !== null && typeof result === 'object' && !Array.isArray(result)) {
-    return result as Record<string, unknown>;
-  }
-  return { result };
+/** Outputs of a plugin run that ends without an error. Plugin runs never record Temporal arguments or results. */
+export function statusOutputs(status: 'ok' | 'cancelled' | 'continued_as_new'): Record<string, unknown> {
+  return { status };
 }
 
-/** Runs suppressed because the worker has no usable destination. */
+/** The `RunTree.end` arguments that close a plugin run. */
+export type RunEnd = [outputs: Record<string, unknown> | undefined, error: string | undefined];
+
+/** The `RunTree.end` arguments for a plugin run whose operation threw `err`; cancellation isn't an error. */
+export function thrownEnd(err: unknown): RunEnd {
+  if (err instanceof CancelledFailure) {
+    return [statusOutputs('cancelled'), undefined];
+  }
+  return [undefined, describeError(err)];
+}
+
+/** Run `fn`, then end and patch the already-posted `run` with an ok status, or with `endThrown` of what `fn` threw. */
+export async function wrapWithRun<T>(
+  run: RunTree,
+  fn: () => Promise<T>,
+  endThrown: (err: unknown) => RunEnd = thrownEnd
+): Promise<T> {
+  let end: RunEnd = [statusOutputs('ok'), undefined];
+  try {
+    return await fn();
+  } catch (err) {
+    end = endThrown(err);
+    throw err;
+  } finally {
+    await run.end(...end);
+    await run.patchRun();
+  }
+}
+
+/** Runs suppressed because the worker has no usable destination, or its env turns off a trace starting here. */
 const untracedRuns = new WeakSet<RunTree>();
 
 export function isUntraced(run: RunTree): boolean {
@@ -155,7 +219,7 @@ export function runHeaders(run: RunTree | undefined): LangSmithTraceContext | un
   const baggage = headers.baggage.split(',').filter(
     (item) => !item.startsWith('langsmith-replicas=') && !item.startsWith('langsmith-metadata=')
   );
-  const metadata = scrubSensitive(run.extra?.metadata as Record<string, unknown> | undefined);
+  const metadata = run.extra?.metadata as Record<string, unknown> | undefined;
   if (metadata && Object.keys(metadata).length > 0) {
     baggage.push(`langsmith-metadata=${encodeURIComponent(JSON.stringify(metadata))}`);
   }
@@ -163,16 +227,6 @@ export function runHeaders(run: RunTree | undefined): LangSmithTraceContext | un
   if (replicas !== undefined) baggage.push(`langsmith-replicas=${encodeURIComponent(JSON.stringify(replicaHeaders(replicas)))}`);
   headers.baggage = baggage.filter(Boolean).join(',');
   return headers;
-}
-
-/** Emit a short-lived marker run, unless LangSmith turned tracing off for it (an env it can't address). */
-export async function emitMarkerRun(marker: RunTree): Promise<void> {
-  if (!marker.tracingEnabled) {
-    return;
-  }
-  await marker.postRun();
-  await marker.end({});
-  await marker.patchRun();
 }
 
 /**
@@ -206,7 +260,8 @@ interface RunTreeParams {
   name: string;
   runType: string;
   parent: RunTree | undefined;
-  inputs?: Record<string, unknown>;
+  /** Merged over the plugin's metadata. */
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -217,13 +272,13 @@ export function buildRunTree(config: EmitterConfig, params: RunTreeParams): RunT
   return new RunTree({
     name: params.name,
     run_type: params.runType,
-    inputs: params.inputs ?? {},
+    inputs: {},
     parent_run: params.parent,
     client: config.client,
     ...destination(params.parent, { project_name: config.projectName, address: config.address }),
     replicas: params.parent?.replicas ?? config.replicas,
     tags: config.tags,
-    extra: { metadata: scrubSensitive(config.metadata) ?? {} },
+    extra: { metadata: { ...config.metadata, ...params.metadata } },
     tracingEnabled: true,
   });
 }

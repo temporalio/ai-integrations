@@ -74,6 +74,17 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Run the framework's own code and hook in through its extension points. Don't copy its objects or depend on their private fields; copies drift from upstream.
 - A behavior change that can alter recorded histories must be gated with a patch, or called out as breaking in the PR with guidance for in-flight runs. This takes precedence over the rules above.
 
+## Plugin contract
+
+These rules apply to every plugin that runs model or tool calls in Activities.
+
+- Every value a plugin sends between Workflow and Activity must survive the configured payload converter. Test it with the real converter and with every non-JSON type the framework's call options and results allow: bytes, `URL`, dates, and abort or cancellation handles. Convert the value, keep it on one side, or refuse it with a clear error. TypeScript plugins check values with `findPayloadChange` from `src/__tests__/helpers/payload-round-trip.ts`, copied from `typescript/_template/`.
+- Model and tool Activities heartbeat on a timer when a heartbeat timeout is set, and pass the Activity's cancellation to the framework call when the call accepts it.
+- A provider error that the framework marks as final is a non-retryable failure. Other errors are left to the retry policy.
+- An Activity result holds no data that the Activity input already holds. The README names every call whose input or result can pass the payload size limit.
+- Every framework option that the plugin's adapter exposes is supported and tested, refused with a clear error when the run starts, or listed in the README as unsupported. A stub value, such as an empty map returned only to satisfy an interface, is not allowed.
+- Before you add a behavior that a sibling plugin already has, read the sibling and follow it, or say in the PR why this plugin differs.
+
 ## Python conventions
 
 - All Python plugins require Python 3.11+ and Temporal SDK 1.36.0+. CI tests Python 3.11 and 3.15.
@@ -141,8 +152,9 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   `typescript/_template/src/__tests__/`; the conventions check keeps each
   plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
-  ranges under the two-week pnpm release-age policy. Preserve first-party and
-  exact AI SDK dependency-family cooldown exceptions inherited from the SDK.
+  ranges under the two-week pnpm release-age policy. Preserve the `@temporalio/*`
+  cooldown exception. Temporary security exceptions name exact patched versions;
+  remove them after those versions pass the cooldown.
   `make check-deps` checks fresh resolution with a temporary lockfile and scripts
   disabled, preserving the committed lockfile and installed dependencies.
 - Activity names remain stable for workflow replay compatibility.
@@ -225,6 +237,7 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 - Dependencies: ordinary CI uses the committed lockfile (`go.mod`/`go.sum` for Go); local `make sync` uses the existing versions. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Python make targets use `uv run --locked`; Go lint, test and build use `-mod=readonly` to preserve the versions selected during sync. Go `sync-latest` runs `go get -u -t ./...`, tidies the module and verifies its checksums. .NET make targets export `RestoreLockedMode=true`; .NET `sync-latest` runs `dotnet package update` on the solution and `dotnet restore --force-evaluate`.
 - Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. Repository setup: branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`) and the release-tag ruleset were configured by hand on 2026-09-09. The `pypi` required-reviewer gate was removed on 2026-10-07.
 - Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, `Go (<plugin>) / ...`, `TypeScript (<plugin>) / ...` and `.NET (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. All plugin keys use `<language>/<plugin>`, where the language is the root folder name (`.NET` jobs map to `dotnet/<plugin>`), so plugins in different languages cannot share an issue.
+- The same nightly reporter checks Dependabot update jobs with `--dependabot`, using `actions: read` and `vulnerability-alerts: read`. It keeps separate `dependabot-failure` issues per plugin, links the latest failed update for each dependency and directory, and comments only when the failed dependencies or conclusions change. Successful updates or resolved security alerts clear the failures; queued/cancelled retries and expired Actions history do not imply recovery. Repository-wide and tooling failures use `repository` and `scripts` keys. These issues do not change the release workflows' existing nightly-test gate.
 
 ## Releases
 

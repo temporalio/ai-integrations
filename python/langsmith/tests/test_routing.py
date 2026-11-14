@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 
 import langsmith
 import pytest
+from langsmith import AgentAddress, agent_address, trace, traceable, tracing_context
 from langsmith import Client as LangSmithClient
-from langsmith import trace, traceable, tracing_context
 from langsmith.run_trees import RunTree, WriteReplica
 from langsmith.utils import LangSmithUserError
 
@@ -38,11 +38,8 @@ from tests.test_integration import (
     traceable_activity,
 )
 
-# Older supported LangSmith versions can still use project-based tracing.
-pytest.importorskip("langsmith.address")
-
-ADDRESS = "lrn:agents/support/environments/staging"
-OTHER_ADDRESS = "lrn:agents/support/environments/production"
+ADDRESS = agent_address("support", "staging")
+OTHER_ADDRESS = agent_address("support", "production")
 REPLICAS: list[WriteReplica] = [
     {"project_name": "primary", "primary": True},
     {"project_name": "default"},
@@ -105,10 +102,10 @@ def test_conflicting_destinations(constructor: Any) -> None:
 
 def test_address_validation() -> None:
     with pytest.raises(LangSmithUserError, match="address"):
-        LangSmithPlugin(client=MagicMock(), address="not-an-address")
+        LangSmithPlugin(client=MagicMock(), address="not-an-address")  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
     plugin = LangSmithPlugin(
         client=MagicMock(),
-        address=ADDRESS.replace("staging", "STAGING"),
+        address={**ADDRESS, "environment": "staging"},  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
     )
     assert plugin.interceptors
     assert isinstance(plugin.interceptors[0], LangSmithInterceptor)
@@ -117,7 +114,7 @@ def test_address_validation() -> None:
 
 def test_address_requires_supported_langsmith(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(langsmith, "address", None)
-    with pytest.raises(ValueError, match="langsmith>=0.14.4"):
+    with pytest.raises(ValueError, match="langsmith>=0.14.10"):
         LangSmithPlugin(client=MagicMock(), address=ADDRESS)
     LangSmithPlugin(client=MagicMock(), project_name="legacy-project")
 
@@ -299,6 +296,14 @@ async def test_explicit_destination_outranks_plugin_default(
     await _assert_replay_is_silent(handle, plugin, mock, client)
 
 
+def _where(run: dict[str, Any]) -> str:
+    """Name a posted run's destination as a hashable key."""
+    address = run.get("address")
+    if address:
+        return f"{address['id']}/{address['environment']}"
+    return run["session_name"]
+
+
 @pytest.mark.parametrize(
     "source,add_temporal_runs",
     [("headers", False), ("headers", True), ("replicas", False)],
@@ -309,7 +314,7 @@ async def test_replica_ids_and_updates_across_temporal(
     env: WorkflowEnvironment,
     source: str,
     add_temporal_runs: bool,
-    secondary_address: str | None,
+    secondary_address: AgentAddress | None,
 ) -> None:
     """Only the primary keeps original IDs; each complete tree gets matching updates."""
     mock = make_mock_ls_client(InMemoryRunCollector())
@@ -328,14 +333,12 @@ async def test_replica_ids_and_updates_across_temporal(
     )
     creates = [call.kwargs for call in mock.create_run.call_args_list]
     updates = [call.kwargs for call in mock.update_run.call_args_list]
-    secondary = secondary_address or "default"
-    destinations = {run.get("address") or run["session_name"] for run in creates}
+    secondary = _where({"address": secondary_address, "session_name": "default"})
+    destinations = {_where(run) for run in creates}
     assert destinations == {"primary", secondary}
     by_destination = {
         destination: {
-            str(run["id"]): run
-            for run in creates
-            if (run.get("address") or run["session_name"]) == destination
+            str(run["id"]): run for run in creates if _where(run) == destination
         }
         for destination in destinations
     }
@@ -361,8 +364,7 @@ async def test_replica_ids_and_updates_across_temporal(
             matching = [
                 update
                 for update in updates
-                if (update.get("address") or update["session_name"]) == destination
-                and str(update["run_id"]) == run_id
+                if _where(update) == destination and str(update["run_id"]) == run_id
             ]
             assert len(matching) == 1
             assert matching[0]["parent_run_id"] == run.get("parent_run_id")

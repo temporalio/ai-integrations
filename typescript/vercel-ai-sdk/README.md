@@ -78,13 +78,12 @@ with the first model call that is not a replay.
 
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
-each MCP server. A different Activity with one of these names now fails with
-`Duplicate registration of Activity '<name>'`; earlier versions kept the last
-one without a warning. If it is registered before `AiSdkPlugin` (in the Worker's
-`activities` or by an earlier plugin), `Worker.create` fails. If a plugin
-applied after `AiSdkPlugin` replaces one, `worker.run()` fails before the Worker
-polls. `Worker.create` applies the Worker's `plugins` in order, then the
-`NativeConnection`'s.
+each MCP server. A different Activity with one of these names fails with
+`Duplicate registration of Activity '<name>'`. If it is registered before
+`AiSdkPlugin` (in the Worker's `activities` or by an earlier plugin),
+`Worker.create` fails. If a plugin applied after `AiSdkPlugin` replaces one,
+`worker.run()` fails before the Worker polls. `Worker.create` applies the
+Worker's `plugins` in order, then the `NativeConnection`'s.
 
 To fix a collision with your own Activity or an MCP server name, rename one of
 them. `StrandsPlugin` (`@temporalio/strands-agents`) also registers
@@ -95,7 +94,9 @@ and, for each MCP server name both register, the same factory function and idle
 timeout. A provider or factory created separately for each instance is refused
 even when its settings are equal, for example `createOpenAI({ apiKey })` called
 once per plugin, or an `async () => ...` factory written inline in each options
-object.
+object. To use models from more than one provider, give one `AiSdkPlugin` a
+`modelProvider` that combines them, for example
+`customProvider({ languageModels, fallbackProvider })` from `ai`.
 
 ## Heartbeats and streaming
 

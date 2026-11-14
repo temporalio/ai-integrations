@@ -75,7 +75,7 @@ dev = [
 
 [tool.uv]
 default-groups = ["dev"]
-required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
+required-version = ">=0.13.0,<0.14"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
 exclude-newer-package = { temporalio = false, temporalio-mcp = false }   # first-party packages are exempt: SDK releases and temporalio-mcp releases must be adoptable on day one
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
