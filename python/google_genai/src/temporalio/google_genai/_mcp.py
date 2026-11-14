@@ -139,10 +139,16 @@ class _ConnectionRecord:
         except BaseException as err:
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
-            if not self._ready.done():
-                self._ready.set_exception(err)
             _CONNECTIONS.pop(self._server, None)
-            raise
+            if self._ready.done():
+                raise
+            self._ready.set_exception(err)
+            # The waiting calls get the error through ``_ready``. Nobody awaits
+            # this task once its record is dropped, so raising the error here
+            # too would only make asyncio log it as never retrieved.
+            # Cancellation and interpreter exits still propagate.
+            if not isinstance(err, Exception):
+                raise
 
     def acquire(self) -> None:
         """Mark a call in flight; pause idle eviction while calls are active."""
