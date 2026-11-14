@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import signal
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -95,7 +96,10 @@ class LocalEnvironment(BaseEnvironment):
             # Timed out or cancelled: never leave the command, or anything it
             # started, running.
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    proc.kill()
+                else:
+                    os.killpg(proc.pid, signal.SIGKILL)
             await proc.wait()
             raise
         assert proc.returncode is not None  # communicate() waited for exit
