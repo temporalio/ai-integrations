@@ -1,6 +1,7 @@
 import { McpClient, ToolValidationError } from '@strands-agents/sdk';
 import type { JSONSchema, JSONValue } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { ApplicationFailure } from '@temporalio/common';
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import { activityInfo, Context as ActivityContext } from '@temporalio/activity';
@@ -455,6 +456,13 @@ async function closeRecord(record: ConnectionRecord): Promise<void> {
   }
 }
 
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `Client`.
+export function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
+  return (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+}
+
 /**
  * The worker-process MCP connections of one {@link StrandsPlugin}, keyed by
  * server name. Workers that share a plugin instance share its connections;
@@ -518,6 +526,19 @@ export class McpConnections {
         retired: false,
         client: (async () => {
           const client = factory();
+          if (
+            client == null ||
+            typeof client.connect !== 'function' ||
+            typeof client.disconnect !== 'function' ||
+            typeof client.listTools !== 'function' ||
+            typeof client.callTool !== 'function'
+          ) {
+            throw ApplicationFailure.nonRetryable(
+              `MCP client factory '${server}' returned ${describeValue(client)}, not a client with ` +
+                'connect(), disconnect(), listTools() and callTool() methods.',
+              'MCPClientFactoryTypeError'
+            );
+          }
           await client.connect();
           return client;
         })(),
