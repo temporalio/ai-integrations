@@ -109,7 +109,13 @@ public final class ChatModelTypes {
       @JsonProperty("metadata") ChatResponseMetadata metadata) {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public record Generation(@JsonProperty("message") Message message) {}
+    public record Generation(
+        @JsonProperty("message") Message message,
+        @JsonProperty("finish_reason") String finishReason) {
+      public Generation(Message message) {
+        this(message, null);
+      }
+    }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     @JsonIgnoreProperties(ignoreUnknown = true)
