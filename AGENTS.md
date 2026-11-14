@@ -468,11 +468,12 @@ gallery.
    differ from nuget.org, fix forward with the next version; nuget.org never
    deletes a version and tags never move.
 6. After the first published version, set `PackageValidationBaselineVersion` in
-   the library csproj to that version and run `make lock` (the baseline package
-   becomes a locked download; `Temporalio.*` is exempt from the cooldown). From
-   then on `dotnet pack` compares the public API with the baseline and fails the
-   build on a breaking change; move the baseline forward with each release, and
-   record an intended break with `<SuppressionFile>` only after review.
+   the library csproj to that version. `dotnet pack` then downloads that exact
+   version from nuget.org on every build (the dist cell needs it listed; the
+   download is pinned by version, not by the lock) and compares the public API
+   with it, failing the build on a breaking change; move the baseline forward
+   with each release, and record an intended break with `<SuppressionFile>` only
+   after review.
 
 ### Python releases
 
