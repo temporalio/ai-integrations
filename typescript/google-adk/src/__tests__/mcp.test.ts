@@ -9,7 +9,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
 
 import { createMCPActivities } from '../activities';
-import { GoogleAdkPlugin } from '../index';
+import { GoogleAdkPlugin, type MCPToolsetFactory } from '../index';
 import { TemporalMCPToolset } from '../workflow';
 import { mockMCPToolset } from '../testing';
 import {
@@ -79,6 +79,59 @@ function makePlugin(): GoogleAdkPlugin {
 }
 
 const getEnv = setupTestEnv(test);
+
+for (const operation of ['listTools', 'callTool', 'listResources', 'readResource']) {
+  test(`${operation} rejects invalid MCP factory results without retries`, async (t) => {
+    const invalidResults: [unknown, string][] = [
+      [undefined, 'undefined'],
+      [null, 'null'],
+      [42, 'number'],
+      [{}, 'Object'],
+      [{ type: 'UnknownConnectionParams' }, 'Object'],
+      // What an async factory returns.
+      [Promise.resolve({ type: 'StdioConnectionParams' }), 'Promise'],
+    ];
+    for (const [result, kind] of invalidResults) {
+      // Passed in place of the factory, the value fails when the Worker is built.
+      t.throws(() => createMCPActivities({ testServer: result as MCPToolsetFactory }), {
+        instanceOf: TypeError,
+        message: `MCP toolset factory 'testServer' is ${kind}, not a function.`,
+      });
+
+      const activities = createMCPActivities({ testServer: () => result as BaseToolset });
+      const activity = activities[`testServer-${operation}`] as (args: unknown) => Promise<unknown>;
+      const err = await t.throwsAsync(
+        new MockActivityEnvironment().run(activity, { toolName: 'echo', args: {}, name: 'file:///test' }),
+        { instanceOf: ApplicationFailure }
+      );
+      t.true(err!.nonRetryable);
+      t.is(err!.type, 'MCPToolsetFactoryTypeError');
+      t.is(
+        err!.message,
+        `MCP toolset factory 'testServer' returned ${kind}, not a BaseToolset or MCPConnectionParams.`
+      );
+    }
+  });
+
+  test(`${operation} passes SSE connection params to ADK`, async (t) => {
+    // ADK fails these itself: 2.3 cannot fetch port 9, and earlier releases never connect.
+    const sse = { type: 'SseConnectionParams', url: 'http://127.0.0.1:9/sse' } as unknown as MCPConnectionParams;
+    const activities = createMCPActivities({ testServer: () => sse });
+    const activity = activities[`testServer-${operation}`] as (args: unknown) => Promise<unknown>;
+    const err = await t.throwsAsync(
+      new MockActivityEnvironment().run(activity, { toolName: 'echo', args: {}, name: 'file:///test' })
+    );
+    t.not((err as ApplicationFailure).type, 'MCPToolsetFactoryTypeError');
+  });
+
+  test(`${operation} keeps MCP factory exceptions retryable`, async (t) => {
+    const activities = createMCPActivities({ testServer: () => { throw new Error('factory failed'); } });
+    const activity = activities[`testServer-${operation}`] as () => Promise<unknown>;
+    const err = await t.throwsAsync(new MockActivityEnvironment().run(activity), { instanceOf: ApplicationFailure });
+    t.false(err!.nonRetryable);
+    t.is(err!.message, 'factory failed');
+  });
+}
 
 // TemporalMCPToolset (E2E)
 test.serial('listToolsReturnsFullSchema', async (t) => {

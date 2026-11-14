@@ -240,6 +240,13 @@ connection params above and ADK's `MCPToolset` both open a new session per
 operation rather than reusing one. Holding a session open across operations is
 the factory's job — see `MCPToolsetFactory`.
 
+A factory must return a `BaseToolset` or `MCPConnectionParams` with type
+`StdioConnectionParams`, `StreamableHTTPConnectionParams` or, with ADK 2.3,
+`SseConnectionParams`. Other results now
+fail the Activity without retries with type `MCPToolsetFactoryTypeError`. Fix
+these factories before upgrading; the next attempt of an in-flight Activity
+also runs this check.
+
 Gate the toolset's tools behind human approval with
 `requireConfirmation` — see [Durable human-in-the-loop](#durable-human-in-the-loop).
 
