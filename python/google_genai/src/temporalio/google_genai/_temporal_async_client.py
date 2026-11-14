@@ -233,9 +233,15 @@ class TemporalAsyncClient(AsyncClient):
                 that leaves it out. These activities heartbeat on a timer at
                 half of it, so a cancel reaches a running call, and a lost
                 worker is noticed, within about 10 seconds. In Temporal Cloud
-                each heartbeat that reaches the service is an Action; a call
-                shorter than 5 seconds sends none. Set ``heartbeat_timeout`` to
-                ``None`` or ``timedelta(0)`` to turn heartbeats off. Workers on
+                each heartbeat that reaches the service is an Action; with the
+                default, a call shorter than 5 seconds sends none. Temporal
+                caps ``heartbeat_timeout`` at ``start_to_close_timeout``, so a
+                shorter one (also from a per-call ``timeout``) makes heartbeats
+                come sooner. Set ``heartbeat_timeout`` to ``None`` or
+                ``timedelta(0)`` to turn heartbeats off; on Vertex AI, also do
+                that, or set it longer, if a credential refresh can take longer
+                than the timeout, since google-genai refreshes on the event
+                loop for ``interactions`` and ``agents``. Workers on
                 an earlier version of this plugin don't heartbeat this way, so
                 a call they run fails after 10 seconds without a heartbeat.
                 The README says how to upgrade and roll back.

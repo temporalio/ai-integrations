@@ -267,9 +267,24 @@ timer, not per chunk. In Temporal Cloud each heartbeat that reaches the service
 is an Action: with the default, at most one every 8 seconds of a running call,
 and none for a call shorter than 5 seconds. A cancelled call can send one more
 as it stops. Set `heartbeat_timeout` to `None` or `timedelta(0)` in
-`activity_config` to turn heartbeats off. The timer runs on the worker's event
-loop, so a call that blocks the loop for longer than the timeout fails with a
-heartbeat timeout.
+`activity_config` to turn heartbeats off.
+
+Temporal caps `heartbeat_timeout` at the activity's `start_to_close_timeout`,
+and the timer uses that capped value. A start-to-close timeout under 10 seconds,
+including one you set per call with `http_options.timeout` or the Interactions
+and Agents `timeout` argument, makes heartbeats come sooner: with a 2-second
+timeout, the timer beats every second, so a 1.7-second call sends one.
+
+The timer runs on the worker's event loop, so a call that blocks the loop for
+longer than the timeout fails with a heartbeat timeout. One case comes from
+google-genai itself: on Vertex AI, `interactions` and `agents` calls refresh
+expired credentials synchronously, on the event loop (model, files and file
+search store calls refresh on a thread). That happens when the worker's
+`genai.Client` has no token yet, and again when the token expires, about once an
+hour. A refresh that takes longer than the heartbeat timeout fails that attempt,
+and Temporal retries it.
+If your credential refresh can be that slow, set a longer `heartbeat_timeout`,
+or `None`, in `activity_config`.
 
 **Breaking change when you upgrade or roll back:** earlier versions of this
 plugin schedule these activities with no `heartbeat_timeout`, and only the
