@@ -17,10 +17,7 @@ import opentelemetry.metrics
 import opentelemetry.trace
 
 from temporalio import workflow
-from temporalio.contrib.pydantic import (
-    PydanticPayloadConverter,
-    ToJsonOptions,
-)
+from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.google_adk._model import (
     invoke_model,
@@ -284,16 +281,9 @@ class GoogleAdkPlugin(SimplePlugin):
         self, converter: DataConverter | None
     ) -> DataConverter:
         if converter is None:
-            return DataConverter(payload_converter_class=_AdkPayloadConverter)
+            return DataConverter(payload_converter_class=PydanticPayloadConverter)
         elif converter.payload_converter_class is DefaultPayloadConverter:
             return dataclasses.replace(
-                converter, payload_converter_class=_AdkPayloadConverter
+                converter, payload_converter_class=PydanticPayloadConverter
             )
         return converter
-
-
-class _AdkPayloadConverter(PydanticPayloadConverter):
-    """PayloadConverter for Google ADK that strips unset None fields."""
-
-    def __init__(self) -> None:
-        super().__init__(ToJsonOptions(exclude_unset=True))
