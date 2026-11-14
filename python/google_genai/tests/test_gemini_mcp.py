@@ -507,6 +507,15 @@ async def test_mcp_factory_return_type_is_non_retryable(operation: str, value: A
     from temporalio.google_genai._models import _McpCallToolRequest
 
     server = "invalid-factory"
+    kind = type(value)
+
+    # Passed in place of the factory, the value fails when the Worker is built.
+    with pytest.raises(TypeError) as type_error:
+        _mcp.build_mcp_activities({server: value})
+    assert str(type_error.value) == (
+        f"MCP server factory {server!r} is "
+        f"{kind.__module__}.{kind.__qualname__}, not callable"
+    )
 
     def factory() -> Any:
         return value

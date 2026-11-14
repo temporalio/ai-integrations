@@ -287,6 +287,13 @@ def build_mcp_activities(
     """Build the list-tools and call-tool activities for every registered server."""
     activities: list[Callable] = []
     for server, factory in mcp_servers.items():
+        # Fail when the Worker is built, not in every MCP Activity.
+        if not callable(factory):
+            kind = type(factory)
+            raise TypeError(
+                f"MCP server factory {server!r} is "
+                f"{kind.__module__}.{kind.__qualname__}, not callable"
+            )
         activities.append(build_list_tools_activity(server, factory, idle_timeout))
         activities.append(build_call_tool_activity(server, factory, idle_timeout))
     return activities
