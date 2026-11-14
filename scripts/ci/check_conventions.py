@@ -751,8 +751,9 @@ class Checker:
         if properties.get("ispackable", "").lower() != "true":
             self.fail(f"{rel}: IsPackable must be true")
         # One framework, tested on every runtime in [ci] runtime-versions: netstandard2.0 like the SDK's own
-        # Extensions packages, or the oldest runtime when a dependency's netstandard2.0 assembly differs from
-        # its net8.0 one (Microsoft.Agents.AI does). A second framework would ship an asset the suite never runs.
+        # Extensions packages, or the oldest runtime when a dependency's netstandard2.0 assembly cannot bind to its
+        # net8.0 one at run time (Microsoft.Agents.AI polyfills IsExternalInit, so its init accessors differ). A second
+        # framework would ship an asset the suite never runs.
         if "targetframeworks" in properties:
             self.fail(f"{rel}: the library targets one framework (TargetFramework, not TargetFrameworks); "
                       "an untested asset is worse than a missing one")

@@ -225,13 +225,15 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   last entry is the SDK channel `global.json` pins (`latestFeature`), the dist cell and the framework
   the clean consumer targets. The library targets one framework: `netstandard2.0`, like the SDK's own
   `Temporalio.Extensions.*` packages, when its dependencies' netstandard2.0 assemblies behave like their
-  net8.0 ones, otherwise the oldest listed runtime. Microsoft Agent Framework's netstandard2.0 assembly
-  has members its net8.0 assembly lacks (`AgentResponse<T>.IsWrappedInObject` has a setter only there),
-  so a netstandard2.0 build of this plugin fails at run time on .NET 8 with `MissingMethodException`,
-  and the plugin targets `net8.0`. A second framework would ship an asset the suite never runs. The
-  test project targets `net<major>.<minor>` for every listed runtime. The matrix runs the oldest runtime on Ubuntu and the newest on Ubuntu (the dist cell),
-  macOS and Windows; every cell installs the `global.json` SDK plus its runtime, fails if `dotnet
-  --version` leaves the SDK channel, and runs `make test TEST_FRAMEWORK=net<runtime>`.
+  net8.0 ones, otherwise the oldest listed runtime. Microsoft Agent Framework's netstandard2.0
+  assemblies polyfill `IsExternalInit` as their own internal type, so their `init` accessors (for
+  example `AgentResponse<T>.IsWrappedInObject`) have a different signature from the net8.0 assemblies,
+  and code compiled against the netstandard2.0 assembly fails at run time on .NET 8 with
+  `MissingMethodException`; the plugin therefore targets `net8.0`. A second framework would ship an
+  asset the suite never runs. The test project targets `net<major>.<minor>` for every listed runtime.
+  The matrix runs the oldest runtime on Ubuntu and the newest on Ubuntu (the dist cell), macOS and
+  Windows; every cell installs the `global.json` SDK plus its runtime, fails if `dotnet --version`
+  leaves the SDK channel, and runs `make test TEST_FRAMEWORK=net<runtime>`.
 
 ## CI
 
