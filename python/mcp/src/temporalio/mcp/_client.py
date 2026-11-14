@@ -152,11 +152,12 @@ def _mcp_client_backend_factory(
     def create(argument: Any = _NOT_SUPPLIED) -> _MCPClientBackend:
         client = invoke(argument)
         if not isinstance(client, Client):
-            # Retryable, so a run waits for the worker to be fixed instead of failing.
             kind = type(client)
             raise ApplicationError(
                 f"MCP server factory {name!r} returned "
-                f"{kind.__module__}.{kind.__qualname__}, not mcp.Client"
+                f"{kind.__module__}.{kind.__qualname__}, not mcp.Client",
+                type="MCPServerFactoryTypeError",
+                non_retryable=True,
             )
         return _MCPClientBackend(client)
 

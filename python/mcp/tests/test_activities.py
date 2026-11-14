@@ -722,7 +722,7 @@ async def test_rejected_tool_result_fails_without_retry(
     assert err.value.non_retryable is True
 
 
-async def test_factory_that_does_not_return_a_client_fails_with_retry() -> None:
+async def test_factory_that_does_not_return_a_client_fails_without_retry() -> None:
     support = _MCPActivities(
         {
             "weather": _mcp_client_backend_factory(
@@ -740,7 +740,8 @@ async def test_factory_that_does_not_return_a_client_fails_with_retry() -> None:
     assert err.value.message == (
         "MCP server factory 'weather' returned builtins.object, not mcp.Client"
     )
-    assert err.value.non_retryable is False
+    assert err.value.type == "MCPServerFactoryTypeError"
+    assert err.value.non_retryable is True
 
 
 async def test_worker_reentry_before_close_starts_keeps_connection_open() -> None:
