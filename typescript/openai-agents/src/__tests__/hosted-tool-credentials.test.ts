@@ -412,23 +412,31 @@ test('the plugin passes its hostedToolCredentials to the model Activity it regis
   t.deepEqual(credentialValues(captured[0]!.tools), CREDENTIAL_VALUES);
 });
 
-test('the heartbeat is already running when the callback is asked for credentials', async (t) => {
+test('the Activity heartbeats while the callback is asked for credentials, and a quick call sends none', async (t) => {
   // A callback that reads a secret manager can outlast the heartbeat timeout, so
-  // the Activity must have heartbeat before it is awaited.
-  const env = new MockActivityEnvironment({ heartbeatTimeoutMs: 200 });
-  let heartbeats = 0;
-  env.on('heartbeat', () => {
-    heartbeats += 1;
-  });
+  // the Activity must heartbeat while it is awaited. The first heartbeat comes
+  // half the timeout after the attempt was scheduled, so a call that ends sooner
+  // sends none, unless the Worker took that long to start it.
+  const heartbeatsFor = async (callbackMs: number, scheduledMsAgo = 0) => {
+    const env = new MockActivityEnvironment({
+      heartbeatTimeoutMs: 200,
+      currentAttemptScheduledTimestampMs: Date.now() - scheduledMsAgo,
+    });
+    let heartbeats = 0;
+    env.on('heartbeat', () => {
+      heartbeats += 1;
+    });
+    const { invokeModelActivity } = createModelActivity(capturingProvider([]), async () => {
+      await new Promise((resolve) => setTimeout(resolve, callbackMs));
+      return undefined;
+    });
+    await env.run(invokeModelActivity, roundTrip(activityInput(hostedTools())));
+    return heartbeats;
+  };
 
-  let heartbeatsWhenAsked = -1;
-  const { invokeModelActivity } = createModelActivity(capturingProvider([]), async () => {
-    heartbeatsWhenAsked = heartbeats;
-    return undefined;
-  });
-  await env.run(invokeModelActivity, roundTrip(activityInput(hostedTools())));
-
-  t.is(heartbeatsWhenAsked, 1);
+  t.is(await heartbeatsFor(0), 0);
+  t.true((await heartbeatsFor(350)) >= 2);
+  t.is(await heartbeatsFor(0, 150), 1);
 });
 
 test.serial('a credential for a field the Workflow already declared is never read', async (t) => {
