@@ -29,6 +29,15 @@ public sealed class WeatherActivities
         }
     }
 
+    // A polymorphic result crosses the Activity boundary with System.Text.Json's $type discriminator.
+    [Activity]
+    public Task<List<Measurement>> GetMeasurementsAsync(string sensor) =>
+        Task.FromResult(new List<Measurement>
+        {
+            new DataMeasurement { Sensor = sensor, Location = "notauri", Value = 21.5 },
+            new ErrorMeasurement { Sensor = sensor, Message = "not found", Code = 7 },
+        });
+
     // The trailing optional token stays out of the tool schema and of the call; the SDK fills its default.
     [Activity]
     [Description("Gets the weather alerts for a city")]

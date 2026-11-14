@@ -1,6 +1,9 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.AI;
 using Temporalio.Api.Enums.V1;
 using Temporalio.Client;
+using Temporalio.Extensions.MicrosoftAgentFramework.Internal;
 using Temporalio.Extensions.MicrosoftAgentFramework.Testing;
 using Temporalio.Extensions.MicrosoftAgentFramework.Tests.Workflows;
 
@@ -291,6 +294,59 @@ public class AgentRunTests : WorkflowTestBase
         Assert.False(HistoryAssert.ActivityCounts(await handle.FetchHistoryAsync()).ContainsKey("GetWeather"));
         var toolResult = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
         Assert.Equal("Error: Function failed.", toolResult.Result?.ToString());
+    }
+
+    // A tool's own JSON with a $type key, or a polymorphic result with System.Text.Json's discriminator, is not
+    // content the Workflow made from AIContent, so the worker leaves it as JSON for the model.
+    [Theory]
+    [InlineData("""{"$type":"data","uri":"notauri"}""")]
+    [InlineData("""{"$type":"functionCall","name":"x"}""")]
+    [InlineData("""{"$type":"error","message":"not found","code":7}""")]
+    public async Task InWorkflowTool_JsonWithTypeKey_ReachesTheModelUnchanged(string payload)
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(("echo_json", new Dictionary<string, object?> { ["payload"] = payload })),
+            ScriptedResponse.Text("ok"));
+        await RunAsync(TestPlugin.For(fake), (ToolsWorkflow wf) => wf.RunAsync(new ToolsInput("Echo", "in-workflow-json")));
+
+        Assert.Equal(2, fake.CallCount);
+        var result = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+        var element = Assert.IsType<JsonElement>(result.Result);
+        Assert.Equal(JsonNode.Parse(payload)!.ToJsonString(), JsonNode.Parse(element.GetRawText())!.ToJsonString());
+        Assert.DoesNotContain(ChatOptionsTransport.SerializedContentKey, result.AdditionalProperties?.Keys ?? []);
+    }
+
+    [Fact]
+    public async Task InWorkflowTool_AIContentResult_RoundTripsToTheProviderClient()
+    {
+        var fake = new FakeChatClient(ScriptedResponse.ToolCalls(("get_weather", City("Kingston"))), ScriptedResponse.Text("ok"));
+        await RunAsync(TestPlugin.For(fake), (ToolsWorkflow wf) => wf.RunAsync(new ToolsInput("Weather?", "in-workflow-content")));
+
+        var result = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+        var data = Assert.IsType<DataContent>(result.Result);
+        Assert.Equal("text/plain", data.MediaType);
+        Assert.Equal("sunny", System.Text.Encoding.UTF8.GetString(data.Data.Span));
+        Assert.DoesNotContain(ChatOptionsTransport.SerializedContentKey, result.AdditionalProperties?.Keys ?? []);
+    }
+
+    [Fact]
+    public async Task ActivityTool_PolymorphicResult_ReachesTheModelUnchanged()
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(("get_measurements", new Dictionary<string, object?> { ["sensor"] = "s1" })),
+            ScriptedResponse.Text("ok"));
+        var (_, handle) = await RunAsync(TestPlugin.For(fake), (ToolsWorkflow wf) => wf.RunAsync(new ToolsInput("Measure", "activity-measurements")));
+
+        Assert.Equal(2, fake.CallCount);
+        Assert.Equal(1, HistoryAssert.ActivityCounts(await handle.FetchHistoryAsync())["GetMeasurements"]);
+        var result = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+        var element = Assert.IsType<JsonElement>(result.Result);
+        var items = element.EnumerateArray().ToList();
+        Assert.Equal(2, items.Count);
+        Assert.Equal("data", items[0].GetProperty("$type").GetString());
+        Assert.Equal("notauri", items[0].GetProperty("uri").GetString());
+        Assert.Equal("error", items[1].GetProperty("$type").GetString());
+        Assert.Equal(7, items[1].GetProperty("code").GetInt32());
     }
 
     [Fact]

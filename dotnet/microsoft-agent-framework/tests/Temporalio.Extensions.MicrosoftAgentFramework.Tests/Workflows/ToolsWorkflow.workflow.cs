@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.AI;
 using Temporalio.Exceptions;
 using Temporalio.Workflows;
@@ -21,6 +22,9 @@ public class ToolsWorkflow
             "activity-methodinfo" => [ActivityAsTool.Create(typeof(WeatherActivities).GetMethod(nameof(WeatherActivities.GetWeatherAsync))!, toolOptions, "get_weather")],
             "activity-report" => [ActivityAsTool.Create((WeatherActivities a) => a.GetReportAsync(default!, default), toolOptions, "get_report")],
             "activity-token" => [ActivityAsTool.Create((WeatherActivities a) => a.GetAlertsAsync(default!, default), toolOptions, "get_weather")],
+            "in-workflow-json" => [AIFunctionFactory.Create((string payload) => JsonDocument.Parse(payload).RootElement.Clone(), "echo_json", "Returns the given JSON")],
+            "in-workflow-content" => [AIFunctionFactory.Create((string city) => new DataContent("data:text/plain;base64,c3Vubnk=", "text/plain"), "get_weather", "Gets the weather for a city")],
+            "activity-measurements" => [ActivityAsTool.Create((WeatherActivities a) => a.GetMeasurementsAsync(default!), toolOptions, "get_measurements")],
             "in-workflow-strict" => [AIFunctionFactory.Create((string city) => $"sunny in {city} (workflow)", new AIFunctionFactoryOptions { Name = "get_weather", Description = "Gets the weather for a city", AdditionalProperties = new Dictionary<string, object?> { ["strict"] = true } })],
             _ => throw new ApplicationFailureException($"Unknown tool kind {input.ToolKind}"),
         };

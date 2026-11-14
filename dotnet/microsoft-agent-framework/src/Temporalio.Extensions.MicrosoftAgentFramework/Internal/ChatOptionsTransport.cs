@@ -20,6 +20,12 @@ namespace Temporalio.Extensions.MicrosoftAgentFramework.Internal;
 /// </summary>
 internal static class ChatOptionsTransport
 {
+    /// <summary>
+    /// The <see cref="AIContent.AdditionalProperties"/> key the Workflow sets on a tool result it serialized
+    /// from an <see cref="AIContent"/>, so the worker knows which results to read back.
+    /// </summary>
+    public const string SerializedContentKey = "MicrosoftAgentFramework.SerializedContent";
+
     private static readonly HashSet<string> SecretKeys = new(["authorization", "x-api-key", "api-key"], StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
@@ -147,27 +153,54 @@ internal static class ChatOptionsTransport
     /// image and file results. Runs on the worker; anything else stays as it arrived.
     /// </summary>
     /// <param name="messages">The Activity input's messages; changed in place.</param>
-    public static void RehydrateToolResults(IEnumerable<ChatMessage> messages)
+    /// <param name="logger">Receives a debug line for a result that stays JSON.</param>
+    public static void RehydrateToolResults(IEnumerable<ChatMessage> messages, ILogger logger)
     {
+        ArgumentNullException.ThrowIfNull(logger);
         foreach (var result in messages.SelectMany(message => message.Contents).OfType<FunctionResultContent>())
         {
+            if (!IsSerializedContent(result))
+            {
+                continue;
+            }
+
+            // The marker is the Workflow's note to this worker; the provider client never sees it.
+            result.AdditionalProperties!.Remove(SerializedContentKey);
             try
             {
                 result.Result = result.Result switch
                 {
-                    JsonElement { ValueKind: JsonValueKind.Object } element when element.TryGetProperty("$type", out _) =>
+                    JsonElement { ValueKind: JsonValueKind.Object } element =>
                         element.Deserialize(AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(AIContent))) ?? result.Result,
-                    JsonElement { ValueKind: JsonValueKind.Array } element when element.GetArrayLength() > 0 &&
-                        element.EnumerateArray().All(item => item.ValueKind == JsonValueKind.Object && item.TryGetProperty("$type", out _)) =>
+                    JsonElement { ValueKind: JsonValueKind.Array } element =>
                         element.Deserialize(AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(IList<AIContent>))) ?? result.Result,
                     _ => result.Result,
                 };
             }
-            catch (JsonException)
+#pragma warning disable CA1031 // A result this worker cannot read back is not a reason to fail the model call.
+            catch (Exception exception)
+#pragma warning restore CA1031
             {
-                // A $type this version of Microsoft.Extensions.AI does not know stays JSON; the model reads the text either way.
+                // The JSON goes to the model as sent; a $type this version of Microsoft.Extensions.AI does not know
+                // reads the same either way.
+                if (logger.IsEnabled(LogLevel.Debug))
+                {
+                    logger.LogDebug(exception, "Tool result {CallId} stays JSON: it could not be read back as AIContent.", result.CallId);
+                }
             }
         }
+    }
+
+    /// <summary>
+    /// Tells the worker that <see cref="FunctionResultContent.Result"/> is JSON the Workflow made from an
+    /// <see cref="AIContent"/> or a list of them, so only those results are turned back into content
+    /// objects; a tool's own JSON with a <c>$type</c> key reaches the model as it is.
+    /// </summary>
+    /// <param name="result">The result to mark.</param>
+    public static void MarkSerializedContent(FunctionResultContent result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        (result.AdditionalProperties ??= new AdditionalPropertiesDictionary())[SerializedContentKey] = true;
     }
 
     /// <summary>Turns a JSON primitive back into the CLR value a provider client checks for; other kinds stay <see cref="JsonElement"/>.</summary>
@@ -183,6 +216,15 @@ internal static class ChatOptionsTransport
         JsonValueKind.Number => element.GetDouble(),
         _ => element,
     };
+
+    private static bool IsSerializedContent(FunctionResultContent result) =>
+        result.AdditionalProperties is { } properties && properties.TryGetValue(SerializedContentKey, out var value) &&
+        value switch
+        {
+            bool flag => flag,
+            JsonElement { ValueKind: JsonValueKind.True } => true,
+            _ => false,
+        };
 
     // Credentials belong in the worker factory: everything here is recorded in Event History with the
     // model Activity's input. The check covers the top level and one nested headers dictionary, the

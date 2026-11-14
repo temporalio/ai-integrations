@@ -325,15 +325,17 @@ internal sealed class AgentLoop
     // AIJsonUtilities when it builds the request. Here the result crosses the Activity boundary first,
     // in the data converter's shape, so the same serialization happens in the Workflow and the model
     // reads the text it would have read natively: a string as is, an AIContent with its $type, any
-    // other object as camel-cased JSON. The caller sees the JSON in FunctionResultContent.Result.
-    private static object? ToTransportable(object? result) => result switch
+    // other object as camel-cased JSON. The caller sees the JSON in FunctionResultContent.Result. The
+    // flag says the JSON came from AIContent, so the worker turns only those results back; a tool's
+    // own JSON with a $type key, or a polymorphic type with System.Text.Json's discriminator, stays JSON.
+    private static (object? Value, bool SerializedContent) ToTransportable(object? result) => result switch
     {
-        null => null,
-        string text => text,
-        JsonElement element => element,
-        AIContent content => JsonSerializer.SerializeToElement(content, AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(AIContent))),
-        IEnumerable<AIContent> contents => JsonSerializer.SerializeToElement(contents.ToList(), AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(IList<AIContent>))),
-        _ => JsonSerializer.SerializeToElement(result, result.GetType(), AIJsonUtilities.DefaultOptions),
+        null => (null, false),
+        string text => (text, false),
+        JsonElement element => (element, false),
+        AIContent content => (JsonSerializer.SerializeToElement(content, AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(AIContent))), true),
+        IEnumerable<AIContent> contents => (JsonSerializer.SerializeToElement(contents.ToList(), AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(IList<AIContent>))), true),
+        _ => (JsonSerializer.SerializeToElement(result, result.GetType(), AIJsonUtilities.DefaultOptions), false),
     };
 
     private static bool IsCancellation(Exception exception) =>
@@ -352,7 +354,14 @@ internal sealed class AgentLoop
         {
             var arguments = new AIFunctionArguments(call.Arguments);
             var result = await function.InvokeAsync(arguments, token).ConfigureAwait(true);
-            return new FunctionResultContent(call.CallId, ToTransportable(result) ?? ToolSucceededText);
+            var (transported, serializedContent) = ToTransportable(result);
+            var content = new FunctionResultContent(call.CallId, transported ?? ToolSucceededText);
+            if (serializedContent)
+            {
+                ChatOptionsTransport.MarkSerializedContent(content);
+            }
+
+            return content;
         }
 #pragma warning disable CA1031 // The model is told that the tool failed; FunctionInvokingChatClient does the same.
         catch (Exception exception) when (!IsCancellation(exception) && exception is not ContinueAsNewException)
