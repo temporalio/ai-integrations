@@ -31,7 +31,7 @@ class StreamingTestModel implements LanguageModelV4 {
 
   constructor(
     private readonly parts: LanguageModelV4StreamPart[],
-    private readonly stallMs: number
+    private readonly stallMs = 0
   ) {}
 
   get supportedUrls(): Record<string, RegExp[]> {
@@ -58,7 +58,7 @@ class StreamingTestModel implements LanguageModelV4 {
   }
 }
 
-function streamingProvider(parts: LanguageModelV4StreamPart[], stallMs: number): ProviderV4 {
+function streamingProvider(parts: LanguageModelV4StreamPart[], stallMs = 0): ProviderV4 {
   return {
     specificationVersion: 'v4',
     languageModel: (_modelId: string): LanguageModelV4 => new StreamingTestModel(parts, stallMs),
