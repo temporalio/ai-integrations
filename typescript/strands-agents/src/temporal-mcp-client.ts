@@ -456,6 +456,13 @@ async function closeRecord(record: ConnectionRecord): Promise<void> {
   }
 }
 
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `Client`.
+export function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
+  return (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+}
+
 /**
  * The worker-process MCP connections of one {@link StrandsPlugin}, keyed by
  * server name. Workers that share a plugin instance share its connections;
@@ -527,7 +534,8 @@ export class McpConnections {
             typeof client.callTool !== 'function'
           ) {
             throw ApplicationFailure.nonRetryable(
-              `MCP client factory '${server}' must return a client with connect(), disconnect(), listTools() and callTool() methods.`,
+              `MCP client factory '${server}' returned ${describeValue(client)}, not a client with ` +
+                'connect(), disconnect(), listTools() and callTool() methods.',
               'MCPClientFactoryTypeError'
             );
           }

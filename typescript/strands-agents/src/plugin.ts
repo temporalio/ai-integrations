@@ -23,6 +23,7 @@ import {
   buildCallToolActivity,
   buildListToolsActivity,
   callToolActivityName,
+  describeValue,
   listToolsActivityName,
   MCP_CONNECTION_IDLE_MS,
   McpConnections,
@@ -156,6 +157,10 @@ export class StrandsPlugin extends SimplePlugin {
     // them, and another StrandsPlugin opens its own, even for the same server name.
     const connections = new McpConnections(idleMs);
     for (const [server, factory] of Object.entries(mcpClients)) {
+      // Fail when the Worker is built, not in every MCP Activity.
+      if (typeof factory !== 'function') {
+        throw new TypeError(`MCP client factory '${server}' is ${describeValue(factory)}, not a function.`);
+      }
       const serverActivities = {
         [listToolsActivityName(server)]: buildListToolsActivity(server, factory, connections),
         [callToolActivityName(server)]: buildCallToolActivity(server, factory, connections),
