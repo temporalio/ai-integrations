@@ -43,8 +43,6 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
 from google.adk.sessions import InMemorySessionService
-from google.adk.telemetry._schema_version import resolve_schema_version
-from google.adk.telemetry.context import TelemetryConfig
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
@@ -610,45 +608,23 @@ async def test_single_agent_telemetry(
 
     spans = dump_spans(exporter.get_finished_spans(), with_attributes=False)
     print("\n".join(spans))
-    expected_spans = [
+    # OpenInference suppresses duplicate ADK invocation/agent spans and emits
+    # its own call_llm spans independently of ADK's telemetry schema.
+    assert spans == [
         "StartWorkflow:WeatherAgent",
         "  RunWorkflow:WeatherAgent",
         "    invocation [test_app]",
-        "      invocation",
-        "        agent_run [test_agent]",
-        "          invoke_agent test_agent",
-        "            execute_tool get_weather",
-        "              StartActivity:get_weather",
-        "                RunActivity:get_weather",
-        "            call_llm",
-        "              StartActivity:invoke_model",
-        "                RunActivity:invoke_model",
-        "            call_llm",
-        "              StartActivity:invoke_model",
-        "                RunActivity:invoke_model",
+        "      agent_run [test_agent]",
+        "        execute_tool get_weather",
+        "          StartActivity:get_weather",
+        "            RunActivity:get_weather",
+        "        call_llm",
+        "          StartActivity:invoke_model",
+        "            RunActivity:invoke_model",
+        "        call_llm",
+        "          StartActivity:invoke_model",
+        "            RunActivity:invoke_model",
     ]
-    # ADK 2.12 introduces workflow spans before the inference format migrates.
-    # ADK 2.13 enables both changes by default.
-    schema_v2 = resolve_schema_version() >= 2
-    if schema_v2:
-        expected_spans[3] = "      invoke_workflow test_agent"
-    if schema_v2 and TelemetryConfig().should_use_experimental_genai_semconv:
-        expected_spans = [
-            "StartWorkflow:WeatherAgent",
-            "  RunWorkflow:WeatherAgent",
-            "    invocation [test_app]",
-            "      invoke_workflow test_agent",
-            "        agent_run [test_agent]",
-            "          invoke_agent test_agent",
-            "            StartActivity:invoke_model",
-            "              RunActivity:invoke_model",
-            "            execute_tool get_weather",
-            "              StartActivity:get_weather",
-            "                RunActivity:get_weather",
-            "            StartActivity:invoke_model",
-            "              RunActivity:invoke_model",
-        ]
-    assert spans == expected_spans
 
 
 async def test_unsetting_timeout():
