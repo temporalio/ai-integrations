@@ -125,7 +125,7 @@ def dotnet_lock(packages: dict[str, str], framework: str = "net10.0") -> str:
 def make_dotnet_plugin(
     root: Path,
     name: str = "fakedotnet",
-    coordinate: str = "Temporalio.Fakedotnet",
+    coordinate: str = "Temporalio.Extensions.Fakedotnet",
     *,
     maturity: str = "pre-release",
 ) -> Path:

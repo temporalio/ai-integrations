@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import smoke_dotnet
 
-COORDINATE = "Temporalio.Fakedotnet"
+COORDINATE = "Temporalio.Extensions.Fakedotnet"
 VERSION = "0.0.1-rc.1"
 
 

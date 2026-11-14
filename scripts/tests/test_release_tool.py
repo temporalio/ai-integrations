@@ -602,8 +602,8 @@ def test_release_notes_initial_and_incremental(plugin_repo: Path, tmp_path: Path
 @pytest.mark.parametrize("language,coordinate,version", [
     ("python", "temporalio-fake", "0.2.0"), ("typescript", "@temporalio/fake", "0.2.0"),
     ("java", "io.temporal:fake", "0.2.0"), ("go", "go.temporal.io/fake", "0.2.0"),
-    ("typescript", "@temporalio/fake", "0.2.0-rc.1"), ("dotnet", "Temporalio.Fake", "0.2.0"),
-    ("dotnet", "Temporalio.Fake", "0.2.0-rc.1"),
+    ("typescript", "@temporalio/fake", "0.2.0-rc.1"), ("dotnet", "Temporalio.Extensions.Fake", "0.2.0"),
+    ("dotnet", "Temporalio.Extensions.Fake", "0.2.0-rc.1"),
 ])
 @pytest.mark.parametrize("incremental", [False, True])
 def test_release_notes_before_tag_creation_use_the_tested_commit(

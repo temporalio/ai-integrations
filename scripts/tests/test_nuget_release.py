@@ -17,7 +17,7 @@ import release_tool
 import yaml
 from conftest import commit_all, git
 
-COORDINATE = "Temporalio.Fakedotnet"
+COORDINATE = "Temporalio.Extensions.Fakedotnet"
 VERSION = "0.0.1-rc.1"
 PLUGIN_DIR = "dotnet/fakedotnet"
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/release-dotnet.yml"
@@ -71,8 +71,8 @@ def test_cli_parse_dotnet_tag_emits_the_sdk_channel(dotnet_repo: Path, capsys: p
 
 @pytest.mark.parametrize("old,new", [
     ('registry = "nuget"', 'registry = "npm"'),
-    ('coordinate = "Temporalio.Fakedotnet"', 'coordinate = "Temporalio.Other"'),
-    ('root-api = "Temporalio.Fakedotnet"', 'root-api = "Temporalio.Other"'),
+    ('coordinate = "Temporalio.Extensions.Fakedotnet"', 'coordinate = "Temporalio.Other"'),
+    ('root-api = "Temporalio.Extensions.Fakedotnet"', 'root-api = "Temporalio.Other"'),
     ('language = "dotnet"', 'language = "go"'),
     ('name = "fakedotnet"', 'name = "other"'),
 ])
@@ -222,9 +222,9 @@ def test_registry_state_is_false_until_the_served_package_exists(tmp_path: Path,
     urls = fake_nuget(monkeypatch, index=["0.0.1-rc.1"], served=nupkg(signature=b"sig"), leaf={"listed": True})
     assert nuget_release.registry_state(COORDINATE, VERSION, dist) is True
     assert urls == [
-        "https://api.nuget.org/v3-flatcontainer/temporalio.fakedotnet/index.json",
-        "https://api.nuget.org/v3-flatcontainer/temporalio.fakedotnet/0.0.1-rc.1/temporalio.fakedotnet.0.0.1-rc.1.nupkg",
-        "https://api.nuget.org/v3/registration5-gz-semver2/temporalio.fakedotnet/0.0.1-rc.1.json",
+        "https://api.nuget.org/v3-flatcontainer/temporalio.extensions.fakedotnet/index.json",
+        "https://api.nuget.org/v3-flatcontainer/temporalio.extensions.fakedotnet/0.0.1-rc.1/temporalio.extensions.fakedotnet.0.0.1-rc.1.nupkg",
+        "https://api.nuget.org/v3/registration5-gz-semver2/temporalio.extensions.fakedotnet/0.0.1-rc.1.json",
     ]
     fake_nuget(monkeypatch, index=["0.0.1-rc.1"], served=nupkg(signature=b"sig"), leaf={})
     assert nuget_release.registry_state(COORDINATE, VERSION, dist) is True
@@ -297,7 +297,7 @@ def test_dotnet_prerelease_notes_name_the_explicit_version(dotnet_repo: Path) ->
     git(dotnet_repo, "tag", f"dotnet/fakedotnet/v{VERSION}")
     notes = release_tool.release_notes(dotnet_repo, PLUGIN_DIR, f"dotnet/fakedotnet/v{VERSION}", "temporalio/ai-integrations")
     assert f"dotnet add package {COORDINATE} --version {VERSION}" in notes
-    assert "TestPyPI" not in notes and "First standalone release of `Temporalio.Fakedotnet`" in notes
+    assert "TestPyPI" not in notes and "First standalone release of `Temporalio.Extensions.Fakedotnet`" in notes
     git(dotnet_repo, "tag", "dotnet/fakedotnet/v0.0.1")
     final = release_tool.release_notes(dotnet_repo, PLUGIN_DIR, "dotnet/fakedotnet/v0.0.1", "temporalio/ai-integrations")
     assert "Pre-release notes" not in final
@@ -388,7 +388,7 @@ def test_nuget_recovery_requires_one_available_package_artifact(nuget_recovery_s
 
 @pytest.mark.parametrize("filename", [
     "plugin.toml", "global.json", "Directory.Build.props", "nuget.config",
-    "src/Temporalio.Fakedotnet/Temporalio.Fakedotnet.csproj", "tests/Temporalio.Fakedotnet.Tests/packages.lock.json",
+    "src/Temporalio.Extensions.Fakedotnet/Temporalio.Extensions.Fakedotnet.csproj", "tests/Temporalio.Extensions.Fakedotnet.Tests/packages.lock.json",
 ])
 def test_nuget_recovery_rejects_changed_package_shaping_files(nuget_recovery_source: tuple, filename: str) -> None:
     repo, *_ = nuget_recovery_source
@@ -400,7 +400,7 @@ def test_nuget_recovery_rejects_changed_package_shaping_files(nuget_recovery_sou
 
 def test_nuget_recovery_ignores_files_that_do_not_shape_the_package(nuget_recovery_source: tuple) -> None:
     repo, *_ = nuget_recovery_source
-    (repo / PLUGIN_DIR / "src/Temporalio.Fakedotnet/FakedotnetPlugin.cs").write_text("// changed after the tag\n")
+    (repo / PLUGIN_DIR / "src/Temporalio.Extensions.Fakedotnet/FakedotnetPlugin.cs").write_text("// changed after the tag\n")
     release_tool.check_recovery_run(repo, "temporalio/ai-integrations", f"dotnet/fakedotnet/v{VERSION}", 123)
 
 

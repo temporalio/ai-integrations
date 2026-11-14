@@ -13,8 +13,8 @@ from check_conventions import Checker
 from conftest import REPO_ROOT, make_dotnet_plugin
 
 PLUGIN = "dotnet/fakedotnet"
-LIB = "src/Temporalio.Fakedotnet/Temporalio.Fakedotnet.csproj"
-TESTS = "tests/Temporalio.Fakedotnet.Tests/Temporalio.Fakedotnet.Tests.csproj"
+LIB = "src/Temporalio.Extensions.Fakedotnet/Temporalio.Extensions.Fakedotnet.csproj"
+TESTS = "tests/Temporalio.Extensions.Fakedotnet.Tests/Temporalio.Extensions.Fakedotnet.Tests.csproj"
 
 
 def edit(repo: Path, rel: str, old: str, new: str) -> None:
@@ -32,7 +32,7 @@ def write_root_props(repo: Path, body: str) -> None:
 
 
 def write_extra_project(repo: Path, body: str) -> None:
-    project = repo / PLUGIN / "src/Temporalio.Fakedotnet.Extra/Temporalio.Fakedotnet.Extra.csproj"
+    project = repo / PLUGIN / "src/Temporalio.Extensions.Fakedotnet.Extra/Temporalio.Extensions.Fakedotnet.Extra.csproj"
     project.parent.mkdir(parents=True, exist_ok=True)
     project.write_text(
         '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n'
@@ -53,18 +53,18 @@ def test_shared_files_without_plugins_pass(repo: Path) -> None:
 
 CASES: dict[str, tuple[Callable[[Path], None], str]] = {
     "coordinate-letters": (
-        lambda r: edit(r, "plugin.toml", 'coordinate = "Temporalio.Fakedotnet"', 'coordinate = "Temporalio.Other"'),
-        "coordinate must be 'Temporalio.fakedotnet' up to casing"),
+        lambda r: edit(r, "plugin.toml", 'coordinate = "Temporalio.Extensions.Fakedotnet"', 'coordinate = "Temporalio.Other"'),
+        "coordinate must be 'Temporalio.Extensions.fakedotnet' up to casing"),
     "root-api": (
-        lambda r: edit(r, "plugin.toml", 'root-api = "Temporalio.Fakedotnet"', 'root-api = "Temporalio.Fakedotnet.Core"'),
-        "root-api must be 'Temporalio.Fakedotnet'"),
+        lambda r: edit(r, "plugin.toml", 'root-api = "Temporalio.Extensions.Fakedotnet"', 'root-api = "Temporalio.Extensions.Fakedotnet.Core"'),
+        "root-api must be 'Temporalio.Extensions.Fakedotnet'"),
     "registry": (lambda r: edit(r, "plugin.toml", 'registry = "nuget"', 'registry = "pypi"'), "registry must be 'nuget'"),
     "runtime-versions": (lambda r: edit(r, "plugin.toml", 'runtime-versions = ["10.0"]', 'runtime-versions = ["10"]'),
                          "major.minor"),
-    "smoke-imports": (lambda r: edit(r, "plugin.toml", "Temporalio.Fakedotnet.FakedotnetPlugin", "Other.Plugin"),
-                      "smoke imports must name types under Temporalio.Fakedotnet"),
-    "package-id": (lambda r: edit(r, LIB, "<PackageId>Temporalio.Fakedotnet</PackageId>", "<PackageId>Temporalio.Other</PackageId>"),
-                   "PackageId must be 'Temporalio.Fakedotnet'"),
+    "smoke-imports": (lambda r: edit(r, "plugin.toml", "Temporalio.Extensions.Fakedotnet.FakedotnetPlugin", "Other.Plugin"),
+                      "smoke imports must name types under Temporalio.Extensions.Fakedotnet"),
+    "package-id": (lambda r: edit(r, LIB, "<PackageId>Temporalio.Extensions.Fakedotnet</PackageId>", "<PackageId>Temporalio.Other</PackageId>"),
+                   "PackageId must be 'Temporalio.Extensions.Fakedotnet'"),
     "version": (lambda r: edit(r, LIB, "<Version>0.0.0</Version>", "<Version>0.1.0</Version>"), "development placeholder"),
     "license-expression": (
         lambda r: edit(r, LIB, "<PackageLicenseFile>LICENSE</PackageLicenseFile>",
@@ -88,7 +88,7 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
     "tests-packable": (lambda r: edit(r, TESTS, "<OutputType>Exe</OutputType>", "<OutputType>Exe</OutputType><IsPackable>true</IsPackable>"),
                        "must not be packable"),
     "project-reference-outside": (
-        lambda r: edit(r, TESTS, "../../src/Temporalio.Fakedotnet/Temporalio.Fakedotnet.csproj", "../../../other/src/Other/Other.csproj"),
+        lambda r: edit(r, TESTS, "../../src/Temporalio.Extensions.Fakedotnet/Temporalio.Extensions.Fakedotnet.csproj", "../../../other/src/Other/Other.csproj"),
         "points outside the plugin"),
     "global-json-roll-forward": (lambda r: edit(r, "global.json", '"rollForward": "latestFeature"', '"rollForward": "latestMajor"'),
                                  "rollForward must be 'latestFeature'"),
@@ -112,21 +112,27 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
         lambda r: edit(r, "nuget.config", "  </packageSources>", '    <add key="mirror" value="https://mirror.example/v3/index.json" />\n  </packageSources>'),
         "must be the only package source"),
     "nuget-config-clear": (lambda r: edit(r, "nuget.config", "    <clear />\n", ""), "must start with <clear />"),
-    "makefile-package": (lambda r: edit(r, "Makefile", "PACKAGE := Temporalio.Fakedotnet", "PACKAGE := Temporalio.Other"),
-                         "must set PACKAGE := Temporalio.Fakedotnet"),
+    "makefile-package": (lambda r: edit(r, "Makefile", "PACKAGE := Temporalio.Extensions.Fakedotnet", "PACKAGE := Temporalio.Other"),
+                         "must set PACKAGE := Temporalio.Extensions.Fakedotnet"),
     "makefile-include": (lambda r: edit(r, "Makefile", "include ../_shared/dotnet.mk", "include ../_shared/other.mk"),
                          "must include ../_shared/dotnet.mk"),
     "readme-relative-link": (lambda r: (r / PLUGIN / "README.md").write_text("see [root](../../README.md)\n"), "relative link"),
     "license-drift": (lambda r: (r / PLUGIN / "LICENSE").write_text("MIT\n"), "LICENSE differs from root"),
     "changelog": (lambda r: (r / PLUGIN / "CHANGELOG.md").write_text("# changes\n"), "no changelog files"),
-    "second-slnx": (lambda r: (r / PLUGIN / "Other.slnx").write_text("<Solution />\n"), "exactly one Temporalio.Fakedotnet.slnx"),
+    "second-slnx": (lambda r: (r / PLUGIN / "Other.slnx").write_text("<Solution />\n"), "exactly one Temporalio.Extensions.Fakedotnet.slnx"),
     "slnx-missing-project": (
-        lambda r: edit(r, "Temporalio.Fakedotnet.slnx", '  <Project Path="tests/Temporalio.Fakedotnet.Tests/Temporalio.Fakedotnet.Tests.csproj" />\n', ""),
-        "must list src/Temporalio.Fakedotnet/Temporalio.Fakedotnet.csproj and tests/"),
-    "lock-missing": (lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/packages.lock.json").unlink(),
-                     "missing src/Temporalio.Fakedotnet/packages.lock.json"),
-    "two-channels": (lambda r: edit(r, "plugin.toml", 'runtime-versions = ["10.0"]', 'runtime-versions = ["10.0", "11.0"]'),
-                     "exactly one SDK channel"),
+        lambda r: edit(r, "Temporalio.Extensions.Fakedotnet.slnx", '  <Project Path="tests/Temporalio.Extensions.Fakedotnet.Tests/Temporalio.Extensions.Fakedotnet.Tests.csproj" />\n', ""),
+        "must list src/Temporalio.Extensions.Fakedotnet/Temporalio.Extensions.Fakedotnet.csproj and tests/"),
+    "lock-missing": (lambda r: (r / PLUGIN / "src/Temporalio.Extensions.Fakedotnet/packages.lock.json").unlink(),
+                     "missing src/Temporalio.Extensions.Fakedotnet/packages.lock.json"),
+    "two-runtimes": (
+        lambda r: (edit(r, "plugin.toml", 'runtime-versions = ["10.0"]', 'runtime-versions = ["8.0", "10.0"]'),
+                   edit(r, LIB, "<TargetFramework>net10.0</TargetFramework>", "<TargetFramework>netstandard2.0</TargetFramework>")),
+        "test project must target net8.0;net10.0"),
+    "library-newer-than-oldest-runtime": (
+        lambda r: (edit(r, "plugin.toml", 'runtime-versions = ["10.0"]', 'runtime-versions = ["8.0", "10.0"]'),
+                   edit(r, TESTS, "<TargetFramework>net10.0</TargetFramework>", "<TargetFrameworks>net8.0;net10.0</TargetFrameworks>")),
+        "TargetFramework must be netstandard2.0 or net8.0"),
     "root-props-weaker-policy": (lambda r: write_root_props(r, "<TreatWarningsAsErrors>false</TreatWarningsAsErrors>"),
                                  "Directory.Build.props: TreatWarningsAsErrors must stay true"),
     "root-props-analyzers-off": (lambda r: write_root_props(r, "<EnableNETAnalyzers>false</EnableNETAnalyzers>"),
@@ -138,12 +144,12 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
     "root-props-packable": (lambda r: write_root_props(r, "<IsPackable>true</IsPackable>"), "would pack the test project too"),
     "nested-props": (lambda r: (r / PLUGIN / "src/Directory.Build.props").write_text("<Project />\n"),
                      "src/Directory.Build.props: a nearer Directory.Build.props replaces the plugin-root one"),
-    "nested-props-in-project": (lambda r: (r / PLUGIN / "tests/Temporalio.Fakedotnet.Tests/Directory.Build.props").write_text("<Project />\n"),
-                                "tests/Temporalio.Fakedotnet.Tests/Directory.Build.props: a nearer Directory.Build.props"),
+    "nested-props-in-project": (lambda r: (r / PLUGIN / "tests/Temporalio.Extensions.Fakedotnet.Tests/Directory.Build.props").write_text("<Project />\n"),
+                                "tests/Temporalio.Extensions.Fakedotnet.Tests/Directory.Build.props: a nearer Directory.Build.props"),
     "targets": (lambda r: (r / PLUGIN / "Directory.Build.targets").write_text("<Project />\n"),
                 "Directory.Build.targets: Directory.Build.targets is evaluated after the csproj"),
-    "nested-targets": (lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/Directory.Build.targets").write_text("<Project />\n"),
-                       "src/Temporalio.Fakedotnet/Directory.Build.targets: Directory.Build.targets is evaluated after"),
+    "nested-targets": (lambda r: (r / PLUGIN / "src/Temporalio.Extensions.Fakedotnet/Directory.Build.targets").write_text("<Project />\n"),
+                       "src/Temporalio.Extensions.Fakedotnet/Directory.Build.targets: Directory.Build.targets is evaluated after"),
     "packages-props": (lambda r: (r / PLUGIN / "Directory.Packages.props").write_text("<Project />\n"),
                        "Directory.Packages.props: Directory.Packages.props moves package versions out of the csproj"),
     "target-framework-floor": (lambda r: edit(r, LIB, "<TargetFramework>net10.0</TargetFramework>", "<TargetFramework>net9.0</TargetFramework>"),
@@ -152,11 +158,11 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
                     "PackageProjectUrl must be https://github.com/temporalio/ai-integrations/tree/main/dotnet/fakedotnet"),
     "library-project-reference": (
         lambda r: edit(r, LIB, '  <ItemGroup>\n    <PackageReference Include="Temporalio"',
-                       '  <ItemGroup>\n    <ProjectReference Include="../Temporalio.Fakedotnet.Extra/Temporalio.Fakedotnet.Extra.csproj" />\n'
+                       '  <ItemGroup>\n    <ProjectReference Include="../Temporalio.Extensions.Fakedotnet.Extra/Temporalio.Extensions.Fakedotnet.Extra.csproj" />\n'
                        '    <PackageReference Include="Temporalio"'),
         "ProjectReference in the packed library"),
     "extra-project-weaker-policy": (lambda r: write_extra_project(r, "<TreatWarningsAsErrors>false</TreatWarningsAsErrors>"),
-                                    "Temporalio.Fakedotnet.Extra.csproj: TreatWarningsAsErrors must stay true"),
+                                    "Temporalio.Extensions.Fakedotnet.Extra.csproj: TreatWarningsAsErrors must stay true"),
     "extra-project-packable": (lambda r: write_extra_project(r, "<IsPackable>true</IsPackable>"), "only src/<Coordinate> is packable"),
     "root-props-analysis-level-none": (lambda r: write_root_props(r, "<AnalysisLevel>none</AnalysisLevel>"),
                                        "Directory.Build.props: AnalysisLevel must stay 10.0"),
@@ -203,16 +209,16 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
         "DiscoverGlobalAnalyzerConfigFiles must stay false"),
     "globalconfig-in-plugin": (lambda r: (r / PLUGIN / ".globalconfig").write_text("is_global = true\n"),
                                ".globalconfig: a .globalconfig would change analyzer severities"),
-    "globalconfig-in-src": (lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/.globalconfig").write_text("is_global = true\n"),
-                            "src/Temporalio.Fakedotnet/.globalconfig: a .globalconfig would change analyzer severities"),
+    "globalconfig-in-src": (lambda r: (r / PLUGIN / "src/Temporalio.Extensions.Fakedotnet/.globalconfig").write_text("is_global = true\n"),
+                            "src/Temporalio.Extensions.Fakedotnet/.globalconfig: a .globalconfig would change analyzer severities"),
     "build-rsp": (lambda r: (r / PLUGIN / "Directory.Build.rsp").write_text("-p:TreatWarningsAsErrors=false\n"),
                   "Directory.Build.rsp: Directory.Build.rsp adds MSBuild switches"),
     "nested-editorconfig": (lambda r: (r / PLUGIN / "src/.editorconfig").write_text("root = true\n"),
                             "src/.editorconfig: a nested .editorconfig overrides"),
     "configure-await-false": (
-        lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/Awaits.cs").write_text(
-            "namespace Temporalio.Fakedotnet;\n\npublic static class Awaits\n{\n    public static async Task RunAsync() => await Task.Yield().ConfigureAwait(false);\n}\n"),
-        "src/Temporalio.Fakedotnet/Awaits.cs:5: ConfigureAwait(false) leaves the Workflow scheduler"),
+        lambda r: (r / PLUGIN / "src/Temporalio.Extensions.Fakedotnet/Awaits.cs").write_text(
+            "namespace Temporalio.Extensions.Fakedotnet;\n\npublic static class Awaits\n{\n    public static async Task RunAsync() => await Task.Yield().ConfigureAwait(false);\n}\n"),
+        "src/Temporalio.Extensions.Fakedotnet/Awaits.cs:5: ConfigureAwait(false) leaves the Workflow scheduler"),
 }
 
 
@@ -227,14 +233,14 @@ def test_each_contract_breach_is_one_violation(dotnet_repo: Path, case: str) -> 
 
 def test_coordinate_prefix_casing_is_reported_first(dotnet_repo: Path) -> None:
     meta = dotnet_repo / PLUGIN / "plugin.toml"
-    meta.write_text(meta.read_text().replace("Temporalio.Fakedotnet", "temporalio.Fakedotnet"))
+    meta.write_text(meta.read_text().replace("Temporalio.Extensions.Fakedotnet", "temporalio.Extensions.Fakedotnet"))
     violations = Checker(dotnet_repo).run()
-    assert violations[0] == (f"{PLUGIN}: plugin.toml coordinate 'temporalio.Fakedotnet' must keep the Temporalio. "
+    assert violations[0] == (f"{PLUGIN}: plugin.toml coordinate 'temporalio.Extensions.Fakedotnet' must keep the Temporalio.Extensions. "
                              "prefix casing and be a valid NuGet ID")
 
 
 def test_build_output_is_not_scanned_for_directory_files(dotnet_repo: Path) -> None:
-    stale = dotnet_repo / PLUGIN / "src/Temporalio.Fakedotnet/obj/Directory.Build.props"
+    stale = dotnet_repo / PLUGIN / "src/Temporalio.Extensions.Fakedotnet/obj/Directory.Build.props"
     stale.parent.mkdir(parents=True)
     stale.write_text("<Project />\n")
     assert Checker(dotnet_repo).run() == []
@@ -250,7 +256,7 @@ def test_shared_import_is_matched_as_xml_not_text(dotnet_repo: Path) -> None:
 
 
 def test_makefile_include_may_carry_a_comment(dotnet_repo: Path) -> None:
-    (dotnet_repo / PLUGIN / "Makefile").write_text("PACKAGE := Temporalio.Fakedotnet\ninclude ../_shared/dotnet.mk # shared targets\n")
+    (dotnet_repo / PLUGIN / "Makefile").write_text("PACKAGE := Temporalio.Extensions.Fakedotnet\ninclude ../_shared/dotnet.mk # shared targets\n")
     assert Checker(dotnet_repo).run() == []
 
 
@@ -284,8 +290,8 @@ def test_xunit_v2_is_rejected_and_xunit_v3_required(dotnet_repo: Path) -> None:
 
 def test_uncommitted_required_files_are_reported(dotnet_repo: Path) -> None:
     import subprocess
-    subprocess.run(["git", "-C", str(dotnet_repo), "rm", "-q", "--cached", f"{PLUGIN}/tests/Temporalio.Fakedotnet.Tests/packages.lock.json"], check=True)
-    assert Checker(dotnet_repo).run() == [f"{PLUGIN}: tests/Temporalio.Fakedotnet.Tests/packages.lock.json must be committed"]
+    subprocess.run(["git", "-C", str(dotnet_repo), "rm", "-q", "--cached", f"{PLUGIN}/tests/Temporalio.Extensions.Fakedotnet.Tests/packages.lock.json"], check=True)
+    assert Checker(dotnet_repo).run() == [f"{PLUGIN}: tests/Temporalio.Extensions.Fakedotnet.Tests/packages.lock.json must be committed"]
 
 
 def test_language_root_build_files_are_forbidden(dotnet_repo: Path) -> None:
@@ -301,7 +307,7 @@ def test_language_root_build_files_are_forbidden(dotnet_repo: Path) -> None:
 
 
 def test_configure_await_false_is_reported_only_under_src(dotnet_repo: Path) -> None:
-    (dotnet_repo / PLUGIN / "tests/Temporalio.Fakedotnet.Tests/Awaits.cs").write_text(
+    (dotnet_repo / PLUGIN / "tests/Temporalio.Extensions.Fakedotnet.Tests/Awaits.cs").write_text(
         "public static class Awaits\n{\n    public static async Task RunAsync() => await Task.Yield().ConfigureAwait(false);\n}\n")
     assert Checker(dotnet_repo).run() == []
 
@@ -331,6 +337,6 @@ def test_missing_shared_files_are_reported(dotnet_repo: Path) -> None:
 
 def test_coordinate_casing_in_plugin_toml_is_canonical(repo: Path) -> None:
     from conftest import commit_all
-    make_dotnet_plugin(repo, "microsoft-agent-framework", "Temporalio.MicrosoftAgentFramework")
+    make_dotnet_plugin(repo, "microsoft-agent-framework", "Temporalio.Extensions.MicrosoftAgentFramework")
     commit_all(repo, "add agent framework")
     assert Checker(repo).run() == []

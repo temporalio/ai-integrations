@@ -82,7 +82,7 @@ JAVA_PLUGIN_MANAGEMENT = """pluginManagement {
 }
 """
 DOTNET_DEVELOPMENT_VERSION = "0.0.0"
-DOTNET_PREFIX = "Temporalio."
+DOTNET_PREFIX = "Temporalio.Extensions."
 DOTNET_SHARED_IMPORT_PATH = "$(MSBuildThisFileDirectory)../_shared/dotnet.props"
 DOTNET_SHARED_IMPORT = f'<Project>\n  <Import Project="{DOTNET_SHARED_IMPORT_PATH}" />\n'
 # Keep equal to dotnet/_shared/dotnet.props and the plugins' global.json floor channel.

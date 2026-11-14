@@ -9,7 +9,7 @@ The package targets `net10.0` and needs `Temporalio` 1.22.0 or later and `Micros
 ## Installation
 
 ```sh
-dotnet add package Temporalio.MicrosoftAgentFramework --prerelease
+dotnet add package Temporalio.Extensions.MicrosoftAgentFramework --prerelease
 dotnet add package Microsoft.Extensions.AI.OpenAI
 ```
 
@@ -24,7 +24,7 @@ using System.ClientModel;
 using System.ClientModel.Primitives;
 using Microsoft.Extensions.AI;
 using OpenAI;
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Client;
 using Temporalio.Worker;
 using Temporalio.Workflows;
@@ -135,7 +135,7 @@ To keep an MCP connection open for the worker's lifetime, set `McpConnectionIdle
 Each model call is one `MicrosoftAgentFramework.InvokeModel` Activity with a 5-minute start-to-close timeout, a 10-second heartbeat timeout and the model name as its summary. The Activity heartbeats at least every 3 seconds while the provider call runs and on every streamed update, so a dead worker is noticed within the heartbeat timeout. Change the options per agent or per client:
 
 ```csharp
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Common;
 using Temporalio.Workflows;
 
@@ -169,7 +169,7 @@ Tools go in `ChatOptions.Tools`, as in Agent Framework. Where a tool runs is you
 using System.ComponentModel;
 using Microsoft.Extensions.AI;
 using Temporalio.Activities;
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Workflows;
 
 public class WeatherActivities
@@ -222,8 +222,8 @@ Register each server's transport on the worker and list its tools from the Workf
 ```csharp
 using Microsoft.Extensions.AI;
 using ModelContextProtocol.Client;
-using Temporalio.MicrosoftAgentFramework;
-using Temporalio.MicrosoftAgentFramework.Mcp;
+using Temporalio.Extensions.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework.Mcp;
 using Temporalio.Workflows;
 
 public static class McpSetup
@@ -279,7 +279,7 @@ The exception is `HostedMcpServerTool.Headers`. The model Activity's input is re
 
 ```csharp
 using Microsoft.Extensions.AI;
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Workflows;
 
 public static class HostedMcpSetup
@@ -321,7 +321,7 @@ Agent Framework's approval contract applies, with the two differences described 
 ```csharp
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Exceptions;
 using Temporalio.Workflows;
 
@@ -434,7 +434,7 @@ To get the updates as the provider produces them, name a Workflow Stream topic; 
 
 ```csharp
 using Microsoft.Extensions.AI;
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Client;
 using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.Workflows;
@@ -480,7 +480,7 @@ The delay before returning gives subscribers time to poll the last batch; a clos
 
 ```csharp
 using System.Text.Json;
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Workflows;
 
 public record ChatInput(IList<string> Prompts, int Index = 0, JsonElement? Session = null);
@@ -514,7 +514,7 @@ What carries over: the serialized session and whatever you put in the input. The
 `RunAsync<T>` sends the JSON schema of `T` as the response format and parses the answer:
 
 ```csharp
-using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework;
 using Temporalio.Workflows;
 
 public record PersonInfo(string Name, int Age);
@@ -564,12 +564,12 @@ The plugin adds Activities and run hooks that count the workers using the instan
 
 ## Testing
 
-`Temporalio.MicrosoftAgentFramework.Testing` ships `FakeChatClient`, `ScriptedResponse` and `InMemoryMcpServer`, so your Workflow tests run without a provider or a network:
+`Temporalio.Extensions.MicrosoftAgentFramework.Testing` ships `FakeChatClient`, `ScriptedResponse` and `InMemoryMcpServer`, so your Workflow tests run without a provider or a network:
 
 ```csharp
 using Microsoft.Extensions.AI;
-using Temporalio.MicrosoftAgentFramework;
-using Temporalio.MicrosoftAgentFramework.Testing;
+using Temporalio.Extensions.MicrosoftAgentFramework;
+using Temporalio.Extensions.MicrosoftAgentFramework.Testing;
 
 var fake = new FakeChatClient(
     ScriptedResponse.ToolCalls(("get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" })),
@@ -592,4 +592,4 @@ make test
 make build
 ```
 
-`make test` builds in Release and runs the suite under Microsoft.Testing.Platform with a local Temporal dev server that `WorkflowEnvironment.StartLocalAsync` downloads on first run. No provider credentials are needed: the suite uses the fakes from the Testing section. The replay test reads the histories under `tests/Temporalio.MicrosoftAgentFramework.Tests/Histories`; set `MICROSOFT_AGENT_FRAMEWORK_RECORD_HISTORIES=1` while running the suite to write fresh copies under `TestResults/recorded-histories`.
+`make test` builds in Release and runs the suite under Microsoft.Testing.Platform with a local Temporal dev server that `WorkflowEnvironment.StartLocalAsync` downloads on first run. No provider credentials are needed: the suite uses the fakes from the Testing section. The replay test reads the histories under `tests/Temporalio.Extensions.MicrosoftAgentFramework.Tests/Histories`; set `MICROSOFT_AGENT_FRAMEWORK_RECORD_HISTORIES=1` while running the suite to write fresh copies under `TestResults/recorded-histories`.

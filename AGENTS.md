@@ -178,8 +178,8 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   `Directory.Packages.props`, and forbids a `ProjectReference` in the packed library (it would become
   a nuspec dependency on a coordinate that is not on nuget.org). The library csproj sets
   `PackageProjectUrl` to its GitHub tree URL.
-- Coordinates are `Temporalio.<Name>` and the root namespace is the coordinate. The first release
-  targets `net10.0` only; .NET 8 and 9 left support on 2026-11-10.
+- Coordinates are `Temporalio.Extensions.<Name>`, the SDK's pattern for libraries that build on
+  `Temporalio`, and the root namespace is the coordinate.
 - The csproj `Version` is `0.0.0`. The release workflow passes `-p:Version=<tag version>` to build,
   test and pack; the tested assembly is the packed assembly (`dotnet pack --no-build`). Never commit a
   real version.
@@ -208,7 +208,7 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   `UseMicrosoftTestingPlatformRunner`), with `Microsoft.Testing.Extensions.TrxReport` for reports.
   VSTest packages (`Microsoft.NET.Test.Sdk`, `xunit.runner.visualstudio`, xunit 2) are not allowed;
   MTP mode rejects them. The runner's switches differ from VSTest: `make test` passes `--report-trx`,
-  and `make test TEST_ARGS='--filter-class Temporalio.MicrosoftAgentFramework.Tests.ReplayTests'` selects a
+  and `make test TEST_ARGS='--filter-class Temporalio.Extensions.MicrosoftAgentFramework.Tests.ReplayTests'` selects a
   class. Tests self-provision the Temporal dev server with the repository's retry policy and need no
   provider credentials.
 - Tooling: `make sync`, `make lint` (`dotnet format --verify-no-changes` on the solution; analyzers run
@@ -408,7 +408,7 @@ gallery.
    publishing policy per .NET plugin, for repository owner `temporalio`, repository
    `ai-integrations`, workflow file `release-dotnet.yml`, environment `nuget`,
    scoped to push new versions of the exact package id
-   (`Temporalio.MicrosoftAgentFramework` today; the SDK team adds one per new
+   (`Temporalio.Extensions.MicrosoftAgentFramework` today; the SDK team adds one per new
    package). A policy on `Temporalio.*` would also cover the SDK's own packages,
    such as `Temporalio.Extensions.WorkflowStreams`, which this repository must
    never be able to publish. An exact id covers a package that does not exist yet,

@@ -195,7 +195,7 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
             out["go_runtime"] = str(meta["ci"]["runtime-versions"][-1])
         elif out["language"] == "dotnet":
             plugin = meta["plugin"]
-            expected = "Temporalio." + out["plugin"].replace("-", "")
+            expected = "Temporalio.Extensions." + out["plugin"].replace("-", "")
             if (plugin.get("language") != "dotnet" or plugin.get("name") != out["plugin"] or plugin.get("registry") != "nuget"
                     or str(out["coordinate"]).lower() != expected.lower() or out["root_api"] != out["coordinate"]):
                 raise PolicyError(".NET tag, plugin metadata, coordinate and root API must match")

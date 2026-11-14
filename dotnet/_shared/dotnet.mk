@@ -1,10 +1,10 @@
 # Shared .NET targets, included from each plugin directory after PACKAGE is set:
-#     PACKAGE := Temporalio.MicrosoftAgentFramework
+#     PACKAGE := Temporalio.Extensions.MicrosoftAgentFramework
 #     include ../_shared/dotnet.mk
 # CI runs these same targets (.github/workflows/_dotnet-plugin.yml), so there is one
 # definition of "lint" and "test". See AGENTS.md (".NET conventions").
 ifndef PACKAGE
-$(error PACKAGE must be set to the NuGet package id (e.g. Temporalio.MicrosoftAgentFramework) before including dotnet.mk)
+$(error PACKAGE must be set to the NuGet package id (e.g. Temporalio.Extensions.MicrosoftAgentFramework) before including dotnet.mk)
 endif
 
 DOTNET ?= dotnet

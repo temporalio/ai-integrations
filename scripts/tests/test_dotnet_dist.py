@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from check_dotnet_dist import check, has_lower_bound, nuspec_framework
 
-COORDINATE = "Temporalio.Fakedotnet"
+COORDINATE = "Temporalio.Extensions.Fakedotnet"
 VERSION = "0.0.1-rc.1"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 LICENSE = b"MIT license text\n"
@@ -87,7 +87,7 @@ def test_valid_publication(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     ("license-drift", "packaged LICENSE differs"),
     ("readme-drift", "packaged README.md differs"),
     ("icon-drift", "packaged icon.png differs"),
-    ("missing-xml", "missing lib/net10.0/Temporalio.Fakedotnet.xml"),
+    ("missing-xml", "missing lib/net10.0/Temporalio.Extensions.Fakedotnet.xml"),
     ("pdb-in-nupkg", "debug symbols belong in the snupkg"),
     ("test-output", "test project output shipped"),
     ("signed", "must be unsigned"),
@@ -98,7 +98,7 @@ def test_valid_publication(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     ("group-framework", "dependency groups"),
     ("commit", "differs from the tested commit"),
     ("no-commit", "Source Link commit"),
-    ("snupkg-pdb", "snupkg is missing lib/net10.0/Temporalio.Fakedotnet.pdb"),
+    ("snupkg-pdb", "snupkg is missing lib/net10.0/Temporalio.Extensions.Fakedotnet.pdb"),
     ("snupkg-version", "snupkg nuspec id or version differs"),
 ])
 def test_publication_rejects_invalid_artifacts(tmp_path: Path, fault: str, message: str) -> None:
@@ -143,7 +143,7 @@ def test_multi_target_packages_need_every_framework(tmp_path: Path) -> None:
     csproj = plugin / "src" / COORDINATE / f"{COORDINATE}.csproj"
     csproj.write_text(csproj.read_text().replace("<TargetFramework>net10.0</TargetFramework>",
                                                  "<TargetFrameworks>net10.0;netstandard2.0</TargetFrameworks>"))
-    with pytest.raises(ValueError, match="missing lib/netstandard2.0/Temporalio.Fakedotnet.dll"):
+    with pytest.raises(ValueError, match="missing lib/netstandard2.0/Temporalio.Extensions.Fakedotnet.dll"):
         check(plugin, VERSION, repo_root=root, commit=COMMIT)
 
 

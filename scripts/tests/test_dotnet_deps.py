@@ -29,9 +29,9 @@ NUGET_CONFIG = '''<?xml version="1.0" encoding="utf-8"?>
 
 def plugin_with_lock(tmp_path: Path, packages: dict[str, str], config: str = NUGET_CONFIG) -> Path:
     plugin = tmp_path / "plugin"
-    (plugin / "src" / "Temporalio.Fakedotnet").mkdir(parents=True)
+    (plugin / "src" / "Temporalio.Extensions.Fakedotnet").mkdir(parents=True)
     (plugin / "nuget.config").write_text(config)
-    (plugin / "src" / "Temporalio.Fakedotnet" / "packages.lock.json").write_text(dotnet_lock(packages))
+    (plugin / "src" / "Temporalio.Extensions.Fakedotnet" / "packages.lock.json").write_text(dotnet_lock(packages))
     return plugin
 
 
@@ -137,10 +137,10 @@ def test_gzip_registration_leaves_are_decoded(tmp_path: Path, monkeypatch: pytes
 
 def test_project_references_and_duplicate_versions_are_fetched_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     plugin = plugin_with_lock(tmp_path, {"xunit.v3": "4.0.3"})
-    tests = plugin / "tests" / "Temporalio.Fakedotnet.Tests"
+    tests = plugin / "tests" / "Temporalio.Extensions.Fakedotnet.Tests"
     tests.mkdir(parents=True)
     lock = json.loads(dotnet_lock({"xunit.v3": "4.0.3"}))
-    lock["dependencies"]["net10.0"]["Temporalio.Fakedotnet"] = {"type": "Project"}
+    lock["dependencies"]["net10.0"]["Temporalio.Extensions.Fakedotnet"] = {"type": "Project"}
     (tests / "packages.lock.json").write_text(json.dumps(lock))
     calls = []
     real = check_dotnet_deps.registration_leaf
@@ -173,7 +173,7 @@ def test_cli_exit_codes_and_summary(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "cooldown 336 hours; exempt ['temporalio', 'temporalio.*']; 2 locked versions" in out
     assert "OK: Temporalio 1.22.0 is listed and exempt from the cooldown" in out
     assert out.rstrip().endswith("OK: every locked version is listed and older than the cooldown")
-    (plugin / "src" / "Temporalio.Fakedotnet" / "packages.lock.json").write_text(dotnet_lock({"xunit.v3": "4.0.3", "Fresh": "1.0.0"}))
+    (plugin / "src" / "Temporalio.Extensions.Fakedotnet" / "packages.lock.json").write_text(dotnet_lock({"xunit.v3": "4.0.3", "Fresh": "1.0.0"}))
     leaves = registry(tmp_path, {("Fresh", "1.0.0"): {"listed": True, "published": published(2)}})
     assert check_dotnet_deps.main(["--plugin-dir", str(plugin), "--registry-dir", str(leaves)]) == 1
     out = capsys.readouterr().out

@@ -13,7 +13,7 @@ cadence.
 
 | Plugin | Package |
 |---|---|
-| [`dotnet/microsoft-agent-framework`](dotnet/microsoft-agent-framework) | [![NuGet](https://img.shields.io/nuget/vpre/Temporalio.MicrosoftAgentFramework.svg)](https://www.nuget.org/packages/Temporalio.MicrosoftAgentFramework) (Pre-release) |
+| [`dotnet/microsoft-agent-framework`](dotnet/microsoft-agent-framework) | [![NuGet](https://img.shields.io/nuget/vpre/Temporalio.Extensions.MicrosoftAgentFramework.svg)](https://www.nuget.org/packages/Temporalio.Extensions.MicrosoftAgentFramework) (Pre-release) |
 | [`go/googleadk`](go/googleadk) | [![Go Reference](https://pkg.go.dev/badge/go.temporal.io/googleadk.svg)](https://pkg.go.dev/go.temporal.io/googleadk) (Public Preview) |
 | [`java/google-adk`](java/google-adk) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/google-adk.svg)](https://central.sonatype.com/artifact/io.temporal/google-adk) (Public Preview) |
 | [`java/spring-ai`](java/spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/spring-ai) (Public Preview) |
