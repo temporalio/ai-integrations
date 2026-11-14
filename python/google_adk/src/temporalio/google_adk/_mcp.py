@@ -99,6 +99,39 @@ class _CallToolArguments:
     tool_context: TemporalToolContext
 
 
+def _type_name(value: object) -> str:
+    kind = type(value)
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _check_toolset_factory(name: str, toolset_factory: object) -> None:
+    # Fail when the Worker is built, not in every MCP Activity.
+    if not callable(toolset_factory):
+        raise TypeError(
+            f"MCP toolset factory {name!r} is {_type_name(toolset_factory)}, "
+            "not callable"
+        )
+
+
+async def _validate_toolset(name: str, toolset: McpToolset) -> McpToolset:
+    if callable(getattr(toolset, "get_tools", None)) and callable(
+        getattr(toolset, "close", None)
+    ):
+        return toolset
+    if callable(getattr(toolset, "close", None)):
+        try:
+            await toolset.close()
+        except Exception:
+            # Cleanup must not hide the invalid factory result.
+            pass
+    raise ApplicationError(
+        f"MCP toolset factory {name!r} returned {_type_name(toolset)}, not a "
+        "toolset with callable get_tools() and close() methods",
+        type="MCPToolsetFactoryTypeError",
+        non_retryable=True,
+    )
+
+
 class TemporalMcpToolSetProvider:
     """Provider for creating Temporal-aware MCP toolsets.
 
@@ -132,6 +165,7 @@ class TemporalMcpToolSetProvider:
                 shared between workflow runs.
         """
         super().__init__()
+        _check_toolset_factory(name, toolset_factory)
         self._name = name
         self._toolset_factory = toolset_factory
 
@@ -143,7 +177,9 @@ class TemporalMcpToolSetProvider:
             # Build a fresh toolset per call, honoring this call's
             # ``factory_argument``, and always close it so no MCP session
             # (or stdio subprocess) leaks. See issue #1663.
-            toolset = self._toolset_factory(args.factory_argument)
+            toolset = await _validate_toolset(
+                self._name, self._toolset_factory(args.factory_argument)
+            )
             try:
                 tools = await toolset.get_tools()
                 return [
@@ -163,7 +199,9 @@ class TemporalMcpToolSetProvider:
         async def call_tool(
             args: _CallToolArguments,
         ) -> _CallToolResult:
-            toolset = self._toolset_factory(args.factory_argument)
+            toolset = await _validate_toolset(
+                self._name, self._toolset_factory(args.factory_argument)
+            )
             try:
                 tools = await toolset.get_tools()
 
@@ -810,6 +848,7 @@ class TemporalStatefulMcpToolSetProvider:
                 shared between workflow runs.
         """
         super().__init__()
+        _check_toolset_factory(name, toolset_factory)
         self._name = name + "-stateful"
         self._toolset_factory = toolset_factory
         self._toolsets: dict[str, _RunningToolset] = {}
@@ -898,7 +937,10 @@ class TemporalStatefulMcpToolSetProvider:
                 # read-back. Check again, and register before the next await.
                 if server_id in self._toolsets:
                     raise _already_running_failure()
-                toolset = self._toolset_factory(args.factory_argument if args else None)
+                toolset = await _validate_toolset(
+                    self._name,
+                    self._toolset_factory(args.factory_argument if args else None),
+                )
                 running = _RunningToolset(
                     toolset,
                     heartbeats,

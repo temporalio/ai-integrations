@@ -22,14 +22,17 @@ for the connection-leak fix (issue #1663): every call builds its own toolset,
 honors that call's ``factory_argument``, and always closes the toolset.
 """
 
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from google.adk.events import EventActions
 from google.adk.tools.mcp_tool import McpToolset
 
+from temporalio.exceptions import ApplicationError
 from temporalio.google_adk._mcp import (
     TemporalMcpToolSetProvider,
+    TemporalStatefulMcpToolSetProvider,
     TemporalToolContext,
     _CallToolArguments,
     _GetToolsArguments,
@@ -103,6 +106,51 @@ def _call_tool_args(factory_argument: Any = None) -> _CallToolArguments:
         arguments={"x": 1},
         tool_context=_tool_context(),
     )
+
+
+@pytest.mark.parametrize("operation", ["list", "call"])
+async def test_invalid_factory_result_is_non_retryable(operation: str) -> None:
+    closed: list[bool] = []
+
+    async def close() -> None:
+        closed.append(True)
+        raise RuntimeError("close failed")
+
+    invalid_results = [
+        (None, "builtins.NoneType"),
+        (object(), "builtins.object"),
+        (SimpleNamespace(get_tools=1), "types.SimpleNamespace"),
+        (SimpleNamespace(get_tools=_FakeToolset().get_tools), "types.SimpleNamespace"),
+        (SimpleNamespace(close=close), "types.SimpleNamespace"),
+    ]
+    for result, kind in invalid_results:
+        # Passed in place of the factory, the value fails when the Worker is built.
+        for provider_type in (
+            TemporalMcpToolSetProvider,
+            TemporalStatefulMcpToolSetProvider,
+        ):
+            with pytest.raises(TypeError) as type_err:
+                provider_type("invalid", cast(Any, result))
+            assert str(type_err.value) == (
+                f"MCP toolset factory 'invalid' is {kind}, not callable"
+            )
+
+        provider = TemporalMcpToolSetProvider(
+            "invalid", lambda _: cast(McpToolset, result)
+        )
+        get_tools, call_tool = provider._get_activities()
+        with pytest.raises(ApplicationError) as err:
+            if operation == "list":
+                await get_tools(_GetToolsArguments(factory_argument=None))
+            else:
+                await call_tool(_call_tool_args())
+        assert err.value.type == "MCPToolsetFactoryTypeError"
+        assert err.value.non_retryable
+        assert err.value.message == (
+            f"MCP toolset factory 'invalid' returned {kind}, not a toolset with "
+            "callable get_tools() and close() methods"
+        )
+    assert closed == [True]
 
 
 async def test_call_tool_creates_and_closes_fresh_toolset_each_call():
