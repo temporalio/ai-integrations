@@ -17,7 +17,6 @@ import pytest
 from temporalio.client import Client
 from temporalio.microsoft_agent_framework import MicrosoftAgentFrameworkPlugin
 from temporalio.microsoft_agent_framework.testing import fake_chat_client
-from temporalio.worker import Worker
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 
@@ -146,11 +145,12 @@ async def test_quickstart_runs(
         # instead, and the worker's plugin gets the fake client in place of
         # OpenAI. Everything else is theirs, the task queue and the workflow id
         # included: a mismatch between the two files leaves the run waiting.
-        config = client.config()
 
         async def connect(target_host: str, *, plugins: Any = (), **_: Any) -> Client:
             assert target_host == "localhost:7233"
-            return Client(**{**config, "plugins": list(plugins)})
+            config = client.config()
+            config["plugins"] = list(plugins)
+            return Client(**config)
 
         monkeypatch.setattr(Client, "connect", connect)
         monkeypatch.setattr(

@@ -242,9 +242,9 @@ async def main(argv: list[str] | None = None) -> int:
         dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION
     )
     try:
-        for path, record in targets.items():
+        for path, recorder in targets.items():
             history = await asyncio.wait_for(
-                record(env.client), timeout=timedelta(minutes=2).total_seconds()
+                recorder(env.client), timeout=timedelta(minutes=2).total_seconds()
             )
             existed = path.exists()
             path.write_text(
