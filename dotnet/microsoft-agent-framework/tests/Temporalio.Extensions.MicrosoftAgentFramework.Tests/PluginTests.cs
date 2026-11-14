@@ -173,8 +173,11 @@ public class PluginTests : WorkflowTestBase
         Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ConfigurationError, error.ErrorType);
         Assert.True(error.NonRetryable);
         Assert.Contains("System.Object(String)", error.Message, StringComparison.Ordinal);
-        Assert.Contains("tested with 1.26.0", error.Message, StringComparison.Ordinal);
-        Assert.Contains("Microsoft.Agents.AI 1.26.0 does not have", error.Message, StringComparison.Ordinal);
+
+        // The message names the installed version, which the newest-dependency lane moves past the tested one.
+        var installed = typeof(Microsoft.Agents.AI.AIAgent).Assembly.GetName().Version!.ToString(3);
+        Assert.Contains($"Microsoft.Agents.AI {installed} does not have", error.Message, StringComparison.Ordinal);
+        Assert.Contains($"tested with {Internal.AgentFrameworkApiGuard.TestedVersion}", error.Message, StringComparison.Ordinal);
     }
 
     private TemporalClient ClientWithPlugin(MicrosoftAgentFrameworkPlugin plugin) => new(
