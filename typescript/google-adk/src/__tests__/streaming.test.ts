@@ -227,25 +227,46 @@ test.serial('streamDisposeFailureIsClassified', async (t) => {
   }
 });
 
+/** A model that waits 100 ms, long enough for a heartbeat timer to fire, then yields `chunks`. */
+class SlowStreamingLlm extends BaseLlm {
+  override async *generateContentAsync(
+    _llmRequest: LlmRequest,
+    _stream?: boolean,
+    _abortSignal?: AbortSignal
+  ): AsyncGenerator<LlmResponse, void> {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    yield* chunks;
+  }
+
+  override async connect(_llmRequest: LlmRequest): Promise<BaseLlmConnection> {
+    throw new Error('SlowStreamingLlm does not connect.');
+  }
+}
+
 // Unit test (MockActivityEnvironment): the model Activities heartbeat only on their
 // timer, the first time half the heartbeat timeout into the call. A streamed call
-// shorter than that sends no heartbeat, however many chunks it has.
-test.serial('shortStreamedCallSendsNoHeartbeat', async (t) => {
+// shorter than that sends no heartbeat, however many chunks it has, and a
+// `heartbeatTimeout` of 0 starts no timer.
+test.serial('streamedCallHeartbeatsOnlyOnTimer', async (t) => {
   const original = WorkflowStreamClient.fromWithinActivity;
   WorkflowStreamClient.fromWithinActivity = (() => ({
     topic: () => ({ publish: () => {} }),
     [Symbol.asyncDispose]: async () => {},
   })) as unknown as typeof WorkflowStreamClient.fromWithinActivity;
   try {
-    const mockEnv = new MockActivityEnvironment({ heartbeatTimeoutMs: 10_000 });
-    let heartbeats = 0;
-    mockEnv.on('heartbeat', () => heartbeats++);
-    const responses: LlmResponse[] = await mockEnv.run(
-      createModelActivities({ modelProvider: fakeModelProvider(chunks) })['adk-invokeModelStreaming'],
-      { model: 'fake-model', request: {} as never, streamingTopic: 'adk-test-stream' }
-    );
-    t.is(responses.length, 3);
-    t.is(heartbeats, 0);
+    const activities = createModelActivities({ modelProvider: (model) => new SlowStreamingLlm({ model }) });
+    for (const heartbeatTimeoutMs of [10_000, 0]) {
+      const mockEnv = new MockActivityEnvironment({ heartbeatTimeoutMs });
+      let heartbeats = 0;
+      mockEnv.on('heartbeat', () => heartbeats++);
+      const responses: LlmResponse[] = await mockEnv.run(activities['adk-invokeModelStreaming'], {
+        model: 'slow-streaming-model',
+        request: {} as never,
+        streamingTopic: 'adk-test-stream',
+      });
+      t.is(responses.length, 3, `heartbeatTimeoutMs ${heartbeatTimeoutMs}`);
+      t.is(heartbeats, 0, `heartbeatTimeoutMs ${heartbeatTimeoutMs}`);
+    }
   } finally {
     WorkflowStreamClient.fromWithinActivity = original;
   }
