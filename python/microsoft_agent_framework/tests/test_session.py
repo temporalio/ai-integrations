@@ -47,6 +47,7 @@ from tests.helpers.microsoft_agent_framework import (
     INVOKE_MODEL,
     SlowFakeChatClient,
     count_scheduled_activities,
+    count_signals,
     new_worker,
     role_of,
     scheduled_activity_events,
@@ -239,6 +240,11 @@ async def test_continue_as_new_carries_pending_prompts(client: Client) -> None:
     first_run = client.get_workflow_handle(handle.id, run_id=handle.result_run_id)
     status = (await first_run.describe()).status
     assert status == WorkflowExecutionStatus.CONTINUED_AS_NEW
+    # All three Signals landed in the first run, so the second prompt and the
+    # end_chat reached the new run through ChatInput, not as Signals of their
+    # own; the replies alone would look the same either way.
+    assert await count_signals(first_run) == 3
+    assert await count_signals(handle) == 0
     assert result["replies"] == ["Second reply."]
     assert result["messages"] == 4
 
