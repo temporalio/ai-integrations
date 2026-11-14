@@ -236,7 +236,8 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   The test project targets `net<major>.<minor>` for every listed runtime. The matrix runs the oldest
   runtime on Ubuntu and the newest on Ubuntu (the dist cell), macOS and Windows; every cell installs
   the `global.json` SDK plus its runtime, fails if `dotnet --version` leaves the SDK channel, and
-  runs `make test TEST_FRAMEWORK=net<runtime>`.
+  runs `make test TEST_FRAMEWORK=net<runtime>`. A plain `make test` runs every listed runtime, so a
+  machine needs their runtimes installed next to the SDK.
 
 ## CI
 

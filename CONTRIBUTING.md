@@ -8,7 +8,8 @@ workflow.
 - Python plugins: install [uv](https://docs.astral.sh/uv/) and GNU make (`brew install make` on
   macOS if needed; `choco install make` on Windows, or use WSL).
 - `cd python/<plugin> && make sync && make lint && make test`.
-- .NET plugins: install the .NET 10 SDK and GNU make; `cd dotnet/<plugin> && make sync && make lint && make test`.
+- .NET plugins: install the .NET 10 SDK, the .NET 8 runtime (the suite runs on both) and GNU make;
+  `cd dotnet/<plugin> && make sync && make lint && make test`.
 
 ## Pull requests
 
