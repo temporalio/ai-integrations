@@ -1,8 +1,9 @@
 """Recorded histories replay through a ``Replayer`` configured with the plugin.
 
 The histories under ``tests/histories`` were recorded by ``tests/record_histories.py``
-from the same workflows the suite runs. Re-record them when one of those
-workflows changes on purpose.
+from the same workflows the suite runs. A recording made before a release
+stays as it is; a change that needs a new one adds a file next to it
+(``tests/histories/README.md``), and every file in the directory replays here.
 """
 
 from __future__ import annotations
@@ -24,18 +25,10 @@ HISTORIES = Path(__file__).with_name("histories")
 WORKFLOWS = [ToolLoopWorkflow, ApprovalWorkflow, StreamingWorkflow, MCPWorkflow]
 
 
+# Every file in the directory, so a recording added for an older shape (see
+# tests/histories/README.md) keeps replaying without being listed here.
 @pytest.mark.parametrize(
-    "file_name",
-    [
-        "tool_loop.json",
-        "approval.json",
-        "streaming.json",
-        # Recorded when the streaming Activity returned one entry per provider
-        # update, including the provider layer's duplicate of each call and
-        # one entry per text chunk. The workflow code must keep replaying it.
-        "streaming_unmerged_record.json",
-        "mcp.json",
-    ],
+    "file_name", sorted(path.name for path in HISTORIES.glob("*.json"))
 )
 async def test_replay_recorded_histories(file_name: str) -> None:
     history = (HISTORIES / file_name).read_text(encoding="utf-8")

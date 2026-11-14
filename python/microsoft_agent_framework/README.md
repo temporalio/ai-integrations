@@ -507,4 +507,4 @@ make lint
 make test
 ```
 
-`tests/test_replay.py` replays the histories under `tests/histories`. After changing one of the recorded workflows, record them again with `UV_NO_EDITABLE=1 uv run --locked python -m tests.record_histories`.
+`tests/test_replay.py` replays every history under `tests/histories`. A recording made before a release stays as it is: a change that needs a new one adds a file next to the old ones (`UV_NO_EDITABLE=1 uv run --locked python -m tests.record_histories --suffix <name>`), and `record_histories.py` refuses to overwrite an existing file unless `--overwrite "<reason>"` is given. `tests/histories/README.md` has the policy.

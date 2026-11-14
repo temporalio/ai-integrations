@@ -6,14 +6,20 @@ Run from ``python/microsoft_agent_framework`` with the same environment ``make t
 
 Each recorder runs one of the suite's workflows against a local dev server
 with scripted chat clients and an in-process MCP server, then writes
-``handle.fetch_history()`` as JSON under ``tests/histories``.
+``handle.fetch_history()`` as JSON under ``tests/histories``. A file that
+exists is not replaced: a recording made before a release stays as it is
+(``tests/histories/README.md``). ``--suffix NAME`` writes ``<scenario>-NAME.json``
+next to the old files for a new shape; ``--overwrite "<reason>"`` replaces
+existing files and prints the reason next to each.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
+import sys
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -184,26 +190,71 @@ RECORDERS = {
 }
 
 
-async def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse ``--suffix`` and ``--overwrite REASON``."""
+    parser = argparse.ArgumentParser(
+        description="Record the histories that tests/test_replay.py replays."
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help="write <scenario>-SUFFIX.json next to the existing files, for a new shape",
+    )
+    parser.add_argument(
+        "--overwrite",
+        metavar="REASON",
+        default=None,
+        help="replace files that exist and print REASON next to each; without it "
+        "an existing file is refused",
+    )
+    return parser.parse_args(argv)
+
+
+def target_path(file_name: str, suffix: str) -> Path:
+    """Return where a scenario's recording goes, with the suffix before the extension."""
+    stem, _, extension = file_name.rpartition(".")
+    return HISTORIES / (f"{stem}-{suffix}.{extension}" if suffix else file_name)
+
+
+async def main(argv: list[str] | None = None) -> int:
+    """Record the scenarios; return 1 when an existing file was refused."""
+    args = parse_args(argv)
     # Constructing the in-process MCP server installs a rich logging handler,
     # whose lazy imports inside the workflow sandbox trip the deadlock detector.
     logging.basicConfig(level=logging.WARNING, force=True)
+    HISTORIES.mkdir(exist_ok=True)
+    refused: list[Path] = []
+    targets: dict[Path, Callable[[Client], Awaitable[WorkflowHistory]]] = {}
+    for file_name, record in RECORDERS.items():
+        path = target_path(file_name, args.suffix)
+        if path.exists() and args.overwrite is None:
+            print(
+                f"refusing to overwrite {path}: a recording made before a release "
+                "stays as it is (tests/histories/README.md); pass --suffix for a new "
+                'file next to it, or --overwrite "<reason>" to replace it'
+            )
+            refused.append(path)
+            continue
+        targets[path] = record
+    if not targets:
+        return 1 if refused else 0
     env = await WorkflowEnvironment.start_local(
         dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION
     )
     try:
-        HISTORIES.mkdir(exist_ok=True)
-        for file_name, record in RECORDERS.items():
+        for path, record in targets.items():
             history = await asyncio.wait_for(
                 record(env.client), timeout=timedelta(minutes=2).total_seconds()
             )
-            (HISTORIES / file_name).write_text(
+            existed = path.exists()
+            path.write_text(
                 json.dumps(json.loads(history.to_json()), indent=2), encoding="utf-8"
             )
-            print(f"wrote {HISTORIES / file_name}")
+            print(f"overwrote {path}: {args.overwrite}" if existed else f"wrote {path}")
     finally:
         await env.shutdown()
+    return 1 if refused else 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
