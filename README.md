@@ -22,7 +22,7 @@ cadence.
 | [`python/google_adk`](python/google_adk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-adk.svg)](https://pypi.org/project/temporalio-google-adk/) (Pre-release) |
 | [`python/google_genai`](python/google_genai) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-genai.svg)](https://pypi.org/project/temporalio-google-genai/) |
 | [`python/langgraph`](python/langgraph) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langgraph.svg)](https://pypi.org/project/temporalio-langgraph/) (Public Preview) |
-| [`python/langsmith`](python/langsmith) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langsmith.svg)](https://pypi.org/project/temporalio-langsmith/) (Public Preview) |
+| [`python/langsmith`](python/langsmith) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langsmith.svg)](https://pypi.org/project/temporalio-langsmith/) |
 | [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Public Preview) |
 | [`python/microsoft_agent_framework`](python/microsoft_agent_framework) | [![PyPI](https://img.shields.io/pypi/v/temporalio-microsoft-agent-framework.svg)](https://pypi.org/project/temporalio-microsoft-agent-framework/) (Pre-release) |
 | [`python/openai_codex`](python/openai_codex) | [![PyPI](https://img.shields.io/pypi/v/temporalio-openai-codex.svg)](https://pypi.org/project/temporalio-openai-codex/) (Pre-release) |
@@ -30,7 +30,7 @@ cadence.
 | [`python/strands_agents`](python/strands_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-strands-agents.svg)](https://pypi.org/project/temporalio-strands-agents/) (Public Preview) |
 | [`python/typesafe`](python/typesafe) | [![PyPI](https://img.shields.io/pypi/v/temporalio-typesafe.svg)](https://pypi.org/project/temporalio-typesafe/) (Pre-release) |
 | [`typescript/google-adk`](typescript/google-adk) | [![npm](https://img.shields.io/npm/v/@temporalio/google-adk.svg)](https://www.npmjs.com/package/@temporalio/google-adk) (Public Preview) |
-| [`typescript/langsmith`](typescript/langsmith) | [![npm](https://img.shields.io/npm/v/@temporalio/langsmith.svg)](https://www.npmjs.com/package/@temporalio/langsmith) (Public Preview) |
+| [`typescript/langsmith`](typescript/langsmith) | [![npm](https://img.shields.io/npm/v/@temporalio/langsmith.svg)](https://www.npmjs.com/package/@temporalio/langsmith) |
 | [`typescript/openai-agents`](typescript/openai-agents) | [![npm](https://img.shields.io/npm/v/@temporalio/openai-agents.svg)](https://www.npmjs.com/package/@temporalio/openai-agents) |
 | [`typescript/strands-agents`](typescript/strands-agents) | [![npm](https://img.shields.io/npm/v/@temporalio/strands-agents.svg)](https://www.npmjs.com/package/@temporalio/strands-agents) (Pre-release) |
 | [`typescript/vercel-ai-sdk`](typescript/vercel-ai-sdk) | [![npm](https://img.shields.io/npm/v/@temporalio/vercel-ai-sdk.svg)](https://www.npmjs.com/package/@temporalio/vercel-ai-sdk) |
