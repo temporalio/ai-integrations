@@ -113,6 +113,25 @@ heartbeat. Set `heartbeatTimeout: 0` to turn heartbeats off. Then a lost Worker
 is noticed only at `startToCloseTimeout`, and a cancellation request does not
 reach the Activity.
 
+Version 1.0.0 schedules these Activities with no `heartbeatTimeout`. Its
+`invokeModel` and `invokeEmbeddingModel` never heartbeat, and its
+`invokeModelStreaming` heartbeats only when a stream part arrives. The timeout
+is recorded when a Workflow schedules the Activity. So while Workers of both
+versions run, a call that a Workflow on this version schedules and a 1.0.0
+Worker runs fails with a heartbeat timeout after 10 seconds without a
+heartbeat, and so does each retry. Rolling back doesn't remove the timeout from
+calls scheduled before.
+
+- To upgrade, put this version on every Worker that runs the model Activities
+  before any Worker that runs Workflows. If the same Workers run both, first
+  deploy this version with `heartbeatTimeout: 0`, for example
+  `new TemporalProvider({ default: { heartbeatTimeout: 0 } })`, and remove it in
+  a later deploy.
+- To roll back, first deploy this version with `heartbeatTimeout: 0`, wait
+  until the calls scheduled before that deploy finish, and then roll back.
+- Runs pinned with Worker Versioning avoid both cases when their model
+  Activities use the Workflow's task queue.
+
 When `invokeModelStreaming` is retried, the new attempt publishes all of its
 stream parts to the topic again, after the parts the failed attempt published.
 A subscriber that wants only the last attempt can discard what it has when a
