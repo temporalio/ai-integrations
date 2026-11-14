@@ -115,7 +115,7 @@ DOTNET_POLICY_PROPERTIES = {
     "GenerateDocumentationFile": "true", "IncludeSymbols": "true", "PublishRepositoryUrl": "true",
     "EnableNETAnalyzers": "true", "RunAnalyzers": "true", "AnalysisMode": "allenabledbydefault", "AnalysisLevel": DOTNET_ANALYSIS_LEVEL,
     "CodeAnalysisTreatWarningsAsErrors": "true", "MSBuildTreatWarningsAsErrors": "true", "NuGetAudit": "true",
-    "DiscoverGlobalAnalyzerConfigFiles": "false",
+    "DiscoverGlobalAnalyzerConfigFiles": "false", "EnablePackageValidation": "true",
 }
 # Workflow code must stay on the Workflow scheduler; dotnet/_shared/analyzers.globalconfig turns CA2007 off for that.
 # The call form only: a comment or a message that names ConfigureAwait(false) is not an await.

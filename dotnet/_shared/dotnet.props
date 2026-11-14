@@ -24,6 +24,10 @@
     <!-- The two globalconfigs below are listed explicitly; a .globalconfig dropped anywhere in a plugin
          tree would otherwise be discovered by the compiler and change analyzer severities. -->
     <DiscoverGlobalAnalyzerConfigFiles>false</DiscoverGlobalAnalyzerConfigFiles>
+    <!-- Package validation runs on pack: the package must be consumable on every framework it targets, and once
+         a plugin sets PackageValidationBaselineVersion to its first published version (release runbook), its
+         public API is compared with that baseline so a breaking change fails the build instead of shipping. -->
+    <EnablePackageValidation>true</EnablePackageValidation>
     <IsPackable>false</IsPackable>
     <Authors>Temporal</Authors>
     <Company>Temporal Technologies Inc.</Company>

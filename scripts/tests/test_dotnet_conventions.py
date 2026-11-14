@@ -206,6 +206,8 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
         "Directory.Build.props: Import of 'extra.props' adds build settings outside dotnet/_shared"),
     "run-analyzers-off": (lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>", "<IsPackable>true</IsPackable><RunAnalyzers>false</RunAnalyzers>"),
                           "RunAnalyzers must stay true"),
+    "package-validation-off": (lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>", "<IsPackable>true</IsPackable><EnablePackageValidation>false</EnablePackageValidation>"),
+                               "EnablePackageValidation must stay true"),
     "nuget-audit-off": (lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>", "<IsPackable>true</IsPackable><NuGetAudit>false</NuGetAudit>"),
                         "NuGetAudit must stay true"),
     "restore-locked-mode-off": (
