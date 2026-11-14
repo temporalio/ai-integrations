@@ -14,7 +14,22 @@ from agents.mcp import MCPServer
 from agents.mcp.server import RequireApprovalSetting
 from mcp import GetPromptResult, ListPromptsResult  # type:ignore
 from mcp import Tool as MCPTool  # type:ignore
-from mcp.types import CallToolResult  # type:ignore
+from mcp.types import (  # type:ignore
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+    CallToolResult,
+)
+
+try:
+    from mcp import (  # type: ignore[attr-defined]  # mcp>=2
+        MCPError as McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
+except ImportError:  # mcp<2
+    from mcp.shared.exceptions import (  # type: ignore[attr-defined,assignment,no-redef]
+        McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1.workflow_pb2 import (
@@ -175,6 +190,30 @@ class _StatelessMCPServerReference(MCPServer):  # type:ignore[reportUnusedClass]
         )
 
 
+# JSON-RPC errors that a retry of the same request cannot fix. INTERNAL_ERROR,
+# timeouts and unknown codes stay retryable. Each stateless activity opens a new
+# connection, so a lost session is retried on a fresh one and needs no exception.
+_NON_RETRYABLE_PROTOCOL_ERRORS = frozenset(
+    {PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS}
+)
+
+
+def _protocol_error(err: McpError) -> ApplicationError:
+    """Convert an MCP protocol error to an ``ApplicationError``.
+
+    Errors a retry cannot fix (invalid request/params, unknown method, parse
+    error) are non-retryable so the activity does not keep retrying them.
+    """
+    error = err.error
+    details = (error.code,) if error.data is None else (error.code, error.data)
+    return ApplicationError(
+        error.message,
+        *details,
+        type="MCPProtocolError",
+        non_retryable=error.code in _NON_RETRYABLE_PROTOCOL_ERRORS,
+    )
+
+
 class StatelessMCPServerProvider:
     """A stateless MCP server implementation for Temporal workflows.
 
@@ -261,6 +300,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.list_tools()
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
@@ -270,6 +311,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.call_tool(args.tool_name, args.arguments, args.meta)
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
@@ -281,6 +324,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.list_prompts()
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
@@ -290,6 +335,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.get_prompt(args.name, args.arguments)
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
