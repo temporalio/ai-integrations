@@ -251,7 +251,9 @@ class Runner:
             file = m.group("file") or m.group("origin") or ""
             line = int(m.group("line") or 0)
             col = int(m.group("col") or 0)
-            proj = m.group("proj") or ""
+            # A multi-targeted project reports once per framework as "X.csproj::TargetFramework=net8.0";
+            # a site is counted once, so the framework suffix is dropped from the key.
+            proj = (m.group("proj") or "").split("::", 1)[0]
             rel = _relpath(file, plugin_dir)
             key = (rel, line, col, m.group("id"), Path(proj).stem if proj else "")
             if key in seen:

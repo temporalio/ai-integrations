@@ -1,10 +1,11 @@
 # Project-wide analyzer severities for every project under dotnet/, listed as EditorConfigFiles in
 # dotnet.props (.globalconfig discovery is off). A path-scoped rule, should a plugin ever need one,
 # goes in the plugin's .editorconfig, which is kept byte-identical to dotnet/_template/.editorconfig.
-# Every entry here is one whose removal fails the Release build (warnings are errors) or `make lint`
-# on the current tree, measured by removing each entry on its own and rebuilding
-# (maf-work/notes/analyzer-narrowing.md); a suppression whose rule never fired was dropped. Keep in
-# order by rule id.
+# Every entry here either fails the Release build (warnings are errors) or `make lint` when removed,
+# measured by removing each entry on its own and rebuilding (`scripts/dev/narrow_dotnet_analyzers.py
+# measure`, temporalio/ai-integrations#523), or is a gate whose comment states the probe that shows
+# it live; a suppression whose rule never fired was dropped. Counts are unique source sites with the
+# test project counted once. Keep in order by rule id.
 is_global = true
 
 # Exceptions carry only the constructors they need: removal fires CA1032 on
@@ -26,10 +27,10 @@ dotnet_diagnostic.CA2007.severity = none
 # (its default is hidden). No effect on the current tree; kept as the only check for unused usings.
 dotnet_diagnostic.IDE0005.severity = warning
 
-# Members are not qualified with `this.`: removal fires SA1101 on 574 sites (306 src, 268 tests).
+# Members are not qualified with `this.`: removal fires SA1101 on 575 sites (306 src, 269 tests).
 dotnet_diagnostic.SA1101.severity = none
 
-# Using directives sit above the namespace: removal fires SA1200 on 288 sites (112 src, 176 tests).
+# Using directives sit above the namespace: removal fires SA1200 on 289 sites (112 src, 177 tests).
 dotnet_diagnostic.SA1200.severity = none
 
 # No file headers: removal fires SA1633 on every file, 108 sites (36 src, 72 tests).

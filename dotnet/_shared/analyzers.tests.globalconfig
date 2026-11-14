@@ -1,8 +1,9 @@
 # Additional severities for *.Tests projects, listed after analyzers.globalconfig (which applies to
 # them as well; global_level = 1 makes this file win should the two ever set the same key). Every
-# entry here is one whose removal fails the Release build (warnings are errors) or `make lint` on the
-# current tree, measured by removing each entry on its own (maf-work/notes/analyzer-narrowing.md);
-# a suppression whose rule never fired was dropped. Keep in order by rule id.
+# entry here fails the Release build (warnings are errors) or `make lint` when removed, measured by
+# removing each entry on its own and rebuilding (`scripts/dev/narrow_dotnet_analyzers.py measure`,
+# temporalio/ai-integrations#523); a suppression whose rule never fired was dropped. Counts are
+# unique source sites with the test project counted once. Keep in order by rule id.
 is_global = true
 global_level = 1
 
