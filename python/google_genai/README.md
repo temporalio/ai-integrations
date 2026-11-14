@@ -259,52 +259,35 @@ raises `GoogleGenAIError`. Tune flush cadence with
 
 ## Heartbeats
 
-The Gemini activities (all but `activity_as_tool` and MCP) heartbeat on a timer
-at half their `heartbeat_timeout`, which defaults to 10 seconds, also in an
-`activity_config` that leaves it out. So a cancel reaches a running call, and a
-lost worker is noticed, within about 10 seconds. Streams heartbeat on the same
-timer, not per chunk. In Temporal Cloud each heartbeat that reaches the service
-is an Action: with the default, at most one every 8 seconds of a running call,
-and none for a call shorter than 5 seconds. A cancelled call can send one more
-as it stops. Set `heartbeat_timeout` to `None` or `timedelta(0)` in
+The Gemini activities, except `activity_as_tool` and MCP, heartbeat every half
+`heartbeat_timeout`, which defaults to 10 seconds, even in an `activity_config`
+that leaves it out. So a cancel or a lost worker is noticed within about 10
+seconds. In Temporal Cloud each heartbeat that reaches the service is an Action:
+with the default, at most one every 8 seconds, and none for calls under 5
+seconds. Set `heartbeat_timeout` to `None` or `timedelta(0)` in
 `activity_config` to turn heartbeats off.
 
-Temporal caps `heartbeat_timeout` at the activity's `start_to_close_timeout`,
-and the timer uses that capped value. A start-to-close timeout under 10 seconds,
-including one you set per call with `http_options.timeout` or the Interactions
-and Agents `timeout` argument, makes heartbeats come sooner: with a 2-second
-timeout, the timer beats every second, so a 1.7-second call sends one.
+Temporal caps `heartbeat_timeout` at `start_to_close_timeout`, including one set
+per call with `http_options.timeout`, so a shorter one makes beats come sooner.
 
 The timer runs on the worker's event loop, so a call that blocks the loop for
-longer than the timeout fails with a heartbeat timeout. One case comes from
-google-genai itself: on Vertex AI, `interactions` and `agents` calls refresh
-expired credentials synchronously, on the event loop (model, files and file
-search store calls refresh on a thread). That happens when the worker's
-`genai.Client` has no token yet, and again when the token expires, about once an
-hour. A refresh that takes longer than the heartbeat timeout fails that attempt,
-and Temporal retries it.
-If your credential refresh can be that slow, set a longer `heartbeat_timeout`,
-or `None`, in `activity_config`.
+longer than the timeout fails that attempt. On Vertex AI, `interactions` and
+`agents` calls refresh credentials on the loop: on the first call, then about
+once an hour. If that can be slow, set a longer `heartbeat_timeout`, or `None`.
 
-**Breaking change when you upgrade or roll back:** earlier versions of this
-plugin schedule these activities with no `heartbeat_timeout`, and only the
-interaction streams heartbeat, once per event. So while workers of both
-versions run, a call that a workflow on this version schedules and a worker on
-an earlier version runs fails with a heartbeat timeout once it runs for 10
-seconds without a heartbeat, and each retry can fail the same way. The timeout
-is recorded when the activity is scheduled, and retries keep it, so rolling back
-doesn't remove it from calls scheduled before.
+**Breaking change when you upgrade or roll back:** earlier versions don't
+heartbeat on a timer. While both versions run, a call that this version
+schedules and an older worker runs fails after 10 seconds without a heartbeat,
+and so does each retry.
 
-- To upgrade, put this version on every worker that runs the Gemini activities
-  before any workflow worker. If the same workers run both, deploy this version
-  with `heartbeat_timeout` set to `None` in `activity_config`, and remove that
-  setting in a later deploy.
-- To roll back, first deploy this version with `heartbeat_timeout` set to
-  `None`, wait until the calls scheduled before that deploy finish, and then
-  roll back.
-- Runs pinned with Worker Versioning avoid both cases when their Gemini
-  activities use the workflow's task queue, since those activities run on
-  workers of the same version.
+- To upgrade, deploy this version to the workers that run the Gemini activities
+  first. If the same workers run workflows too, deploy it with
+  `heartbeat_timeout=None` in `activity_config` and remove that in a later
+  deploy.
+- To roll back, first deploy with `heartbeat_timeout=None`, then wait for the
+  calls scheduled before that deploy to finish: they keep the 10-second timeout.
+- Runs pinned with Worker Versioning avoid both, when their Gemini activities
+  use the workflow's task queue.
 
 ## Retries & errors
 
