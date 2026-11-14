@@ -308,7 +308,8 @@ public class ChatModelActivityImpl implements ChatModelActivity {
             .map(
                 gen ->
                     new ChatModelTypes.ChatModelActivityOutput.Generation(
-                        fromAssistantMessage(gen.getOutput())))
+                        fromAssistantMessage(gen.getOutput()),
+                        gen.getMetadata() != null ? gen.getMetadata().getFinishReason() : null))
             .collect(Collectors.toList());
 
     ChatModelTypes.ChatModelActivityOutput.ChatResponseMetadata metadata = null;
