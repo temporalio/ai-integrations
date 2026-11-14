@@ -1,6 +1,7 @@
 import test from 'ava';
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
+import { TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from '..';
 import { TOOL_FILTER_UNSUPPORTED_TYPE } from '../common/mcp-types';
 import { StatelessMCPServerProvider, filterListedTools } from '../worker/mcp-provider';
 import { statelessMcpServer } from '../workflow/mcp-client';
@@ -23,6 +24,31 @@ function fakeServer(toolFilter: MCPServer['toolFilter'], onConnect = () => {}): 
     async invalidateToolsCache() {},
   };
 }
+
+test('StatelessMCPServerProvider rejects invalid factory results before connecting or closing', async (t) => {
+  let connects = 0;
+  let closes = 0;
+  const incompleteServer = {
+    ...fakeServer(undefined, () => connects++),
+    async close() {
+      closes++;
+    },
+    callTool: undefined,
+  };
+  for (const value of [undefined, null, 42, {}, Promise.resolve(fakeServer(undefined)), incompleteServer]) {
+    const activities = new StatelessMCPServerProvider('files', () => value as MCPServer)._getActivities();
+    for (const name of ['files-stateless-list-tools', 'files-stateless-call-tool']) {
+      const err = await t.throwsAsync(activities[name]!({ toolName: 'read', args: {} }), {
+        instanceOf: ApplicationFailure,
+      });
+      t.is(err?.type, 'MCPServerFactoryTypeError');
+      t.true(err?.nonRetryable);
+      t.regex(err!.message, /MCP server factory 'files'/);
+    }
+  }
+  t.is(connects, 0);
+  t.is(closes, 0);
+});
 
 test('filterListedTools applies a static filter with the agent SDK rules', (t) => {
   const tools = ['read', 'read_all', 'delete'].map((name) => ({ name }));
@@ -70,4 +96,40 @@ test('statelessMcpServer keeps cacheToolsList assignable and reports false with 
   t.false(filtered.cacheToolsList);
   filtered.cacheToolsList = true;
   t.false(filtered.cacheToolsList);
+});
+
+function serverWithResolver(onConnect: () => void): MCPServer {
+  return {
+    cacheToolsList: false,
+    name: 'tickets',
+    toolMetaResolver: () => ({ tenant: 'tenant-7' }),
+    async connect() {
+      onConnect();
+      throw new Error('connection refused');
+    },
+    async close() {},
+    async listTools() {
+      return [];
+    },
+    async callTool() {
+      return [];
+    },
+    async invalidateToolsCache() {},
+  };
+}
+
+test('StatelessMCPServerProvider refuses a toolMetaResolver without connecting', async (t) => {
+  let connects = 0;
+  const activities = new StatelessMCPServerProvider('tickets', () =>
+    serverWithResolver(() => connects++)
+  )._getActivities();
+
+  for (const name of ['tickets-stateless-list-tools', 'tickets-stateless-call-tool']) {
+    const err = await t.throwsAsync(activities[name]!({ toolName: 'echo', args: {} }), {
+      instanceOf: ApplicationFailure,
+    });
+    t.is(err?.type, TOOL_META_RESOLVER_UNSUPPORTED_TYPE);
+    t.true(err?.nonRetryable);
+  }
+  t.is(connects, 0);
 });

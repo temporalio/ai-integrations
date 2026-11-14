@@ -1,17 +1,23 @@
 import { setTracingDisabled, withTrace } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
+import { Worker } from '@temporalio/worker';
 import { helpers } from '@temporalio/test-helpers';
 import { OpenAIAgentsPlugin, OpenAIAgentsTraceClientInterceptor, SandboxClientProvider } from '..';
 import { installAgentSdkCollector } from './helpers/openai-agents-spans';
 import { makeTestFunction } from './helpers/test-fn';
-import { FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
+import { FakeModelProvider, handoffResponse, textResponse, toolCallResponse } from './stubs/openai-agents';
 import { FakeSandboxClient, FakeSandboxSession } from './stubs/sandbox-fakes';
 import {
+  customHandoffSandboxAgentWithoutConfigWorkflow,
+  customHandoffSandboxToolWorkflow,
   sandboxAgentWorkflow,
   sandboxApprovalResumeWorkflow,
   sandboxArchiveLimitsWorkflow,
+  sandboxClientChangedWorkflow,
   sandboxExecWorkflow,
   sandboxManifestResumeWorkflow,
+  sandboxNestedApprovalWorkflow,
+  sandboxNoModelWorkflow,
   sandboxValidationWorkflow,
 } from './workflows/openai-sandbox';
 
@@ -94,6 +100,7 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
         modelProvider: new FakeModelProvider([
           toolCallResponse('run_command', { cmd: 'echo hello' }),
           textResponse('Done.'),
+          toolCallResponse('run_command', { cmd: 'echo hello' }),
         ]),
         modelParams: { startToCloseTimeout: '30s' },
         sandboxClientProviders: [new SandboxClientProvider('fake', client)],
@@ -105,13 +112,87 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
   process.env[MANIFEST_SECRET_VAR] = MANIFEST_SECRET;
   try {
     await worker.runUntil(async () => {
-      t.is(await executeWorkflow(sandboxApprovalResumeWorkflow), 'Done.');
+      // The approved sandbox tool writes the caller's context object, not a copy rebuilt from JSON.
+      t.is(await executeWorkflow(sandboxApprovalResumeWorkflow), 'Done. writes=sandbox-tool');
+      // Restoring the state fails when the agents given don't have the paused one, and the run fails.
+      const err = await t.throwsAsync(
+        executeWorkflow(sandboxApprovalResumeWorkflow, { args: [true], workflowExecutionTimeout: '20 seconds' })
+      );
+      t.is((err as any)?.cause?.type, 'AgentsWorkflowError');
+      t.regex(String((err as any)?.cause?.message), /not found/);
     });
   } finally {
     delete process.env[MANIFEST_SECRET_VAR];
   }
 
   t.true(client.resumeCalls >= 1, 'the preserved session is re-established through resume()');
+});
+
+for (const [copied, parentName, rebuilt] of [
+  [false, 'sandbox-parent', false],
+  [true, 'sandbox-parent', false],
+  [false, 'Nested', false],
+  [true, 'Nested', false],
+  [false, 'sandbox-parent', true],
+  [true, 'sandbox-parent', true],
+  [false, 'Nested', true],
+  [true, 'Nested', true],
+] as const) {
+  // Serial: each case starts a Worker, and starting many at once can starve a slow CI runner.
+  test.serial(
+    `A nested approval behind ${copied ? 'a copy of an' : 'an'} asTool() tool in a sandbox run whose parent is named '${parentName}' ${copied ? 'fails the resume' : 'resumes'}${rebuilt ? ' with rebuilt agents' : ''}`,
+    async (t) => {
+      const { createWorker, executeWorkflow } = helpers(t);
+      const worker = await createWorker({
+        plugins: [
+          new OpenAIAgentsPlugin({
+            modelProvider: new FakeModelProvider([
+              toolCallResponse('ask_nested', { input: 'q' }),
+              toolCallResponse('confirmAction', { reason: 'approved' }),
+              textResponse('nested done'),
+              textResponse('parent done'),
+            ]),
+            sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
+          }),
+        ],
+      });
+
+      await worker.runUntil(async () => {
+        const result = await executeWorkflow(sandboxNestedApprovalWorkflow, { args: [copied, parentName, rebuilt] });
+        if (copied) {
+          t.regex(result, /^AgentsWorkflowError: The approval for 'confirmAction' of agent 'Nested' can't be resumed/);
+          t.regex(result, /executions=0$/);
+        } else {
+          t.is(result, 'parent done executions=1');
+        }
+      });
+    }
+  );
+}
+
+test("A SandboxAgent that names no model keeps its capabilities' providerData, such as compaction", async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const settings: any[] = [];
+  const provider = {
+    getModel() {
+      return {
+        async getResponse(request: any) {
+          settings.push(request.modelSettings);
+          return textResponse('done');
+        },
+      } as any;
+    },
+  };
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: provider,
+        sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
+      }),
+    ],
+  });
+  await worker.runUntil(async () => t.is(await executeWorkflow(sandboxNoModelWorkflow), 'done'));
+  t.is(settings[0]?.providerData?.context_management?.[0]?.type, 'compaction');
 });
 
 test('setArchiveLimits is forwarded to the persistWorkspace and hydrateWorkspace Activities', async (t) => {
@@ -141,7 +222,8 @@ test('Sandbox configuration errors are raised inside the Workflow', async (t) =>
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
-        modelProvider: new FakeModelProvider([]),
+        // The lead's call in the last case, whose nested SandboxAgent fails before calling its model.
+        modelProvider: new FakeModelProvider([toolCallResponse('ask_sandbox', { input: 'hello' })]),
         sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
       }),
     ],
@@ -222,4 +304,98 @@ test('addTemporalSpans: sandbox exec emits sandbox:* spans carrying only safe me
   } finally {
     await agentSdk.teardown();
   }
+});
+
+for (const inGraph of [false, true]) {
+  test(`A custom Handoff target ${inGraph ? 'also in the handoff graph' : 'returned only by the callback'} gets the sandbox config`, async (t) => {
+    const { createWorker, executeWorkflow } = helpers(t);
+    const session = new FakeSandboxSession();
+    const client = new FakeSandboxClient(session);
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([
+            handoffResponse('transfer_to_desk'),
+            toolCallResponse('ask_sandbox', { input: 'go' }),
+            toolCallResponse('run_command', { cmd: 'echo hello' }),
+            textResponse('sandbox done'),
+            textResponse('vip answer'),
+          ]),
+          sandboxClientProviders: [new SandboxClientProvider('fake', client)],
+        }),
+      ],
+    });
+
+    await worker.runUntil(async () => {
+      t.is(await executeWorkflow(customHandoffSandboxToolWorkflow, { args: [inGraph] }), 'vip: vip answer');
+    });
+    t.is(session.execCalls[0]?.cmd, 'echo hello');
+  });
+}
+
+for (const [kind, event] of [
+  ['agent-start', 'agent_start'],
+  ['tool-start', 'agent_tool_start'],
+] as const) {
+  test(`A sandbox client that an ${event} listener replaces with a raw one never runs`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const session = new FakeSandboxSession();
+    const client = new FakeSandboxClient(session);
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider(
+            kind === 'agent-start'
+              ? [toolCallResponse('run_command', { cmd: 'echo hello' }), textResponse('Done.')]
+              : [toolCallResponse('ask_sandbox', { input: 'go' })]
+          ),
+          sandboxClientProviders: [new SandboxClientProvider('fake', client)],
+        }),
+      ],
+    });
+
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(sandboxClientChangedWorkflow, {
+        args: [kind],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      const output = await handle.result();
+      t.notRegex(output, /the raw sandbox client ran/);
+      const { events } = await handle.fetchHistory();
+      const activities = (events ?? []).map((e) => e.activityTaskScheduledEventAttributes?.activityType?.name);
+      if (kind === 'agent-start') {
+        // The run keeps the client it was checked with.
+        t.is(output, 'Done.');
+        t.true(
+          activities.some((name) => name?.startsWith('fake')),
+          activities.join(', ')
+        );
+        t.is(session.execCalls[0]?.cmd, 'echo hello');
+      } else {
+        // The nested run checks the sandbox config it uses as it starts; the failure is the tool's output.
+        t.regex(output, /An error occurred while running the tool.*runOptions\.sandbox\.client must be created via/);
+        t.is(client.createCalls.length, 0);
+      }
+      await Worker.runReplayHistory(
+        {
+          workflowBundle: t.context.workflowBundle,
+          plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })],
+        },
+        await handle.fetchHistory()
+      );
+    });
+  });
+}
+
+test('A custom Handoff returning a SandboxAgent without runConfig.sandbox fails the Workflow', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([handoffResponse('transfer_to_desk')]) })],
+  });
+
+  await worker.runUntil(async () => {
+    const err = await t.throwsAsync(executeWorkflow(customHandoffSandboxAgentWithoutConfigWorkflow));
+    t.regex(String((err as any)?.cause?.message), /SandboxAgent execution requires `RunConfig.sandbox`/);
+    t.is((err as any)?.cause?.type, 'AgentsWorkflowError');
+  });
 });

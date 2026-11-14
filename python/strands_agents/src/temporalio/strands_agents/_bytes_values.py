@@ -127,16 +127,6 @@ def decode_messages(messages: Any) -> Any:
     return _map_messages(messages, _decode)
 
 
-def encode_tool_result(result: Any) -> Any:
-    """Tag the ``bytes`` in a Strands tool result as base64."""
-    return _map_tool_result(result, _encode)
-
-
-def decode_tool_result(result: Any) -> Any:
-    """Restore the ``bytes`` that ``encode_tool_result`` tagged."""
-    return _map_tool_result(result, _decode)
-
-
 def encode_event(event: Any) -> Any:
     """Tag the ``bytes`` in a model stream event as base64."""
     return _map_event(event, _encode)

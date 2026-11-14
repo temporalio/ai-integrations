@@ -12,7 +12,6 @@ does without Temporal.
 from __future__ import annotations
 
 import importlib
-import sys
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -20,10 +19,6 @@ from typing import Any
 import pytest
 
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")

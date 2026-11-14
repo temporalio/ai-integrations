@@ -2,18 +2,20 @@ import asyncio
 import zlib
 from collections.abc import Sequence
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
+from mcp.types import Tool
 from strands import tool
 from strands.hooks import AfterToolCallEvent, HookProvider, HookRegistry
-from strands.types.tools import AgentTool, ToolResult
+from strands.types.tools import AgentTool
 
 from temporalio import activity
 from temporalio.api.common.v1 import Payload
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import WorkflowHistory
 from temporalio.converter import PayloadCodec
-from temporalio.strands_agents._temporal_mcp_client import _CallToolArgs, _MCPToolInfo
+from temporalio.mcp import TemporalMCPClient
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.strands_agents.workflow import activity_as_hook, activity_as_tool
 
@@ -24,6 +26,21 @@ def get_activities(history: WorkflowHistory) -> list[str]:
         for event in history.events
         if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
     ]
+
+
+def get_heartbeat_timeouts(history: WorkflowHistory) -> list[timedelta | None]:
+    return [
+        event.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+        or None
+        for event in history.events
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ]
+
+
+def load_history(name: str, workflow_id: str = "legacy-replay") -> WorkflowHistory:
+    """Load the recorded history ``tests/histories/<name>.json``."""
+    path = Path(__file__).parent / "histories" / f"{name}.json"
+    return WorkflowHistory.from_json(workflow_id, path.read_text())
 
 
 class CompressionCodec(PayloadCodec):
@@ -54,11 +71,11 @@ async def blocking_lookup(query: str) -> str:
     return query
 
 
-@activity.defn(name="blocking-mcp-call-tool")
-async def blocking_mcp_call_tool(args: _CallToolArgs) -> ToolResult:
+@activity.defn(name="temporalio.mcp.blocking-mcp.call-tool")
+async def blocking_mcp_call_tool(_request: dict[str, Any]) -> dict[str, Any]:
     blocking_tool_started.set()
     await asyncio.Future()
-    return ToolResult(toolUseId=args.tool_use_id, status="success", content=[])
+    return {"content": []}
 
 
 @activity.defn
@@ -104,7 +121,13 @@ def blocking_tool(kind: str) -> AgentTool:
     if kind == "hook":
         return lookup
     return TemporalMCPTool(
-        "blocking-mcp",
-        _MCPToolInfo("lookup", "Look up a query", {"type": "object"}),
-        options,
+        TemporalMCPClient(
+            "blocking-mcp",
+            activity_config={"start_to_close_timeout": timedelta(seconds=30)},
+        ),
+        Tool(
+            name="lookup",
+            description="Look up a query",
+            input_schema={"type": "object"},
+        ),
     )

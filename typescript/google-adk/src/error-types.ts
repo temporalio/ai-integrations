@@ -52,6 +52,19 @@ export const MCP_TOOL_NOT_FOUND_FAILURE_TYPE = 'GoogleAdkMCPToolNotFound';
 export const MODEL_ERROR_FAILURE_TYPE = 'GoogleAdkModelError';
 
 /**
+ * Error type for a streamed model call whose responses could not all be published to
+ * its `streamingTopic`. Raised inside the model Activity, so it arrives wrapped in an
+ * `ActivityFailure`. In an ADK agent run it is recorded like a model failure: it fails
+ * the Workflow, or rejects the Update that ran the turn, unless an
+ * `onModelErrorCallback` passes it to `markModelFailureHandled`. It is non-retryable
+ * when a retry would call the model again and fail the same way: the server refused a
+ * batch (over its payload or gRPC message size limit, or past the run's Signal limit),
+ * or Workflow Streams gave up on it after its fixed 10-minute retry limit. Other
+ * failures, such as a send during a shorter server outage, are retried.
+ */
+export const STREAM_ERROR_FAILURE_TYPE = 'GoogleAdkStreamError';
+
+/**
  * Error type for a failed MCP `listTools` or `callTool` call. Raised inside an
  * Activity, so wherever you catch it, it arrives wrapped in an `ActivityFailure`:
  * match it through the `.cause` chain, never against the caught error's own `.type`.

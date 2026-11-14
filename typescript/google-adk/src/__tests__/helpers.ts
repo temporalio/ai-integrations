@@ -116,6 +116,9 @@ export const reverseDef: MockMCPToolDefinition = {
 /** Absolute path to the test workflows source bundled into the sandbox. */
 export const workflowsPath = path.resolve(here, '../../src/__tests__/workflows.ts');
 
+/** Absolute path to the compiled failure converter module that converts a copy of each failure. */
+export const copyingFailureConverterPath = path.resolve(here, './copying-failure-converter.js');
+
 /** A model that always raises a non-retryable (HTTP 400) error. */
 export class ThrowingLlm extends BaseLlm {
   static override readonly supportedModels: Array<string | RegExp> = ['boom'];
@@ -329,7 +332,8 @@ export class ToolCallingLlm extends BaseLlm {
 
 /**
  * A `modelProvider` that maps `boom` → {@link ThrowingLlm}, `slow-model` →
- * {@link SlowLlm}, `abort-model` → {@link AbortingLlm}, and everything else →
+ * {@link SlowLlm}, `abort-model` → {@link AbortingLlm}, `call-wait-approval-model` →
+ * a {@link ToolCallingLlm} that calls `wait_approval`, and everything else →
  * {@link FakeLlm} (optionally with canned responses).
  */
 export function defaultTestProvider(responses?: LlmResponse[]): (model: string) => BaseLlm {
@@ -337,6 +341,8 @@ export function defaultTestProvider(responses?: LlmResponse[]): (model: string) 
     if (model === 'boom') return new ThrowingLlm({ model });
     if (model === 'slow-model') return new SlowLlm({ model });
     if (model === 'abort-model') return new AbortingLlm({ model });
+    if (model === 'call-wait-approval-model')
+      return new ToolCallingLlm({ model, toolName: 'wait_approval', toolArgs: {} });
     return new FakeLlm({ model, responses });
   };
 }
@@ -353,6 +359,8 @@ export interface WithWorkerOptions {
    * still evaluates first, these follow.
    */
   workflowInterceptorModules?: string[];
+  /** A failure converter module for the Workflows and the Worker. */
+  failureConverterPath?: string;
 }
 
 const bundleCache = new Map<string, Promise<WorkflowBundle>>();
@@ -367,7 +375,7 @@ const bundleCache = new Map<string, Promise<WorkflowBundle>>();
  * `configureBundler` runs twice per miss (here, then in the bundler), so it must also be pure.
  */
 function getWorkflowBundle(
-  options: Pick<BundleOptions, 'workflowsPath' | 'workflowInterceptorModules' | 'plugins'>
+  options: Pick<BundleOptions, 'workflowsPath' | 'workflowInterceptorModules' | 'plugins' | 'failureConverterPath'>
 ): Promise<WorkflowBundle> {
   const plugins = options.plugins ?? [];
   const resolved = plugins.reduce<BundleOptions>((acc, plugin) => plugin.configureBundler?.(acc) ?? acc, options);
@@ -409,6 +417,7 @@ export async function withWorker<T>(
     workflowsPath,
     workflowInterceptorModules: options.workflowInterceptorModules,
     plugins: options.plugins,
+    failureConverterPath: options.failureConverterPath,
   });
   const worker = await Worker.create({
     connection: env.nativeConnection,
@@ -418,6 +427,7 @@ export async function withWorker<T>(
     plugins: options.plugins,
     activities: options.activities,
     maxCachedWorkflows: options.maxCachedWorkflows ?? 0,
+    dataConverter: options.failureConverterPath ? { failureConverterPath: options.failureConverterPath } : undefined,
   });
   return worker.runUntil(fn());
 }
@@ -453,7 +463,10 @@ export async function waitForScheduledActivities(
 
 /** An `ActivityTaskScheduled` history event, narrowed to what the helpers below read. */
 type ScheduledActivityEvent = {
-  activityTaskScheduledEventAttributes?: { activityType?: { name?: string | null } | null } | null;
+  activityTaskScheduledEventAttributes?: {
+    activityType?: { name?: string | null } | null;
+    heartbeatTimeout?: { seconds?: unknown } | null;
+  } | null;
   userMetadata?: { summary?: unknown } | null;
 };
 
@@ -484,6 +497,20 @@ export function getScheduledActivitySummary(
   activityTypeName: string
 ): string | undefined {
   return getScheduledActivitySummaries(events, activityTypeName)[0];
+}
+
+/**
+ * Reads the heartbeat timeout, in whole seconds, of every `ActivityTaskScheduled`
+ * event with the given activity type name, in history order; an entry is
+ * `undefined` where the event has none.
+ */
+export function getScheduledHeartbeatTimeouts(
+  events: ScheduledActivityEvent[],
+  activityTypeName: string
+): Array<number | undefined> {
+  return events
+    .filter((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === activityTypeName)
+    .map((e) => Number(e.activityTaskScheduledEventAttributes?.heartbeatTimeout?.seconds ?? 0) || undefined);
 }
 
 /**

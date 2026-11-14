@@ -1,4 +1,12 @@
-import type { AgentInputItem, ModelProvider, ModelRequest, ModelResponse, StreamEvent } from '@openai/agents-core';
+import {
+  getDefaultModelSettings,
+  type AgentInputItem,
+  type ModelProvider,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelSettings,
+  type StreamEvent,
+} from '@openai/agents-core';
 import { APIError } from 'openai';
 import { ApplicationFailure, type Duration } from '@temporalio/common';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
@@ -40,14 +48,48 @@ export function toSerializedModelResponse(response: ModelResponse): SerializedMo
   };
 }
 
+/**
+ * Upstream's model settings defaults for this process's default model under the run's settings, as
+ * upstream merges them when no model is named, and its `reasoningEffortImplicit` marker for them.
+ */
+function withDefaultModelSettings(
+  runSettings: ModelSettings,
+  cleared: string[] = []
+): {
+  modelSettings: ModelSettings;
+  reasoningEffortImplicit: boolean;
+} {
+  const defaults = getDefaultModelSettings();
+  const modelSettings: ModelSettings = { ...defaults, ...runSettings };
+  // Upstream merges these nested settings key by key; the defaults set no others.
+  if (defaults.reasoning && runSettings.reasoning) {
+    modelSettings.reasoning = { ...defaults.reasoning, ...runSettings.reasoning };
+  }
+  if (defaults.text && runSettings.text) modelSettings.text = { ...defaults.text, ...runSettings.text };
+  for (const key of cleared) {
+    const [outer, inner] = key.split('.') as [keyof ModelSettings, string | undefined];
+    if (inner === undefined) delete modelSettings[outer];
+    else delete (modelSettings[outer] as Record<string, unknown> | undefined)?.[inner];
+  }
+  return {
+    modelSettings,
+    reasoningEffortImplicit: defaults.reasoning?.effort !== undefined && runSettings.reasoning?.effort === undefined,
+  };
+}
+
 async function fromSerializedModelRequest(
   wire: SerializedModelRequest,
   hostedToolCredentials: HostedToolCredentialsResolver | undefined
 ): Promise<ModelRequest> {
+  const { modelSettings, reasoningEffortImplicit } = wire.implicitModelSettings
+    ? withDefaultModelSettings(wire.modelSettings, wire.clearedModelSettings)
+    : { modelSettings: wire.modelSettings, reasoningEffortImplicit: wire.reasoningEffortImplicit };
   return {
+    // Upstream's internal field, which its OpenAI models read.
+    ...(reasoningEffortImplicit !== undefined && { _internal: { reasoningEffortImplicit } }),
     systemInstructions: wire.systemInstructions,
     input: wire.input as string | AgentInputItem[],
-    modelSettings: wire.modelSettings,
+    modelSettings,
     tools: hostedToolCredentials ? await injectHostedToolCredentials(wire.tools, hostedToolCredentials) : wire.tools,
     toolsExplicitlyProvided: wire.toolsExplicitlyProvided,
     outputType: wire.outputType,

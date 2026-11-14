@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import faulthandler
 import os
 import subprocess
 import threading
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator
 from functools import partial
 from pathlib import Path
 
@@ -83,14 +82,7 @@ def pytest_timeout_set_timer(
     return True
 
 
-@pytest.fixture(scope="session")
-def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
-    loop = asyncio.get_event_loop_policy().new_event_loop()  # type: ignore[reportDeprecated]
-    yield loop
-    loop.close()
-
-
-@pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
+@pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     global _server_started
     environment = await start_local_with_retry(

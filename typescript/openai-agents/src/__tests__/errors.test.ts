@@ -1,4 +1,5 @@
 import test from 'ava';
+import { GuardrailExecutionError, ToolCallError } from '@openai/agents-core';
 import { ApplicationFailure, ActivityFailure } from '@temporalio/common';
 import { unwrapTemporalFailure } from '../common/errors';
 import { normalizeAgentsRunError } from '../workflow/runner';
@@ -45,6 +46,31 @@ test('normalizeAgentsRunError: plain Error becomes AgentsWorkflowError Applicati
   t.true(fail.nonRetryable);
   t.is(fail.cause, original);
   t.regex(fail.message, /Agent workflow failed: user instructions threw/);
+});
+
+test('normalizeAgentsRunError: a tool or guardrail TemporalFailure becomes the cause of AgentsWorkflowError', (t) => {
+  const cases: [Error, boolean][] = [
+    [new ActivityFailure('Activity task failed', 'someActivity', undefined, undefined, undefined), false],
+    [ApplicationFailure.retryable('tool failed', 'TryAgain'), false],
+    [ApplicationFailure.nonRetryable('tool rejected', 'ToolRejected'), true],
+  ];
+  for (const [tf, nonRetryable] of cases) {
+    for (const original of [
+      new ToolCallError('tool failed', tf),
+      new GuardrailExecutionError('guardrail failed', tf),
+    ]) {
+      const fail = normalizeAgentsRunError(original) as ApplicationFailure;
+      t.true(fail instanceof ApplicationFailure);
+      t.is(fail.type, 'AgentsWorkflowError');
+      if (nonRetryable) {
+        t.true(fail.nonRetryable);
+      } else {
+        t.false(fail.nonRetryable);
+      }
+      t.is(fail.message, `Agent workflow failed: ${original.message}`);
+      t.is(fail.cause, tf);
+    }
+  }
 });
 
 test('normalizeAgentsRunError: non-Error value is rethrown as-is', (t) => {

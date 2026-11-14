@@ -15,16 +15,16 @@ import type { ActivityInboundCallsInterceptorFactory, NexusInboundCallsIntercept
 import { HEADER_KEY, decodeContextString, readContextHeader, type LangSmithTraceContext } from './propagation';
 import {
   RUN_TYPE,
-  asOutputs,
-  describeError,
   buildRunTree,
-  inheritedDestination,
   runActivityRunName,
   runCancelNexusHandlerRunName,
   runStartNexusHandlerRunName,
   runTreeFromContext,
+  wrapWithRun,
 } from './run-tree';
 import type { EmitterConfig } from './sinks';
+import { bindReplicaCredentials, destination } from './routing';
+import { withRunTreeDefaults } from './worker-run-tree';
 
 /**
  * Reconstruct the propagated parent run from a LangSmith trace context, wired to
@@ -43,8 +43,11 @@ function reconstructParentRun(config: EmitterConfig, ctx: LangSmithTraceContext 
     id: parsed.id,
     trace_id: parsed.trace_id,
     dotted_order: parsed.dotted_order,
+    start_time: parsed.start_time,
     parent_run_id: parsed.parent_run_id,
-    ...inheritedDestination(config, parsed),
+    ...destination(parsed, { project_name: config.projectName, address: config.address }),
+    replicas: bindReplicaCredentials(parsed.replicas, config.replicas),
+    distributedParentId: parsed.distributedParentId,
     client: config.client,
     // Force-enable so nested body `traceable` runs emit; tracing gate is `isTracingEnabled()`.
     tracingEnabled: true,
@@ -52,25 +55,29 @@ function reconstructParentRun(config: EmitterConfig, ctx: LangSmithTraceContext 
 }
 
 /**
- * Run `fn` with `op` installed as the active LangSmith run, emitting the run
- * around the call unless LangSmith turned tracing off for it (an env it can't
- * address). Shared by activity and Nexus handlers.
+ * Run a handler under `parent`. With `addTemporalRuns`, wrap it in the operation run from `build`, emitted unless
+ * LangSmith turned tracing off for it (an env it can't address). Shared by activity and Nexus handlers.
  */
-async function traceOperation<T>(op: RunTree, fn: () => Promise<T>): Promise<T> {
-  if (!op.tracingEnabled) {
-    return withRunTree(op, fn);
+async function traceHandler<T>(
+  config: EmitterConfig,
+  parent: RunTree | undefined,
+  build: () => RunTree,
+  fn: () => Promise<T>
+): Promise<T> {
+  // A propagated parent keeps tracing on, as LangSmith does; the env only gates traces that start here.
+  if (!parent && !isTracingEnabled()) {
+    return fn();
   }
-  await op.postRun();
-  try {
-    const result = await withRunTree(op, fn);
-    await op.end(asOutputs(result));
-    await op.patchRun();
-    return result;
-  } catch (err) {
-    await op.end(undefined, describeError(err));
-    await op.patchRun();
-    throw err;
+  if (!config.addTemporalRuns) {
+    // Without a parent, native roots fall back to the plugin's routing defaults.
+    return parent ? withRunTree(parent, fn) : withRunTreeDefaults(config, fn);
   }
+  const run = build();
+  if (!run.tracingEnabled) {
+    return withRunTree(run, fn);
+  }
+  await run.postRun();
+  return wrapWithRun(run, () => withRunTree(run, fn));
 }
 
 /**
@@ -81,30 +88,23 @@ async function traceOperation<T>(op: RunTree, fn: () => Promise<T>): Promise<T> 
 export function createActivityInboundInterceptor(config: EmitterConfig): ActivityInboundCallsInterceptorFactory {
   return (ctx: ActivityContext) => ({
     async execute(input, next) {
-      if (!isTracingEnabled()) {
-        return next(input);
-      }
       const parent = reconstructParentRun(config, readContextHeader(input.headers));
-      if (!config.addTemporalRuns) {
-        // Propagation only: nest the user's body `traceable` runs under the
-        // reconstructed parent without emitting a Temporal-operation run.
-        // No propagated parent: run the body with no ambient run by design (nothing to attach to).
-        return parent ? withRunTree(parent, () => next(input)) : next(input);
-      }
-      const activityType = ctx.info.activityType;
-      const run = buildRunTree(config, {
-        name: runActivityRunName(activityType),
-        runType: RUN_TYPE.TOOL,
-        parent,
-        inputs: { args: input.args },
-      });
-      return traceOperation(run, () => next(input));
+      const build = () => {
+        const { activityType, activityId, workflowExecution } = ctx.info;
+        return buildRunTree(config, {
+          name: runActivityRunName(activityType),
+          runType: RUN_TYPE.TOOL,
+          parent,
+          metadata: {
+            temporalWorkflowID: workflowExecution?.workflowId ?? '',
+            temporalRunID: workflowExecution?.runId ?? '',
+            temporalActivityID: activityId,
+          },
+        });
+      };
+      return traceHandler(config, parent, build, () => next(input));
     },
   });
-}
-
-function nexusContext(headers: Record<string, string>): LangSmithTraceContext | undefined {
-  return decodeContextString(headers[HEADER_KEY]);
 }
 
 /**
@@ -116,21 +116,12 @@ export function createNexusInboundInterceptor(config: EmitterConfig): NexusInbou
   const handle = async <I extends { ctx: { service: string; operation: string; headers: Record<string, string> } }, O>(
     input: I,
     next: (input: I) => Promise<O>,
-    nameOf: (s: string, o: string) => string
+    nameOf: (service: string, operation: string) => string
   ): Promise<O> => {
-    if (!isTracingEnabled()) {
-      return next(input);
-    }
-    const parent = reconstructParentRun(config, nexusContext(input.ctx.headers));
-    if (!config.addTemporalRuns) {
-      return parent ? withRunTree(parent, () => next(input)) : next(input);
-    }
-    const run = buildRunTree(config, {
-      name: nameOf(input.ctx.service, input.ctx.operation),
-      runType: RUN_TYPE.CHAIN,
-      parent,
-    });
-    return traceOperation(run, () => next(input));
+    const parent = reconstructParentRun(config, decodeContextString(input.ctx.headers[HEADER_KEY]));
+    const build = () =>
+      buildRunTree(config, { name: nameOf(input.ctx.service, input.ctx.operation), runType: RUN_TYPE.TOOL, parent });
+    return traceHandler(config, parent, build, () => next(input));
   };
 
   return {

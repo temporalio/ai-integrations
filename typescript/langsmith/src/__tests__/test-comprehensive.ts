@@ -122,7 +122,7 @@ const EXPECTED_TRUE: string[] = [
   '            comprehensive_activity_inner',
   '    StartChildWorkflow:ComprehensiveReceiverWorkflow',
   '    SignalChildWorkflow:signal',
-  '      HandleSignal:signal',
+  '    HandleSignal:signal',
   '    RunWorkflow:ComprehensiveReceiverWorkflow',
   '    StartNexusOperation:comprehensiveNexusService/greet',
   '    RunStartNexusOperationHandler:comprehensiveNexusService/greet',

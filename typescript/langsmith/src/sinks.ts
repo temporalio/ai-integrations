@@ -4,10 +4,12 @@
  * @module
  */
 
-import { isTracingEnabled, type Client } from 'langsmith';
-import type { RunTree } from 'langsmith/run_trees';
+import type { Client } from 'langsmith';
+import { RunTree, type RunTreeConfig, type WriteReplica } from 'langsmith/run_trees';
+import type { Logger } from '@temporalio/common';
 import type { Sinks } from '@temporalio/workflow';
 import type { InjectedSinks } from '@temporalio/worker';
+import { bindReplicaCredentials, type ReplicaRouting } from './routing';
 
 /** Plain-JSON description of a LangSmith run crossing the isolate→worker boundary. */
 export interface SerializedRun {
@@ -27,8 +29,9 @@ export interface SerializedRun {
   extra?: Record<string, unknown>;
   tags?: string[];
   project_name?: string;
-  /** Agent address, set instead of `project_name` for an addressed run, in the installed LangSmith's own form. */
-  address?: RunTree['address'];
+  address?: RunTreeConfig['address'];
+  replicas?: ReplicaRouting[];
+  distributedParentId?: string;
   events?: Record<string, unknown>[];
 }
 
@@ -40,6 +43,9 @@ export interface EmitterConfig {
   addTemporalRuns: boolean;
   /** Target LangSmith project. */
   projectName?: string;
+  address?: RunTreeConfig['address'];
+  /** Full replica configuration is local to the client/worker process. */
+  replicas?: WriteReplica[];
   /** Tags attached to every emitted run. */
   tags?: string[];
   /** Metadata merged into every emitted run. */
@@ -55,69 +61,53 @@ export interface LangSmithSinks extends Sinks {
     /** Emit a `createRun` for a newly started run. */
     createRun(run: SerializedRun): void;
     /** Emit an `updateRun` (end / outputs / error / events) for a run. */
-    updateRun(run: SerializedRun): void;
+    updateRun(run: SerializedRun, options?: Parameters<RunTree['patchRun']>[0]): void;
   };
 }
 
-// langsmith's CreateRunParams omits tags, but createRun spreads them into the request at runtime.
-function toCreateParams(run: SerializedRun): Parameters<Client['createRun']>[0] & { tags?: string[] } {
-  return {
-    id: run.id,
-    trace_id: run.trace_id,
-    dotted_order: run.dotted_order,
-    parent_run_id: run.parent_run_id,
-    name: run.name,
-    run_type: run.run_type,
-    start_time: run.start_time,
+function emissionRun(run: SerializedRun, client: Client, replicas: WriteReplica[] | undefined): RunTree {
+  const tree = new RunTree({
+    ...run,
     inputs: run.inputs ?? {},
-    extra: run.extra,
-    tags: run.tags,
-    project_name: run.project_name,
-    address: run.address,
-  };
+    client,
+    replicas: bindReplicaCredentials(run.replicas, replicas),
+    tracingEnabled: true,
+  });
+  tree.events = run.events as RunTree['events'];
+  return tree;
 }
 
-function toUpdateParams(run: SerializedRun): Parameters<Client['updateRun']>[1] {
-  return {
-    end_time: run.end_time,
-    outputs: run.outputs,
-    error: run.error,
-    extra: run.extra,
-    tags: run.tags,
-    events: run.events,
-    dotted_order: run.dotted_order,
-    trace_id: run.trace_id,
-    parent_run_id: run.parent_run_id,
+/**
+ * Build the worker-side {@link InjectedSinks} routing serialized runs to a real LangSmith client, and a `drain` that
+ * resolves once every queued write has reached the client.
+ */
+export function createLangSmithSinks(
+  client: Client,
+  replicas: WriteReplica[] | undefined,
+  logger: Logger
+): { sinks: InjectedSinks<LangSmithSinks>; drain: () => Promise<void> } {
+  // Writes run one at a time in call order, so an update never overtakes its create.
+  let writes = Promise.resolve();
+  // The Workflow already decided whether to trace each run, so the env isn't checked again here.
+  const enqueue = (write: () => Promise<void>): void => {
+    // Emission must never fail the workflow.
+    writes = writes.then(write).catch((err: unknown) => {
+      logger.error(`LangSmith background I/O error: ${String(err)}`);
+    });
   };
-}
-
-/** Build the worker-side {@link InjectedSinks} routing serialized runs to a real LangSmith client. */
-export function createLangSmithSinks(client: Client): InjectedSinks<LangSmithSinks> {
   return {
-    [LANGSMITH_SINK_NAME]: {
-      createRun: {
-        fn: (_info, run) => {
-          // Honor the LangSmith tracing gate at the real-env emission point.
-          if (!isTracingEnabled()) {
-            return;
-          }
-          void Promise.resolve(client.createRun(toCreateParams(run))).catch(() => {
-            /* swallow: emission must never fail the workflow */
-          });
+    sinks: {
+      [LANGSMITH_SINK_NAME]: {
+        createRun: {
+          fn: (_info, run) => enqueue(() => emissionRun(run, client, replicas).postRun()),
+          callDuringReplay: false,
         },
-        callDuringReplay: false,
-      },
-      updateRun: {
-        fn: (_info, run) => {
-          if (!isTracingEnabled()) {
-            return;
-          }
-          void Promise.resolve(client.updateRun(run.id, toUpdateParams(run))).catch(() => {
-            /* swallow: emission must never fail the workflow */
-          });
+        updateRun: {
+          fn: (_info, run, options) => enqueue(() => emissionRun(run, client, replicas).patchRun(options)),
+          callDuringReplay: false,
         },
-        callDuringReplay: false,
       },
     },
+    drain: () => writes,
   };
 }

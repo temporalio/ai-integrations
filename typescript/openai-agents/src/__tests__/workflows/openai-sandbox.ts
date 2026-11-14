@@ -1,11 +1,14 @@
-import { Agent, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, tool, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
 import {
   Capability,
   Manifest,
   SandboxAgent,
   isEnvValueReference,
+  type SandboxClient,
+  type SandboxRunConfig,
   type SandboxSessionLike,
 } from '@openai/agents-core/sandbox';
+import { ApplicationFailure } from '@temporalio/workflow';
 import { TemporalOpenAIRunner, workerEnvValue, temporalSandboxClient } from '../../workflow';
 
 class TestSandboxCapability extends Capability {
@@ -72,7 +75,10 @@ export async function sandboxAgentWorkflow(): Promise<string> {
   return `${result.finalOutput}`;
 }
 
-/** A sandbox tool that interrupts for approval, so the run preserves its owned session. */
+/**
+ * A sandbox tool that interrupts for approval, so the run preserves its owned session. It records
+ * its call in the run context's `writes`.
+ */
 class ApprovalSandboxCapability extends Capability {
   readonly type = 'approval_sandbox';
 
@@ -89,8 +95,9 @@ class ApprovalSandboxCapability extends Capability {
           additionalProperties: false,
         } as any,
         strict: true,
-        invoke: async (_ctx: RunContext<any>, input: string): Promise<string> => {
+        invoke: async (ctx: RunContext<{ writes: string[] }>, input: string): Promise<string> => {
           if (!this._session) throw new Error('approval_sandbox capability is not bound to a session');
+          ctx.context.writes.push('sandbox-tool');
           return this._session.execCommand!(JSON.parse(input));
         },
         needsApproval: async () => true,
@@ -100,7 +107,11 @@ class ApprovalSandboxCapability extends Capability {
   }
 }
 
-export async function sandboxApprovalResumeWorkflow(): Promise<string> {
+/**
+ * With `otherAgent`, resumes with an agent graph that doesn't have the paused agent. Returns the
+ * output and the tool calls the caller's context object got.
+ */
+export async function sandboxApprovalResumeWorkflow(otherAgent = false): Promise<string> {
   const agent = new SandboxAgent({
     name: 'sandbox-approval',
     model: 'gpt-4o-mini',
@@ -112,12 +123,79 @@ export async function sandboxApprovalResumeWorkflow(): Promise<string> {
   const runner = new TemporalOpenAIRunner();
   const runConfig = { sandbox: { client: temporalSandboxClient('fake') } };
 
-  const result = await runner.run(agent, 'run a command', { runConfig });
+  const context = { writes: [] as string[] };
+  const result = await runner.run(agent, 'run a command', { runConfig, context });
   if (result.interruptions.length === 0) return 'no-interruption';
   for (const interruption of result.interruptions) result.state.approve(interruption);
 
-  const resumed = await runner.run(agent, result.state, { runConfig });
-  return `${resumed.finalOutput}`;
+  const resumeAgent = otherAgent ? new Agent({ name: 'other', model: 'gpt-4o-mini' }) : agent;
+  const resumed = await runner.run(resumeAgent, result.state, { runConfig });
+  return `${resumed.finalOutput} writes=${context.writes.join(',')}`;
+}
+
+/** A `SandboxAgent` that names no model, with the default capabilities, which include compaction. */
+export async function sandboxNoModelWorkflow(): Promise<string> {
+  const agent = new SandboxAgent({ name: 'sandbox-no-model', instructions: 'Answer.' });
+  const result = await new TemporalOpenAIRunner().run(agent, 'hello', {
+    runConfig: { sandbox: { client: temporalSandboxClient('fake') } },
+  });
+  return `${result.finalOutput}`;
+}
+
+/**
+ * A `SandboxAgent` named `parentName` reaches `Nested` through `ask_nested`, the `asTool()` tool or a
+ * spread copy, and `Nested` pauses on an approval. Approves it and resumes, with the same agents or,
+ * if `rebuilt`, with new ones built the same way. Returns the output and the approved action's runs,
+ * or the resumed run's failure.
+ */
+export async function sandboxNestedApprovalWorkflow(
+  copied: boolean,
+  parentName = 'sandbox-parent',
+  rebuilt = false
+): Promise<string> {
+  let executions = 0;
+  const confirmAction = tool({
+    name: 'confirmAction',
+    description: 'Confirm the action.',
+    parameters: {
+      type: 'object' as const,
+      properties: { reason: { type: 'string' } },
+      required: ['reason'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async () => `confirmed:${++executions}`,
+  });
+  const buildAgent = () => {
+    const nested = new Agent({
+      name: 'Nested',
+      instructions: 'Answer as nested.',
+      model: 'nested-model',
+      tools: [confirmAction],
+    });
+    const askNested = nested.asTool({ toolName: 'ask_nested' });
+    return new SandboxAgent({
+      name: parentName,
+      instructions: 'Reach nested.',
+      model: 'gpt-4o-mini',
+      capabilities: [new TestSandboxCapability()],
+      tools: [copied ? { ...askNested } : askNested],
+    });
+  };
+  const agent = buildAgent();
+  const runner = new TemporalOpenAIRunner();
+  const runConfig = { sandbox: { client: temporalSandboxClient('fake') } };
+
+  const result = await runner.run(agent, 'go', { runConfig });
+  if (result.state._sandbox === undefined) return 'no-sandbox-state';
+  for (const interruption of result.interruptions) result.state.approve(interruption);
+  try {
+    const resumed = await runner.run(rebuilt ? buildAgent() : agent, result.state, { runConfig });
+    return `${resumed.finalOutput} executions=${executions}`;
+  } catch (err) {
+    if (err instanceof ApplicationFailure) return `${err.type}: ${err.message} executions=${executions}`;
+    throw err;
+  }
 }
 
 export async function sandboxManifestResumeWorkflow(): Promise<string> {
@@ -201,5 +279,101 @@ export async function sandboxValidationWorkflow(): Promise<string> {
     }
   }
 
+  try {
+    await runner.run(new SandboxAgent({ name: 'sandbox', model: 'gpt-4o-mini' }), 'hello', {
+      runConfig: { sandbox: { client: temporalSandboxClient('fake'), session: { state: {} } as any } },
+    });
+    return 'FAIL: raw-session should have thrown';
+  } catch (e) {
+    if (!/Do not pass a raw sandbox session directly/.test((e as Error).message)) {
+      return `FAIL: unexpected raw-session error: ${(e as Error).message}`;
+    }
+  }
+
+  // As upstream, an asTool() tool returns the error of a nested SandboxAgent with no sandbox config as
+  // its output, and the run goes on.
+  const lead = new Agent({
+    name: 'lead',
+    model: 'gpt-4o-mini',
+    tools: [new SandboxAgent({ name: 'sandbox', model: 'gpt-4o-mini' }).asTool({ toolName: 'ask_sandbox' })],
+    toolUseBehavior: 'stop_on_first_tool',
+  });
+  const output = `${(await runner.run(lead, 'hello')).finalOutput}`;
+  if (!/^An error occurred while running the tool.*SandboxAgent execution requires/.test(output)) {
+    return `FAIL: unexpected nested-no-config output: ${output}`;
+  }
+
   return 'OK';
+}
+
+/** A sandbox client that runs in the Workflow, which the plugin must never call. */
+const rawSandboxClient = {
+  backendId: 'raw',
+  async create(): Promise<never> {
+    throw new Error('the raw sandbox client ran in the Workflow');
+  },
+} as unknown as SandboxClient;
+
+/**
+ * A listener replaces a sandbox config's client with a raw one after the runner checked it: on the
+ * run's own config when `SandboxAgent` starts (`agent-start`), or on an `asTool()` tool's
+ * `runOptions.sandbox` when the lead calls the tool (`tool-start`).
+ */
+export async function sandboxClientChangedWorkflow(kind: 'agent-start' | 'tool-start'): Promise<string> {
+  const sandbox: SandboxRunConfig = { client: temporalSandboxClient('fake') };
+  const agent = new SandboxAgent({
+    name: 'sandbox-changed',
+    model: 'gpt-4o-mini',
+    capabilities: [new TestSandboxCapability()],
+  });
+  if (kind === 'agent-start') {
+    agent.on('agent_start', () => (sandbox.client = rawSandboxClient));
+    const result = await new TemporalOpenAIRunner().run(agent, 'run a command', { runConfig: { sandbox } });
+    return `${result.finalOutput}`;
+  }
+  const lead = new Agent({
+    name: 'lead',
+    model: 'gpt-4o-mini',
+    tools: [agent.asTool({ toolName: 'ask_sandbox', runOptions: { sandbox } })],
+    toolUseBehavior: 'stop_on_first_tool',
+  });
+  lead.on('agent_tool_start', () => (sandbox.client = rawSandboxClient));
+  const result = await new TemporalOpenAIRunner().run(lead, 'help');
+  return `${result.finalOutput}`;
+}
+
+/**
+ * A custom `Handoff` whose callback returns `vip`, which asks a nested `SandboxAgent` through
+ * `agent.asTool()`. With `inGraph`, `vip` is also a handoff of the router, so the runner sees it up front.
+ */
+export async function customHandoffSandboxToolWorkflow(inGraph: boolean): Promise<string> {
+  const specialist = new SandboxAgent({
+    name: 'sandbox-specialist',
+    model: 'gpt-4o-mini',
+    capabilities: [new TestSandboxCapability()],
+  });
+  const vip = new Agent({
+    name: 'vip',
+    model: 'gpt-4o-mini',
+    tools: [specialist.asTool({ toolName: 'ask_sandbox' })],
+  });
+  const standard = new Agent({ name: 'standard', model: 'gpt-4o-mini' });
+  const desk = new Handoff(standard, async () => vip);
+  desk.toolName = 'transfer_to_desk';
+  const router = new Agent({ name: 'router', model: 'gpt-4o-mini', handoffs: inGraph ? [desk, vip] : [desk] });
+  const result = await new TemporalOpenAIRunner().run(router, 'help', {
+    runConfig: { sandbox: { client: temporalSandboxClient('fake') } },
+  });
+  return `${result.lastAgent?.name}: ${result.finalOutput}`;
+}
+
+/** A custom `Handoff` whose callback returns a `SandboxAgent`, with no `runConfig.sandbox`. */
+export async function customHandoffSandboxAgentWithoutConfigWorkflow(): Promise<string> {
+  const specialist = new SandboxAgent({ name: 'sandbox-specialist', model: 'gpt-4o-mini' });
+  const standard = new Agent({ name: 'standard', model: 'gpt-4o-mini' });
+  const desk = new Handoff(standard, async () => specialist);
+  desk.toolName = 'transfer_to_desk';
+  const router = new Agent({ name: 'router', model: 'gpt-4o-mini', handoffs: [desk] });
+  await new TemporalOpenAIRunner().run(router, 'help');
+  return 'FAIL: should have thrown';
 }

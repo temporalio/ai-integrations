@@ -23,6 +23,19 @@ export interface SerializedModelRequest {
   conversationId?: string;
   tracing: JsonValue;
   overridePromptModel?: boolean;
+  /** Upstream's internal `reasoningEffortImplicit` marker, which models use to drop an implicit effort. */
+  reasoningEffortImplicit?: boolean;
+  /**
+   * No model was named and the agent set no model settings, so `modelSettings` holds only the run's.
+   * The Worker adds upstream's defaults for its own default model, as upstream does when it resolves
+   * the model in the same process.
+   */
+  implicitModelSettings?: boolean;
+  /**
+   * With `implicitModelSettings`, the run settings set to `undefined`, which clear a default: a key,
+   * or a key of `reasoning` or `text` such as `reasoning.effort`.
+   */
+  clearedModelSettings?: string[];
 }
 
 export interface SerializedModelResponse {

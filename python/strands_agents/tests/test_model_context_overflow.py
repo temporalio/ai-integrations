@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
+import mcp
 import pytest
 from mcp import StdioServerParameters, stdio_client
 from strands import Agent
@@ -418,15 +419,18 @@ class ToolsRecordingModel(SmallContextModel):
             yield event
 
 
-def _echo_client() -> MCPClient:
-    return MCPClient(
-        lambda: stdio_client(
-            StdioServerParameters(
-                command=sys.executable,
-                args=[str(Path(__file__).parent / "echo_mcp_server.py")],
-            )
-        )
-    )
+_ECHO_PARAMS = StdioServerParameters(
+    command=sys.executable,
+    args=[str(Path(__file__).parent / "echo_mcp_server.py")],
+)
+
+
+def _echo_client() -> mcp.Client:
+    return mcp.Client(stdio_client(_ECHO_PARAMS))
+
+
+def _strands_echo_client() -> MCPClient:
+    return MCPClient(cast(Any, lambda: stdio_client(_ECHO_PARAMS)))
 
 
 @workflow.defn
@@ -457,7 +461,7 @@ async def test_summarization_agent_keeps_its_mcp_tools(
     # must stay in its registry after a summary, so the next summary has them too.
     control_model = ToolsRecordingModel()
     control_agent = Agent(
-        model=control_model, tools=[_echo_client()], callback_handler=None
+        model=control_model, tools=[_strands_echo_client()], callback_handler=None
     )
     try:
         manager = SummarizingConversationManager(summarization_agent=control_agent)
@@ -493,7 +497,7 @@ async def test_summarization_agent_keeps_its_mcp_tools(
         assert model.tools == control_model.tools
         assert (
             get_activities(await handle.fetch_history()).count(
-                "echo_summarizer-list-tools"
+                "temporalio.mcp.echo_summarizer.list-tools"
             )
             == 1
         )

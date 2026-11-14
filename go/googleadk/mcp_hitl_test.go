@@ -2,6 +2,8 @@ package googleadk_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 
@@ -15,6 +17,7 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/agent/workflowagents/sequentialagent"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
@@ -52,6 +55,21 @@ func guardedMCPFactory() googleadk.MCPFactory {
 	}
 }
 
+// flakyToolset is a toolset without tools whose Tools call fails while fail is
+// set, the way a toolset fails to reach its server.
+type flakyToolset struct {
+	fail *bool
+}
+
+func (flakyToolset) Name() string { return "flaky" }
+
+func (f flakyToolset) Tools(agent.ReadonlyContext) ([]tool.Tool, error) {
+	if *f.fail {
+		return nil, errors.New("flaky toolset unavailable")
+	}
+	return nil, nil
+}
+
 // mcpHitlResult is the serializable output of mcpHitlWorkflow.
 type mcpHitlResult struct {
 	// Paused reports that the first Run pass paused on a pending confirmation.
@@ -82,16 +100,33 @@ type mcpHitlResult struct {
 //	        ADK re-dispatches the original call with the decision attached; the
 //	        snapshot carries it to the worker-side tool, which executes on
 //	        approval or rejects on denial.
-func mcpHitlWorkflow(ctx workflow.Context, confirm bool) (mcpHitlResult, error) {
-	root, err := llmagent.New(llmagent.Config{
+//
+// See mcpHitlCase for the variations.
+func mcpHitlWorkflow(ctx workflow.Context, c mcpHitlCase) (mcpHitlResult, error) {
+	excluded, flaky := false, false
+	assistant, err := llmagent.New(llmagent.Config{
 		Name:        "assistant",
 		Description: "root assistant",
 		Model:       googleadk.NewModel("fake-model"),
 		Instruction: "be helpful",
-		Toolsets:    []tool.Toolset{googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{Name: "guarded-server"})},
+		Toolsets: []tool.Toolset{googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{
+			Name: "guarded-server",
+			ToolFilter: func(_ agent.ReadonlyContext, t tool.Tool) bool {
+				return !excluded || t.Name() != "guarded"
+			},
+		}), flakyToolset{&flaky}},
 	})
 	if err != nil {
 		return mcpHitlResult{}, err
+	}
+	root := assistant
+	if c.SequentialRoot {
+		if root, err = sequentialagent.New(sequentialagent.Config{AgentConfig: agent.Config{
+			Name:      "pipeline",
+			SubAgents: []agent.Agent{assistant},
+		}}); err != nil {
+			return mcpHitlResult{}, err
+		}
 	}
 	r, err := runner.New(runner.Config{
 		AppName:           "test-app",
@@ -108,7 +143,8 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm bool) (mcpHitlResult, error) 
 	// --- Pass 1: run until the agent pauses on a confirmation. ---
 	var pass1 []*session.Event
 	msg := genai.NewContentFromText("run the guarded tool", genai.RoleUser)
-	for ev, rerr := range r.Run(adkCtx, "user-1", "session-1", msg, agent.RunConfig{}) {
+	run := r.Run(adkCtx, "user-1", "session-1", msg, agent.RunConfig{})
+	for ev, rerr := range run {
 		if rerr != nil {
 			return mcpHitlResult{}, rerr
 		}
@@ -131,9 +167,31 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm bool) (mcpHitlResult, error) 
 	// --- Pass 2: simulate the human's decision, then resume. ---
 	resume := googleadk.ConfirmationResponse(googleadk.ConfirmationDecision{
 		FunctionCallID: pending[0].FunctionCallID,
-		Confirmed:      confirm,
+		Confirmed:      c.Confirm,
 	})
-	for ev, rerr := range r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{}) {
+	if c.ReuseMessage || c.ReuseIterator {
+		*msg = *resume
+		resume = msg
+	}
+	if c.RetryResume {
+		flaky = true
+		var failed error
+		for _, rerr := range r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{}) {
+			if rerr != nil {
+				failed = rerr
+				break
+			}
+		}
+		if failed == nil {
+			return res, errors.New("the first resume did not fail")
+		}
+		flaky = false
+	}
+	excluded = c.ExcludeBeforeResume
+	if !c.ReuseIterator {
+		run = r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{})
+	}
+	for ev, rerr := range run {
 		if rerr != nil {
 			return res, rerr
 		}
@@ -161,6 +219,31 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm bool) (mcpHitlResult, error) 
 	return res, nil
 }
 
+// mcpHitlCase selects the variations of mcpHitlWorkflow.
+type mcpHitlCase struct {
+	// Confirm is the human's decision.
+	Confirm bool
+	// ExcludeBeforeResume makes the toolset's ToolFilter stop allowing the
+	// guarded tool after pass 1, so the approved call must not run on resume.
+	ExcludeBeforeResume bool
+	// ReuseMessage makes pass 2 overwrite pass 1's message with the decision
+	// and resume with the same *genai.Content, the way a caller that receives
+	// each message into one variable does.
+	ReuseMessage bool
+	// RetryResume makes the first resume fail because another toolset cannot
+	// list its tools, after the MCP toolset listed and filtered. The filter
+	// changes only then, and the workflow retries the resume with the same
+	// message.
+	RetryResume bool
+	// SequentialRoot runs the assistant under a sequential agent, so the
+	// runner's root is not an LLM agent.
+	SequentialRoot bool
+	// ReuseIterator makes pass 2 overwrite pass 1's message with the decision
+	// and iterate pass 1's runner.Run iterator again instead of calling
+	// runner.Run.
+	ReuseIterator bool
+}
+
 // newMcpHitlEnv builds a test environment with mcpHitlWorkflow registered and
 // the guarded MCP toolset wired.
 func newMcpHitlEnv(t *testing.T, s *testsuite.WorkflowTestSuite) (*testsuite.TestWorkflowEnvironment, *activityCounter) {
@@ -185,25 +268,35 @@ func newMcpHitlEnv(t *testing.T, s *testsuite.WorkflowTestSuite) (*testsuite.Tes
 // surfaces it, with the original call attached for the human), and the approval
 // flows back through the snapshot so the tool executes exactly once.
 func TestMCPToolConfirmationPausesAndResumes(t *testing.T) {
-	mcpGuardedRuns.Store(0)
+	for _, tc := range []mcpHitlCase{
+		{},
+		{ReuseMessage: true},
+		{ReuseMessage: true, RetryResume: true},
+		{SequentialRoot: true, ReuseIterator: true},
+	} {
+		tc.Confirm = true
+		t.Run(fmt.Sprintf("%+v", tc), func(t *testing.T) {
+			mcpGuardedRuns.Store(0)
 
-	var s testsuite.WorkflowTestSuite
-	env, counter := newMcpHitlEnv(t, &s)
-	env.ExecuteWorkflow(mcpHitlWorkflow, true)
+			var s testsuite.WorkflowTestSuite
+			env, counter := newMcpHitlEnv(t, &s)
+			env.ExecuteWorkflow(mcpHitlWorkflow, tc)
 
-	require.True(t, env.IsWorkflowCompleted())
-	require.NoError(t, env.GetWorkflowError())
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
 
-	var res mcpHitlResult
-	require.NoError(t, env.GetWorkflowResult(&res))
+			var res mcpHitlResult
+			require.NoError(t, env.GetWorkflowResult(&res))
 
-	require.True(t, res.Paused, "agent must pause on a pending confirmation")
-	assert.Equal(t, "guarded", res.OriginalCallName, "the human must see the original tool call")
-	assert.NotEmpty(t, res.PendingHint)
-	assert.EqualValues(t, 1, mcpGuardedRuns.Load(), "guarded MCP tool must run exactly once, only after approval")
-	assert.Contains(t, res.ResumedToolResponses, "guarded")
-	assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName),
-		"one pending pass, one approved execution")
+			require.True(t, res.Paused, "agent must pause on a pending confirmation")
+			assert.Equal(t, "guarded", res.OriginalCallName, "the human must see the original tool call")
+			assert.NotEmpty(t, res.PendingHint)
+			assert.EqualValues(t, 1, mcpGuardedRuns.Load(), "guarded MCP tool must run exactly once, only after approval")
+			assert.Contains(t, res.ResumedToolResponses, "guarded")
+			assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName),
+				"one pending pass, one approved execution")
+		})
+	}
 }
 
 // TestMCPToolConfirmationDenialBlocksTool proves the denial path: the human's
@@ -215,7 +308,7 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 
 	var s testsuite.WorkflowTestSuite
 	env, counter := newMcpHitlEnv(t, &s)
-	env.ExecuteWorkflow(mcpHitlWorkflow, false)
+	env.ExecuteWorkflow(mcpHitlWorkflow, mcpHitlCase{})
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
@@ -229,4 +322,46 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 		"the resumed function response must carry the rejection")
 	assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName),
 		"the denial is delivered to the worker-side tool, which rejects without running the handler")
+}
+
+// TestMCPToolConfirmationResumeHonorsCurrentToolFilter proves that a tool the
+// ToolFilter excludes while its confirmation is pending does not run when the
+// human approves: ADK resumes the call from the toolset's current Tools list,
+// which the filter governs at that point, not when the tools were listed. The
+// resume keeps the paused run's invocation ID, and with ReuseMessage also its
+// *genai.Content. With RetryResume, a failed resume already listed and
+// filtered before the filter changed, and the retry passes the same message.
+// With ReuseIterator under a sequential root, ADK runs the kept iterator again
+// with the same RunConfig.
+func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
+	for _, tc := range []mcpHitlCase{
+		{},
+		{ReuseMessage: true},
+		{RetryResume: true},
+		{ReuseMessage: true, RetryResume: true},
+		{SequentialRoot: true, ReuseMessage: true},
+		{SequentialRoot: true, ReuseIterator: true},
+	} {
+		tc.Confirm, tc.ExcludeBeforeResume = true, true
+		t.Run(fmt.Sprintf("%+v", tc), func(t *testing.T) {
+			mcpGuardedRuns.Store(0)
+
+			var s testsuite.WorkflowTestSuite
+			env, counter := newMcpHitlEnv(t, &s)
+			env.ExecuteWorkflow(mcpHitlWorkflow, tc)
+
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+
+			var res mcpHitlResult
+			require.NoError(t, env.GetWorkflowResult(&res))
+
+			require.True(t, res.Paused, "agent must pause on a pending confirmation")
+			assert.EqualValues(t, 0, mcpGuardedRuns.Load(), "an excluded tool must not run after approval")
+			assert.Contains(t, res.ResumedGuardedError, "not found",
+				"ADK must not find the excluded tool when it resumes the call")
+			assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName),
+				"only the pending pass reaches the worker")
+		})
+	}
 }

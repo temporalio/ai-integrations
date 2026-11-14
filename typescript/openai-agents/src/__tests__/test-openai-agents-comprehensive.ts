@@ -6,12 +6,13 @@
  * so every workflow task replays.
  */
 import { randomUUID } from 'crypto';
-import test from 'ava';
+import test, { type ExecutionContext } from 'ava';
 import { withTrace, withCustomSpan } from '@openai/agents-core';
 import { Client, WorkflowFailedError } from '@temporalio/client';
-import { ApplicationFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure, type Workflow } from '@temporalio/common';
 import type { WorkflowBundleWithSourceMap } from '@temporalio/worker';
-import { bundleWorkflowCode } from '@temporalio/worker';
+import { bundleWorkflowCode, NativeConnection } from '@temporalio/worker';
+import { SimplePlugin } from '@temporalio/plugin';
 import type { TestWorkflowEnvironment } from '@temporalio/test-helpers';
 import { Worker, createTestWorkflowEnvironment } from '@temporalio/test-helpers';
 import {
@@ -21,7 +22,13 @@ import {
   SandboxClientProvider,
   DEDICATED_WORKER_FAILURE_TYPE,
 } from '..';
-import { FakeModelProvider, textResponse, toolCallResponse, handoffResponse } from './stubs/openai-agents-fakes';
+import {
+  FakeModelProvider,
+  textResponse,
+  toolCallResponse,
+  toolCallModelProvider,
+  handoffResponse,
+} from './stubs/openai-agents-fakes';
 import { FakeSandboxClient } from './stubs/sandbox-fakes';
 import { installOtelCollector, installAgentSdkCollector } from './helpers/openai-agents-spans';
 import { startLocalWithRetry } from './helpers/environment';
@@ -32,6 +39,7 @@ import {
   retryableModelWorkflow,
   nonRetryableModelWorkflow,
   toolFailureWorkflow,
+  guardrailFailureWorkflow,
   brokenStatefulMcpWorkflow,
   crashSignal,
   traceableSignal,
@@ -855,20 +863,26 @@ test('Non-retryable model error fails workflow with classified ApplicationFailur
   });
 });
 
+/** `cause` is retryable, and its cause is `failingTool`'s `ActivityFailure`, which carries `reason`. */
+function assertFailingToolChain(t: ExecutionContext, cause: unknown, reason: string): void {
+  t.false((cause as ApplicationFailure).nonRetryable);
+  const activityFailure = (cause as ApplicationFailure).cause;
+  t.true(activityFailure instanceof ActivityFailure, String(activityFailure));
+  const failure = activityFailure?.cause;
+  t.true(failure instanceof ApplicationFailure, String(failure));
+  t.is((failure as ApplicationFailure).type, 'ToolFailed');
+  t.deepEqual((failure as ApplicationFailure).details, [reason]);
+}
+
 test('Activity-backed tool failure crashes workflow with AgentsWorkflowError (Python parity)', async (t) => {
   await withTestEnv(async (env) => {
     const taskQueue = `tool-fail-${randomUUID()}`;
     // Python parity: when an activity-backed tool throws, the failure is NOT
     // fed back to the agent loop; it propagates as an ActivityFailure and the
-    // runner wraps it as a non-retryable AgentsWorkflowError, crashing the
-    // workflow. The model only needs the first toolCallResponse; the second
-    // turn never happens.
-    const modelProvider = new FakeModelProvider(() => {
-      function* gen() {
-        yield toolCallResponse('failingTool', { reason: 'no-reason' });
-      }
-      return gen();
-    });
+    // runner wraps it as an AgentsWorkflowError, crashing the workflow. The
+    // model answers every request with the tool call, so the retried run fails
+    // the same way.
+    const modelProvider = toolCallModelProvider('failingTool', { reason: 'no-reason' });
     const plugin = new OpenAIAgentsPlugin({ modelProvider });
     const worker = await Worker.create({
       connection: env.nativeConnection,
@@ -879,22 +893,109 @@ test('Activity-backed tool failure crashes workflow with AgentsWorkflowError (Py
     });
     const client = new Client({ connection: env.connection, plugins: [plugin] });
     await worker.runUntil(async () => {
-      const err = (await t.throwsAsync(
-        client.workflow.execute(toolFailureWorkflow, {
-          args: ['use the failing tool please'],
-          workflowId: `tool-fail-${randomUUID()}`,
-          taskQueue,
-          workflowExecutionTimeout: '30 seconds',
-        }),
-        { instanceOf: WorkflowFailedError }
-      )) as WorkflowFailedError;
+      const handle = await client.workflow.start(toolFailureWorkflow, {
+        args: ['use the failing tool please'],
+        workflowId: `tool-fail-${randomUUID()}`,
+        taskQueue,
+        workflowExecutionTimeout: '30 seconds',
+        retry: { maximumAttempts: 2 },
+      });
+      const err = (await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError })) as WorkflowFailedError;
+      t.not((await handle.describe()).runId, handle.firstExecutionRunId);
 
       const cause = err.cause;
       t.true(cause instanceof ApplicationFailure, 'cause must be ApplicationFailure');
       t.is((cause as ApplicationFailure).type, 'AgentsWorkflowError');
+      assertFailingToolChain(t, cause, 'no-reason');
     });
   });
 });
+
+const failedActivityCases: [string, Workflow, unknown[], string, boolean][] = [
+  [
+    'A failed Activity tool fails a streamed run with AgentsWorkflowError',
+    toolFailureWorkflow,
+    ['go', true],
+    'no-reason',
+    true,
+  ],
+  [
+    'A guardrail whose Activity failed fails the run with AgentsWorkflowError',
+    guardrailFailureWorkflow,
+    ['go'],
+    'guardrail',
+    false,
+  ],
+];
+
+for (const [title, workflow, args, reason, retried] of failedActivityCases) {
+  test(title, async (t) => {
+    await withTestEnv(async (env) => {
+      const taskQueue = `tool-fail-${randomUUID()}`;
+      const plugin = new OpenAIAgentsPlugin({
+        modelProvider: toolCallModelProvider('failingTool', { reason: 'no-reason' }),
+      });
+      const worker = await Worker.create({
+        connection: env.nativeConnection,
+        plugins: [plugin],
+        workflowBundle: sharedWorkflowBundle,
+        activities,
+        taskQueue,
+      });
+      const client = new Client({ connection: env.connection, plugins: [plugin] });
+      await worker.runUntil(async () => {
+        const handle = await client.workflow.start(workflow, {
+          args,
+          workflowId: `tool-fail-${randomUUID()}`,
+          taskQueue,
+          workflowExecutionTimeout: '30 seconds',
+          ...(retried && { retry: { maximumAttempts: 2 } }),
+        });
+        const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+        if (retried) {
+          t.not((await handle.describe()).runId, handle.firstExecutionRunId);
+        }
+        t.true(err?.cause instanceof ApplicationFailure, String(err?.cause));
+        t.is((err?.cause as ApplicationFailure).type, 'AgentsWorkflowError');
+        assertFailingToolChain(t, err?.cause, reason);
+      });
+    });
+  });
+}
+
+for (const stream of [false, true]) {
+  test(`A Workflow retry policy doesn't retry a ${stream ? 'streamed run' : 'run'} whose tool threw a non-retryable ApplicationFailure`, async (t) => {
+    await withTestEnv(async (env) => {
+      const taskQueue = `tool-retry-${randomUUID()}`;
+      const plugin = new OpenAIAgentsPlugin({ modelProvider: toolCallModelProvider('rejectingTool', {}) });
+      const worker = await Worker.create({
+        connection: env.nativeConnection,
+        plugins: [plugin],
+        workflowBundle: sharedWorkflowBundle,
+        activities,
+        taskQueue,
+      });
+      const client = new Client({ connection: env.connection, plugins: [plugin] });
+      await worker.runUntil(async () => {
+        const handle = await client.workflow.start(toolFailureWorkflow, {
+          args: ['go', stream],
+          workflowId: `tool-retry-${randomUUID()}`,
+          taskQueue,
+          workflowExecutionTimeout: '30 seconds',
+          retry: { maximumAttempts: 2 },
+        });
+        const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+        t.is((await handle.describe()).runId, handle.firstExecutionRunId);
+        t.true(err?.cause instanceof ApplicationFailure, String(err?.cause));
+        t.is((err?.cause as ApplicationFailure).type, 'AgentsWorkflowError');
+        t.true((err?.cause as ApplicationFailure).nonRetryable);
+        const failure = err?.cause?.cause;
+        t.true(failure instanceof ApplicationFailure, String(failure));
+        t.is((failure as ApplicationFailure).type, 'ToolRejected');
+      });
+    });
+  });
+}
 
 test('Stateful MCP dedicated-worker failure produces DedicatedWorkerFailure', async (t) => {
   await withTestEnv(async (env) => {
@@ -927,5 +1028,69 @@ test('Stateful MCP dedicated-worker failure produces DedicatedWorkerFailure', as
       t.true(cause instanceof ApplicationFailure, 'cause must be ApplicationFailure');
       t.is((cause as ApplicationFailure).type, DEDICATED_WORKER_FAILURE_TYPE);
     });
+  });
+});
+
+test('runWorker refuses an Activity a later plugin replaced, and starts the Worker at once', async (t) => {
+  await withTestEnv(async (env) => {
+    const replaced =
+      /^Duplicate registration of Activity 'invokeModelActivity': a plugin applied after OpenAIAgentsPlugin replaced/;
+    const connection = await NativeConnection.connect({ address: env.address });
+    const later = new SimplePlugin({ name: 'later', activities: { invokeModelActivity: async () => 'other' } });
+    const worker = await Worker.create({
+      connection,
+      namespace: env.namespace,
+      plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) }), later],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `later-plugin-${randomUUID()}`,
+    });
+    await t.throwsAsync(worker.run(), { instanceOf: TypeError, message: replaced });
+    t.is(worker.getState(), 'STOPPED');
+
+    // One instance on the connection and the Worker, with the later plugin on the connection: both of
+    // the instance's checks run, and the Worker must still stop cleanly.
+    const plugin = new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) });
+    const shared = await NativeConnection.connect({ address: env.address, plugins: [plugin, later] });
+    const twice = await Worker.create({
+      connection: shared,
+      namespace: env.namespace,
+      plugins: [plugin],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `later-plugin-twice-${randomUUID()}`,
+    });
+    await t.throwsAsync(twice.run(), { instanceOf: TypeError, message: replaced });
+    t.is(twice.getState(), 'STOPPED');
+    await shared.close();
+
+    // runUntil stops the Worker after its callback only if the Worker is already running, so the
+    // check must not yield before it starts: not for a callback that throws at once, and not for
+    // two instances that both check.
+    const options = { modelProvider: new FakeModelProvider([]) };
+    const alone = await Worker.create({
+      connection,
+      namespace: env.namespace,
+      plugins: [new OpenAIAgentsPlugin(options)],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `run-until-throws-${randomUUID()}`,
+    });
+    await t.throwsAsync(
+      alone.runUntil(() => {
+        throw new Error('boom');
+      }),
+      { message: 'boom' }
+    );
+    t.is(alone.getState(), 'STOPPED');
+    const two = await Worker.create({
+      connection,
+      namespace: env.namespace,
+      plugins: [new OpenAIAgentsPlugin(options), new OpenAIAgentsPlugin(options)],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `run-until-two-${randomUUID()}`,
+    });
+    t.is(await two.runUntil(() => Promise.resolve('done')), 'done');
+    t.is(two.getState(), 'STOPPED');
+
+    // Throws if a Worker still holds the connection.
+    await connection.close();
   });
 });

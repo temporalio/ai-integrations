@@ -25,7 +25,7 @@ import {
   callToolActivityName,
   listToolsActivityName,
   MCP_CONNECTION_IDLE_MS,
-  _evictConnection,
+  McpConnections,
 } from './temporal-mcp-client';
 
 // What each Activity a StrandsPlugin builds was built from: its name, then what it depends on.
@@ -56,13 +56,14 @@ const REMEDY =
  * - `mcpClients` — name → MCP client factory map. Workflow-side
  *   `TemporalMCPClient({ server: 'name' })` selects a factory by name; the
  *   per-server `{name}-listTools` and `{name}-callTool` activities reuse one
- *   lazily-opened worker-process connection. Tools are enumerated live on each
+ *   lazily-opened connection, which belongs to this plugin instance and closes
+ *   when the last worker using the plugin stops. Tools are enumerated live on each
  *   `listTools`. By default (`TemporalMCPClient`'s `cacheTools: false`) the
  *   agent re-lists on each turn, so it picks up MCP-server changes (including
  *   redeploys) mid-workflow without restarting the worker; set `cacheTools:
  *   true` to list once at the start of the workflow instead.
  *
- * - `mcpConnectionIdleTimeout` — how long a worker-process MCP connection is
+ * - `mcpConnectionIdleTimeout` — how long an idle MCP connection is
  *   kept open between `callTool` activities before it's disconnected. The window
  *   only starts once no activity is using the connection, so it never cuts off
  *   an in-flight call, however long it runs. Accepts a millisecond number or a
@@ -95,6 +96,16 @@ function strandsActivityInbound(ctx: ActivityContext): ActivityInboundCallsInter
   };
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Temporal plugin that runs Strands Agents inside Temporal workflows. Model,
  * MCP tool, and (via {@link workflow.activityAsTool}) custom-tool invocations
@@ -108,6 +119,9 @@ function strandsActivityInbound(ctx: ActivityContext): ActivityInboundCallsInter
  * ```
  */
 export class StrandsPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   constructor(options: StrandsPluginOptions = {}) {
     let modelFactories = options.models;
     let defaultName: string | undefined;
@@ -138,10 +152,13 @@ export class StrandsPlugin extends SimplePlugin {
 
     const mcpClients = options.mcpClients ?? {};
     const idleMs = msOptionalToNumber(options.mcpConnectionIdleTimeout);
+    // This plugin's own MCP connections: the Workers that share this instance share
+    // them, and another StrandsPlugin opens its own, even for the same server name.
+    const connections = new McpConnections(idleMs);
     for (const [server, factory] of Object.entries(mcpClients)) {
       const serverActivities = {
-        [listToolsActivityName(server)]: buildListToolsActivity(server, factory, idleMs),
-        [callToolActivityName(server)]: buildCallToolActivity(server, factory, idleMs),
+        [listToolsActivityName(server)]: buildListToolsActivity(server, factory, connections),
+        [callToolActivityName(server)]: buildCallToolActivity(server, factory, connections),
       };
       for (const [name, fn] of Object.entries(serverActivities)) {
         activities[name] = fn;
@@ -149,17 +166,8 @@ export class StrandsPlugin extends SimplePlugin {
       }
     }
 
-    const runContext = async (next: () => Promise<void>): Promise<void> => {
-      try {
-        await next();
-      } finally {
-        // Close any worker-process MCP connections opened lazily by the
-        // listTools/callTool activities.
-        for (const server of Object.keys(mcpClients)) {
-          await _evictConnection(server);
-        }
-      }
-    };
+    // Closes the MCP connections once the last Worker using this plugin stops.
+    const runContext = (next: () => Promise<void>): Promise<void> => connections.use(next);
 
     super({
       name: 'StrandsPlugin',
@@ -230,12 +238,14 @@ export class StrandsPlugin extends SimplePlugin {
    *     `@google/genai`, `ai`). The workers constructs models worker-side;
    *     workflow code only goes through {@link TemporalModel}.
    *   - `@aws-sdk/client-s3`, dynamically imported by the SDK's S3-backed
-   *     `context-offloader` vended plugin — worker-only, never reached from
-   *     workflow code.
+   *     `context-offloader` vended plugin. The offloader can run in workflows
+   *     with in-memory storage; S3 I/O must run in Activities.
    *   - `@temporalio/activity` and `@temporalio/client`, which the
    *     worker-only halves of {@link TemporalMCPClient}, {@link autoHeartbeat},
    *     and `@temporalio/workflow-streams/client` import.
    *   - `path` / `crypto`, pulled in transitively by the same worker-only code.
+   *   - `node:crypto`, dynamically imported by `LocalFileStorage` through the
+   *     unified storage entrypoint. In-memory storage does not use it.
    *
    * - Replace the dynamic-imported MCP transport helpers
    *   (`@modelcontextprotocol/sdk/client/{stdio,sse,streamableHttp}.js` and
@@ -318,7 +328,7 @@ interface WebpackCompiler {
 function emptyModuleRewritesPlugin(): WebpackPlugin {
   const empty = require.resolve('./empty-module');
   const ignorePattern =
-    /^(?:node:(?:fs\/promises|os|path|process|stream)|@modelcontextprotocol\/sdk\/client\/(?:stdio|sse|streamableHttp)\.js|eventsource|eventsource-parser\/stream)$/;
+    /^(?:node:(?:crypto|fs\/promises|os|path|process|stream)|@modelcontextprotocol\/sdk\/client\/(?:stdio|sse|streamableHttp)\.js|eventsource|eventsource-parser\/stream)$/;
   return {
     apply(compiler) {
       const { NormalModuleReplacementPlugin } = compiler.webpack;

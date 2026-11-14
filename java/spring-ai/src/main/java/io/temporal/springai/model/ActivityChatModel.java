@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.springframework.ai.chat.messages.*;
+import org.springframework.ai.chat.metadata.ChatGenerationMetadata;
 import org.springframework.ai.chat.metadata.ChatResponseMetadata;
 import org.springframework.ai.chat.metadata.DefaultUsage;
 import org.springframework.ai.chat.metadata.RateLimit;
@@ -434,7 +435,15 @@ public class ActivityChatModel implements ChatModel {
   private ChatResponse toResponse(ChatModelTypes.ChatModelActivityOutput output) {
     List<Generation> generations =
         output.generations().stream()
-            .map(gen -> new Generation(toAssistantMessage(gen.message())))
+            .map(
+                gen -> {
+                  AssistantMessage message = toAssistantMessage(gen.message());
+                  return gen.finishReason() != null
+                      ? new Generation(
+                          message,
+                          ChatGenerationMetadata.builder().finishReason(gen.finishReason()).build())
+                      : new Generation(message);
+                })
             .collect(Collectors.toList());
 
     var builder = ChatResponse.builder().generations(generations);

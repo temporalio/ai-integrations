@@ -7,26 +7,28 @@ expected activity.
 
 from __future__ import annotations
 
-import sys
+import functools
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
-
 pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
-from temporalio.worker import Worker  # noqa: E402
-from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
+from temporalio.common import RetryPolicy  # noqa: E402
+from temporalio.worker import Replayer, Worker  # noqa: E402
+from temporalio.workflow import ActivityConfig  # noqa: E402
+from tests.helpers.deepagents import (  # noqa: E402
+    count_scheduled_activities,
+    scheduled_activity_attrs,
+)
 
 with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents import (  # noqa: E402
@@ -39,11 +41,12 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
 
 INVOKE_TOOL = "deepagents.invoke_tool"
+# Dedicated queue for tool activities, so tests can prove task-queue routing.
+TOOL_TASK_QUEUE = "da-tool-queue"
+TEN_SECONDS = ActivityConfig(start_to_close_timeout=timedelta(seconds=10))
 
-# Bind deepagents symbols off the module importorskip returns: a static
-# `from deepagents import ...` cannot resolve on Python 3.10 (deepagents
-# needs >= 3.11), and with the package absent the type checkers mis-resolve
-# the name against this same-named test directory.
+# Resolve framework symbols through the imported module to avoid confusing
+# the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
@@ -107,6 +110,38 @@ async def echo_activity(text: str) -> str:
 
 
 @activity.defn
+async def echo_twice(text: str, /, times: int = 2, sep: str = ",") -> str:
+    # `text` is positional-only; the model still passes it by name.
+    return sep.join([text] * times)
+
+
+class EchoActivities:
+    @activity.defn
+    async def echo_method(self, text: Annotated[str, "The text to echo."]) -> str:
+        return f"method:{text}"
+
+    @activity.defn
+    async def echo_self_typed(self: Self, text: str) -> str:
+        return f"method:{text}"
+
+
+@activity.defn
+class EchoClass:
+    """An echo activity whose prefix is set on the worker."""
+
+    # A class-level annotation for the constructor's parameter: without it, the
+    # tool built from the constructor failed to build at all.
+    prefix: str
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+
+    async def __call__(self, text: Annotated[str, "The text to echo."]) -> str:
+        """Echo text with the worker's prefix."""
+        return f"{self.prefix}:{text}"
+
+
+@activity.defn
 async def forecast_activity(city: str, days: int, units: str = "C") -> str:
     return f"{city}:{days}:{units}"
 
@@ -119,23 +154,34 @@ async def quota_activity() -> str:
 @workflow.defn
 class ActivityAsToolWorkflow:
     @workflow.run
-    async def run(self, text: str) -> str:
-        tool = activity_as_tool(
-            echo_activity, start_to_close_timeout=timedelta(seconds=10)
-        )
-        return await tool.ainvoke({"text": text})
+    async def run(self, text: str) -> list[str]:
+        calls: list[tuple[Callable[..., Any], dict[str, Any]]] = [
+            (echo_activity, {"text": text}),
+            # `times` is left out and `sep` is passed: LangChain fills in the
+            # default before it calls the tool.
+            (echo_twice, {"text": text, "sep": "+"}),
+            (EchoActivities.echo_method, {"text": text}),
+            (EchoClass, {"text": text}),
+        ]
+        results = []
+        for activity_ref, args in calls:
+            tool = activity_as_tool(
+                activity_ref,
+                activity_options=ActivityConfig(
+                    start_to_close_timeout=timedelta(seconds=10),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                ),
+            )
+            results.append(await tool.ainvoke(args))
+        return results
 
 
 @workflow.defn
 class ActivityParametersAsToolWorkflow:
     @workflow.run
     async def run(self) -> list[str]:
-        forecast = activity_as_tool(
-            forecast_activity, start_to_close_timeout=timedelta(seconds=10)
-        )
-        quota = activity_as_tool(
-            quota_activity, start_to_close_timeout=timedelta(seconds=10)
-        )
+        forecast = activity_as_tool(forecast_activity, activity_options=TEN_SECONDS)
+        quota = activity_as_tool(quota_activity, activity_options=TEN_SECONDS)
         return [
             await forecast.ainvoke({"city": "Paris", "days": 3}),
             await forecast.ainvoke({"city": "Oslo", "days": 1, "units": "F"}),
@@ -166,7 +212,12 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
         env.client,
         task_queue="da-act-tool",
         workflows=[ActivityAsToolWorkflow],
-        activities=[echo_activity],
+        activities=[
+            echo_activity,
+            echo_twice,
+            EchoActivities().echo_method,
+            EchoClass("worker"),
+        ],
         plugins=[plugin],
     ):
         handle = await env.client.start_workflow(
@@ -177,9 +228,275 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
         )
         out = await handle.result()
 
-    assert out == "echo:hi"
+    # Each activity gets the model's arguments as its own parameters; the
+    # callable class's registered instance gets them in __call__.
+    assert out == ["echo:hi", "hi+hi", "method:hi", "worker:hi"]
     counts = await count_scheduled_activities(handle)
-    assert counts["echo_activity"] == 1, counts
+    assert counts == {
+        "echo_activity": 1,
+        "echo_twice": 1,
+        "echo_method": 1,
+        "EchoClass": 1,
+    }, counts
+    # The tool's own task queue, no heartbeat timeout, the configured
+    # start-to-close and the default "tool:<name>" summary.
+    attrs = await scheduled_activity_attrs(handle, "echo_activity")
+    assert attrs is not None
+    assert attrs.task_queue.name == "da-act-tool"
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+    await Replayer(
+        workflows=[ActivityAsToolWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(await handle.fetch_history())
+
+
+@pytest.mark.parametrize("option", ["arg", "args"])
+def test_activity_as_tool_rejects_reserved_activity_options(option: str) -> None:
+    """arg and args are built from the model's tool call, so the caller can't set them."""
+    options: Any = {"start_to_close_timeout": timedelta(seconds=10), option: "x"}
+    with pytest.raises(ValueError, match=option):
+        activity_as_tool(echo_activity, activity_options=options)
+
+
+def test_activity_as_tool_requires_a_timeout() -> None:
+    """Temporal needs a start-to-close or schedule-to-close timeout; fail at construction."""
+    with pytest.raises(ValueError, match="schedule_to_close_timeout"):
+        activity_as_tool(echo_activity)
+    with pytest.raises(ValueError, match="schedule_to_close_timeout"):
+        activity_as_tool(echo_activity, activity_options=ActivityConfig(task_queue="q"))
+    # schedule_to_close_timeout alone is enough.
+    tool = activity_as_tool(
+        echo_activity,
+        activity_options=ActivityConfig(
+            schedule_to_close_timeout=timedelta(seconds=30)
+        ),
+    )
+    assert tool.name == "echo_activity"
+
+
+@workflow.defn
+class ActivityAsToolOptionsWorkflow:
+    @workflow.run
+    async def run(self, text: str) -> list[str]:
+        options = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=10),
+            heartbeat_timeout=timedelta(seconds=3),
+            task_queue=TOOL_TASK_QUEUE,
+            summary="weather lookup",
+        )
+        tool = activity_as_tool(
+            echo_activity,
+            activity_options=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=10),
+                heartbeat_timeout=timedelta(seconds=3),
+                task_queue=TOOL_TASK_QUEUE,
+                summary="echo",
+                activity_id="echo-call",
+            ),
+        )
+        # A multi-parameter activity with a defaulted parameter: the options
+        # compose with the per-parameter argument mapping.
+        forecast = activity_as_tool(forecast_activity, activity_options=options)
+        return [
+            await tool.ainvoke({"text": text}),
+            await forecast.ainvoke({"city": "Paris", "days": 3}),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_activity_as_tool_activity_options(env: WorkflowEnvironment) -> None:
+    """activity_options carries the full ActivityConfig: the tool activity
+    lands on the routed task queue with the heartbeat timeout, start-to-close,
+    summary and the caller's activity_id. The routed activity worker has no
+    plugin, so the scheduling needs no plugin-side cooperation.
+    """
+    plugin = DeepAgentsPlugin()
+    async with (
+        Worker(
+            env.client,
+            task_queue="da-act-tool-opts",
+            workflows=[ActivityAsToolOptionsWorkflow],
+            plugins=[plugin],
+        ),
+        Worker(
+            env.client,
+            task_queue=TOOL_TASK_QUEUE,
+            activities=[echo_activity, forecast_activity],
+        ),
+    ):
+        handle = await env.client.start_workflow(
+            ActivityAsToolOptionsWorkflow.run,
+            "hi",
+            id=f"da-act-tool-opts-{uuid.uuid4()}",
+            task_queue="da-act-tool-opts",
+        )
+        out = await handle.result()
+
+    assert out == ["echo:hi", "Paris:3:C"]
+    for name in ("echo_activity", "forecast_activity"):
+        attrs = await scheduled_activity_attrs(handle, name)
+        assert attrs is not None, name
+        assert attrs.task_queue.name == TOOL_TASK_QUEUE
+        assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=3)
+        assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+    echo_attrs = await scheduled_activity_attrs(handle, "echo_activity")
+    assert echo_attrs is not None
+    assert echo_attrs.activity_id == "echo-call"
+    await Replayer(
+        workflows=[ActivityAsToolOptionsWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(await handle.fetch_history())
+
+
+class EchoBase:
+    async def __call__(self, text: str) -> str:
+        """Echo text from the base class."""
+        return text
+
+
+@activity.defn
+class DocumentedEchoClass(EchoBase):
+    """Echo text from the class docstring."""
+
+    async def __call__(self, text: str) -> str:
+        return text
+
+
+@activity.defn
+class InheritedEchoClass(EchoBase):
+    async def __call__(self, text: str) -> str:
+        return text
+
+
+@activity.defn
+@dataclass
+class EchoDataclass(EchoBase):
+    # No docstring, so dataclasses writes "EchoDataclass(prefix: 'str')".
+    prefix: str
+
+
+@activity.defn
+class StaticEchoClass:
+    @staticmethod
+    async def __call__(text: str) -> str:
+        return text
+
+
+@activity.defn
+class ClassMethodEchoClass:
+    @classmethod
+    async def __call__(cls, text: str) -> str:
+        return text
+
+
+async def _echo_with(_receiver: object, text: str) -> str:
+    return text
+
+
+@activity.defn
+class PartialMethodEchoClass:
+    __call__ = functools.partialmethod(_echo_with)
+
+
+@activity.defn
+class PartialKeywordEchoClass:
+    # Binding `text` by keyword makes it keyword-only.
+    __call__ = functools.partialmethod(_echo_with, text="hi")
+
+
+@pytest.mark.parametrize(
+    "activity_ref, args, description",
+    [
+        # No `self` for a method passed as Class.method, even annotated (a string
+        # here, under `from __future__ import annotations`).
+        (
+            EchoActivities.echo_method,
+            {"text": "The text to echo."},
+            "Temporal activity echo_method.",
+        ),
+        (
+            EchoActivities.echo_self_typed,
+            {"text": None},
+            "Temporal activity echo_self_typed.",
+        ),
+        # A class offers __call__'s parameters and docstring, not its constructor's
+        # or its class docstring.
+        (
+            EchoClass,
+            {"text": "The text to echo."},
+            "Echo text with the worker's prefix.",
+        ),
+        # Without a __call__ docstring, the class's own docstring, else that of
+        # an inherited __call__.
+        (DocumentedEchoClass, {"text": None}, "Echo text from the class docstring."),
+        (InheritedEchoClass, {"text": None}, "Echo text from the base class."),
+        # Not the docstring dataclasses writes, which names the constructor's
+        # parameters.
+        (EchoDataclass, {"text": None}, "Echo text from the base class."),
+        # The receiver of each __call__ form is dropped, as an instance binds it.
+        (StaticEchoClass, {"text": None}, "Temporal activity StaticEchoClass."),
+        (
+            ClassMethodEchoClass,
+            {"text": None},
+            "Temporal activity ClassMethodEchoClass.",
+        ),
+        (
+            PartialMethodEchoClass,
+            {"text": None},
+            "Temporal activity PartialMethodEchoClass.",
+        ),
+    ],
+)
+def test_activity_as_tool_schema(
+    activity_ref: Any, args: dict[str, str | None], description: str
+) -> None:
+    # `args` maps each parameter the model is offered to its description.
+    tool = activity_as_tool(activity_ref, activity_options=TEN_SECONDS)
+    assert {name: arg.get("description") for name, arg in tool.args.items()} == args
+    assert tool.description == description
+
+
+@activity.defn
+class NoCallActivity:
+    pass
+
+
+@activity.defn
+class KeywordOnlyActivity:
+    async def __call__(self, *, text: str) -> str:
+        return text
+
+
+@activity.defn
+async def varargs_activity(text: str, *more: str) -> str:
+    return text + "".join(more)
+
+
+@activity.defn
+async def kwargs_activity(text: str, **extra: str) -> str:
+    return text + "".join(extra.values())
+
+
+class BadAnnotationActivity(EchoClass):
+    # Not decorated, so only activity_as_tool reads this annotation.
+    async def __call__(self, text: Missing) -> str:  # type: ignore
+        return text
+
+
+@pytest.mark.parametrize(
+    "activity_ref, message",
+    [
+        (NoCallActivity, "to have a __call__"),
+        (KeywordOnlyActivity, "keyword-only argument 'text'"),
+        (PartialKeywordEchoClass, "partialmethod binds an argument by keyword"),
+        (varargs_activity, r"\*more"),
+        (kwargs_activity, r"\*\*extra"),
+        (BadAnnotationActivity, "name 'Missing' is not defined"),
+        (EchoClass("workflow"), "not an instance of it"),
+    ],
+)
+def test_activity_as_tool_rejects(activity_ref: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        activity_as_tool(activity_ref, activity_options=TEN_SECONDS)
 
 
 @pytest.mark.asyncio

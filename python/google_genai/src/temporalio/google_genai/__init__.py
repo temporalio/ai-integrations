@@ -1,9 +1,5 @@
 """First-class Temporal integration for the Google Gemini SDK.
 
-.. warning::
-    This module is experimental and may change in future versions.
-    Use with caution in production environments.
-
 This integration lets you use the Gemini SDK's async client with full
 automatic function calling (AFC) support. Every API call becomes a
 **durable Temporal activity**. Tools default to plain workflow methods
@@ -38,7 +34,7 @@ activities against a pooled worker-side connection.  Server-side MCP on Vertex
 AI (``Tool(mcp_servers=[McpServer(...)])``) and the Interactions API's MCP step
 types are executed by Google's backend and flow through unchanged as request /
 response data — no extra wiring needed.  Client-side MCP requires the
-``temporalio-google-genai[mcp]`` extra (MCP Python SDK v1).
+``temporalio-google-genai[mcp]`` extra (MCP Python SDK v1 or v2).
 
 Streaming: set ``TemporalAsyncClient(streaming_topic=...)`` and host a
 :class:`temporalio.contrib.workflow_streams.WorkflowStream` in the workflow's

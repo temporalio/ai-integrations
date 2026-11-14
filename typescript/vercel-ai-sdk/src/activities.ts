@@ -4,22 +4,72 @@ import type {
   LanguageModelV4FinishReason,
   LanguageModelV4GenerateResult,
   LanguageModelV4Usage,
+  LanguageModelV4,
   EmbeddingModelV4Result,
+  SharedV4FileData,
   SharedV4ProviderMetadata,
   SharedV4ProviderOptions,
   SharedV4Headers,
   SharedV4Warning,
   ProviderV4,
 } from '@ai-sdk/provider';
-import { asSchema, type Schema, type ToolExecutionOptions } from 'ai';
+import { APICallError, getErrorMessage } from '@ai-sdk/provider';
+import { detectMediaType, isFullMediaType, isUrlSupported } from '@ai-sdk/provider-utils';
+import { asSchema, createDownload, type Schema, type ToolExecutionOptions } from 'ai';
 import type { MCPClient } from '@ai-sdk/mcp';
 import { ApplicationFailure } from '@temporalio/common';
 import { Context } from '@temporalio/activity';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { msOptionalToNumber, type Duration } from '@temporalio/common/lib/time';
 import type { McpClientFactories, McpClientFactory } from './mcp';
+import { withSources } from './activity-sources';
+import { encodeContentFileData, encodeResultFileData } from './file-data';
 
 const encoder = new TextEncoder();
+
+// A slow provider call must not look like a lost Worker, and a cancellation request
+// reaches the Activity only through heartbeats. This timer sends the only heartbeats, the
+// first one half the timeout in, so a shorter call sends none.
+function heartbeatUntilDisposed(): Disposable {
+  const ctx = Context.current();
+  const timeoutMs = ctx.info.heartbeatTimeoutMs;
+  if (!timeoutMs) return { [Symbol.dispose]: () => {} };
+  const timer = setInterval(() => ctx.heartbeat(), timeoutMs / 2);
+  timer.unref();
+  return { [Symbol.dispose]: () => clearInterval(timer) };
+}
+
+// The AI SDK marks provider errors that fail the same way on retry with `isRetryable: false`.
+// Temporal owns the retries, so the Activity takes the same verdict.
+function isFinalProviderError(error: unknown): error is APICallError {
+  return APICallError.isInstance(error) && !error.isRetryable;
+}
+
+async function callProvider<T>(call: () => PromiseLike<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (isFinalProviderError(error)) {
+      throw ApplicationFailure.create({
+        message: error.message,
+        // The type the Worker gives a thrown error, so that failure handlers and
+        // `nonRetryableErrorTypes` in use today continue to match.
+        type: error.constructor.name,
+        nonRetryable: true,
+        cause: error,
+      });
+    }
+    throw error;
+  }
+}
+
+// Raw HTTP bodies repeat the prompt and the returned content, and a request body can hold
+// downloaded file bytes. Event History must not record them.
+function withoutBody<T extends object>(value: T | undefined): Omit<T, 'body'> | undefined {
+  if (value === undefined) return undefined;
+  const { body: _body, ...rest } = value as T & { body?: unknown };
+  return rest;
+}
 
 /**
  * Arguments for invoking a language model activity.
@@ -81,8 +131,6 @@ export interface CallToolArgs {
 
 /**
  * Options controlling MCP connection reuse for {@link createActivities}.
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export interface CreateActivitiesOptions {
   /**
@@ -97,6 +145,15 @@ export interface CreateActivitiesOptions {
    * don't tolerate a reused or concurrent session.
    */
   mcpConnectionIdleTimeout?: Duration;
+
+  /**
+   * Downloads a prompt file or image URL that the model does not support, before the
+   * model activity calls the model. Defaults to `createDownload()` from `ai`.
+   */
+  download?: (options: {
+    url: URL;
+    abortSignal?: AbortSignal;
+  }) => PromiseLike<{ data: Uint8Array; mediaType: string | undefined }>;
 }
 
 /**
@@ -170,6 +227,33 @@ export async function _evictMcpConnectionsForServer(name: string): Promise<void>
   );
 }
 
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `Client`.
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
+  return (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+}
+
+async function resolveMcpClient(name: string, factory: McpClientFactory, clientArgs: unknown): Promise<MCPClient> {
+  const client = await factory(clientArgs);
+  if (client == null || typeof client.tools !== 'function' || typeof client.close !== 'function') {
+    // A rejected client may still hold a connection; release it before failing. Best-effort, so a
+    // cleanup error can't replace the validation failure.
+    if (typeof client?.close === 'function') {
+      try {
+        await client.close();
+      } catch {
+        // Ignore; report the validation failure below.
+      }
+    }
+    throw ApplicationFailure.nonRetryable(
+      `MCP client factory '${name}' returned ${describeValue(client)}, not a client with tools() and close() methods.`,
+      'MCPClientFactoryTypeError'
+    );
+  }
+  return client;
+}
+
 /**
  * Acquires the pooled MCP connection for `${name}:${clientArgs}`, creating it if absent, and marks it
  * in-use for the duration of one call. Cancels any pending idle-eviction timer and increments the
@@ -184,7 +268,7 @@ function acquireMcpConnection(
   const key = mcpConnectionKey(name, clientArgs);
   let entry = mcpConnections.get(key);
   if (entry === undefined) {
-    const client = factory(clientArgs);
+    const client = resolveMcpClient(name, factory, clientArgs);
     entry = { client, refCount: 0, broken: false };
     mcpConnections.set(key, entry);
     // If the connect/factory call fails, drop the rejected promise so the next call retries
@@ -228,18 +312,26 @@ function releaseMcpConnection(key: string, entry: McpConnectionEntry, idleMs: nu
  * @param mcpClientFactories A mapping of server names to functions to create mcp clients
  * @param options Options controlling MCP connection reuse (see {@link CreateActivitiesOptions})
  * @returns An object containing the activity functions
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export function createActivities(
   provider: ProviderV4,
   mcpClientFactories?: McpClientFactories,
   options?: CreateActivitiesOptions
 ): object {
+  const download = options?.download ?? createDownload();
   let activities = {
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
+      using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
-      return await model.doGenerate(args.options);
+      await prepareFileUrls(args.options, model, download);
+      const result = await callProvider(() =>
+        model.doGenerate({ ...args.options, abortSignal: Context.current().cancellationSignal })
+      );
+      return encodeResultFileData({
+        ...result,
+        request: withoutBody(result.request),
+        response: withoutBody(result.response),
+      });
     },
 
     /**
@@ -253,13 +345,18 @@ export function createActivities(
      * don't recognize; no normalization happens here.
      */
     async invokeModelStreaming(args: InvokeModelStreamingArgs): Promise<InvokeModelResult> {
+      // Declared first so it is disposed last, after the stream flush.
+      using _heartbeat = heartbeatUntilDisposed();
       await using stream = WorkflowStreamClient.fromWithinActivity({
         batchInterval: args.streamingBatchInterval ?? '100 milliseconds',
       });
       const events = stream.topic(args.streamingTopic);
 
       const model = provider.languageModel(args.modelId);
-      const streamResult = await model.doStream(args.options);
+      await prepareFileUrls(args.options, model, download);
+      const streamResult = await callProvider(() =>
+        model.doStream({ ...args.options, abortSignal: Context.current().cancellationSignal })
+      );
 
       const content: LanguageModelV4Content[] = [];
       let finishReason: LanguageModelV4FinishReason = { unified: 'other', raw: undefined };
@@ -269,6 +366,7 @@ export function createActivities(
       };
       const warnings: SharedV4Warning[] = [];
       let responseMetadata: Record<string, unknown> | undefined;
+      let providerMetadata: SharedV4ProviderMetadata | undefined;
       let sawFinish = false;
       let sawError = false;
       let streamError: unknown;
@@ -279,10 +377,9 @@ export function createActivities(
       const reader = streamResult.stream.getReader();
 
       while (true) {
-        const { done, value: part } = await reader.read();
+        const { done, value } = await callProvider(() => reader.read());
         if (done) break;
-
-        Context.current().heartbeat();
+        const part = encodeContentFileData(value);
 
         // Publish the raw stream part as JSON so consumers can switch on
         // the native AI SDK type. Accumulation below is for the final
@@ -337,6 +434,7 @@ export function createActivities(
           case 'finish':
             finishReason = part.finishReason;
             usage = part.usage;
+            providerMetadata = part.providerMetadata;
             sawFinish = true;
             break;
           case 'raw':
@@ -368,13 +466,19 @@ export function createActivities(
 
       // An `error` part signals a provider failure even when the stream still delivers a
       // `finish` part afterwards — fail the activity rather than return a partial result as
-      // success. `part.error` is untyped, so it cannot be classified as deterministic here;
-      // surface it as retryable and let the activity retry policy govern, matching how a
-      // provider error thrown from `doGenerate` behaves in the non-streaming activity.
+      // success.
       if (sawError) {
-        throw ApplicationFailure.retryable(
-          `Model stream emitted an error part${sawFinish ? '' : ' and ended without a finish part'}: ${streamError}`
-        );
+        const ending = sawFinish ? '' : ' and ended without a finish part';
+        // `part.error` is untyped. Only an `APICallError` says whether a retry can help, so any
+        // other value is left to the activity retry policy, as in `invokeModel`.
+        throw ApplicationFailure.create({
+          message: `Model stream emitted an error part${ending}: ${getErrorMessage(streamError)}`,
+          // Every stream failure keeps the type `Error`, so that failure handlers and
+          // `nonRetryableErrorTypes` in use today continue to match. The `cause` has the detail.
+          type: 'Error',
+          nonRetryable: isFinalProviderError(streamError),
+          cause: streamError instanceof Error ? streamError : undefined,
+        });
       }
 
       return {
@@ -382,30 +486,96 @@ export function createActivities(
         finishReason,
         usage,
         warnings,
-        request: streamResult.request,
-        response: responseMetadata ? { ...responseMetadata, ...streamResult.response } : streamResult.response,
+        providerMetadata,
+        request: withoutBody(streamResult.request),
+        response: withoutBody(
+          responseMetadata
+            ? { ...responseMetadata, ...streamResult.response }
+            : streamResult.response
+        ),
       };
     },
 
     async invokeEmbeddingModel(args: InvokeEmbeddingModelArgs): Promise<InvokeEmbeddingModelResult> {
+      using _heartbeat = heartbeatUntilDisposed();
       const model = provider.embeddingModel(args.modelId);
-      return await model.doEmbed({
-        values: args.values,
-        providerOptions: args.providerOptions,
-        headers: args.headers,
-      });
+      const result = await callProvider(() =>
+        model.doEmbed({
+          values: args.values,
+          providerOptions: args.providerOptions,
+          headers: args.headers,
+          abortSignal: Context.current().cancellationSignal,
+        })
+      );
+      return { ...result, response: withoutBody(result.response) };
     },
   };
+  withSources(activities, [provider, options?.download]);
   if (mcpClientFactories !== undefined) {
     const idleMs = msOptionalToNumber(options?.mcpConnectionIdleTimeout) ?? MCP_CONNECTION_IDLE_MS;
     Object.entries(mcpClientFactories).forEach(([name, func]) => {
+      // Fail when the Worker is built, not in every MCP Activity.
+      if (typeof func !== 'function') {
+        throw new TypeError(`MCP client factory '${name}' is ${describeValue(func)}, not a function.`);
+      }
       activities = {
         ...activities,
-        ...activitiesForName(name, func, idleMs),
+        ...withSources(activitiesForName(name, func, idleMs), [func, idleMs]),
       };
     });
   }
   return activities;
+}
+
+type PromptFilePart = { data: SharedV4FileData; mediaType: string };
+
+/**
+ * Restores `URL` objects in prompt file data, then downloads each URL the model does not
+ * support, in the prompt locations `generateText` downloads from. Returns true when it
+ * downloaded a file.
+ */
+async function prepareFileUrls(
+  options: LanguageModelV4CallOptions,
+  model: LanguageModelV4,
+  download: NonNullable<CreateActivitiesOptions['download']>
+): Promise<boolean> {
+  const downloadable: { part: PromptFilePart; url: URL }[] = [];
+  const visit = (part: PromptFilePart, canDownload: boolean): void => {
+    if (part.data.type !== 'url') return;
+    // The JSON payload converter turns a `URL` into its `href` string.
+    const url = (part.data.url = new URL(part.data.url));
+    if (canDownload) downloadable.push({ part, url });
+  };
+  for (const message of options.prompt) {
+    if (message.role === 'system') continue;
+    for (const part of message.content) {
+      if (part.type === 'file') visit(part, message.role === 'user');
+      else if (part.type === 'reasoning-file') visit(part, false);
+      else if (part.type === 'tool-result' && part.output.type === 'content') {
+        for (const item of part.output.value) if (item.type === 'file') visit(item, true);
+      }
+    }
+  }
+  if (downloadable.length === 0) return false;
+  const supportedUrls = await model.supportedUrls;
+  const abortSignal = Context.current().cancellationSignal;
+  const unsupported = downloadable.filter(
+    ({ part, url }) =>
+      !isUrlSupported({ mediaType: part.mediaType, url: url.toString(), supportedUrls })
+  );
+  await Promise.all(
+    unsupported.map(async ({ part, url }) => {
+      const file = await download({ url, abortSignal });
+      part.data = { type: 'data', data: file.data };
+      if (file.mediaType != null && !isFullMediaType(part.mediaType)) {
+        part.mediaType = file.mediaType;
+      }
+      // `generateText` trusts an image signature in the bytes over the given media type.
+      const imageType = detectMediaType({ data: file.data, topLevelType: 'image' });
+      if (imageType != null) part.mediaType = imageType;
+    })
+  );
+  return unsupported.length > 0;
 }
 
 async function extractTools(mcpClient: MCPClient): Promise<Record<string, ListToolResult>> {
@@ -437,7 +607,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
   async function listToolsActivity(args: ListToolArgs): Promise<Record<string, ListToolResult>> {
     if (idleMs <= 0) {
       // Opt-out: restore the original create-then-close-per-call behavior.
-      const mcpClient = await mcpClientFactory(args.clientArgs);
+      const mcpClient = await resolveMcpClient(name, mcpClientFactory, args.clientArgs);
       try {
         return await extractTools(mcpClient);
       } finally {
@@ -461,7 +631,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
   async function callToolActivity(args: CallToolArgs): Promise<unknown> {
     if (idleMs <= 0) {
       // Opt-out: restore the original create-then-close-per-call behavior.
-      const mcpClient = await mcpClientFactory(args.clientArgs);
+      const mcpClient = await resolveMcpClient(name, mcpClientFactory, args.clientArgs);
       try {
         return await callTool(mcpClient, args);
       } finally {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.metadata
 import inspect
 import random
 import time
@@ -16,10 +17,7 @@ import opentelemetry.metrics
 import opentelemetry.trace
 
 from temporalio import workflow
-from temporalio.contrib.pydantic import (
-    PydanticPayloadConverter,
-    ToJsonOptions,
-)
+from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.google_adk._model import (
     invoke_model,
@@ -227,7 +225,7 @@ class GoogleAdkPlugin(SimplePlugin):
                         "google.adk",
                         "google.genai",
                         "mcp",
-                        # ADK imports OpenTelemetry context lazily for graph workflows.
+                        # ADK 2.9+ imports OpenTelemetry context on every agent turn.
                         "opentelemetry",
                         # ADK probes these optional model SDKs lazily on each LLM turn.
                         "anthropic",
@@ -256,6 +254,13 @@ class GoogleAdkPlugin(SimplePlugin):
             workflow_runner=workflow_runner,
         )
 
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-google-adk")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
+
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
         """See base class. Also warns when the global OpenTelemetry meter or
         tracer provider is not replay-safe, since ADK telemetry would
@@ -276,16 +281,9 @@ class GoogleAdkPlugin(SimplePlugin):
         self, converter: DataConverter | None
     ) -> DataConverter:
         if converter is None:
-            return DataConverter(payload_converter_class=_AdkPayloadConverter)
+            return DataConverter(payload_converter_class=PydanticPayloadConverter)
         elif converter.payload_converter_class is DefaultPayloadConverter:
             return dataclasses.replace(
-                converter, payload_converter_class=_AdkPayloadConverter
+                converter, payload_converter_class=PydanticPayloadConverter
             )
         return converter
-
-
-class _AdkPayloadConverter(PydanticPayloadConverter):
-    """PayloadConverter for Google ADK that strips unset None fields."""
-
-    def __init__(self) -> None:
-        super().__init__(ToJsonOptions(exclude_unset=True))

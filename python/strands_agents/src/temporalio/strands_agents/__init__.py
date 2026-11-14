@@ -8,12 +8,13 @@ from ._sandbox_activity import (
     SandboxWorkflowContext,
 )
 from ._temporal_agent import TemporalAgent
-from ._temporal_mcp_client import TemporalMCPClient
+from ._temporal_mcp_client import MCPToolNameConflictError, TemporalMCPClient
 from ._temporal_sandbox import TemporalSandbox
 from ._worker_env_ref import AllowAllWorkerEnvVars, temporal_worker_env_ref
 
 __all__ = [
     "AllowAllWorkerEnvVars",
+    "MCPToolNameConflictError",
     "SandboxStreamEvent",
     "StrandsPlugin",
     "SandboxWorkflowChain",

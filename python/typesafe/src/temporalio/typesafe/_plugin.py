@@ -10,6 +10,7 @@ Workflow code talks to it through
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -140,6 +141,13 @@ class TypeSafePlugin(SimplePlugin):
             activities=support.activities,
             workflow_runner=workflow_runner,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-typesafe")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     @staticmethod
     def _register_response_models(

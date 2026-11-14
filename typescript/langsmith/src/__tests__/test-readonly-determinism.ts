@@ -1,5 +1,5 @@
 /**
- * Read-only handlers must not perturb the Workflow's main PRNG: a perturbed draw
+ * Read-only handlers must not perturb the Workflow's main PRNG or the run-id stream: a perturbed draw
  * would change a replayed command and surface as a determinism violation.
  *
  * @module
@@ -17,7 +17,7 @@ process.env.LANGSMITH_TRACING = 'true';
 
 useSharedEnv(test);
 
-test('read-only handlers do not perturb the main random sequence', async (t) => {
+test('read-only handlers do not perturb the main random sequence or the run-id stream', async (t) => {
   const collector = new InMemoryRunCollector();
   const options = { addTemporalRuns: true };
 
@@ -33,8 +33,9 @@ test('read-only handlers do not perturb the main random sequence', async (t) => 
         workflowId: `readonly-determinism-${Date.now()}`,
       });
 
-      // Runs the read-only validator path on the live cached instance.
+      // Runs the read-only validator and query paths on the live cached instance.
       await t.throwsAsync(handle.executeUpdate(workflows.readonlyUpdate, { args: ['x'] }));
+      t.is(await handle.query(workflows.readonlyQuery), 'queried');
 
       await handle.signal(workflows.releaseSignal);
       await handle.result();

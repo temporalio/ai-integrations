@@ -14,12 +14,10 @@ package googleadk_test
 // update riding a catch-up workflow task is validated in the task's final
 // live batch, so a validator always observes IsReplaying false.
 //
-// Query handlers inherit whatever the last processed history event left in
-// the IsReplaying flag: false from a warm cache or a command-free catch-up,
-// true right after a catch-up replay whenever a command event or the
-// workflow-completion event trails the last workflow task. IsReadOnly is what
-// keeps query-time telemetry recording in that second shape; these probes
-// fail if either predicate changes what query handlers observe.
+// Query handlers can retain IsReplaying from history reconstruction. Its value
+// depends on the SDK's query replay boundary and the history shape. IsReadOnly
+// keeps query-time telemetry recording even when IsReplaying remains true.
+// These probes check recording from both a warm cache and reconstructed state.
 
 import (
 	"context"
@@ -176,11 +174,10 @@ func (h *queryProbeHarness) signal(done bool) {
 	require.NoError(h.t, h.c.SignalWorkflow(h.ctx, h.run.GetID(), h.run.GetRunID(), "control", done))
 }
 
-// TestQueryHandlerGateOnCommandFreeHistory: with no command event trailing
-// the last workflow task (a bare signal await, e.g. HITL), a catch-up replay
-// ends on the WorkflowTaskCompleted, which Go classifies as non-replay — the
-// query handler observes IsReplaying false, and its telemetry records without
-// even needing the IsReadOnly leg of the gate.
+// TestQueryHandlerGateOnCommandFreeHistory checks that a query records telemetry
+// before and after cache eviction when a workflow awaits only a signal. The
+// replay boundary depends on the SDK version, so the post-replay query may
+// observe either value of IsReplaying.
 func TestQueryHandlerGateOnCommandFreeHistory(t *testing.T) {
 	c := testClient(t)
 
@@ -206,9 +203,8 @@ func TestQueryHandlerGateOnCommandFreeHistory(t *testing.T) {
 
 	h.evict()
 	rep = h.query()
-	require.False(t, rep.Replaying,
-		"after a catch-up replay of a command-free history the trailing WorkflowTaskCompleted resets the flag, so the query observes IsReplaying false")
-	require.True(t, rep.Enabled)
+	t.Logf("query after cache eviction: IsReplaying=%v", rep.Replaying)
+	require.True(t, rep.Enabled, "the gated counter must remain enabled inside a query handler after replay")
 	require.GreaterOrEqual(t, collectInt64Sum(t, capture.reader, "query_probe_recordings"), afterLive+1,
 		"the post-catch-up query recording must survive the gate")
 

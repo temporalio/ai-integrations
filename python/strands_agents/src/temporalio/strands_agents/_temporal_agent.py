@@ -12,20 +12,23 @@ from strands.agent.conversation_manager import (
     SummarizingConversationManager,
 )
 from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent, HookCallback
+from strands.tools.registry import ToolRegistry
 from strands.tools.structured_output._structured_output_context import (
     StructuredOutputContext,
 )
 from strands.types._events import ForceStopEvent, TypedEvent
 from strands.types.agent import AgentInput, Limits
 from strands.types.content import Messages
-from strands.types.exceptions import ContextWindowOverflowException
+from strands.types.exceptions import ContextWindowOverflowException, EventLoopException
+from strands.types.tools import AgentTool
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._summary import prepare_summary
-from ._temporal_mcp_client import TemporalMCPClient
+from ._temporal_mcp_client import MCPToolNameConflictError, TemporalMCPClient
+from ._temporal_mcp_tool import TemporalMCPTool
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
 
@@ -35,6 +38,88 @@ _SNAPSHOT_DISABLED = (
     "a finer granularity than Strands snapshots. Remove the snapshot call "
     "and rely on Temporal's durable execution instead."
 )
+
+
+def _server_name(tool: AgentTool) -> str:
+    # The server's own name for an MCP tool, which tool_filters match. A prefix
+    # makes the agent's name differ from it.
+    return tool.mcp_tool.name if isinstance(tool, TemporalMCPTool) else tool.tool_name
+
+
+def _listed_as(provider: TemporalMCPClient, tool: AgentTool) -> str:
+    listed = _server_name(tool)
+    if listed == tool.tool_name:
+        return f"'{provider.server}'"
+    return f"'{provider.server}' (as '{listed}')"
+
+
+def _duplicate_tool_name(
+    tool: AgentTool,
+    provider: TemporalMCPClient,
+    other: str,
+    held: tuple[AgentTool, TemporalMCPClient] | None,
+) -> MCPToolNameConflictError:
+    # Strands' words when it refuses a name, then where the two tools come from.
+    name = tool.tool_name
+    if other == name:
+        refused = f"Tool name '{name}' already exists."
+    else:
+        refused = f"Tool name '{name}' already exists as '{other}'."
+    if held is None:
+        source = (
+            f"MCP server {_listed_as(provider, tool)} lists it, and another tool "
+            "of the agent has it. Set a prefix (or a different one) on the "
+            f"server's TemporalMCPClient, or drop '{_server_name(tool)}' with its "
+            "tool_filters."
+        )
+        return MCPToolNameConflictError(f"{refused} {source}")
+    held_tool, holder = held
+    if holder is provider:
+        both = "it twice" if other == name else "both names"
+        source = f"MCP server '{provider.server}' lists {both}."
+    elif holder.server == provider.server:
+        source = (
+            "The agent has two TemporalMCPClient handles for MCP server "
+            f"'{provider.server}'. Give one a different prefix, narrow one's "
+            "tool_filters, or pass only one."
+        )
+    else:
+        source = (
+            f"MCP servers {_listed_as(holder, held_tool)} and "
+            f"{_listed_as(provider, tool)} both list it. Set a prefix (or a "
+            "different one) on one server's TemporalMCPClient, or drop the tool "
+            "from one with its tool_filters."
+        )
+    return MCPToolNameConflictError(f"{refused} {source}")
+
+
+def _check_mcp_tools(
+    listings: dict[TemporalMCPClient, list[AgentTool]],
+    reg: ToolRegistry,
+    mcp_names: set[str],
+) -> None:
+    # The rule ToolRegistry.register_tool() applies, for the turn's tools
+    # against each other and the agent's other tools, before the registry
+    # changes: a name may not be taken, nor differ from a taken one only by '-'
+    # or '_'. The other tools are read from the registry now, since a Signal
+    # handler can add one while a listing runs. Dynamic tools' names (such as
+    # structured output's) are compared exactly, as Strands does.
+    held = {
+        name.replace("-", "_"): name for name in reg.registry if name not in mcp_names
+    }
+    dynamic = set(reg.dynamic_tools) - mcp_names
+    seen: dict[str, tuple[AgentTool, TemporalMCPClient]] = {}
+    for provider, tools in listings.items():
+        for tool in tools:
+            name = tool.tool_name
+            key = name.replace("-", "_")
+            if key in seen:
+                other = seen[key][0].tool_name
+                raise _duplicate_tool_name(tool, provider, other, seen[key])
+            if key in held or name in dynamic:
+                other = held.get(key, name)
+                raise _duplicate_tool_name(tool, provider, other, None)
+            seen[key] = (tool, provider)
 
 
 class _WorkflowInflightInvocation(_InflightInvocation):
@@ -88,7 +173,8 @@ class TemporalAgent(Agent):
 
     ``model`` is the name of a factory registered in
     ``StrandsPlugin(models={...})``. The activity options apply to every model
-    invocation this agent makes. ``sandbox`` is a workflow-side
+    invocation this agent makes; ``heartbeat_timeout`` defaults to 10 seconds
+    (see ``TemporalModel``). ``sandbox`` is a workflow-side
     ``TemporalSandbox`` whose name selects a worker-side factory. All other
     keyword arguments are forwarded to Strands' ``Agent`` (``tools``, ``hooks``, ``system_prompt``,
     ``structured_output_model``, ``messages``, etc.).
@@ -106,7 +192,7 @@ class TemporalAgent(Agent):
         schedule_to_close_timeout: timedelta | None = None,
         schedule_to_start_timeout: timedelta | None = None,
         start_to_close_timeout: timedelta | None = None,
-        heartbeat_timeout: timedelta | None = None,
+        heartbeat_timeout: timedelta | None = timedelta(seconds=10),
         retry_policy: RetryPolicy | None = None,
         cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL,
         versioning_intent: VersioningIntent | None = None,
@@ -177,52 +263,73 @@ class TemporalAgent(Agent):
         # BeforeModelCallEvent hook, which runs on the workflow loop just before
         # the registry is read each turn. cache_tools=True lists once (guarded
         # by _fetched); cache_tools=False re-lists every turn.
-        for provider in self.tool_registry._tool_providers:
-            if isinstance(provider, TemporalMCPClient):
-                self.hooks.add_callback(
-                    BeforeModelCallEvent, self._make_mcp_refresh_hook(provider)
-                )
-
-    def _make_mcp_refresh_hook(
-        self, provider: TemporalMCPClient
-    ) -> HookCallback[BeforeModelCallEvent]:
-        async def hook(event: BeforeModelCallEvent) -> None:  # type: ignore[reportUnusedParameter]
-            await self._refresh_mcp_tools(provider)
-
-        return hook
+        self._mcp_providers = [
+            provider
+            for provider in self.tool_registry._tool_providers
+            if isinstance(provider, TemporalMCPClient)
+        ]
+        # Names this agent's MCP tools hold, from the last turn; load_tools()
+        # gives none at construction. A name stays the servers' while they list
+        # it: a tool put under it meanwhile is replaced at the next turn, and
+        # removed with the name.
+        self._mcp_names: set[str] = set()
+        if self._mcp_providers:
+            self.hooks.add_callback(BeforeModelCallEvent, self._refresh_mcp_tools)
 
     async def _load_cached_mcp_tools(self) -> None:
-        """List the tools of each cache_tools MCP client that has not listed them."""
-        for provider in self.tool_registry._tool_providers:
-            if isinstance(provider, TemporalMCPClient) and provider._cache_tools:
-                await self._refresh_mcp_tools(provider)
+        """Put this agent's MCP tools in its registry now, if a client caches them."""
+        if any(provider._cache_tools for provider in self._mcp_providers):
+            await self._refresh_mcp_tools(BeforeModelCallEvent(agent=self))
 
-    async def _refresh_mcp_tools(self, provider: TemporalMCPClient) -> None:
-        if provider._cache_tools and provider._fetched:
-            return
-        old_names = {tool.tool_name for tool in provider._tools}
-        await provider._refresh()
-        self._reconcile_mcp_tools(provider, old_names)
-
-    def _reconcile_mcp_tools(
-        self,
-        provider: TemporalMCPClient,
-        old_names: set[str],
-    ) -> None:
-        reg = self.tool_registry
-        new = {tool.tool_name: tool for tool in provider._tools}
-        # Tools the server dropped or renamed since the last listing. There is
-        # no public unregister, so remove them from the registry directly.
-        for name in old_names - set(new):
+    async def _refresh_mcp_tools(self, event: BeforeModelCallEvent) -> None:
+        # List the providers that are due in order, as one hook per provider
+        # did, and check the listings so far after each one, so a refused turn
+        # lists no further. Then apply the turn's tools together, so a name can
+        # move from one server to another in one turn. The last check runs
+        # after the last listing, with no await before the registry changes.
+        reg = event.agent.tool_registry
+        listings: dict[TemporalMCPClient, list[AgentTool]] = {}
+        for provider in self._mcp_providers:
+            if not (provider._cache_tools and provider._fetched):
+                await provider._refresh()
+            # Read now: another agent sharing the provider may list it again
+            # while this one waits for the next listing.
+            listings[provider] = provider._tools
+            _check_mcp_tools(listings, reg, self._mcp_names)
+        new = {tool.tool_name for tools in listings.values() for tool in tools}
+        # Tools the servers dropped or renamed since the last turn.
+        # ToolRegistry.remove() needs Strands 1.63, so remove them directly.
+        for name in self._mcp_names - new:
             reg.registry.pop(name, None)
             reg.dynamic_tools.pop(name, None)
         # replace() swaps an existing tool in place (no hot-reload guard);
         # register_tool() adds a newly-discovered one.
-        for name, tool in new.items():
-            if name in reg.registry:
-                reg.replace(tool)
-            else:
-                reg.register_tool(tool)
+        for tools in listings.values():
+            for tool in tools:
+                if tool.tool_name in reg.registry:
+                    reg.replace(tool)
+                else:
+                    reg.register_tool(tool)
+        self._mcp_names = new
+
+    async def _run_loop(self, *args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
+        # After a tool call, Strands runs the next model call inside the last
+        # cycle and wraps most errors from it in EventLoopException. Raise a
+        # tool name conflict as itself, so Workflow code can catch it and it
+        # fails the Workflow as a non-retryable ApplicationError.
+        events = super()._run_loop(*args, **kwargs)
+        try:
+            async for event in events:
+                yield event
+        except EventLoopException as err:
+            if isinstance(err.__cause__, MCPToolNameConflictError):
+                raise err.__cause__ from None
+            raise
+        finally:
+            # Close Strands' loop as stream_async closes this one, so its
+            # cleanup, such as AfterInvocationEvent hooks, finishes before a
+            # closed stream returns.
+            await events.aclose()
 
     async def _execute_event_loop_cycle(
         self,

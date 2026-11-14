@@ -188,7 +188,7 @@ class OneShotWorkflow:
 
 @workflow.defn
 class StreamingWorkflow:
-    """Sends the prompt with ``include_partial_messages`` and publishes the stream events to the ``events`` topic. Returns the messages once told to ``finish``."""
+    """Sends the prompt with ``include_partial_messages`` and publishes the stream events to the ``events`` topic. Returns the messages, stream events included, once told to ``finish``."""
 
     @workflow.init
     def __init__(self, prompt: str) -> None:

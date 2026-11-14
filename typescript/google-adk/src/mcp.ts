@@ -45,7 +45,7 @@ import { type ActivityOptions, inWorkflowContext, isCancellation, log, proxyActi
 import { underAbortSignal } from './abort';
 import { gateOnConfirmation } from './confirmation';
 import { MCP_TOOLSET_OUTSIDE_WORKFLOW_FAILURE_TYPE } from './error-types';
-import { activityOptionsFrom } from './model';
+import { activityOptionsFrom, withDefaultHeartbeatTimeout } from './model';
 
 /**
  * A worker-side factory that produces a real MCP toolset (or connection
@@ -107,8 +107,11 @@ export interface TemporalMCPToolsetOptions {
   /** Prefix applied to advertised tool names (mirrors ADK `MCPToolset`). */
   prefix?: string;
   /**
-   * Per-call Activity configuration (timeouts, retry, task queue). Tool calls
-   * take it as given; {@link TemporalMCPToolset.listResources} and
+   * Per-call Activity configuration (timeouts, retry, task queue).
+   * `heartbeatTimeout` defaults to 10 seconds. The MCP Activities heartbeat on a
+   * timer at half of it, so a cancel reaches a running call and a lost worker is
+   * noticed. Set it to `0` to turn the timer off. Tool calls take the rest as
+   * given; {@link TemporalMCPToolset.listResources} and
    * {@link TemporalMCPToolset.readResource} default `retry.maximumAttempts` to
    * 3 first, because a resource failure is skipped rather than raised. Set
    * `retry.maximumAttempts` yourself to override that, or
@@ -296,7 +299,9 @@ export class TemporalMCPToolset extends BaseToolset {
   override async close(): Promise<void> {}
 
   private activities(defaultSummary: string): MCPActivities {
-    return proxyActivities<MCPActivities>(activityOptionsFrom(this.options.activity, defaultSummary));
+    return proxyActivities<MCPActivities>(
+      activityOptionsFrom(withDefaultHeartbeatTimeout(this.options.activity), defaultSummary)
+    );
   }
 
   /**
@@ -316,7 +321,7 @@ export class TemporalMCPToolset extends BaseToolset {
       ...activity,
       retry: { maximumAttempts: DEFAULT_RESOURCE_MAX_ATTEMPTS, ...activity?.retry },
     };
-    return proxyActivities<MCPActivities>(activityOptionsFrom(options, defaultSummary));
+    return proxyActivities<MCPActivities>(activityOptionsFrom(withDefaultHeartbeatTimeout(options), defaultSummary));
   }
 
   /** The real ADK toolset for the direct (non-Workflow) path. */
@@ -378,7 +383,10 @@ class TemporalMCPTool extends BaseTool {
       if (gated !== undefined) return gated;
     }
     const activities = proxyActivities<MCPActivities>(
-      activityOptionsFrom(this.toolsetOptions.activity, `adk.mcp ${this.toolsetOptions.name}.${this.originalName}`)
+      activityOptionsFrom(
+        withDefaultHeartbeatTimeout(this.toolsetOptions.activity),
+        `adk.mcp ${this.toolsetOptions.name}.${this.originalName}`
+      )
     );
     const callTool = activities[`${this.toolsetOptions.name}-callTool`] as (args: MCPCallToolArgs) => Promise<unknown>;
     // Cancellable once the gate has let the call through, as for `activityAsTool`.

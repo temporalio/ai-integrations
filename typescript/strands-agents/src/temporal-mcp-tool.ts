@@ -23,15 +23,18 @@ export class TemporalMCPTool extends Tool {
   readonly description: string;
   readonly toolSpec: ToolSpec;
   readonly server: string;
+  /** The tool's name on the MCP server, which a `prefix` does not change. */
+  readonly serverToolName: string;
   private readonly activityOptions: ActivityOptions;
 
-  constructor(server: string, info: McpToolInfo, activityOptions: ActivityOptions) {
+  constructor(server: string, info: McpToolInfo, activityOptions: ActivityOptions, prefix?: string) {
     super();
     this.server = server;
-    this.name = info.name;
+    this.serverToolName = info.name;
+    this.name = prefix ? `${prefix}_${info.name}` : info.name;
     this.description = info.description || `Tool which performs ${info.name}`;
     this.toolSpec = {
-      name: info.name,
+      name: this.name,
       description: this.description,
       inputSchema: toJsonSchema(info.inputSchema),
     };
@@ -50,7 +53,7 @@ export class TemporalMCPTool extends Tool {
     });
     try {
       const raw = await activities[callToolActivityName(this.server)]!({
-        toolName: this.name,
+        toolName: this.serverToolName,
         args: input,
       });
       const result = raw as { content?: unknown[]; isError?: boolean } | null;

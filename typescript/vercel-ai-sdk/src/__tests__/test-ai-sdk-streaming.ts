@@ -17,8 +17,10 @@ import type {
   LanguageModelV4Usage,
   ProviderV4,
 } from '@ai-sdk/provider';
+import { APICallError } from '@ai-sdk/provider';
 import type { Client } from '@temporalio/client';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, defaultPayloadConverter } from '@temporalio/common';
+import { decodePayloadWire } from '@temporalio/workflow-streams/workflow';
 import { MockActivityEnvironment } from '@temporalio/testing';
 import { createActivities } from '../activities';
 import type { InvokeModelResult, InvokeModelStreamingArgs } from '../activities';
@@ -28,7 +30,10 @@ class StreamingTestModel implements LanguageModelV4 {
   readonly provider = 'temporal';
   readonly modelId = 'StreamingTestModel';
 
-  constructor(private readonly parts: LanguageModelV4StreamPart[]) {}
+  constructor(
+    private readonly parts: LanguageModelV4StreamPart[],
+    private readonly stallMs = 0
+  ) {}
 
   get supportedUrls(): Record<string, RegExp[]> {
     return {};
@@ -39,10 +44,11 @@ class StreamingTestModel implements LanguageModelV4 {
   }
 
   async doStream(_options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
-    const parts = this.parts;
+    const { parts, stallMs } = this;
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
-        start(controller) {
+        async start(controller) {
+          if (stallMs) await new Promise((resolve) => setTimeout(resolve, stallMs));
           for (const part of parts) controller.enqueue(part);
           controller.close();
         },
@@ -53,10 +59,10 @@ class StreamingTestModel implements LanguageModelV4 {
   }
 }
 
-function streamingProvider(parts: LanguageModelV4StreamPart[]): ProviderV4 {
+function streamingProvider(parts: LanguageModelV4StreamPart[], stallMs = 0): ProviderV4 {
   return {
     specificationVersion: 'v4',
-    languageModel: (_modelId: string): LanguageModelV4 => new StreamingTestModel(parts),
+    languageModel: (_modelId: string): LanguageModelV4 => new StreamingTestModel(parts, stallMs),
     embeddingModel: (_modelId: string): EmbeddingModelV4 => {
       throw new Error('Not implemented');
     },
@@ -85,20 +91,24 @@ function recordingClient(published: unknown[][]): Client {
 }
 
 async function runStreamingActivity(
-  parts: LanguageModelV4StreamPart[]
-): Promise<{ result: InvokeModelResult; published: unknown[][] }> {
-  const activities = createActivities(streamingProvider(parts)) as {
+  parts: LanguageModelV4StreamPart[],
+  // The heartbeat timeout the plugin schedules by default, and a provider that answers at once.
+  { heartbeatTimeoutMs = 10_000, stallMs = 0 } = {}
+): Promise<{ result: InvokeModelResult; published: unknown[][]; heartbeats: number }> {
+  const activities = createActivities(streamingProvider(parts, stallMs)) as {
     invokeModelStreaming: (args: InvokeModelStreamingArgs) => Promise<InvokeModelResult>;
   };
   const published: unknown[][] = [];
-  const env = new MockActivityEnvironment(undefined, { client: recordingClient(published) });
+  const env = new MockActivityEnvironment({ heartbeatTimeoutMs }, { client: recordingClient(published) });
+  let heartbeats = 0;
+  env.on('heartbeat', () => heartbeats++);
   const result = (await env.run(activities.invokeModelStreaming, {
     modelId: 'StreamingTestModel',
     options: { prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] },
     streamingTopic: 'test-topic',
     streamingBatchInterval: '10ms',
   } satisfies InvokeModelStreamingArgs)) as InvokeModelResult;
-  return { result, published };
+  return { result, published, heartbeats };
 }
 
 const usage: LanguageModelV4Usage = {
@@ -123,7 +133,7 @@ test('invokeModelStreaming publishes every part and assembles the final result',
     { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
   ];
 
-  const { result, published } = await runStreamingActivity(parts);
+  const { result, published, heartbeats } = await runStreamingActivity(parts);
 
   t.deepEqual(result.content, [
     { type: 'text', text: 'Hello, world!', providerMetadata: undefined },
@@ -133,7 +143,8 @@ test('invokeModelStreaming publishes every part and assembles the final result',
   t.deepEqual(result.finishReason, { unified: 'stop', raw: undefined });
   t.deepEqual(result.usage, usage);
   t.deepEqual(result.warnings, [{ type: 'unsupported', feature: 'test-feature' }]);
-  t.deepEqual(result.request, { body: 'test-request-body' });
+  // The request body repeats the prompt, so the result keeps it out of Event History.
+  t.deepEqual(result.request, {});
   // Response metadata from the stream is merged with the model's response info.
   t.deepEqual(result.response, {
     id: 'resp-1',
@@ -145,6 +156,22 @@ test('invokeModelStreaming publishes every part and assembles the final result',
   // Every stream part (including `raw`) is published to the topic exactly once.
   const totalPublished = published.reduce((sum, batch) => sum + batch.length, 0);
   t.is(totalPublished, parts.length);
+
+  // The call ends well before half the timeout, so its 12 parts send no heartbeat.
+  t.is(heartbeats, 0);
+});
+
+test('invokeModelStreaming sends no heartbeat when heartbeatTimeout is 0', async (t) => {
+  // The provider stalls long enough for a timer to fire, if the Activity started one.
+  const { heartbeats } = await runStreamingActivity(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
+    ],
+    { heartbeatTimeoutMs: 0, stallMs: 100 }
+  );
+
+  t.is(heartbeats, 0);
 });
 
 test('invokeModelStreaming retains the latest text provider metadata', async (t) => {
@@ -201,4 +228,174 @@ test('invokeModelStreaming throws when the stream emits an error even if a finis
   t.false(err!.nonRetryable);
   t.regex(err!.message, /mid-stream provider failure/);
   t.notRegex(err!.message, /without a finish part/);
+});
+
+function errorPartStream(error: unknown): LanguageModelV4StreamPart[] {
+  return [
+    { type: 'stream-start', warnings: [] },
+    { type: 'error', error },
+    { type: 'finish', finishReason: { unified: 'error', raw: undefined }, usage },
+  ];
+}
+
+test('invokeModelStreaming fails without retry on a non-retryable APICallError part', async (t) => {
+  const error = new APICallError({
+    message: 'Invalid API key',
+    url: 'https://provider.invalid/v1/chat',
+    requestBodyValues: {},
+    statusCode: 401,
+    isRetryable: false,
+  });
+
+  const err = await t.throwsAsync(runStreamingActivity(errorPartStream(error)), {
+    instanceOf: ApplicationFailure,
+  });
+  t.true(err!.nonRetryable);
+  t.is(err!.type, 'Error');
+  t.is(err!.cause, error);
+  t.regex(err!.message, /Invalid API key/);
+});
+
+test('A retryable APICallError stream part keeps the failure type Error', async (t) => {
+  const error = new APICallError({
+    message: 'Overloaded',
+    url: 'https://provider.invalid/v1/chat',
+    requestBodyValues: {},
+    statusCode: 529,
+  });
+
+  const err = await t.throwsAsync(runStreamingActivity(errorPartStream(error)), {
+    instanceOf: ApplicationFailure,
+  });
+  t.false(err!.nonRetryable);
+  t.is(err!.type, 'Error');
+});
+
+test('invokeModelStreaming reports a plain object error part as JSON', async (t) => {
+  const error = { type: 'overloaded_error', message: 'Overloaded' };
+  const err = await t.throwsAsync(runStreamingActivity(errorPartStream(error)), {
+    instanceOf: ApplicationFailure,
+  });
+  t.false(err!.nonRetryable);
+  t.notRegex(err!.message, /\[object Object\]/);
+  t.regex(err!.message, /: \{"type":"overloaded_error","message":"Overloaded"\}$/);
+  t.is(err!.cause, undefined);
+});
+
+test('invokeModelStreaming retains finish provider metadata', async (t) => {
+  const providerMetadata = { test: { cachedTokens: 7 } };
+  const { result } = await runStreamingActivity([
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage, providerMetadata },
+  ]);
+
+  t.deepEqual(result.providerMetadata, providerMetadata);
+});
+
+test('invokeModelStreaming publishes and returns binary file data as base64', async (t) => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 0, 255]);
+  const encoded = { type: 'data', data: Buffer.from(bytes).toString('base64') } as const;
+  const { result, published } = await runStreamingActivity([
+    { type: 'file', mediaType: 'image/png', data: { type: 'data', data: bytes } },
+    { type: 'reasoning-file', mediaType: 'image/png', data: { type: 'data', data: bytes } },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
+  ]);
+
+  t.deepEqual(result.content, [
+    { type: 'file', mediaType: 'image/png', data: encoded },
+    { type: 'reasoning-file', mediaType: 'image/png', data: encoded },
+  ]);
+  const decoder = new TextDecoder();
+  const parts = published.flat().map((item) => {
+    const payload = decodePayloadWire((item as { data: string }).data);
+    return JSON.parse(decoder.decode(defaultPayloadConverter.fromPayload<Uint8Array>(payload)));
+  });
+  t.deepEqual(parts.slice(0, 2), result.content);
+});
+
+test('invokeModelStreaming downloads tool-result URLs and restores assistant URLs', async (t) => {
+  const seen: LanguageModelV4CallOptions[] = [];
+  const model = new StreamingTestModel([
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
+  ]);
+  const provider: ProviderV4 = {
+    ...streamingProvider([]),
+    languageModel: (): LanguageModelV4 => ({
+      specificationVersion: 'v4',
+      provider: 'temporal',
+      modelId: 'StreamingTestModel',
+      // A `PromiseLike`, which the spec allows.
+      supportedUrls: Promise.resolve({ 'image/*': [/^https:\/\/supported\.test\//] }),
+      doGenerate: (options) => model.doGenerate(options),
+      doStream: async (options) => {
+        seen.push(options);
+        return model.doStream(options);
+      },
+    }),
+  };
+  const downloaded: string[] = [];
+  const activities = createActivities(provider, undefined, {
+    download: async ({ url }) => {
+      downloaded.push(url.href);
+      return { data: new Uint8Array([1, 2, 3]), mediaType: 'image/gif' };
+    },
+  }) as { invokeModelStreaming: (args: InvokeModelStreamingArgs) => Promise<InvokeModelResult> };
+  // URL fields arrive as strings, as they do after the JSON payload converter.
+  const fileUrl = (url: string, mediaType: string) => ({
+    type: 'file' as const,
+    mediaType,
+    data: { type: 'url' as const, url: url as unknown as URL },
+  });
+  const prompt: LanguageModelV4CallOptions['prompt'] = [
+    { role: 'assistant', content: [fileUrl('https://unsupported.test/a.png', 'image/png')] },
+    {
+      role: 'tool',
+      content: [
+        {
+          type: 'tool-result',
+          toolCallId: 'call-1',
+          toolName: 'screenshot',
+          output: {
+            type: 'content',
+            value: [
+              fileUrl('https://unsupported.test/b', 'image'),
+              fileUrl('https://supported.test/c.png', 'image/png'),
+            ],
+          },
+        },
+      ],
+    },
+  ];
+  const env = new MockActivityEnvironment(undefined, { client: recordingClient([]) });
+  await env.run(activities.invokeModelStreaming, {
+    modelId: 'StreamingTestModel',
+    options: { prompt },
+    streamingTopic: 'test-topic',
+    streamingBatchInterval: '10ms',
+  } satisfies InvokeModelStreamingArgs);
+
+  t.deepEqual(downloaded, ['https://unsupported.test/b']);
+  const [assistant, tool] = seen[0]!.prompt;
+  if (assistant?.role !== 'assistant' || tool?.role !== 'tool') {
+    throw new Error('Unexpected prompt');
+  }
+  const assistantFile = assistant.content[0];
+  if (assistantFile?.type !== 'file' || assistantFile.data.type !== 'url') {
+    throw new Error('Expected an assistant URL file part');
+  }
+  t.true(assistantFile.data.url instanceof URL);
+  const toolResult = tool.content[0];
+  if (toolResult?.type !== 'tool-result' || toolResult.output.type !== 'content') {
+    throw new Error('Expected tool-result content');
+  }
+  const [downloadedFile, supportedFile] = toolResult.output.value;
+  t.deepEqual(downloadedFile, {
+    type: 'file',
+    mediaType: 'image/gif',
+    data: { type: 'data', data: new Uint8Array([1, 2, 3]) },
+  });
+  if (supportedFile?.type !== 'file' || supportedFile.data.type !== 'url') {
+    throw new Error('Expected a supported URL file part');
+  }
+  t.true(supportedFile.data.url instanceof URL);
+  t.is(supportedFile.data.url.href, 'https://supported.test/c.png');
 });
