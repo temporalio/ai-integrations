@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import builtins
 import importlib
 import re
 import symtable
 import sys
-import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -119,9 +120,12 @@ def _quickstart_files() -> dict[str, str]:
 
 
 async def test_quickstart_runs(
-    client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    client: Client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The quickstart files start a Worker and run the Workflow as written.
+    """The quickstart files run as written: worker.py's main() and client.py's main().
 
     Compiling the blocks does not catch a provider import in ``workflow.py``:
     the sandbox re-imports that file per run, and the OpenAI SDK's import tree
@@ -136,31 +140,33 @@ async def test_quickstart_runs(
     monkeypatch.syspath_prepend(str(package))
     names = [name.removesuffix(".py") for name in _QUICKSTART_FILES]
     try:
-        quickstart = importlib.import_module("workflow")
-        # The provider imports and the factory live in worker.py; client.py
-        # imports the workflow module like the worker does.
-        importlib.import_module("worker")
-        importlib.import_module("client")
-        plugin = MicrosoftAgentFrameworkPlugin(
-            chat_clients={"gpt-4o": fake_chat_client(["Hi."])}
-        )
+        worker_module = importlib.import_module("worker")
+        client_module = importlib.import_module("client")
+        # The files connect to localhost:7233; both get the test server
+        # instead, and the worker's plugin gets the fake client in place of
+        # OpenAI. Everything else is theirs, the task queue and the workflow id
+        # included: a mismatch between the two files leaves the run waiting.
         config = client.config()
-        config["plugins"] = [plugin]
-        plugged = Client(**config)
-        task_queue = f"quickstart-{uuid.uuid4()}"
-        async with Worker(
-            plugged,
-            task_queue=task_queue,
-            workflows=[quickstart.HelloWorkflow],
-            max_cached_workflows=0,
-        ):
-            result = await plugged.execute_workflow(
-                quickstart.HelloWorkflow.run,
-                "Hello",
-                id=f"quickstart-{uuid.uuid4()}",
-                task_queue=task_queue,
-            )
+
+        async def connect(target_host: str, *, plugins: Any = (), **_: Any) -> Client:
+            assert target_host == "localhost:7233"
+            return Client(**{**config, "plugins": list(plugins)})
+
+        monkeypatch.setattr(Client, "connect", connect)
+        monkeypatch.setattr(
+            worker_module,
+            "plugin",
+            MicrosoftAgentFrameworkPlugin(
+                chat_clients={"gpt-4o": fake_chat_client(["Hi."])}
+            ),
+        )
+        worker_task = asyncio.create_task(worker_module.main())
+        try:
+            await asyncio.wait_for(client_module.main(), timeout=30)
+        finally:
+            worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
     finally:
         for name in names:
             sys.modules.pop(name, None)
-    assert result == "Hi."
+    assert capsys.readouterr().out.strip() == "Hi."
