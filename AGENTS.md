@@ -417,12 +417,15 @@ gallery.
    ruleset only makes tags immutable (update, deletion and non-fast-forward rules,
    no creation restriction, no bypass actors), and the `nuget` environment has no
    reviewers, like `pypi`, `testpypi` and `npm`. The limit is the nuget.org policy
-   itself. The account that owns the `Temporalio.` prefix registers one trusted
-   publishing policy per .NET plugin, for repository owner `temporalio`, repository
-   `ai-integrations`, workflow file `release-dotnet.yml`, environment `nuget`,
-   scoped to push new versions of the exact package id
-   (`Temporalio.Extensions.MicrosoftAgentFramework` today; the SDK team adds one per new
-   package). A policy on `Temporalio.*` would also cover the SDK's own packages,
+   itself. The account that owns the `Temporalio.` prefix reservation registers one
+   trusted publishing policy per .NET plugin, for repository owner `temporalio`,
+   repository `ai-integrations`, workflow file `release-dotnet.yml`, environment
+   `nuget`, with the scope that pushes new packages and package versions, not the
+   one limited to new versions of existing packages: the first publish creates the
+   package, and nuget.org accepts a new id under a reserved prefix only from the
+   prefix owner. The policy's package pattern is the exact package id
+   (`Temporalio.Extensions.MicrosoftAgentFramework` today; the SDK team adds one per
+   new package). A policy on `Temporalio.*` would also cover the SDK's own packages,
    such as `Temporalio.Extensions.WorkflowStreams`, which this repository must
    never be able to publish. An exact id covers a package that does not exist yet,
    so no interactive first publish is needed. Reuse the profile that sdk-dotnet's
