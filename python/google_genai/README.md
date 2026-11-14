@@ -264,9 +264,32 @@ at half their `heartbeat_timeout`, which defaults to 10 seconds, also in an
 `activity_config` that leaves it out. So a cancel reaches a running call, and a
 lost worker is noticed, within about 10 seconds. Streams heartbeat on the same
 timer, not per chunk. In Temporal Cloud each heartbeat that reaches the service
-is an Action: at most one every 8 seconds of a running call, and none for a call
-shorter than 5 seconds. Set `heartbeat_timeout` to `None` in `activity_config`
-to turn heartbeats off.
+is an Action: with the default, at most one every 8 seconds of a running call,
+and none for a call shorter than 5 seconds. A cancelled call can send one more
+as it stops. Set `heartbeat_timeout` to `None` or `timedelta(0)` in
+`activity_config` to turn heartbeats off. The timer runs on the worker's event
+loop, so a call that blocks the loop for longer than the timeout fails with a
+heartbeat timeout.
+
+**Breaking change when you upgrade or roll back:** earlier versions of this
+plugin schedule these activities with no `heartbeat_timeout`, and only the
+interaction streams heartbeat, once per event. So while workers of both
+versions run, a call that a workflow on this version schedules and a worker on
+an earlier version runs fails with a heartbeat timeout once it runs for 10
+seconds without a heartbeat, and each retry can fail the same way. The timeout
+is recorded when the activity is scheduled, and retries keep it, so rolling back
+doesn't remove it from calls scheduled before.
+
+- To upgrade, put this version on every worker that runs the Gemini activities
+  before any workflow worker. If the same workers run both, deploy this version
+  with `heartbeat_timeout` set to `None` in `activity_config`, and remove that
+  setting in a later deploy.
+- To roll back, first deploy this version with `heartbeat_timeout` set to
+  `None`, wait until the calls scheduled before that deploy finish, and then
+  roll back.
+- Runs pinned with Worker Versioning avoid both cases when their Gemini
+  activities use the workflow's task queue, since those activities run on
+  workers of the same version.
 
 ## Retries & errors
 

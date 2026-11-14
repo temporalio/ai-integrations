@@ -235,7 +235,10 @@ class TemporalAsyncClient(AsyncClient):
                 worker is noticed, within about 10 seconds. In Temporal Cloud
                 each heartbeat that reaches the service is an Action; a call
                 shorter than 5 seconds sends none. Set ``heartbeat_timeout`` to
-                ``None`` to turn heartbeats off.
+                ``None`` or ``timedelta(0)`` to turn heartbeats off. Workers on
+                an earlier version of this plugin don't heartbeat this way, so
+                a call they run fails after 10 seconds without a heartbeat.
+                The README says how to upgrade and roll back.
             streaming_topic: When set, ``generate_content_stream`` publishes each
                 streamed ``GenerateContentResponse`` to this
                 :class:`temporalio.contrib.workflow_streams.WorkflowStream`

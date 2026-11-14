@@ -2394,7 +2394,7 @@ async def _run_real_activity(
 
 
 def _heartbeat_counting_env(
-    heartbeat_timeout: timedelta,
+    heartbeat_timeout: timedelta | None,
 ) -> tuple[ActivityEnvironment, list[Any]]:
     """Return an ``ActivityEnvironment`` and the list its heartbeats go to."""
     env = ActivityEnvironment()
@@ -2421,8 +2421,9 @@ _ALL_ACTIVITIES: list[tuple[str, Any]] = [
     [
         (timedelta(milliseconds=200), 0.5, True),
         (timedelta(seconds=10), 0, False),
+        (None, 0.1, False),
     ],
-    ids=["slow-call", "short-call"],
+    ids=["slow-call", "short-call", "off"],
 )
 @pytest.mark.parametrize(
     ("activity_name", "req"),
@@ -2432,14 +2433,15 @@ _ALL_ACTIVITIES: list[tuple[str, Any]] = [
 async def test_activity_heartbeats_on_a_timer(
     activity_name: str,
     req: Any,
-    heartbeat_timeout: timedelta,
+    heartbeat_timeout: timedelta | None,
     server_seconds: float,
     heartbeats: bool,
 ):
     """Every activity heartbeats on a timer at half the heartbeat timeout.
 
-    The first beat waits that long, so a short call sends none. The fake server
-    answers 400 after ``server_seconds``; only the heartbeats matter here.
+    The first beat waits that long, so a short call sends none, and with no
+    heartbeat timeout there are none at all. The fake server answers 400 after
+    ``server_seconds``; only the heartbeats matter here.
     """
     env, sent = _heartbeat_counting_env(heartbeat_timeout)
     with _gemini_client_failing_with(400, server_seconds) as (gemini, _hits):
