@@ -12,12 +12,6 @@ namespace Temporalio.Extensions.MicrosoftAgentFramework.Tests;
 /// </summary>
 public sealed partial class DevServerFixture : IAsyncLifetime
 {
-    // The three startup failures as Temporal's core words them, anchored to the start of the
-    // message after an optional "<context>: " prefix. A client error that merely mentions a timeout
-    // is not one of them. dotnet/_template/DevServerFixture.cs carries the same pattern.
-    [GeneratedRegex(@"^(?:[^:]*: )?(?:ephemeral server at \S+ did not start within |failed to download ephemeral server executable:|invalid ephemeral server download: could not (?:read|extract) )", RegexOptions.CultureInvariant)]
-    private static partial Regex RetryableStartupError();
-
     public WorkflowEnvironment Env { get; private set; } = null!;
 
     public ITemporalClient Client => Env.Client;
@@ -75,4 +69,10 @@ public sealed partial class DevServerFixture : IAsyncLifetime
         };
 
     internal static bool IsRetryable(string message) => RetryableStartupError().IsMatch(message);
+
+    // The three startup failures as Temporal's core words them, anchored to the start of the
+    // message after an optional "<context>: " prefix. A client error that merely mentions a timeout
+    // is not one of them. dotnet/_template/DevServerFixture.cs carries the same pattern.
+    [GeneratedRegex(@"^(?:[^:]*: )?(?:ephemeral server at \S+ did not start within |failed to download ephemeral server executable:|invalid ephemeral server download: could not (?:read|extract) )", RegexOptions.CultureInvariant)]
+    private static partial Regex RetryableStartupError();
 }
