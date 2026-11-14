@@ -106,7 +106,7 @@ public class StreamingTests : WorkflowTestBase
     }
 
     [Fact]
-    public async Task StreamingTopic_LongStream_FlushesEveryMaxBatchSizeUpdates()
+    public async Task StreamingTopic_LongStream_FlushesAtMaxBatchSize()
     {
         var text = string.Join(' ', Enumerable.Range(1, 300).Select(i => $"w{i}"));
         var fake = new FakeChatClient(ScriptedResponse.Text(text).WithStreamingDelay(TimeSpan.FromMilliseconds(1)));
@@ -132,10 +132,11 @@ public class StreamingTests : WorkflowTestBase
             var result = await handle.GetResultAsync();
             Assert.Equal(text, result.FinalText);
 
-            // 301 updates (300 text pieces and the usage) over a bound of 256: the size limit forces a second
-            // publish Signal, no Signal carries more than the bound, and together they carry every update. The
-            // 30-second interval may still flush between the size-limit flushes on a slow runner, so the exact
-            // count is not asserted.
+            // 301 updates (300 text pieces and the usage) against a bound of 256. The bound wakes the publisher's
+            // background flusher, which takes the whole buffer, so the first Signal carries at least 256 updates and
+            // possibly more (items published before the swap join it); a stale wake can add a Signal for the items
+            // that arrived during the first Signal's RPC, so the count is at least two. The 30-second interval timer
+            // starts on the first publish and cannot fire inside the subscriber's own 30-second window.
             var history = await handle.FetchHistoryAsync();
             var batches = new List<int>();
             foreach (var signaled in history.Events.Select(e => e.WorkflowExecutionSignaledEventAttributes).Where(a => a?.SignalName == WorkflowStreamConstants.PublishSignalName))
@@ -147,7 +148,7 @@ public class StreamingTests : WorkflowTestBase
             }
 
             Assert.True(batches.Count >= 2, $"the size bound must split the stream into at least two Signals, got {batches.Count}");
-            Assert.All(batches, count => Assert.InRange(count, 1, Activities.ModelActivities.MaxStreamingBatchSize));
+            Assert.True(batches[0] >= Activities.ModelActivities.MaxStreamingBatchSize, $"the first Signal is the size-triggered flush and carries at least the bound, got {batches[0]}");
             Assert.Equal(301, batches.Sum());
         });
     }
