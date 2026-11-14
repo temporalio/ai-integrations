@@ -1,4 +1,4 @@
-import { Agent, Handoff, tool, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, RunState, tool, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
 import {
   Capability,
   Manifest,
@@ -8,7 +8,7 @@ import {
   type SandboxRunConfig,
   type SandboxSessionLike,
 } from '@openai/agents-core/sandbox';
-import { ApplicationFailure } from '@temporalio/workflow';
+import { ApplicationFailure, condition, defineQuery, defineSignal, setHandler } from '@temporalio/workflow';
 import { TemporalOpenAIRunner, workerEnvValue, temporalSandboxClient } from '../../workflow';
 
 class TestSandboxCapability extends Capability {
@@ -108,10 +108,10 @@ class ApprovalSandboxCapability extends Capability {
 }
 
 /**
- * With `otherAgent`, resumes with an agent graph that doesn't have the paused agent. Returns the
- * output and the tool calls the caller's context object got.
+ * Pauses for approval and resumes, with `serialized` from the paused state's string. Returns the output and
+ * the tool calls the caller's context object got.
  */
-export async function sandboxApprovalResumeWorkflow(otherAgent = false): Promise<string> {
+export async function sandboxApprovalResumeWorkflow(serialized = false): Promise<string> {
   const agent = new SandboxAgent({
     name: 'sandbox-approval',
     model: 'gpt-4o-mini',
@@ -127,10 +127,182 @@ export async function sandboxApprovalResumeWorkflow(otherAgent = false): Promise
   const result = await runner.run(agent, 'run a command', { runConfig, context });
   if (result.interruptions.length === 0) return 'no-interruption';
   for (const interruption of result.interruptions) result.state.approve(interruption);
+  const state = serialized ? await RunState.fromString(agent, result.state.toString()) : result.state;
 
-  const resumeAgent = otherAgent ? new Agent({ name: 'other', model: 'gpt-4o-mini' }) : agent;
-  const resumed = await runner.run(resumeAgent, result.state, { runConfig });
+  const resumed = await runner.run(agent, state, { runConfig });
   return `${resumed.finalOutput} writes=${context.writes.join(',')}`;
+}
+
+/**
+ * Pauses for approval and resumes from the paused state's string. With `changed`, the resume's agent names
+ * another Worker variable; with `extra-reference`, the string gains a reference that the agent's manifest
+ * doesn't have.
+ */
+export async function sandboxResumeEnvironmentWorkflow(mode: 'changed' | 'extra-reference'): Promise<string> {
+  const agentNaming = (variable: string) =>
+    new SandboxAgent({
+      name: 'sandbox-approval',
+      model: 'gpt-4o-mini',
+      capabilities: [new ApprovalSandboxCapability()],
+      defaultManifest: new Manifest({ environment: { API_KEY: workerEnvValue(variable) } }),
+    });
+  const agent = agentNaming('OPENAI_AGENTS_TEST_MANIFEST_SECRET');
+  const runner = new TemporalOpenAIRunner();
+  const runConfig = { sandbox: { client: temporalSandboxClient('fake') } };
+  const result = await runner.run(agent, 'run a command', { runConfig, context: { writes: [] as string[] } });
+  if (result.interruptions.length === 0) return 'no-interruption';
+  for (const interruption of result.interruptions) result.state.approve(interruption);
+  const serialized: unknown = JSON.parse(result.state.toString());
+  if (mode === 'extra-reference') addEnvironmentReference(serialized);
+  const resumeAgent = mode === 'changed' ? agentNaming('OPENAI_AGENTS_TEST_OTHER_SECRET') : agent;
+  const state = await RunState.fromString(resumeAgent, JSON.stringify(serialized));
+  return `${(await runner.run(resumeAgent, state, { runConfig })).finalOutput}`;
+}
+
+/** Adds `EXTRA`, a reference to another Worker variable, next to each serialized `API_KEY` reference. */
+function addEnvironmentReference(value: unknown): void {
+  if (value === null || typeof value !== 'object') return;
+  const environment = (value as { environment?: Record<string, { name?: unknown }> }).environment;
+  if (environment?.API_KEY?.name === 'OPENAI_AGENTS_TEST_MANIFEST_SECRET') {
+    environment.EXTRA = { ...environment.API_KEY, name: 'OPENAI_AGENTS_TEST_OTHER_SECRET' };
+  }
+  for (const child of Object.values(value)) addEnvironmentReference(child);
+}
+
+/** `run_now` runs a command at once, and `run_approved` after approval. */
+class EchoSandboxCapability extends Capability {
+  readonly type = 'echo_sandbox';
+
+  override tools(): Tool<any>[] {
+    const runCommand = (name: string, needsApproval: boolean): FunctionTool =>
+      ({
+        type: 'function',
+        name,
+        description: name,
+        parameters: {
+          type: 'object',
+          properties: { cmd: { type: 'string' } },
+          required: ['cmd'],
+          additionalProperties: false,
+        } as any,
+        strict: true,
+        invoke: async (_ctx: RunContext<any>, input: string): Promise<string> => {
+          if (!this._session) throw new Error('echo_sandbox capability is not bound to a session');
+          return this._session.execCommand!(JSON.parse(input));
+        },
+        needsApproval: async () => needsApproval,
+        isEnabled: async () => true,
+      }) as FunctionTool;
+    return [runCommand('run_now', false), runCommand('run_approved', true)];
+  }
+}
+
+/**
+ * A sandbox whose manifest names the Worker variable `variable` runs a command, pauses for approval of
+ * another, and resumes. Returns the outputs of both commands.
+ */
+export async function sandboxWorkerEnvWorkflow(variable: string): Promise<string> {
+  const agent = new SandboxAgent({
+    name: 'sandbox-worker-env',
+    model: 'gpt-4o-mini',
+    capabilities: [new EchoSandboxCapability()],
+    defaultManifest: new Manifest({ environment: { API_KEY: workerEnvValue(variable) } }),
+  });
+  const runner = new TemporalOpenAIRunner();
+  const runConfig = { sandbox: { client: temporalSandboxClient('local') } };
+  const result = await runner.run(agent, 'run commands', { runConfig });
+  if (result.interruptions.length === 0) return 'no-interruption';
+  for (const interruption of result.interruptions) result.state.approve(interruption);
+  const resumed = await runner.run(agent, result.state, { runConfig });
+  return [...result.newItems, ...resumed.newItems]
+    .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
+    .join('\n');
+}
+
+const APPROVAL_MOUNTS = {
+  none: undefined,
+  resumable: { type: 's3_mount', bucket: 'b', mountPath: 'data', mountStrategy: { type: 'docker_volume', driver: 'rclone' } },
+  'in-container': {
+    type: 's3_mount',
+    bucket: 'b',
+    mountPath: 'data',
+    mountStrategy: { type: 'in_container', pattern: { type: 'rclone' } },
+  },
+  opaque: {
+    type: 's3_mount',
+    bucket: 'b',
+    mountPath: 'data',
+    mountStrategy: { type: 'docker_volume', driver: 'rclone', driverOptions: { 'vfs-cache-mode': 'full' } },
+  },
+} as const;
+
+export type ApprovalMount = keyof typeof APPROVAL_MOUNTS;
+export const approvalPausedQuery = defineQuery<boolean>('approvalPaused');
+export const approvalResumeSignal = defineSignal('approvalResume');
+
+/**
+ * A sandbox with `mount` and, if `variable` is given, a reference to that Worker variable runs `first`,
+ * pauses for approval of `second`, and resumes from `result.state`, after `approvalResumeSignal` if
+ * `waitForSignal`. Returns the outputs of both commands.
+ */
+export async function sandboxApprovalMountWorkflow(
+  mount: ApprovalMount,
+  variable?: string,
+  waitForSignal = false
+): Promise<string> {
+  let paused = false;
+  let resume = !waitForSignal;
+  setHandler(approvalPausedQuery, () => paused);
+  setHandler(approvalResumeSignal, () => {
+    resume = true;
+  });
+  const entry = APPROVAL_MOUNTS[mount];
+  const agent = new SandboxAgent({
+    name: 'sandbox-approval-mount',
+    model: 'gpt-4o-mini',
+    capabilities: [new EchoSandboxCapability()],
+    defaultManifest: new Manifest({
+      ...(variable !== undefined ? { environment: { KEY: workerEnvValue(variable) } } : {}),
+      ...(entry !== undefined ? { entries: { data: entry } } : {}),
+    }),
+  });
+  const runConfig = () => ({ sandbox: { client: temporalSandboxClient('lifecycle') } });
+  const runner = new TemporalOpenAIRunner();
+  const result = await runner.run(agent, 'run commands', { runConfig: runConfig() });
+  if (result.interruptions.length === 0) return 'no-interruption';
+  for (const interruption of result.interruptions) result.state.approve(interruption);
+  paused = true;
+  await condition(() => resume);
+  const resumed = await runner.run(agent, result.state, { runConfig: runConfig() });
+  return resumed.newItems
+    .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
+    .join('\n');
+}
+
+/** Runs a sandbox agent with `mount`, then approves and resumes once per later variable, each with a new client; returns the last command's output. */
+export async function sandboxApprovalSequenceWorkflow(mount: ApprovalMount, variables: string[]): Promise<string> {
+  const entry = APPROVAL_MOUNTS[mount];
+  const agent = new SandboxAgent({
+    name: 'sandbox-approval-sequence',
+    model: 'gpt-4o-mini',
+    capabilities: [new EchoSandboxCapability()],
+  });
+  const runConfig = (variable: string) => ({
+    sandbox: {
+      client: temporalSandboxClient('lifecycle'),
+      manifest: new Manifest({
+        environment: { KEY: workerEnvValue(variable) },
+        ...(entry !== undefined ? { entries: { data: entry } } : {}),
+      }),
+    },
+  });
+  const runner = new TemporalOpenAIRunner();
+  let result = await runner.run(agent, 'run commands', { runConfig: runConfig(variables[0]!) });
+  for (const variable of variables.slice(1)) {
+    for (const interruption of result.interruptions) result.state.approve(interruption);
+    result = await runner.run(agent, result.state, { runConfig: runConfig(variable) });
+  }
+  return result.newItems.flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : [])).at(-1) ?? '';
 }
 
 /** A `SandboxAgent` that names no model, with the default capabilities, which include compaction. */
@@ -143,15 +315,16 @@ export async function sandboxNoModelWorkflow(): Promise<string> {
 }
 
 /**
- * A `SandboxAgent` named `parentName` reaches `Nested` through `ask_nested`, the `asTool()` tool or a
- * spread copy, and `Nested` pauses on an approval. Approves it and resumes, with the same agents or,
- * if `rebuilt`, with new ones built the same way. Returns the output and the approved action's runs,
- * or the resumed run's failure.
+ * A `SandboxAgent` named `parentName`, with a `mount`, reaches `Nested` through `ask_nested`, the
+ * `asTool()` tool or a spread copy, and `Nested` pauses on an approval. Approves it and resumes, with the
+ * same agents or, if `rebuilt`, with new ones built the same way. Returns the output and the approved
+ * action's runs, or the resumed run's failure.
  */
 export async function sandboxNestedApprovalWorkflow(
   copied: boolean,
   parentName = 'sandbox-parent',
-  rebuilt = false
+  rebuilt = false,
+  mount: ApprovalMount = 'none'
 ): Promise<string> {
   let executions = 0;
   const confirmAction = tool({
@@ -180,6 +353,7 @@ export async function sandboxNestedApprovalWorkflow(
       model: 'gpt-4o-mini',
       capabilities: [new TestSandboxCapability()],
       tools: [copied ? { ...askNested } : askNested],
+      ...(mount === 'none' ? {} : { defaultManifest: new Manifest({ entries: { data: APPROVAL_MOUNTS[mount] } }) }),
     });
   };
   const agent = buildAgent();
@@ -299,47 +473,50 @@ export async function sandboxValidationWorkflow(): Promise<string> {
     toolUseBehavior: 'stop_on_first_tool',
   });
   const output = `${(await runner.run(lead, 'hello')).finalOutput}`;
-  if (!/^An error occurred while running the tool.*SandboxAgent execution requires/.test(output)) {
+  if (!/^An error occurred while running the tool/.test(output)) {
     return `FAIL: unexpected nested-no-config output: ${output}`;
   }
 
   return 'OK';
 }
 
-/** A sandbox client that runs in the Workflow, which the plugin must never call. */
-const rawSandboxClient = {
-  backendId: 'raw',
-  async create(): Promise<never> {
-    throw new Error('the raw sandbox client ran in the Workflow');
-  },
-} as unknown as SandboxClient;
-
 /**
  * A listener replaces a sandbox config's client with a raw one after the runner checked it: on the
  * run's own config when `SandboxAgent` starts (`agent-start`), or on an `asTool()` tool's
- * `runOptions.sandbox` when the lead calls the tool (`tool-start`).
+ * `runOptions.sandbox` when the lead calls the tool (`tool-start`). The output says when the raw client
+ * ran, which upstream's generic tool error would otherwise hide.
  */
 export async function sandboxClientChangedWorkflow(kind: 'agent-start' | 'tool-start'): Promise<string> {
+  let rawRan = false;
+  // A sandbox client that runs in the Workflow, which the plugin must never call.
+  const rawSandboxClient = {
+    backendId: 'raw',
+    async create(): Promise<never> {
+      rawRan = true;
+      throw new Error('the raw sandbox client ran in the Workflow');
+    },
+  } as unknown as SandboxClient;
   const sandbox: SandboxRunConfig = { client: temporalSandboxClient('fake') };
   const agent = new SandboxAgent({
     name: 'sandbox-changed',
     model: 'gpt-4o-mini',
     capabilities: [new TestSandboxCapability()],
   });
+  let output: string;
   if (kind === 'agent-start') {
     agent.on('agent_start', () => (sandbox.client = rawSandboxClient));
-    const result = await new TemporalOpenAIRunner().run(agent, 'run a command', { runConfig: { sandbox } });
-    return `${result.finalOutput}`;
+    output = `${(await new TemporalOpenAIRunner().run(agent, 'run a command', { runConfig: { sandbox } })).finalOutput}`;
+  } else {
+    const lead = new Agent({
+      name: 'lead',
+      model: 'gpt-4o-mini',
+      tools: [agent.asTool({ toolName: 'ask_sandbox', runOptions: { sandbox } })],
+      toolUseBehavior: 'stop_on_first_tool',
+    });
+    lead.on('agent_tool_start', () => (sandbox.client = rawSandboxClient));
+    output = `${(await new TemporalOpenAIRunner().run(lead, 'help')).finalOutput}`;
   }
-  const lead = new Agent({
-    name: 'lead',
-    model: 'gpt-4o-mini',
-    tools: [agent.asTool({ toolName: 'ask_sandbox', runOptions: { sandbox } })],
-    toolUseBehavior: 'stop_on_first_tool',
-  });
-  lead.on('agent_tool_start', () => (sandbox.client = rawSandboxClient));
-  const result = await new TemporalOpenAIRunner().run(lead, 'help');
-  return `${result.finalOutput}`;
+  return rawRan ? `the raw sandbox client ran in the Workflow: ${output}` : output;
 }
 
 /**

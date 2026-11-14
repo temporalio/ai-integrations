@@ -1,15 +1,18 @@
 import type {
+  ManifestInput,
   SandboxClient,
   SandboxClientCreateArgs,
   SandboxClientOptions,
   SandboxClientResumeOptions,
+  SandboxPreservedSessionReuseOptions,
   SandboxRunConfig,
+  SandboxSession,
   SandboxSessionLike,
   SandboxSessionSerializationOptions,
 } from '@openai/agents-core/sandbox';
 import { Manifest } from '@openai/agents-core/sandbox';
 import { ApplicationFailure, type ActivityOptions } from '@temporalio/common';
-import { scheduleActivity } from '@temporalio/workflow';
+import { isCancellation, scheduleActivity } from '@temporalio/workflow';
 import {
   SANDBOX_CLIENT_CREATE_SUFFIX,
   SANDBOX_CLIENT_DELETE_SUFFIX,
@@ -28,6 +31,33 @@ import {
 import { TemporalSandboxSession } from './sandbox-session';
 import { maybeTemporalSpan } from './span-helpers';
 
+/** A session a `TemporalSandboxClient` created or resumed, with the mounts that decide how upstream resumes it. */
+export interface LiveSandboxSession {
+  session: TemporalSandboxSession;
+  inContainerMounts: boolean;
+  nonResumableMountAuthority: boolean;
+}
+
+/** The sessions this Workflow's `TemporalSandboxClient`s created or resumed, by provider name and session ID. */
+const liveSessions = new Map<string, LiveSandboxSession>();
+
+/** The environment, path grants and mount command allowlist of `manifest`, which a live sandbox keeps. */
+function manifestAuthority(manifest: ManifestInput | undefined): string | undefined {
+  if (manifest === undefined) return undefined;
+  const { environment, extraPathGrants, remoteMountCommandAllowlist } = encodeManifest(
+    manifest instanceof Manifest ? manifest : new Manifest(manifest)
+  );
+  return JSON.stringify([
+    Object.entries(environment).sort(([a], [b]) => (a < b ? -1 : 1)),
+    extraPathGrants,
+    remoteMountCommandAllowlist,
+  ]);
+}
+
+function throwIfCancelled(error: unknown): void {
+  if (isCancellation(error)) throw error;
+}
+
 /**
  * Workflow-side sandbox client. Holds no connection to any sandbox backend —
  * session creation, resumption, and every session operation are dispatched as
@@ -38,6 +68,8 @@ import { maybeTemporalSpan } from './span-helpers';
  */
 export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions, TemporalSandboxSessionState> {
   readonly backendId: string;
+  /** Manifest environment references are resolved by the sandbox backend on the Worker, never in the Workflow. */
+  readonly environmentPreparation = 'client' as const;
   private readonly _name: string;
   private readonly _config: ActivityOptions;
 
@@ -79,17 +111,25 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
     state: TemporalSandboxSessionState,
     options?: SandboxClientResumeOptions
   ): Promise<SandboxSessionLike<TemporalSandboxSessionState>> {
+    const envelope = serializeSessionEnvelope(state.sessionId, state, state.providerState);
+    // Upstream passes the agent's current manifest as authoritative. Its environment, path grants and
+    // mount command allowlist replace the persisted ones, so a stale or altered RunState can't pick what
+    // the Worker resolves.
+    if (options?.trustedManifest !== undefined) {
+      const trusted = encodeManifest(options.trustedManifest);
+      envelope.manifest = {
+        ...envelope.manifest,
+        environment: trusted.environment,
+        extraPathGrants: trusted.extraPathGrants,
+        remoteMountCommandAllowlist: trusted.remoteMountCommandAllowlist,
+      };
+    }
     const result = await maybeTemporalSpan(
       sandboxSpanName(SANDBOX_CLIENT_RESUME_SUFFIX),
       () =>
         scheduleActivity<SandboxSessionResult>(
           `${this._name}${SANDBOX_CLIENT_RESUME_SUFFIX}`,
-          [
-            {
-              state: serializeSessionEnvelope(state.sessionId, state, state.providerState),
-              archiveLimits: options?.archiveLimits,
-            },
-          ],
+          [{ state: envelope, archiveLimits: options?.archiveLimits }],
           this._config
         ),
       { sessionId: state.sessionId }
@@ -167,13 +207,54 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
     };
   }
 
+  /**
+   * Whether upstream may reuse a session a paused run kept live: only while `trustedManifest` gives it the
+   * environment, extra path grants and remote mount command allowlist it was created with, which a live
+   * session keeps.
+   */
+  canReusePreservedOwnedSession(
+    state: TemporalSandboxSessionState,
+    options?: SandboxPreservedSessionReuseOptions
+  ): boolean {
+    return (
+      options?.trustedManifest === undefined ||
+      manifestAuthority(state.manifest) === manifestAuthority(options.trustedManifest)
+    );
+  }
+
+  /** @internal */
+  _liveSession(sessionId: string): LiveSandboxSession | undefined {
+    return liveSessions.get(JSON.stringify([this._name, sessionId]));
+  }
+
+  /**
+   * @internal Closes `session` as upstream's cleanup does. If its Worker no longer holds it, deletes it
+   * through this client instead; if that fails too, the session is left.
+   */
+  async _close(session: TemporalSandboxSession): Promise<void> {
+    const options = { reason: 'cleanup' };
+    for (const step of [(session as SandboxSession).preStop, session.stop, session.shutdown]) {
+      await step?.call(session, options).catch(throwIfCancelled);
+    }
+    await session.delete(options).catch(async (error: unknown) => {
+      throwIfCancelled(error);
+      await this.delete(session.state).catch(throwIfCancelled);
+    });
+  }
+
   private wrapSession(result: SandboxSessionResult): TemporalSandboxSession {
-    return new TemporalSandboxSession(
+    const session = new TemporalSandboxSession(
       this._name,
       this._config,
       reviveWorkflowSessionState(result.state),
       result.supportsPty
     );
+    liveSessions.set(JSON.stringify([this._name, session.state.sessionId]), {
+      session,
+      inContainerMounts: result.inContainerMounts === true,
+      nonResumableMountAuthority: result.nonResumableMountAuthority === true,
+    });
+    return session;
   }
 }
 

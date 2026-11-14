@@ -16,11 +16,14 @@ import type {
 import { SandboxError } from '@openai/agents-core/sandbox';
 import {
   isStringRecord,
+  manifestHasInContainerMounts,
+  manifestHasNonResumableMountAuthority,
+  rebindPersistedMountCredentials,
   rehydratePersistedEnvironmentForRuntime,
   sanitizeEnvironmentForPersistence,
 } from '@openai/agents-core/sandbox/internal';
 import { ApplicationFailure } from '@temporalio/common';
-import { bindWorkerEnvVarReferences, registerWorkerEnvVarContext } from '../common/worker-env-vars';
+import { registerWorkerEnvVarContext } from '../common/worker-env-vars';
 import {
   SANDBOX_CLIENT_CREATE_SUFFIX,
   SANDBOX_CLIENT_DELETE_SUFFIX,
@@ -132,8 +135,12 @@ function unsupportedOperation(name: string, operation: string): never {
  * Wraps a real `SandboxClient` with a unique name so multiple sandbox
  * backends can be registered on a single Temporal Worker. Each provider gets
  * its own set of Activities whose names are prefixed with the provider name.
- * Live sessions are cached by session id; any Worker can serve any session's
- * Activities because a cache miss is self-healed via `client.resume()`.
+ * Live sessions are cached by session id. Any Worker can serve a session's
+ * Activities because a cache miss is self-healed via `client.resume()`,
+ * except for a session whose manifest has an in-container mount, or a mount
+ * upstream can't verify after persistence, such as one with
+ * `dockerVolumeMountStrategy()` and `driverOptions`: upstream refuses to
+ * resume it, so its Activities fail on a cache miss.
  *
  * On the Worker side, pass providers to the plugin:
  *
@@ -183,11 +190,7 @@ export class SandboxClientProvider {
   private async rehydrateState(payload: SerializedSandboxSessionState): Promise<SandboxSessionState> {
     const record = toSdkStateRecord(payload);
     if (this.client.deserializeSessionState) {
-      const state = await workerEnvVarStorage.run(this._resolvableWorkerEnvVars, () =>
-        this.client.deserializeSessionState!(record)
-      );
-      bindWorkerEnvVarReferences(state.manifest.environment, this._resolvableWorkerEnvVars);
-      return state;
+      return await this.client.deserializeSessionState(record);
     }
     // Mirrors `deserializeLocalSandboxSessionStateValues`: Worker-injected keys are not
     // in the manifest and cannot be re-derived, so they sit under the rehydrated set.
@@ -201,6 +204,18 @@ export class SandboxClientProvider {
       manifest,
       environment: { ...injected, ...(await rehydratePersistedEnvironmentForRuntime(manifest, persisted)) },
     } as SandboxSessionState;
+  }
+
+  /**
+   * Upstream's runner rebinds a deserialized state's mounts from a trusted manifest before resume, and
+   * backends refuse a state with mounts that wasn't rebound. The Worker trusts the envelope's manifest,
+   * which the Workflow sends.
+   */
+  private async resumableState(payload: SerializedSandboxSessionState): Promise<SandboxSessionState> {
+    return rebindPersistedMountCredentials(
+      await this.rehydrateState(payload),
+      decodeManifest(payload.manifest, this._resolvableWorkerEnvVars)
+    );
   }
 
   private async session(payload: SerializedSandboxSessionState): Promise<SandboxSession> {
@@ -220,7 +235,7 @@ export class SandboxClientProvider {
     }
     const resume = this.client.resume.bind(this.client);
     const resumePromise = (async (): Promise<SandboxSession> => {
-      const session = await resume(await this.rehydrateState(payload));
+      const session = await resume(await this.resumableState(payload));
       this._sessions.set(payload.sessionId, session);
       return session;
     })();
@@ -254,6 +269,8 @@ export class SandboxClientProvider {
     return {
       state: serializeSessionEnvelope(sessionId, session.state, await this.providerState(session.state)),
       supportsPty: session.supportsPty?.() ?? false,
+      ...(manifestHasInContainerMounts(session.state.manifest) ? { inContainerMounts: true } : {}),
+      ...(manifestHasNonResumableMountAuthority(session.state.manifest) ? { nonResumableMountAuthority: true } : {}),
     };
   }
 
@@ -291,7 +308,7 @@ export class SandboxClientProvider {
       ): Promise<SandboxSessionResult> => {
         if (!this.client.resume) unsupportedOperation(n, 'resume');
         const session = await this.client.resume(
-          await this.rehydrateState(input.state),
+          await this.resumableState(input.state),
           input.archiveLimits !== undefined ? { archiveLimits: input.archiveLimits } : undefined
         );
         this._sessions.set(input.state.sessionId, session);
@@ -469,8 +486,16 @@ export class SandboxClientProvider {
       },
     };
 
+    // Upstream copies manifests, in create() and applyManifest() for example, and each copy rebuilds its
+    // Worker environment references, which take the allowlist from this context.
     return Object.fromEntries(
-      Object.entries(activities).map(([name, fn]) => [name, this.withSpan(name, translateSandboxErrors(fn))])
+      Object.entries(activities).map(([name, fn]) => [
+        name,
+        this.withSpan(
+          name,
+          translateSandboxErrors((...args) => workerEnvVarStorage.run(this._resolvableWorkerEnvVars, () => fn(...args)))
+        ),
+      ])
     );
   }
 
