@@ -207,6 +207,12 @@ carries the server name. Tool discovery and calls run as `{name}-list-tools` /
 model. Set `cache_tools=True` to list a server's tools once per workflow instead
 of per turn.
 
+MCP factories must return an async context manager. Other return types now fail
+the Activity without retries with type `MCPServerFactoryTypeError`, naming the
+factory and returned type. Fix these factories before upgrading: the next
+attempt of an in-flight Activity also runs this check. Deploying a corrected
+Worker will not automatically resume an Activity that has already failed.
+
 ## Streaming
 
 `generate_content_stream` works as usual — the workflow iterates chunks (batched

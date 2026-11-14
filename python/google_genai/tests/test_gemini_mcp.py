@@ -19,6 +19,8 @@ Plus the server-side pass-through paths that need no shim code:
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
 import sys
 from collections.abc import AsyncGenerator
@@ -497,6 +499,60 @@ def _failing_factory(error: Exception):
         yield _FailingSession()
 
     return factory
+
+
+@pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
+@pytest.mark.parametrize("value", [None, object()])
+async def test_mcp_factory_return_type_is_non_retryable(operation: str, value: Any):
+    from temporalio.exceptions import ApplicationError
+    from temporalio.google_genai import _mcp
+    from temporalio.google_genai._models import _McpCallToolRequest
+
+    server = "invalid-factory"
+    kind = type(value)
+
+    # Passed in place of the factory, the value fails when the Worker is built.
+    with pytest.raises(TypeError) as type_error:
+        _mcp.build_mcp_activities({server: value})
+    assert str(type_error.value) == (
+        f"MCP server factory {server!r} is "
+        f"{kind.__module__}.{kind.__qualname__}, not callable"
+    )
+
+    def factory() -> Any:
+        return value
+
+    # The error must reach only the Activity. asyncio reports a task whose error
+    # nobody read when the task is collected.
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+
+    def report(_: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        reported.append(context)
+
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(report)
+    try:
+        if operation == "list-tools":
+            call = _mcp.build_list_tools_activity(server, factory)()
+        else:
+            call = _mcp.build_call_tool_activity(server, factory)(
+                _McpCallToolRequest(name="echo", arguments={})
+            )
+        with pytest.raises(ApplicationError) as exc_info:
+            await call
+        assert exc_info.value.type == "MCPServerFactoryTypeError"
+        assert exc_info.value.non_retryable
+        assert f"MCP server factory {server!r} returned" in exc_info.value.message
+        assert server not in _mcp._CONNECTIONS
+        # Let the loop run its pending callbacks, which still reference the
+        # connection, before collecting.
+        del exc_info
+        await asyncio.sleep(0)
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous_handler)
+    assert reported == []
 
 
 @pytest.mark.parametrize("operation", ["list-tools", "call-tool"])

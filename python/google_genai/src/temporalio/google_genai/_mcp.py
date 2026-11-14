@@ -124,16 +124,31 @@ class _ConnectionRecord:
 
     async def _run(self, factory: McpSessionFactory) -> None:
         try:
-            async with factory() as session:
+            context = factory()
+            if not isinstance(context, AbstractAsyncContextManager):
+                kind = type(context)
+                raise ApplicationError(
+                    f"MCP server factory {self._server!r} returned "
+                    f"{kind.__module__}.{kind.__qualname__}, not an async context manager",
+                    type="MCPServerFactoryTypeError",
+                    non_retryable=True,
+                )
+            async with context as session:
                 self._ready.set_result(session)
                 await self._stop.wait()
         except BaseException as err:
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
-            if not self._ready.done():
-                self._ready.set_exception(err)
             _CONNECTIONS.pop(self._server, None)
-            raise
+            if self._ready.done():
+                raise
+            self._ready.set_exception(err)
+            # The waiting calls get the error through ``_ready``. Nobody awaits
+            # this task once its record is dropped, so raising the error here
+            # too would only make asyncio log it as never retrieved.
+            # Cancellation and interpreter exits still propagate.
+            if not isinstance(err, Exception):
+                raise
 
     def acquire(self) -> None:
         """Mark a call in flight; pause idle eviction while calls are active."""
@@ -278,6 +293,13 @@ def build_mcp_activities(
     """Build the list-tools and call-tool activities for every registered server."""
     activities: list[Callable] = []
     for server, factory in mcp_servers.items():
+        # Fail when the Worker is built, not in every MCP Activity.
+        if not callable(factory):
+            kind = type(factory)
+            raise TypeError(
+                f"MCP server factory {server!r} is "
+                f"{kind.__module__}.{kind.__qualname__}, not callable"
+            )
         activities.append(build_list_tools_activity(server, factory, idle_timeout))
         activities.append(build_call_tool_activity(server, factory, idle_timeout))
     return activities
