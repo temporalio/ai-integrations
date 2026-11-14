@@ -217,7 +217,10 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   analyzer severities live in `dotnet/_shared/analyzers.globalconfig` (listed as
   `EditorConfigFiles` in `dotnet.props`, with `.globalconfig` discovery off so nothing else reaches the
   compiler). `StyleCop.Analyzers` is referenced by each project with
-  `PrivateAssets="all"`.
+  `PrivateAssets="all"`. An analyzer or editorconfig entry stays only with a comment stating what fails
+  without it, measured by removing the entry and rebuilding
+  (`scripts/dev/narrow_dotnet_analyzers.py`); the measurement is re-run when the SDK or the analyzer
+  packages move.
 - `plugin.toml` `[ci] runtime-versions` lists the .NET runtimes the tests run on, oldest first; the
   last entry is the SDK channel `global.json` pins (`latestFeature`), the dist cell and the framework
   the clean consumer targets. The library targets one framework: `netstandard2.0`, like the SDK's own

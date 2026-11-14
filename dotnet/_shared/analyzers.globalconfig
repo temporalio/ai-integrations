@@ -1,69 +1,39 @@
-# Project-wide analyzer severities for every project under dotnet/, imported through
-# GlobalAnalyzerConfigFiles in dotnet.props. Path-scoped rules (such as workflow files) live in the
-# plugin's .editorconfig, which is kept byte-identical to dotnet/_template/.editorconfig.
-# Seeded from sdk-dotnet's .editorconfig so plugin code reads like SDK code. Keep in order by rule id.
+# Project-wide analyzer severities for every project under dotnet/, listed as EditorConfigFiles in
+# dotnet.props (.globalconfig discovery is off). A path-scoped rule, should a plugin ever need one,
+# goes in the plugin's .editorconfig, which is kept byte-identical to dotnet/_template/.editorconfig.
+# Every entry here is one whose removal fails the Release build (warnings are errors) or `make lint`
+# on the current tree, measured by removing each entry on its own and rebuilding
+# (maf-work/notes/analyzer-narrowing.md); a suppression whose rule never fired was dropped. Keep in
+# order by rule id.
 is_global = true
 
-# We cannot reasonably mark ourselves CLSCompliant one way or another if
-# libraries we rely on like Microsoft.Extensions.Logging.Abstractions don't
-dotnet_diagnostic.CA1014.severity = none
-
-# We have exceptions we don't want all constructors on
+# Exceptions carry only the constructors they need: removal fires CA1032 on
+# MicrosoftAgentFrameworkWorkflowException (src) and FakeRequestFailedException (tests), 2 sites.
 dotnet_diagnostic.CA1032.severity = none
 
-# We allow nested classes e.g. in cases of sum types
-dotnet_diagnostic.CA1034.severity = none
-
-# We use nullable types instead of checking params are non-null, even in public methods
-dotnet_diagnostic.CA1062.severity = none
-
-# We are not concerned with globalization. The category-wide option does not work
-# in our analyzers, so we disable each rule.
-dotnet_diagnostic.CA1303.severity = none
-dotnet_diagnostic.CA1304.severity = none
-dotnet_diagnostic.CA1305.severity = none
-dotnet_diagnostic.CA1307.severity = none
-dotnet_diagnostic.CA1310.severity = none
-dotnet_diagnostic.CA1311.severity = none
-
-# For many of our properties like task tokens, we're ok returning byte arrays
-dotnet_diagnostic.CA1819.severity = none
-
-# ReadOnlySpan conversion errors when using string.Concat
-dotnet_diagnostic.CA1845.severity = none
-
-# String.Contains(Char) doesn't exist in older .NET
-dotnet_diagnostic.CA1847.severity = none
-
-# We accept logging performance can improve later
+# Logging goes through the ILogger extension methods, not LoggerMessage delegates: removal fires
+# CA1848 on 8 call sites in src (AgentLoop x4, ChatOptionsTransport, McpConnectionCache,
+# ModelActivities, TemporalAgent).
 dotnet_diagnostic.CA1848.severity = none
-dotnet_diagnostic.CA1873.severity = none
 
 # No ConfigureAwait(false) anywhere: Workflow code must stay on the Workflow scheduler, so the fixer
 # `dotnet format` runs for this rule would turn a correct await into a hop off it, and worker code
 # gains nothing from it. check_conventions.py fails on ConfigureAwait(false) under dotnet/*/src/.
+# Removal fires CA2007 on every await: 39 sites in src and 206 in tests.
 dotnet_diagnostic.CA2007.severity = none
 
-# Do not want to make all exceptions [Serializable], we don't support cross-AppDomain currently
-dotnet_diagnostic.CA2237.severity = none
-
-# Warn on unused imports
+# Unused using directives fail `make lint`: `dotnet format` reports IDE0005 only at warning or above
+# (its default is hidden). No effect on the current tree; kept as the only check for unused usings.
 dotnet_diagnostic.IDE0005.severity = warning
 
-# Do not require "this." prefix, devs are smart enough to know when to qualify
+# Members are not qualified with `this.`: removal fires SA1101 on 574 sites (306 src, 268 tests).
 dotnet_diagnostic.SA1101.severity = none
 
-# Allow using directives outside of the namespace
+# Using directives sit above the namespace: removal fires SA1200 on 288 sites (112 src, 176 tests).
 dotnet_diagnostic.SA1200.severity = none
 
-# Don't require a blank line after every closing brace
-dotnet_diagnostic.SA1513.severity = none
-
-# Don't require a blank line before single line comments
+# A single-line comment needs no blank line before it: removal fires SA1515 once (src TemporalAgent.cs).
 dotnet_diagnostic.SA1515.severity = none
 
-# Do not require partial class documentation
-dotnet_diagnostic.SA1601.severity = none
-
-# Do not require file header
+# No file headers: removal fires SA1633 on every file, 108 sites (36 src, 72 tests).
 dotnet_diagnostic.SA1633.severity = none

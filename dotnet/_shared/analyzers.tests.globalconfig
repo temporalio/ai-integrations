@@ -1,63 +1,37 @@
-# Additional severities for *.Tests projects (imported after analyzers.globalconfig).
-# Seeded from sdk-dotnet's tests/Temporalio.Tests/.editorconfig. Keep in order by rule id.
+# Additional severities for *.Tests projects, listed after analyzers.globalconfig (which applies to
+# them as well; global_level = 1 makes this file win should the two ever set the same key). Every
+# entry here is one whose removal fails the Release build (warnings are errors) or `make lint` on the
+# current tree, measured by removing each entry on its own (maf-work/notes/analyzer-narrowing.md);
+# a suppression whose rule never fired was dropped. Keep in order by rule id.
 is_global = true
 global_level = 1
 
-# We use getters for queries, they cannot be properties
-dotnet_diagnostic.CA1024.severity = none
+# Test code does not null-check its parameters: removal fires CA1062 on 29 parameters, all in the
+# test project (xunit fixtures, message handlers and Workflow entry points). The library validates
+# its public parameters at 42 ArgumentNullException.ThrowIfNull sites under src/, so the shared
+# analyzers.globalconfig no longer suppresses the rule.
+dotnet_diagnostic.CA1062.severity = none
 
-# Test classes are public for the test framework; a test executable has no API surface to hide
+# Test types are public for the test framework; a test executable has no API surface to hide:
+# removal fires CA1515 on 52 types.
 dotnet_diagnostic.CA1515.severity = none
 
-# Tests can have underscores in method names
+# Test method names use underscores: removal fires CA1707 on 124 tests.
 dotnet_diagnostic.CA1707.severity = none
 
-# Don't force workflows to have static methods
+# Activity methods, Workflow handlers and fixture helpers are instance members on purpose: removal
+# fires CA1822 on 15 members (WeatherActivities x5, DevServerFixture.WorkflowOptions and 9 handlers
+# in *.workflow.cs).
 dotnet_diagnostic.CA1822.severity = none
 
-# Don't need to mark test classes sealed
-dotnet_diagnostic.CA1852.severity = none
-
-# Don't need to make array params static readonly for test performance
-dotnet_diagnostic.CA1861.severity = none
-
-# ConfigureAwait not needed in tests
-dotnet_diagnostic.CA2007.severity = none
-
-# Do not need task scheduler for workflows
-dotnet_diagnostic.CA2008.severity = none
-
-# Workflow randomness is intentionally deterministic
-dotnet_diagnostic.CA5394.severity = none
-
-# Do not need docs in test project
-dotnet_diagnostic.CS1591.severity = none
-
-# Test projects may turn XML documentation output off (GenerateDocumentationFile=false)
+# The test csproj turns XML documentation output off (GenerateDocumentationFile=false), which
+# StyleCop reports once per build: removal fires SA0001.
 dotnet_diagnostic.SA0001.severity = none
 
-# Allow async methods to not have await in them
-dotnet_diagnostic.CS1998.severity = none
-
-# We're ok having parameters span lines in tests
-dotnet_diagnostic.SA1118.severity = none
-
-# To test lambda attributes, lambda and attribute share line
-dotnet_diagnostic.SA1134.severity = none
-
-# We want to have classes near their tests
+# Helper members and types sit next to the tests that use them: removal fires SA1201 in 3 files
+# (DevServerFixture, McpTests, WorkflowTestBase).
 dotnet_diagnostic.SA1201.severity = none
-dotnet_diagnostic.SA1204.severity = none
 
-# We allow underscores as names (DotNetAnalyzers/StyleCopAnalyzers#2599)
-dotnet_diagnostic.SA1313.severity = none
-
-# Do not need docs in test project
+# Test members are undocumented. The build skips the documentation rules while the documentation
+# file is off, but `dotnet format` runs them: removal fails `make lint` with SA1600 on 291 members.
 dotnet_diagnostic.SA1600.severity = none
-dotnet_diagnostic.SA1602.severity = none
-
-# No need to avoid things using TaskScheduler.Current in workflows
-dotnet_diagnostic.VSTHRD105.severity = none
-
-# Do not need to suffix tests with "Async"
-dotnet_diagnostic.VSTHRD200.severity = none
