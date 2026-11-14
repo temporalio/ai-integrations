@@ -1,8 +1,9 @@
+using System.Text.Json;
 using Microsoft.Extensions.AI;
 using Temporalio.Api.Enums.V1;
-using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.Extensions.MicrosoftAgentFramework.Testing;
 using Temporalio.Extensions.MicrosoftAgentFramework.Tests.Workflows;
+using Temporalio.Extensions.WorkflowStreams;
 
 namespace Temporalio.Extensions.MicrosoftAgentFramework.Tests;
 
@@ -131,9 +132,23 @@ public class StreamingTests : WorkflowTestBase
             var result = await handle.GetResultAsync();
             Assert.Equal(text, result.FinalText);
 
-            // 301 updates (300 text pieces and the usage) at a 30-second interval: one publish Signal when the
-            // 256th update is buffered and one for the rest when the stream ends. Without the bound there would be one.
-            Assert.Equal(2, HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.WorkflowExecutionSignaled));
+            // 301 updates (300 text pieces and the usage) over a bound of 256: the size limit forces a second
+            // publish Signal, no Signal carries more than the bound, and together they carry every update. The
+            // 30-second interval may still flush between the size-limit flushes on a slow runner, so the exact
+            // count is not asserted.
+            var history = await handle.FetchHistoryAsync();
+            var batches = new List<int>();
+            foreach (var signaled in history.Events.Select(e => e.WorkflowExecutionSignaledEventAttributes).Where(a => a?.SignalName == WorkflowStreamConstants.PublishSignalName))
+            {
+                // The publish Signal's input is the extension's internal batch record; its items array is all the test needs.
+                var batch = (JsonElement)Client.Options.DataConverter.PayloadConverter.ToValue(signaled!.Input.Payloads_.Single(), typeof(JsonElement))!;
+                var entries = batch.EnumerateObject().Single(property => string.Equals(property.Name, "items", StringComparison.OrdinalIgnoreCase)).Value;
+                batches.Add(entries.GetArrayLength());
+            }
+
+            Assert.True(batches.Count >= 2, $"the size bound must split the stream into at least two Signals, got {batches.Count}");
+            Assert.All(batches, count => Assert.InRange(count, 1, Activities.ModelActivities.MaxStreamingBatchSize));
+            Assert.Equal(301, batches.Sum());
         });
     }
 }
