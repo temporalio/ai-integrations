@@ -7,6 +7,7 @@ public static class TestWorkflows
     [
         typeof(HelloWorkflow),
         typeof(CancellationWorkflow),
+        typeof(CallerCancellationWorkflow),
         typeof(ToolsWorkflow),
         typeof(ApprovalWorkflow),
         typeof(ApprovalUpdateWorkflow),

@@ -67,6 +67,40 @@ public class CancellationTests : WorkflowTestBase
         });
     }
 
+    // The Workflow-cancel cases above cannot see the token wiring: the Activity gets the Workflow's own token by
+    // default and no further model call starts in a cancelled Workflow. Here the Workflow stays alive, so the
+    // cancel must travel through the caller's token into the Activity options and back out of the tool as a
+    // cancellation, not as a tool error that the model would answer.
+    [Fact]
+    public async Task CallerToken_CancelledDuringActivityTool_CancelsTheActivity_AndSurfacesTheCancellation()
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(("get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" })),
+            ScriptedResponse.Text("never"));
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var handle = await Client.StartWorkflowAsync((CallerCancellationWorkflow wf) => wf.RunAsync("Weather?"), Fixture.WorkflowOptions(worker, "cancel-caller-token"));
+            await WaitForActivityStartAsync(handle, "SlowWeather");
+            await handle.SignalAsync(wf => wf.CancelRunAsync());
+            var result = await handle.GetResultAsync();
+
+            // The cancellation that reaches the caller is the tool Activity's own: without the loop's cancellation
+            // filter it would become a tool error, and the run would fail only when the next model call sees the
+            // cancelled token.
+            Assert.Equal("cancelled: SlowWeather", result);
+
+            var history = await handle.FetchHistoryAsync();
+            var scheduled = Assert.Single(HistoryAssert.Scheduled(history, "SlowWeather"));
+            var cancelRequested = Assert.Single(history.Events, e => e.ActivityTaskCancelRequestedEventAttributes is not null);
+            Assert.Equal(scheduled.EventId, cancelRequested.ActivityTaskCancelRequestedEventAttributes!.ScheduledEventId);
+            Assert.Equal(1, HistoryAssert.Count(history, EventType.ActivityTaskCanceled));
+            Assert.Equal(0, HistoryAssert.Count(history, EventType.WorkflowExecutionCanceled));
+            Assert.Equal(1, HistoryAssert.ActivityCounts(history)[ModelActivityNames.InvokeModel]);
+            Assert.Equal(1, fake.CallCount);
+        });
+    }
+
     private static long EventId(Temporalio.Common.WorkflowHistory history, EventType type) => history.Events.Single(e => e.EventType == type).EventId;
 
     // History records ActivityTaskStarted only when the Activity ends; the service's pending activities show it running.
