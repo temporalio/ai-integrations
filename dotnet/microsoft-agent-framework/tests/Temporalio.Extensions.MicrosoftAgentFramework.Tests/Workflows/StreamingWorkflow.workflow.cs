@@ -25,6 +25,10 @@ public class StreamingWorkflow
         {
             StreamingTopic = input.Topic,
             StreamingBatchInterval = input.Topic is null ? null : input.BatchInterval ?? TimeSpan.FromMilliseconds(50),
+
+            // These tests are about batching, not heartbeats: a wide timeout keeps a loaded runner from timing the
+            // model Activity out while it publishes.
+            ModelActivityOptions = new ActivityOptions { HeartbeatTimeout = TimeSpan.FromSeconds(60) },
             ChatOptions = new ChatOptions
             {
                 Tools = input.WithTool ? [AIFunctionFactory.Create((string city) => $"sunny in {city}", "get_weather", "Gets the weather for a city")] : null,

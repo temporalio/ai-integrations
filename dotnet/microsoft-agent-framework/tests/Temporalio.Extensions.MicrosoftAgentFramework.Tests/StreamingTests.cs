@@ -139,7 +139,10 @@ public class StreamingTests : WorkflowTestBase
             // swaps before the Activity's final FlushAsync, which the 45 remaining updates at 1 ms each give it time
             // to do; a stale wake can add a third Signal. The 30-second interval timer starts on the first publish
             // and cannot fire inside the subscriber's own 30-second window.
+            // A retried model Activity republishes every update, so a second attempt would double the sum below;
+            // report it as a retry instead.
             var history = await handle.FetchHistoryAsync();
+            Assert.Equal(1, HistoryAssert.LastAttempt(history, ModelActivityNames.InvokeModel));
             var batches = new List<int>();
             foreach (var signaled in history.Events.Select(e => e.WorkflowExecutionSignaledEventAttributes).Where(a => a?.SignalName == WorkflowStreamConstants.PublishSignalName))
             {
