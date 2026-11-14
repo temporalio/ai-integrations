@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import TracebackType
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import EventActions
@@ -14,12 +14,9 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset
 from google.adk.tools.mcp_tool import McpTool, McpToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
 from google.adk.tools.tool_confirmation import ToolConfirmation
 from google.adk.tools.tool_context import ToolContext
-from google.genai import types
 from google.genai.types import FunctionDeclaration
-from mcp import Tool as McpBaseTool
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1.workflow_pb2 import (
@@ -53,7 +50,7 @@ class _ToolResult:
     is_long_running: bool
     custom_metadata: dict[str, Any] | None
     function_declaration: FunctionDeclaration | None
-    tool_definition: McpBaseTool | None = None
+    fenced_function_declaration: FunctionDeclaration | None = None
 
 
 @dataclass
@@ -171,7 +168,9 @@ class TemporalMcpToolSetProvider:
                         tool.is_long_running,
                         tool.custom_metadata,
                         tool._get_declaration(),
-                        tool.raw_mcp_tool if isinstance(tool, McpTool) else None,
+                        tool._build_fenced_declaration()
+                        if isinstance(tool, McpTool)
+                        else None,
                     )
                     for tool in tools
                 ]
@@ -209,40 +208,48 @@ class TemporalMcpToolSetProvider:
         return get_tools, call_tool
 
 
-class _TemporalMCPManager(MCPSessionManager):
-    def __init__(self) -> None:  # pyright: ignore[reportMissingSuperCall]
-        # process_llm_request never uses the manager, so no initialization is needed.
-        pass
-
-
-async def _process_tool_llm_request(
-    tool: BaseTool,
-    tool_definition: McpBaseTool | None,
-    *,
-    tool_context: ToolContext,
-    llm_request: LlmRequest,
-) -> None:
-    if tool_definition is None:
-        await BaseTool.process_llm_request(
-            tool, tool_context=tool_context, llm_request=llm_request
+class _RecordedMcpTool(McpTool):
+    def __init__(self, tool: BaseTool, fenced_declaration: FunctionDeclaration) -> None:
+        # This adapter only runs request preparation; execution stays in Activities.
+        BaseTool.__init__(
+            self,
+            name=tool.name,
+            description=tool.description,
+            is_long_running=tool.is_long_running,
+            custom_metadata=tool.custom_metadata,
         )
-        return
+        self._declaration = cast(FunctionDeclaration, tool._get_declaration())
+        self._fenced_declaration = fenced_declaration
 
-    mcp_tool = McpTool(
-        mcp_tool=tool_definition,
-        mcp_session_manager=_TemporalMCPManager(),
-    )
-    mcp_tool.name = tool.name
-    mcp_tool.description = tool.description
-    mcp_tool.is_long_running = tool.is_long_running
-    mcp_tool.custom_metadata = tool.custom_metadata
-    await mcp_tool.process_llm_request(
-        tool_context=tool_context, llm_request=llm_request
-    )
-    llm_request.tools_dict[tool.name] = tool
+    def _get_declaration(self) -> FunctionDeclaration:
+        return self._declaration
+
+    def _build_fenced_declaration(self) -> FunctionDeclaration:
+        return self._fenced_declaration
 
 
-class _TemporalTool(BaseTool):
+class _TemporalBaseTool(BaseTool):
+    _declaration: FunctionDeclaration | None
+    _fenced_declaration: FunctionDeclaration | None
+
+    def _get_declaration(self) -> FunctionDeclaration | None:
+        return self._declaration
+
+    async def process_llm_request(
+        self, *, tool_context: ToolContext, llm_request: LlmRequest
+    ) -> None:
+        if self._fenced_declaration is None:
+            await super().process_llm_request(
+                tool_context=tool_context, llm_request=llm_request
+            )
+        else:
+            await _RecordedMcpTool(self, self._fenced_declaration).process_llm_request(
+                tool_context=tool_context, llm_request=llm_request
+            )
+            llm_request.tools_dict[self.name] = self
+
+
+class _TemporalTool(_TemporalBaseTool):
     def __init__(
         self,
         set_name: str,
@@ -254,7 +261,7 @@ class _TemporalTool(BaseTool):
         description: str,
         is_long_running: bool = False,
         custom_metadata: dict[str, Any] | None = None,
-        tool_definition: McpBaseTool | None = None,
+        fenced_declaration: FunctionDeclaration | None = None,
     ):
         super().__init__(
             name=name,
@@ -268,20 +275,7 @@ class _TemporalTool(BaseTool):
             start_to_close_timeout=timedelta(minutes=1)
         )
         self._declaration = declaration
-        self._tool_definition = tool_definition
-
-    def _get_declaration(self) -> types.FunctionDeclaration | None:
-        return self._declaration
-
-    async def process_llm_request(
-        self, *, tool_context: ToolContext, llm_request: LlmRequest
-    ) -> None:
-        await _process_tool_llm_request(
-            self,
-            self._tool_definition,
-            tool_context=tool_context,
-            llm_request=llm_request,
-        )
+        self._fenced_declaration = fenced_declaration
 
     async def run_async(
         self, *, args: dict[str, Any], tool_context: ToolContext
@@ -393,7 +387,7 @@ class TemporalMcpToolSet(BaseToolset):
                 description=tool_result.description,
                 is_long_running=tool_result.is_long_running,
                 custom_metadata=tool_result.custom_metadata,
-                tool_definition=tool_result.tool_definition,
+                fenced_declaration=tool_result.fenced_function_declaration,
             )
             for tool_result in tool_results
         ]
@@ -901,7 +895,9 @@ class TemporalStatefulMcpToolSetProvider:
                     tool.is_long_running,
                     tool.custom_metadata,
                     tool._get_declaration(),
-                    tool.raw_mcp_tool if isinstance(tool, McpTool) else None,
+                    tool._build_fenced_declaration()
+                    if isinstance(tool, McpTool)
+                    else None,
                 )
                 for tool in tools
             ]
@@ -1001,7 +997,7 @@ class TemporalStatefulMcpToolSetProvider:
         return (connect,)
 
 
-class _TemporalStatefulTool(BaseTool):
+class _TemporalStatefulTool(_TemporalBaseTool):
     def __init__(
         self,
         set_name: str,
@@ -1013,7 +1009,7 @@ class _TemporalStatefulTool(BaseTool):
         description: str,
         is_long_running: bool = False,
         custom_metadata: dict[str, Any] | None = None,
-        tool_definition: McpBaseTool | None = None,
+        fenced_declaration: FunctionDeclaration | None = None,
     ):
         super().__init__(
             name=name,
@@ -1025,20 +1021,7 @@ class _TemporalStatefulTool(BaseTool):
         self._session = session
         self._config = config
         self._declaration = declaration
-        self._tool_definition = tool_definition
-
-    def _get_declaration(self) -> types.FunctionDeclaration | None:
-        return self._declaration
-
-    async def process_llm_request(
-        self, *, tool_context: ToolContext, llm_request: LlmRequest
-    ) -> None:
-        await _process_tool_llm_request(
-            self,
-            self._tool_definition,
-            tool_context=tool_context,
-            llm_request=llm_request,
-        )
+        self._fenced_declaration = fenced_declaration
 
     @_handle_worker_failure
     async def run_async(
@@ -1266,7 +1249,7 @@ class TemporalStatefulMcpToolSet(BaseToolset):
                 description=tool_result.description,
                 is_long_running=tool_result.is_long_running,
                 custom_metadata=tool_result.custom_metadata,
-                tool_definition=tool_result.tool_definition,
+                fenced_declaration=tool_result.fenced_function_declaration,
             )
             for tool_result in tool_results
         ]

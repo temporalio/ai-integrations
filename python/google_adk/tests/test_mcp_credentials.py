@@ -98,7 +98,7 @@ async def test_api_key_authenticates_inside_activity_without_entering_payloads(
             native._get_declaration(),
             name=native.name,
             description=native.description,
-            tool_definition=native.raw_mcp_tool,
+            fenced_declaration=native._build_fenced_declaration(),
         )
         argument_type = _StatefulCallToolArguments
     else:
@@ -111,7 +111,7 @@ async def test_api_key_authenticates_inside_activity_without_entering_payloads(
             native._get_declaration(),
             name=native.name,
             description=native.description,
-            tool_definition=native.raw_mcp_tool,
+            fenced_declaration=native._build_fenced_declaration(),
         )
         argument_type = _CallToolArguments
 
