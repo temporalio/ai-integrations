@@ -18,28 +18,37 @@ The choice is always explicit: an unwrapped non-builtin tool runs in-workflow,
 and the plugin warns at construction so that is a conscious decision, never a
 silent one.
 
-Registries here live in a ``temporalio``-namespaced (sandbox-passthrough) module,
-so the object the worker's activity sees is the same one the module-level
-``tool_as_activity(...)`` / ``TemporalBackend(...)`` call populated. They hold
-worker-wide wiring, not per-workflow state.
+Registries here live in a ``temporalio``-namespaced (sandbox-passthrough) module
+and are process-local. Tools must be registered at startup in every activity
+worker. Instance-backed ``TemporalBackend`` wrappers require activities to run
+in the same process; named ``TemporalBackend`` handles send a factory argument
+so any activity worker can construct the backend independently.
 """
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
+import sys
 import threading
+import typing
 import uuid as _uuid
 import warnings
 import weakref
 from collections.abc import Mapping
+from dataclasses import is_dataclass
 from datetime import timedelta
-from functools import wraps
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 from temporalio import activity as activity_mod
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
+from temporalio.workflow import ActivityConfig
 
 # LangChain is a runtime dependency of the *tool seam*, but importing this module
 # must not require it (the plugin imports it just to read tool defaults). So the
@@ -208,14 +217,154 @@ def lookup_backend(ref: str) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
+# Options activity_as_tool builds itself from the model's tool call.
+_RESERVED_ACTIVITY_OPTIONS = frozenset({"arg", "args"})
+
+
+def _call_function(method: Any) -> Callable | None:
+    """Return the function under a function, staticmethod, classmethod or partialmethod."""
+    while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
+        method = (
+            method.func
+            if isinstance(method, functools.partialmethod)
+            else method.__func__
+        )
+    return method if inspect.isfunction(method) else None
+
+
+def _docstring(fn: Any) -> str | None:
+    """Return ``fn``'s docstring, unless it is missing or blank."""
+    doc = getattr(fn, "__doc__", None) if fn is not None else None
+    return doc if doc and doc.strip() else None
+
+
+def _generated_class_doc(cls: type) -> str | None:
+    """Return the docstring dataclasses or namedtuple writes for a class that has none."""
+    if is_dataclass(cls):
+        try:
+            # Format it as dataclasses did when it made the class.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+                # 3.14 left a forward reference in the __init__ dataclasses
+                # generated unevaluated, and the field keeps the reference from
+                # that time.
+                annotate = getattr(cls.__init__, "__annotate__", None)
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
+                    field_types = {
+                        n: f.type for n, f in cls.__dataclass_fields__.items()
+                    }
+                    signature = signature.replace(
+                        parameters=[
+                            p.replace(annotation=field_types.get(p.name, p.annotation))
+                            for p in signature.parameters.values()
+                        ]
+                    )
+            else:
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
+            return cls.__name__ + str(signature).replace(" -> None", "")
+        except (TypeError, ValueError):
+            return cls.__name__
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
+def _class_doc(cls: type) -> str | None:
+    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    doc = _docstring(cls)
+    if doc is None or not doc.startswith(cls.__name__):
+        return doc
+    try:
+        generated = _generated_class_doc(cls)
+    except Exception:
+        # dataclasses would have failed the same way, so it didn't write this
+        # docstring.
+        return doc
+    return None if doc == generated else doc
+
+
+def _tool_signature(
+    activity: Callable,
+) -> tuple[inspect.Signature, dict[str, Any], str | None]:
+    """Return the parameters the model fills, their types, and the tool's docstring."""
+    if inspect.isclass(activity):
+        # Workflow code references a callable-class activity by its class, but the
+        # worker's registered instance runs __call__, so take __call__'s parameters
+        # as an instance binds it: without the receiver of a method, classmethod or
+        # partialmethod, and with every parameter of a staticmethod.
+        calls = [vars(c)["__call__"] for c in activity.__mro__ if "__call__" in vars(c)]
+        func = _call_function(calls[0]) if calls else None
+        if func is None:
+            raise ValueError(
+                f"activity_as_tool requires {activity.__name__} to have a __call__ "
+                "that is a function, staticmethod, classmethod or "
+                "functools.partialmethod."
+            )
+        try:
+            signature = inspect.signature(calls[0].__get__(object(), activity))
+            hints = typing.get_type_hints(func, include_extras=True)
+        except Exception as e:
+            raise ValueError(
+                f"activity_as_tool cannot read {activity.__name__}.__call__: {e}"
+            ) from e
+        # A functools.partialmethod that binds an argument by keyword makes the
+        # arguments after it keyword-only.
+        bound_by_keyword = isinstance(calls[0], functools.partialmethod) and bool(
+            calls[0].keywords
+        )
+        # __call__'s own docstring, else the class's, else that of a __call__ it inherits.
+        doc = (
+            _docstring(_call_function(vars(activity).get("__call__")))
+            or _class_doc(activity)
+            or next(filter(None, map(_docstring, map(_call_function, calls))), None)
+        )
+    else:
+        signature = inspect.signature(activity)
+        hints = typing.get_type_hints(activity, include_extras=True)
+        doc = activity.__doc__
+        bound_by_keyword = False
+        # A first parameter named `self` is the receiver of a method passed as
+        # Class.method, however it is annotated: the worker registers the bound
+        # method, so its instance supplies it.
+        params = list(signature.parameters.values())
+        if params and params[0].name == "self":
+            signature = signature.replace(parameters=params[1:])
+    # The tool passes the model's arguments to the activity by position, one per
+    # parameter, so it can't pass *args, keyword-only arguments or **kwargs. The
+    # model names every argument, positional-only ones included.
+    parameters = []
+    for p in signature.parameters.values():
+        if p.kind is inspect.Parameter.VAR_POSITIONAL:
+            raise ValueError(f"activity_as_tool cannot pass *{p.name}.")
+        if p.kind is inspect.Parameter.KEYWORD_ONLY:
+            message = f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
+            if bound_by_keyword:
+                message += (
+                    " Its functools.partialmethod binds an argument by keyword,"
+                    " which makes the arguments after it keyword-only."
+                )
+            raise ValueError(message)
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            raise ValueError(f"activity_as_tool cannot pass **{p.name}.")
+        if p.kind is inspect.Parameter.POSITIONAL_ONLY:
+            p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        parameters.append(p)
+    return signature.replace(parameters=parameters), hints, doc
+
+
 def activity_as_tool(
     activity: Callable,
     *,
-    start_to_close_timeout: timedelta,
     name: str | None = None,
     description: str | None = None,
-    retry_policy: Any = None,
-    summary: str | None = None,
+    activity_options: ActivityConfig | None = None,
 ) -> BaseTool:
     """Expose an existing Temporal activity as a Deep Agents tool.
 
@@ -224,14 +373,26 @@ def activity_as_tool(
     ``workflow.execute_activity`` — Temporal owns its retries and timeout.
 
     Args:
-        activity: A function decorated with ``@activity.defn``.
-        start_to_close_timeout: Required per-call timeout for the activity.
+        activity: A function decorated with ``@activity.defn``, a method passed
+            as ``Class.method``, or a callable-class activity passed as its class.
         name: Override the tool name advertised to the model (defaults to
             the activity definition name).
         description: Override the tool description advertised to the model
             (defaults to the activity docstring).
-        retry_policy: Optional Temporal retry policy for the activity.
-        summary: Optional ``summary=`` recorded on each activity invocation.
+        activity_options: The ``workflow.execute_activity`` options for each
+            call: timeouts, ``retry_policy``, ``task_queue``,
+            ``heartbeat_timeout``, ``activity_id``, ``summary``, and so on. Must
+            set ``start_to_close_timeout`` or ``schedule_to_close_timeout``.
+            ``summary`` defaults to ``"tool:<name>"``. ``arg`` and ``args`` are
+            reserved: the tool builds them from the model's call.
+
+    Raises:
+        ValueError: If ``activity`` is not a named activity, is an instance of a
+            callable-class activity, is a class without a ``__call__`` the tool
+            can use, or takes arguments the tool can't pass: ``*args``,
+            keyword-only arguments or ``**kwargs``; if ``activity_options``
+            sets ``arg`` or ``args``; or if it sets neither a start-to-close
+            nor a schedule-to-close timeout.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -248,35 +409,46 @@ def activity_as_tool(
             "activity_as_tool requires a named activity (dynamic activities "
             "have no definition name); pass name= explicitly."
         )
-    tool_desc = description or (activity.__doc__ or f"Temporal activity {tool_name}.")
-    act_summary = summary or f"tool:{tool_name}"
-
-    # Temporal activities take a single positional argument. StructuredTool infers
-    # the model-facing schema from ``_run``'s signature, so we mirror the activity's
-    # own parameter names onto ``_run`` (via ``@wraps``) and then collapse the
-    # keyword call the model produces back into that single positional payload.
-    import inspect
-
-    params = [
-        p for p in inspect.signature(activity).parameters if p not in ("self", "cls")
-    ]
-
-    @wraps(activity)
-    async def _run(*args: Any, **kwargs: Any) -> Any:
-        if args and not kwargs:
-            payload: Any = args[0] if len(args) == 1 else list(args)
-        elif len(params) == 1 and len(kwargs) == 1:
-            # Single-argument activity: pass the value directly, not {"arg": value}.
-            payload = next(iter(kwargs.values()))
-        else:
-            payload = kwargs
-        return await workflow.execute_activity(
-            activity,
-            payload,
-            start_to_close_timeout=start_to_close_timeout,
-            retry_policy=retry_policy,
-            summary=act_summary,
+    if not inspect.isclass(activity) and hasattr(
+        type(activity), "__temporal_activity_definition"
+    ):
+        raise ValueError(
+            f"activity_as_tool requires the activity class {type(activity).__name__}, "
+            "not an instance of it."
         )
+    signature, hints, doc = _tool_signature(activity)
+    tool_desc = description or (doc or f"Temporal activity {tool_name}.")
+
+    opts: dict[str, Any] = dict(activity_options or {})
+    reserved = _RESERVED_ACTIVITY_OPTIONS & opts.keys()
+    if reserved:
+        raise ValueError(
+            f"activity_options must not set {', '.join(sorted(reserved))}: "
+            "the tool builds the activity arguments from the model's call."
+        )
+    if (
+        opts.get("start_to_close_timeout") is None
+        and opts.get("schedule_to_close_timeout") is None
+    ):
+        raise ValueError(
+            "activity_as_tool requires start_to_close_timeout or "
+            "schedule_to_close_timeout in activity_options."
+        )
+    # The default summary this helper has always recorded.
+    opts.setdefault("summary", f"tool:{tool_name}")
+
+    async def _run(*args: Any, **kwargs: Any) -> Any:
+        # The model's arguments go to the activity by position, in parameter order.
+        # Defaults are passed too: the worker decodes arguments with the
+        # activity's type hints only when every parameter has a value.
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return await workflow.execute_activity(activity, args=bound.args, **opts)
+
+    # StructuredTool builds the model-facing schema from _run's signature and types.
+    setattr(_run, "__signature__", signature)
+    _run.__annotations__ = hints
+    _run.__doc__ = doc
 
     _ROUTED_TOOL_NAMES.add(tool_name)
     return StructuredTool.from_function(
@@ -303,6 +475,10 @@ def tool_as_activity(
     same name and argument schema (so the model's calls are unchanged) but, when
     invoked in-workflow, dispatches ``deepagents.invoke_tool`` instead of running
     the tool body inline.
+
+    Call this at module import or worker startup on every process that can
+    execute tool activities. Registration inside a workflow alone does not
+    make the tool available in another worker process.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import BaseTool, StructuredTool
@@ -404,8 +580,7 @@ def install_backend_async_patch() -> None:
     method natively are unaffected; only the protocol defaults are replaced.
     Idempotent.
     """
-    # importlib: `deepagents` is absent on Python 3.10 environments (its floor
-    # is 3.11), so a static import here fails type-checking there.
+    # Resolve the framework's top-level package explicitly.
     BackendProtocol = importlib.import_module(
         "deepagents.backends.protocol"
     ).BackendProtocol
@@ -504,13 +679,39 @@ class TemporalBackend:
 
     Unknown attribute access is forwarded to the inner backend so backend
     metadata / configuration the agent reads (but that does no I/O) still works.
+
+    Wrapping an instance requires the operation's activity to run in the same
+    process as the workflow. For multiple worker processes or serverless workers,
+    pass the name of a factory registered with
+    ``DeepAgentsPlugin(backends=...)`` instead. No backend is constructed
+    in the workflow; each activity attempt invokes the worker-side factory.
+
+    Args:
+        inner: Backend instance, or the name of a worker-side backend factory.
+        activity_options: SDK ``ActivityConfig`` for backend activity timeouts,
+            retries and routing.
+        factory_argument: Serializable argument passed to a named factory, such
+            as a sandbox ID. It is recorded in workflow history; keep credentials
+            on the worker. Factories declaring one positional parameter receive
+            this value (``None`` by default); parameterless factories are called
+            without arguments. Operations and retries must reconnect to the same
+            external state; instance memory is not carried between operations.
+        backend_type: Required for a named factory. Class used to advertise
+            delete and shell capabilities and method signatures, without
+            instantiating it. For a composite backend, supply a class exposing
+            the default backend's capabilities.
+        metadata: For a named factory, attributes read by workflow code, such
+            as ``id`` for a sandbox. Values must be deterministic and require no I/O.
     """
 
     def __new__(
         cls,
         inner: Any,
         *,
-        activity_options: Mapping[str, Any] | None = None,
+        activity_options: ActivityConfig | None = None,
+        factory_argument: Any = None,
+        backend_type: type | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> "TemporalBackend":
         """Pick the wrapper class that mirrors ``inner``'s optional capabilities.
 
@@ -518,10 +719,28 @@ class TemporalBackend:
         gets a mirrored subclass of ``MyBackend``, so ``isinstance`` and any
         methods it defines are preserved.
         """
+        if isinstance(inner, str):
+            if not inner:
+                raise ValueError("A backend factory name is required.")
+            if backend_type is None:
+                raise ValueError(
+                    "backend_type is required for a named backend factory."
+                )
+            mirror = backend_type
+        else:
+            if (
+                factory_argument is not None
+                or backend_type is not None
+                or metadata is not None
+            ):
+                raise ValueError(
+                    "factory_argument, backend_type and metadata require a named backend factory."
+                )
+            mirror = inner
         target: type[TemporalBackend] = (
             cls
             if getattr(cls, "_temporal_mirror_of", None) is not None
-            else _wrapper_class_for(inner, cls)
+            else _wrapper_class_for(mirror, cls)
         )
         return object.__new__(target)
 
@@ -529,10 +748,30 @@ class TemporalBackend:
         self,
         inner: Any,
         *,
-        activity_options: Mapping[str, Any] | None = None,
+        activity_options: ActivityConfig | None = None,
+        factory_argument: Any = None,
+        backend_type: type | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        """Wrap ``inner`` so its I/O ops dispatch as durable activities."""
+        """Wrap an instance or reference a named worker-side backend factory."""
+        self._backend_factory: str | None = None
+        self._factory_argument: Any = None
+        self._configure_dispatch(activity_options)
+        if isinstance(inner, str):
+            self._inner = SimpleNamespace(**dict(metadata or {}))
+            self._backend_factory = inner
+            self._factory_argument = factory_argument
+            return
         self._inner = inner
+        register_backend(self._ref, inner)
+        # Balance the registration when this wrapper is garbage-collected
+        # (workflow completion / cache eviction) so per-run backends do not
+        # accumulate in the worker-global registry. The finalizer captures
+        # (ref, inner) — not ``self`` — so it cannot keep the wrapper alive,
+        # and it only removes its own registration (see _unregister_backend).
+        self._finalizer = weakref.finalize(self, _unregister_backend, self._ref, inner)
+
+    def _configure_dispatch(self, activity_options: ActivityConfig | None) -> None:
         # A deterministic id: workflow.uuid4() is seeded per-run, so the ref is
         # identical across replays (unlike id(inner)). Falls back to a plain uuid
         # when a backend is wrapped outside a workflow (e.g. in a plain test).
@@ -542,13 +781,6 @@ class TemporalBackend:
             self._ref = f"backend:{_uuid.uuid4().hex}"
         self._opts: dict[str, Any] = dict(activity_options or {})
         self._opts.setdefault("start_to_close_timeout", timedelta(minutes=1))
-        register_backend(self._ref, inner)
-        # Balance the registration when this wrapper is garbage-collected
-        # (workflow completion / cache eviction) so per-run backends do not
-        # accumulate in the worker-global registry. The finalizer captures
-        # (ref, inner) — not ``self`` — so it cannot keep the wrapper alive,
-        # and it only removes its own registration (see _unregister_backend).
-        self._finalizer = weakref.finalize(self, _unregister_backend, self._ref, inner)
 
     async def _dispatch(self, op: str, *args: Any, **kwargs: Any) -> Any:
         from temporalio.deepagents.workflow import call_backend_op
@@ -556,8 +788,10 @@ class TemporalBackend:
         activity_input = _activity.BackendOpInput(
             backend_ref=self._ref,
             op=op,
-            args=list(args),
-            kwargs=dict(kwargs),
+            args=_serde.dump_backend_result(list(args)),
+            kwargs=_serde.dump_backend_result(dict(kwargs)),
+            backend_factory=self._backend_factory,
+            factory_argument=self._factory_argument,
         )
         output = await call_backend_op(
             activity_input,
@@ -635,10 +869,14 @@ def _wrapper_class_for(
         filesystem = importlib.import_module("deepagents.middleware.filesystem")
     except ImportError:
         return base
-    inner_cls = type(inner)
+    inner_cls = inner if isinstance(inner, type) else type(inner)
     default_delete = protocol.BackendProtocol.delete
     has_delete = getattr(inner_cls, "delete", default_delete) is not default_delete
-    has_execute = bool(filesystem.supports_execution(inner))
+    has_execute = (
+        issubclass(inner_cls, protocol.SandboxBackendProtocol)
+        if isinstance(inner, type)
+        else bool(filesystem.supports_execution(inner))
+    )
     # Keyed by the inner CLASS too, since the dispatchers carry its method
     # signatures. ``has_execute`` stays in the key: for a ``CompositeBackend``
     # deepagents answers it per instance, from the default backend.

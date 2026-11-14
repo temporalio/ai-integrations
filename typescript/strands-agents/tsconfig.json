@@ -1,0 +1,17 @@
+{
+  "extends": [
+    "@tsconfig/node20/tsconfig.json",
+    "../_shared/tsconfig.json"
+  ],
+  "compilerOptions": {
+    "module": "node20",
+    "moduleResolution": "node16",
+    "outDir": "./lib",
+    "rootDir": "./src",
+    "stripInternal": true
+  },
+  "references": [],
+  "include": [
+    "./src/**/*.ts"
+  ]
+}

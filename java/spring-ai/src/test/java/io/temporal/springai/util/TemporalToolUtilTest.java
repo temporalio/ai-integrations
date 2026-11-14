@@ -80,9 +80,9 @@ class TemporalToolUtilTest {
   }
 
   @Test
-  void convertTools_plainString_throwsIllegalState() {
+  void convertTools_plainString_throwsIllegalArgument() {
     // String has no @Tool methods — Spring AI's ToolCallbacks.from() throws
-    assertThrows(IllegalStateException.class, () -> TemporalToolUtil.convertTools("not a tool"));
+    assertThrows(IllegalArgumentException.class, () -> TemporalToolUtil.convertTools("not a tool"));
   }
 
   // --- Tests for @SideEffectTool ---
@@ -134,6 +134,19 @@ class TemporalToolUtilTest {
   }
 
   // --- Tests for mixed tool types ---
+
+  @Test
+  void convertTools_existingCallback_preservesExecutionAndMetadata() {
+    ToolCallback callback = TemporalToolUtil.convertTools(new UnannotatedTools()).get(0);
+
+    List<ToolCallback> callbacks =
+        TemporalToolUtil.convertTools(new MathTools(), callback, new TimestampTools());
+
+    assertEquals(4, callbacks.size());
+    assertSame(callback, callbacks.get(2));
+    assertEquals("\"result\"", callbacks.get(2).call("{}"));
+    assertInstanceOf(SideEffectToolCallback.class, callbacks.get(3));
+  }
 
   @Test
   void convertTools_mixedPlainAndSideEffect_allConvertCorrectly() {

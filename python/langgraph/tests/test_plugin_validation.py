@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+from dataclasses import make_dataclass
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from langchain_core.runnables import RunnableLambda
 from langgraph.func import task  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
+from langgraph.runtime import Runtime
 from langgraph.types import RetryPolicy  # pyright: ignore[reportMissingTypeStubs]
 from pytest import raises
 from typing_extensions import TypedDict
 
 from temporalio.langgraph import LangGraphPlugin
+from temporalio.langgraph._activity import (
+    ActivityInput,
+    wrap_activity,
+    wrap_execute_activity,
+)
+from tests.test_two_nodes import Context, ModelContext
 
 
 class State(TypedDict):
@@ -64,6 +75,46 @@ def test_functional_task_missing_execute_in_raises() -> None:
         LangGraphPlugin(tasks=[my_task])
 
 
+def test_functional_task_closure_raises() -> None:
+    """@task functions must be module-level: their qualname is the activity name.
+
+    Graph API nodes may be closures (see test_sync_node.py and
+    test_continue_as_new_cached.py), but a Functional API task has no
+    separate activity name to fall back to.
+    """
+
+    @task
+    def my_task(x: int) -> int:
+        return x + 1
+
+    with raises(ValueError, match="closures/local functions are not supported"):
+        LangGraphPlugin(
+            tasks=[my_task],
+            activity_options={"my_task": {"execute_in": "activity"}},
+        )
+
+
+def test_graph_node_main_module_raises() -> None:
+    """The closure fallback doesn't extend to other task_id rejections.
+
+    A ``__main__`` node function's ``module.qualname`` isn't stable across
+    runs of a script, so it stays rejected as before; only closures and
+    local functions fall back to the activity name.
+    """
+
+    def node(state: State) -> dict[str, str]:  # pyright: ignore[reportUnusedParameter]
+        return {"value": "done"}
+
+    node.__qualname__ = node.__name__  # not a closure as far as task_id cares
+    node.__module__ = "__main__"
+    g = StateGraph(State)
+    g.add_node("node", node, metadata={"execute_in": "activity"})
+    g.add_edge(START, "node")
+
+    with raises(ValueError, match="defined in __main__"):
+        LangGraphPlugin(graphs={"main-module-graph": g})
+
+
 def test_execute_in_in_default_activity_options_raises() -> None:
     with raises(ValueError, match="cannot be set in default_activity_options"):
         LangGraphPlugin(default_activity_options={"execute_in": "activity"})
@@ -87,3 +138,51 @@ def test_task_retry_policy_raises() -> None:
 
     with raises(ValueError, match="retry_policy"):
         LangGraphPlugin(tasks=[my_task])
+
+
+def test_context_schema_id_conflict_raises() -> None:
+    first = make_dataclass("Collision", [("user_id", str)])
+    second = make_dataclass("Collision", [("user_id", str)])
+    with raises(ValueError, match="Conflicting context schema ID"):
+        LangGraphPlugin(
+            graphs={
+                "first": StateGraph(State, context_schema=first),
+                "second": StateGraph(State, context_schema=second),
+            }
+        )
+
+
+@pytest.mark.parametrize("unknown_id", [False, True])
+async def test_context_payload_errors(unknown_id: bool) -> None:
+    schema_id = f"{ModelContext.__module__}.{ModelContext.__qualname__}"
+    wrapped = wrap_activity(async_node, context_schemas={schema_id: ModelContext})
+    input = ActivityInput(
+        args=({},),
+        kwargs={},
+        langgraph_config={
+            "context_schema_id": "unknown" if unknown_id else schema_id,
+            "context": {"userId": 123, "tenant": {"name": "acme"}},
+        },
+    )
+    with raises(
+        ValueError, match="Unknown context schema ID" if unknown_id else "userId"
+    ):
+        await wrapped(input)
+
+
+async def test_unregistered_context_type_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "temporalio.workflow.info",
+        lambda: SimpleNamespace(run_id="unregistered-context"),
+    )
+    wrapped = wrap_execute_activity(wrap_activity(async_node))
+    with raises(ValueError, match="is not registered"):
+        await wrapped({}, runtime=Runtime(context=Context(user_id="alice")))
+
+
+def test_plugin_reports_package_version() -> None:
+    assert LangGraphPlugin().version() == importlib.metadata.version(
+        "temporalio-langgraph"
+    )

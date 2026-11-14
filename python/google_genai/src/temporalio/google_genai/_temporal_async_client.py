@@ -164,10 +164,6 @@ class _TemporalAsyncModels(AsyncModels):
 class TemporalAsyncClient(AsyncClient):
     """An ``AsyncClient`` whose API calls run as Temporal activities.
 
-    .. warning::
-        This API is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Builds a private ``BaseApiClient`` that dispatches HTTP calls through
     ``workflow.execute_activity`` and wraps it, so the SDK's request-formatting
     code (including the AFC loop) runs in the workflow while only the actual

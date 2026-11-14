@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.metadata
 import inspect
 import random
 import time
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from types import FrameType
 from typing import TYPE_CHECKING, Any
@@ -199,7 +200,7 @@ class GoogleAdkPlugin(SimplePlugin):
         """
 
         @asynccontextmanager
-        async def run_context() -> AsyncIterator[None]:
+        async def run_context() -> AsyncGenerator[None, None]:
             setup_deterministic_runtime()
             yield
 
@@ -214,13 +215,20 @@ class GoogleAdkPlugin(SimplePlugin):
                 # cryptography dependencies outside the sandbox before either
                 # worker execution or replay. google.adk is passed through below.
                 importlib.import_module("google.adk.auth.auth_handler")
+                # ADK also probes optional model providers on the first LLM turn.
+                # Warm its cached discovery here so their large import trees
+                # cannot trip the workflow deadlock detector during execution
+                # or replay. ADK tolerates providers that are not installed.
+                from google.adk.flows.llm_flows.contents import _id_pairing_model_types
+
+                _id_pairing_model_types()
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(
                         "google.adk",
                         "google.genai",
                         "mcp",
-                        # ADK imports OpenTelemetry context lazily for graph workflows.
+                        # ADK 2.9+ imports OpenTelemetry context on every agent turn.
                         "opentelemetry",
                         # ADK probes these optional model SDKs lazily on each LLM turn.
                         "anthropic",
@@ -248,6 +256,13 @@ class GoogleAdkPlugin(SimplePlugin):
             run_context=lambda: run_context(),
             workflow_runner=workflow_runner,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-google-adk")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
         """See base class. Also warns when the global OpenTelemetry meter or

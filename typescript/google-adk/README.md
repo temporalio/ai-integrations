@@ -1,0 +1,875 @@
+# @temporalio/google-adk
+
+Release stage: Public Preview.
+
+Run [Google Agent Development Kit](https://github.com/google/adk-js) (`@google/adk`)
+agents as durable [Temporal](https://temporal.io) Workflows.
+
+Your ADK agent graph — agents, tools, plugins, and ADK 2.0's workflow (graph)
+runtime — runs inside the Workflow and replays deterministically. The plugin
+routes non-deterministic boundaries out to Activities:
+
+- every **model call** (`generateContentAsync`) becomes a retryable, observable
+  Activity,
+- every **MCP tool call**, resource listing and resource read becomes an Activity,
+- an **Activity** can be a graph node (`activityNode`) or a tool (`activityAsTool`).
+
+Regular ADK `FunctionTool`s still run in the Workflow. If a tool performs I/O,
+wrap an existing Temporal Activity with `activityAsTool`.
+
+## Install
+
+```bash
+npm install @temporalio/google-adk
+```
+
+The supported peer range is `@google/adk` `>=2.0.0 <2.4.0` and `@google/genai`
+`^2.9.0` (ADK 2.3 itself requires `@google/genai` 2.29.1 or newer; keep your own
+copy inside ADK's range so the Workflow bundle holds one). The ceiling is exact by
+design: the plugin's Workflow-sandbox shims are keyed to what ADK reaches at
+module load, so an ADK minor outside this range can break the Workflow bundle.
+`@modelcontextprotocol/sdk` is an optional peer: install it if you use
+`TemporalMCPToolset` (ADK 2.0 made it optional too).
+
+Node.js 22.17.0 or newer is required (the package's `engines` field). The floor
+is the one `@mikro-orm/core` 7 declares, a dependency of ADK 2.1 and later; the
+plugin repeats it. An older Node is refused under `engine-strict`, and otherwise
+installs with a warning from npm and none from pnpm, outside what MikroORM, and
+so the plugin, supports.
+
+ADK 2.1 through 2.3 also import the `uuid` package without declaring it. The
+plugin depends on `uuid`, the Workflow bundle resolves ADK's import to that
+copy, and on the Worker the plugin resolves it to the same copy whenever Node
+cannot resolve it on its own. Under a hoisting layout (npm, Yarn, pnpm's
+default) Node finds a copy anyway. Under a strict layout such as pnpm with
+`hoist=false` the plugin's answer exists once the plugin is loaded, and for
+CommonJS modules only (what the plugin itself and a `tsconfig` with `module:
+commonjs` produce): import it (any entry point) before `@google/adk` in every
+process that loads ADK, the Worker, and a client that imports a Workflow module
+such as the one below. The plugin does not hook Node's ES module loader, so in
+an ES module project a module that imports `@google/adk`, the Workflow module
+included, still fails there (`Cannot find package 'uuid'`). Declaring the
+dependency for ADK fixes the layout for both, with no import order to mind:
+
+```yaml
+# pnpm-workspace.yaml
+packageExtensions:
+  '@google/adk':
+    dependencies:
+      uuid: '^11'
+```
+
+Under such a layout the Worker's bundler also resolves `@temporalio/workflow`
+from your project, so declare it as a dependency of your application.
+
+Provide Gemini credentials to the Worker as usual, for example with
+`GOOGLE_GENAI_API_KEY`, `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
+
+### Upgrading ADK
+
+Versions of this plugin for `@google/adk` 1.5 are not compatible with 2.0, and a
+Workflow started under 1.5 cannot be replayed by a Worker on 2.0: ADK's internals
+and its id generation changed. Drain in-flight Workflows before switching, or run
+the two versions on separate task queues. Nothing in your Workflow code has to
+change; raw model strings (`model: 'gemini-2.5-flash'`) now work inside a Workflow
+without `TemporalModel` (see [Model routing](#model-routing)).
+
+ADK minors within the range also change the agent loop in ways a history records
+(2.1 resumes run-time tool gates that 2.0 refused; 2.3 returns a node's input-schema
+rejection to the model as a tool error), so treat an ADK minor upgrade like a
+Workflow code change: drain in-flight Workflows, or move between the versions
+with Worker Versioning or separate task queues.
+
+## Hello world
+
+Register `GoogleAdkPlugin` on the Worker. Everything else is ordinary ADK code.
+
+### `workflows.ts`
+
+```typescript
+// The plugin before ADK: in a CommonJS project this loads it first (see Install).
+import { TemporalModel } from '@temporalio/google-adk/workflow';
+import { InMemoryRunner, LlmAgent, isFinalResponse, stringifyContent } from '@google/adk';
+
+export async function askAgent(prompt: string): Promise<string> {
+  const agent = new LlmAgent({
+    name: 'assistant',
+    // Optional — a raw 'gemini-2.5-flash' string works too; wrap it to set
+    // Activity options (timeouts, retries, streaming) for the model calls.
+    model: new TemporalModel('gemini-2.5-flash'),
+    instruction: 'You are a helpful assistant.',
+  });
+
+  const runner = new InMemoryRunner({ agent });
+
+  let text = '';
+  for await (const event of runner.runEphemeral({
+    userId: 'user',
+    newMessage: { role: 'user', parts: [{ text: prompt }] },
+  })) {
+    if (isFinalResponse(event)) text = stringifyContent(event);
+  }
+  return text;
+}
+```
+
+### `worker.ts`
+
+```typescript
+import { Worker } from '@temporalio/worker';
+import { GoogleAdkPlugin } from '@temporalio/google-adk';
+
+async function main() {
+  const worker = await Worker.create({
+    taskQueue: 'adk',
+    workflowsPath: require.resolve('./workflows'),
+    // Register the plugin on the Worker. This installs the model Activities and
+    // the Workflow bundler configuration required by @google/adk.
+    plugins: [new GoogleAdkPlugin()],
+  });
+  await worker.run();
+}
+
+main();
+```
+
+### `client.ts`
+
+```typescript
+import { Client } from '@temporalio/client';
+import { askAgent } from './workflows';
+
+async function main() {
+  // No plugin is needed on the Client for this package. The Worker registration
+  // above is what makes TemporalModel calls execute as Activities.
+  const client = new Client();
+
+  const result = await client.workflow.execute(askAgent, {
+    taskQueue: 'adk',
+    workflowId: 'adk-hello',
+    args: ['Write a haiku about durable execution.'],
+  });
+  console.log(result);
+}
+
+main();
+```
+
+## Usage
+
+### Model calls
+
+`TemporalModel` is a Workflow-safe ADK model. Inside a Workflow, each
+`generateContentAsync` call runs as a Temporal Activity. Configure Activity
+timeouts, retry policy, task queue, summary, and heartbeat timeout with
+`TemporalModelOptions.activity`.
+
+```typescript
+const agent = new LlmAgent({
+  name: 'assistant',
+  model: new TemporalModel('gemini-2.5-flash', {
+    activity: {
+      startToCloseTimeout: '5 minutes',
+      heartbeatTimeout: '30 seconds',
+      retry: { maximumAttempts: 3 },
+    },
+  }),
+});
+```
+
+A model failure is non-retryable unless its status says a retry could succeed,
+so a bad request fails the Workflow on the first attempt no matter the retry
+policy. To opt out, handle the error in an ADK `onModelErrorCallback`, pass
+that same error to `markModelFailureHandled`, and return a substitute event
+built with ADK's `createEvent`.
+
+ADK turns a model error into an event rather than rethrowing it, so a run can
+finish normally on a failure nobody saw; the plugin raises such a failure as the
+Workflow (or the Update handler that ran the turn) returns. What counts as the
+recovery is the same agent answering later in the same ADK invocation: a node
+`retryConfig` that re-runs the agent, or a graph that activates the node again,
+leaves nothing to raise. Another agent answering does not clear it, and neither
+does a later turn, which is a new question rather than a second go at the one
+that failed.
+
+### Model routing
+
+Inside a Workflow, ADK's built-in model classes (`Gemini`, `ApigeeLlm`) cannot run:
+they call the network from the sandbox. The plugin therefore re-registers their
+model-name patterns in the Workflow's `LLMRegistry` to a `TemporalModel`, so an
+agent configured with a raw string — `model: 'gemini-2.5-flash'`,
+`model: 'apigee/…'` — is durable without any change, using `TemporalModel`'s
+default Activity options (a one-minute `startToCloseTimeout`, a 10-second
+`heartbeatTimeout`, no streaming). Wrap
+the string in `new TemporalModel(name, options)` to customize.
+
+The Worker is untouched: there the real class runs inside the model Activity, so
+`GoogleAdkPluginOptions.modelProvider` still resolves the same names.
+
+`RoutedLlm` holds model _instances_, so build it from `TemporalModel`s. Set
+`autoRouteModels: false` on the plugin only if you register your own sandbox-safe
+`BaseLlm` for one of those patterns.
+
+### MCP tools
+
+Use `TemporalMCPToolset` in Workflow code and register the matching MCP factory
+on the Worker:
+
+```typescript
+// worker
+new GoogleAdkPlugin({
+  mcpToolsets: {
+    filesystem: () => ({
+      type: 'StdioConnectionParams',
+      serverParams: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/data'] },
+    }),
+  },
+});
+
+// workflow
+const agent = new LlmAgent({
+  name: 'fs',
+  model: new TemporalModel('gemini-2.5-flash'),
+  tools: [new TemporalMCPToolset({ name: 'filesystem' })],
+});
+```
+
+Per-session MCP state — a pagination cursor, a working directory, an
+authenticated session — does not carry from one MCP operation to the next: the
+connection params above and ADK's `MCPToolset` both open a new session per
+operation rather than reusing one. Holding a session open across operations is
+the factory's job — see `MCPToolsetFactory`.
+
+Gate the toolset's tools behind human approval with
+`requireConfirmation` — see [Durable human-in-the-loop](#durable-human-in-the-loop).
+
+### MCP resources
+
+ADK 2.0's `MCPToolset` lists and reads MCP resources. `TemporalMCPToolset` does
+the same through `<name>-listResources` / `<name>-readResource` Activities, and
+`loadMcpResourceTool` is the counterpart of ADK's `LoadMcpResourceTool`: the model
+asks for resources by name, and on the next model call the tool appends their
+contents to the request.
+
+```typescript
+const toolset = new TemporalMCPToolset({ name: 'filesystem' });
+const agent = new LlmAgent({
+  name: 'reader',
+  model: new TemporalModel('gemini-2.5-flash'),
+  tools: [toolset, loadMcpResourceTool(toolset)],
+});
+```
+
+ADK re-lists the server's resources before every model call; the plugin lists
+once per tool instance instead (each listing is an Activity), and
+`loadMcpResourceTool(toolset, { refreshResourceList: true })` restores ADK's
+behavior. As in ADK, resource contents are appended to one request only — the
+model must ask again to see them on a later turn — and a failed listing or read
+is logged and skipped, not raised. A factory-supplied toolset must be an
+`MCPToolset` (or expose `listResources` / `readResource`) for resources to work;
+connection params always do.
+
+Because they are skipped rather than raised, resource reads are best-effort and
+bounded: `listResources` and `readResource` default `activity.retry.maximumAttempts`
+to 3, where a tool call keeps Temporal's unlimited default. Without that bound an
+unreachable server would retry behind the model turn forever and never reach the
+skip path. Set `activity: { retry: { maximumAttempts: n } }` on the toolset to
+choose your own, or `maximumAttempts: Number.POSITIVE_INFINITY` for unlimited.
+`0` is not a way to say unlimited here: the SDK rejects it with a `ValueError`.
+
+`loadMcpResourceTool` lists and reads in `processLlmRequest`, under ADK's abort
+signal, so an aborted run cancels those Activities just as it cancels a model or
+tool call: when a sibling node in a `Workflow` graph fails, ADK aborts the run and
+waits for every outstanding node, and the agent node unwinds at once instead of
+waiting out the listing's timeouts. A cancelled listing is not memoized, and a
+cancellation is raised rather than logged and skipped.
+
+A cancelled listing or read ends its Activity cancelled. ADK's own
+`MCPToolset.listResources()` / `readResource(name)` take no `AbortSignal`, so for
+connection params and for a factory that returns an unmodified `MCPToolset` the
+plugin issues those MCP requests itself, over the toolset's own session manager,
+with the Activity's signal: a cancel aborts the pending request and sends the
+server `notifications/cancelled`. Any other toolset with resource methods is
+raced against the signal instead, so the Activity still ends cancelled at once,
+but its request runs on until the toolset's own timeout.
+
+### Activities as tools
+
+Use `activityAsTool` to expose an existing Temporal Activity to the agent:
+
+```typescript
+import { activityAsTool } from '@temporalio/google-adk/workflow';
+import { Type } from '@google/genai';
+
+const lookupTool = activityAsTool({
+  name: 'lookupOrder',
+  description: 'Look up an order by id.',
+  parameters: { type: Type.OBJECT, properties: { orderId: { type: Type.STRING } } },
+});
+```
+
+### Graph workflows
+
+ADK 2.0's workflow runtime — `Workflow`, `node()`, `JoinNode`, routing,
+`dynamicEntry`, `RequestInput` — is plain async code driven by session events,
+so it runs inside a Temporal Workflow unchanged, with one gap: a `timeout` on an
+`LlmAgent` node does not cancel the agent's model call (see **Agent node
+timeouts** below). Use `activityNode` to make a registered Activity a node:
+
+```typescript
+import { InMemoryRunner, JoinNode, Workflow } from '@google/adk';
+import { activityNode } from '@temporalio/google-adk/workflow';
+
+const fetchA = activityNode({ name: 'fetchData', nodeName: 'fetch_a', args: () => ['a'] });
+const fetchB = activityNode({ name: 'fetchData', nodeName: 'fetch_b', args: () => ['b'] });
+const join = new JoinNode({ name: 'join' });
+const summarize = activityNode({
+  name: 'summarize',
+  activity: { startToCloseTimeout: '2 minutes', retry: { maximumAttempts: 3 } },
+});
+
+const graph = new Workflow({
+  name: 'report',
+  edges: [
+    ['START', fetchA, join],
+    ['START', fetchB, join],
+    [join, summarize],
+  ],
+});
+const runner = new InMemoryRunner({ agent: graph });
+```
+
+- **Input and output.** By default the node's input is passed to the Activity as
+  its single argument and the Activity's result, whatever its shape, is the
+  node's output; `args` maps the input (and `NodeContext`, for state) to the
+  Activity's argument list. The node's event carries the result as `output`
+  only, with no `content`, so a result with a `parts` array is not taken for
+  genai `Content` the way ADK's `FunctionNode` would take it. An Activity
+  returning nothing (`undefined` or `null`) completes the node with a `null`
+  output, so its successors receive `null`. ADK records a node as done only
+  when its events carry an output, and without one a completed Activity would
+  run again when a paused graph resumes.
+- **Schemas.** A Zod `outputSchema` checks every result, one with a `parts`
+  array included, which ADK's own check lets through as genai `Content`. A genai
+  `Schema` is checked by ADK's validator, which the plugin cannot reach and which
+  still lets such a result through, so give an Activity whose result can carry
+  `parts` a Zod `outputSchema`. The `inputSchema` check is ADK's as it is: an
+  input that is genai `Content` (the run's opening message, when it has no text
+  part) is left for `args` to handle.
+- **Node names.** The node is named after the Activity unless `nodeName` says
+  otherwise, and the name may not contain `.`, `/` or `@`: ADK reads a node path
+  back by those characters (its segments, and the run-id suffix), and a name
+  containing one breaks the resume that fast-forwards a completed node.
+  `activityNode` refuses one, so an Activity type such as `payments.charge` or
+  `charge@customer` needs a `nodeName`.
+- **Routing.** A node returns `createEvent({ route: 'approve', output })` and the
+  edge `[router, { approve: a, [DEFAULT_ROUTE]: b }]` picks the branch; only that
+  branch's Activity runs.
+- **Dynamic nodes.** Inside a `node(async (ctx, input) => …)` body,
+  `await ctx.runNode(activityNode(…), input)` runs the Activity as a child and
+  returns its result — in loops, in `Promise.all`, behind conditions.
+- **Node as tool.** A `Workflow` (or any node) in an `LlmAgent`'s `tools` becomes a
+  tool. Give it a Zod object `inputSchema` for real parameters; a genai `Schema`
+  advertises a single `request` string, which only a string-typed schema accepts.
+  An object-typed one rejects it: ADK 2.3 returns that rejection to the model as
+  a tool error, earlier releases end the turn with no tool response.
+- **Retries and timeouts.** Prefer Temporal's `activity.retry` and timeouts. ADK's
+  `retryConfig` re-runs the whole node on top of them (match an Activity failure
+  with `exceptions: ['ActivityFailure']`; ADK matches error names), its backoff is
+  a durable timer, and its jitter is drawn from the Workflow's `Math.random()`.
+  A node `timeout` (seconds) is a durable timer that cancels the in-flight
+  Activity and fails the node with ADK's `NodeTimeoutError` once that
+  cancellation has settled, so a retry never overlaps the Activity it replaces.
+  What "settled" means is the Activity's `cancellationType`: unset
+  (`TRY_CANCEL`) it settles at once and the Activity winds down on its own; with
+  `WAIT_CANCELLATION_COMPLETED` the node waits for the Activity to acknowledge,
+  which it only does at its next heartbeat. The plugin runs this deadline
+  itself, because ADK's own races the node and then abandons the unwind.
+- **Agent node timeouts.** A `timeout` on an `LlmAgent` node is ADK's own
+  deadline, and it never reaches the agent's model call: ADK runs the agent with
+  the run's abort signal rather than the node's. When the node times out, its
+  model Activity keeps running, and so does a tool or model callback it was
+  waiting on; a `retryConfig` that retries `NodeTimeoutError` starts the next
+  attempt beside it, and the work left open is only cancelled when the run
+  itself fails or is cancelled. A cancellation of that work never counts, whenever
+  it arrives: the plugin tracks each node attempt and ignores a cancellation that
+  ADK absorbs in an attempt the node's timeout abandoned, while a retry or another
+  item of a `ParallelWorker` is an attempt of its own. That includes work a retry
+  joins after the abandoned attempt started it, such as a retried `ParallelWorker`
+  or `ctx.runNode` with an explicit `runId`: its cancellation is ignored too.
+  Today any node `timeout` cancelled mid-call fails Workflow Tasks until the node
+  times out and fails the run
+  ([#389](https://github.com/temporalio/ai-integrations/issues/389)); once that
+  is fixed, a run whose retry joined such work fails with
+  `GoogleAdkNodeReportedError` instead of ending CANCELLED.
+  Once the retry has answered, a model failure from that work no longer counts
+  either: the plugin numbers model calls as they start, and ignores the failure
+  of a call that started before the same agent's latest answer in that run.
+  Bound an agent's model call with the model Activity's own
+  `startToCloseTimeout` or `scheduleToCloseTimeout` (`TemporalModel`'s `activity`
+  options) instead, and put a deadline on Activity work with `activityNode`.
+- **Fan-in.** Use a `JoinNode`: it is the node type that waits for every
+  predecessor, and its input is the map from predecessor name to that node's
+  output. ADK's `waitForOutput` flag is not a fan-in gate (it parks a node that
+  ended with no output and no route), so `activityNode` does not expose it.
+- **Resume.** ADK resumes a paused graph from the session's events: a node that
+  already produced output is always fast-forwarded rather than re-run, so an
+  `activityNode`'s Activity is not scheduled again. (ADK's `rerunOnResume`
+  concerns a node that paused for input last turn, which an Activity node never
+  does, so `activityNode` does not expose it either.) Resume is at-least-once
+  for a dynamic node's body — put side effects in `activityNode` /
+  `activityAsTool` children, or make them idempotent.
+- `LongRunningFunctionTool`s (including a node-as-tool) cannot be used as a
+  `ToolNode`; ADK rejects that.
+
+### Durable human-in-the-loop
+
+ADK pauses a run by emitting a long-running function call — `adk_request_input`
+from a `RequestInput` node or ADK's `requestInputTool`, `adk_request_confirmation`
+from a tool gated with `requireConfirmation` — and resumes when a later user
+message answers it. Because the runner runs inside the Workflow, the wait is
+ordinary Workflow code, and the plugin supplies the wire format:
+
+```typescript
+import { InMemoryRunner } from '@google/adk';
+import type { Content, Part } from '@google/genai';
+import { ApplicationFailure } from '@temporalio/common';
+import { condition, defineQuery, defineUpdate, setHandler } from '@temporalio/workflow';
+import {
+  HITL_RESPONSE_FAILURE_TYPE,
+  hitlConfirmationResponse,
+  hitlInputResponse,
+  pendingHitlRequests,
+  type HitlConfirmation,
+  type HitlRequest,
+} from '@temporalio/google-adk/workflow';
+
+export const pendingQuery = defineQuery<HitlRequest[]>('pending');
+export const respondUpdate = defineUpdate<void, [string, unknown]>('respond');
+
+// `graph` is the Workflow built in the section above; any RunnableRoot works.
+export async function reviewWorkflow(prompt: string): Promise<unknown> {
+  let pending: HitlRequest[] = [];
+  const answers = new Map<string, Part>();
+  setHandler(pendingQuery, () => pending);
+  // Build the response inside the handler, so a bad answer rejects the Update
+  // rather than failing a Workflow Task once it is already in history.
+  setHandler(respondUpdate, async (interruptId, value) => {
+    // Handlers run before the body resumes, so the answer can arrive before the body
+    // has published its request: wait briefly (only when it is not pending yet, since
+    // a timeout starts a timer), and refuse only an id that never shows up.
+    const isPending = () => pending.some((r) => r.interruptId === interruptId);
+    if (!isPending()) await condition(isPending, '5 seconds');
+    const request = pending.find((r) => r.interruptId === interruptId);
+    if (!request) {
+      throw ApplicationFailure.nonRetryable(`nothing is waiting on '${interruptId}'`, HITL_RESPONSE_FAILURE_TYPE);
+    }
+    answers.set(
+      interruptId,
+      request.kind === 'confirmation'
+        ? hitlConfirmationResponse(request, value as HitlConfirmation)
+        : hitlInputResponse(request, value)
+    );
+  });
+
+  const runner = new InMemoryRunner({ agent: graph });
+  const session = await runner.sessionService.createSession({ appName: runner.appName, userId: 'user' });
+  let newMessage: Content = { role: 'user', parts: [{ text: prompt }] };
+  for (;;) {
+    let output: unknown;
+    for await (const event of runner.runAsync({ userId: 'user', sessionId: session.id, newMessage })) {
+      if (event.output !== undefined) output = event.output;
+    }
+    const current = await runner.sessionService.getSession({
+      appName: runner.appName,
+      userId: 'user',
+      sessionId: session.id,
+    });
+    pending = pendingHitlRequests(current?.events ?? []);
+    if (pending.length === 0) return output;
+
+    await condition(() => pending.every((r) => answers.has(r.interruptId)));
+    newMessage = { role: 'user', parts: pending.map((r) => answers.get(r.interruptId)!) };
+  }
+}
+```
+
+- `pendingHitlRequests(events)` returns ADK's `UserInputRequest`s (plain JSON, so a
+  Query can return them) that still await an answer, minus credential requests. The
+  returned `HitlRequest` is a union of `HitlInputRequest` and `HitlConfirmationRequest`
+  discriminated on `kind`, so narrowing on `kind` picks the builder that accepts it.
+- `hitlInputResponse(request, value)` answers an input request: a plain object is
+  sent as-is, anything else is wrapped in ADK's `{ result: value }` envelope.
+  ADK unwraps that envelope by shape (any response whose single key is `result`)
+  and parses the _string_ it unwraps as JSON, unless the request declared a
+  `responseSchema` that accepts strings. A string that reads as JSON is therefore
+  refused rather than silently retyped — declare a string schema on the
+  `RequestInput`, or pass the parsed value. Any string that parses is refused, a
+  quoted one included: `'"foo"'` would reach the node as `foo`. `value` must be a
+  JSON value (`null` included): `undefined` is refused because ADK reads it as no
+  answer, so the node would ask again while `pendingHitlRequests` counts it as
+  answered, and a function, symbol or bigint because it is not JSON. A structured
+  answer (an object or array) is also checked against the request's
+  `responseSchema` exactly as ADK checks it when the graph resumes, zod's
+  `fromJSONSchema` over the JSON Schema recorded on the interrupt, and refused with
+  ADK's own message if it does not match; a bare scalar is exempt, as it is in ADK.
+  An answer the builder accepts is one ADK will accept.
+- An answer can reach the handler before the request it answers is pending. Within one
+  Workflow Task the SDK runs signal and update handlers before it resumes the Workflow
+  body, so an Update that lands in the task carrying the turn's last Activity result
+  runs while `pending` still holds the previous turn's list. A handler that depends on
+  state the body sets has to `condition()` on it, as the one above does, or it will
+  refuse a valid answer; the bound only decides how long an unknown id takes to refuse.
+- Both builders refuse an answer only by throwing a non-retryable `ApplicationFailure`
+  of type `HITL_RESPONSE_FAILURE_TYPE`, never any other error, whatever they are
+  handed: they check a decision or value before reading it, schema included. That is
+  what makes it safe to call them on the raw argument where the answer arrives, in
+  the Signal or Update handler, as above: the SDK rejects an Update only for a
+  `TemporalFailure`, so validating there tells the caller no, while letting a bad
+  answer through to the Workflow body would fail the Workflow Task over and over with
+  the answer already accepted (ADK refuses a schema mismatch on resume with a plain
+  `Error`).
+- `hitlConfirmationResponse(request, { confirmed, hint?, payload? })` answers a tool
+  gate. `confirmed` must be a boolean and `hint`, when present, a string; anything
+  else (`null`, `'yes'`) is refused rather than guessed, since ADK approves only on
+  `confirmed === true`. ADK reads approvals from the **latest** user message only,
+  so answer every pending confirmation in one message, and rebuild the agent for
+  the resumed turn with the same tool names — an approval naming a tool the agent
+  no longer has is refused with `IntentMismatchError`.
+- Gate an Activity or MCP tool with `requireConfirmation` (a flag, or a predicate
+  over the arguments that must be a pure function of them): the Activity is not
+  scheduled until the human approves, and a rejection returns ADK's rejection
+  result to the model. The same gate applies to a `TemporalMCPToolset` used
+  directly with ADK (outside a Workflow, from `connectionParams`). A gate is only
+  enforced on an `LlmAgent` turn; ADK's workflow `ToolNode` does not route through
+  confirmation. Declare the gate this
+  way rather than calling `toolContext.requestConfirmation()` from a tool body:
+  a declared gate resumes on every supported ADK version, whereas a gate
+  requested only at run time — `SecurityPlugin`'s `CONFIRM` outcome included —
+  resumes only from ADK 2.1 on; ADK 2.0.0 bound an approval to a tool whose
+  `checkRequireConfirmation` said the call needs one and refused the rest,
+  ending the Workflow with `GoogleAdkIntentMismatchError`
+  (`confirmation_not_required`).
+
+  ```typescript
+  activityAsTool({ name: 'deploy', description: 'Deploy.', parameters, requireConfirmation: true });
+  new TemporalMCPToolset({ name: 'ops', requireConfirmation: (toolName) => toolName === 'delete' });
+  ```
+
+  With `runConfig: { plainTextToolConfirmation: true }`, a plain "yes" answers
+  the single most recent pending gate — the tool runs, but the gate's function
+  call is never answered, so `pendingHitlRequests` keeps listing it; track it
+  yourself, as for agent-raised input requests below.
+
+- **Agent-raised input requests.** `requestInputTool` / `getUserChoiceTool` on a
+  plain `LlmAgent` pause the turn, but ADK 2.0 removes the framework call and its
+  function response from the model's context: a `hitlInputResponse` clears ADK's
+  pending list without the model ever seeing the value. Answer those with an
+  ordinary text turn instead, and track the answered id yourself (ADK's list
+  clears only on a function response). Graph `RequestInput` nodes and node-tools
+  receive `hitlInputResponse` values as their input.
+- Each turn appends to the session and to the Workflow history. A conversation
+  long enough to need `continueAsNew` has to carry the session's events into the
+  next run and replay them into a fresh session: an `InMemoryRunner`'s session
+  does not survive the boundary.
+
+### Failures
+
+A model or Activity failure ends the Workflow through its `ActivityFailure` as
+usual. ADK's own runtime errors are plain `Error`s, and the Temporal SDK treats an
+unexpected error as a Workflow _Task_ failure that retries forever; the plugin
+therefore converts the ones a graph produces as outcomes into non-retryable
+`ApplicationFailure`s (the ADK error is the `cause`):
+
+| ADK error                   | `ApplicationFailure.type`                                                                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `NodeTimeoutError`          | `GoogleAdkNodeTimeoutError`                                                                                                   |
+| `NodeReportedError`         | `GoogleAdkNodeReportedError` (or the recorded model `ActivityFailure` when a `TemporalModel` call was what the node absorbed) |
+| `NodeSchemaValidationError` | `GoogleAdkNodeSchemaValidationError`                                                                                          |
+| `IntentMismatchError`       | `GoogleAdkIntentMismatchError`                                                                                                |
+| `StateSchemaError`          | `GoogleAdkStateSchemaError`                                                                                                   |
+| `InvocationAbortedError`    | `GoogleAdkInvocationAbortedError`                                                                                             |
+| `DynamicNodeFailError`      | `GoogleAdkDynamicNodeFailError` (or the Temporal failure the dynamic child raised, which the wrapper carries outside `cause`) |
+
+The mapping is exported as `ADK_RUNTIME_FAILURE_TYPES`. Anything else ADK throws
+— a malformed human reply, `StreamingMode.BIDI`, a reserved function _call_ in a
+client message — keeps the SDK's convention; use
+`WorkerOptions.workflowFailureErrorTypes` to fail the execution on more.
+
+Cancellation is not a failure. When a cancelled Workflow cancels the model call
+an agent node is waiting on, ADK absorbs the cancelled call like any model error
+and reports the node as failed (`NodeReportedError`); the plugin ends the
+execution CANCELLED with the model Activity's own cancellation instead. A
+cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too.
+So does a cancel that ADK absorbs in a tool (its `requireConfirmation` predicate
+included) or a model callback, such as a `LongRunningFunctionTool` waiting for a
+Signal or a `beforeModelCallback` waiting for an Activity: in an agent node it
+ends the execution CANCELLED rather than completing it (a tool) or failing it
+with `GoogleAdkNodeReportedError` (a model callback). A cancel absorbed in a
+Signal handler ends the execution when the main function returns, after its
+cleanup; if the main function has already returned, the execution ends as the
+main function did. A cancellation that the handler's own later step throws
+after that (a `sleep` or an Activity after the ADK turn) is subject to
+[temporalio/sdk-typescript#2639](https://github.com/temporalio/sdk-typescript/issues/2639):
+such a run can stay RUNNING until the SDK fixes it. A Signal handler that
+throws instead, because a later step of its own rejects with the cancel or
+because its ADK graph run reports the node failed (`NodeReportedError`), ends
+the execution CANCELLED at once, before that cleanup: to clean up first, catch
+the error in the handler or run the turn in the main function. Only the
+execution's own cancellation counts, followed from the operation it cancelled: a
+cancel that only an inner scope (`CancellationScope.withTimeout`) caused, or any
+other error a tool or callback throws, leaves the outcome to the Workflow, even
+when the Workflow's cancellation was requested meanwhile. A recorded
+cancellation outranks the errors ADK's runtime throws, but not an error the
+Workflow's own code throws after the turn: that one still decides how the
+execution ends.
+
+A failing sibling does not cancel the execution either. When a graph node fails,
+ADK aborts the run and waits for the nodes still running before failing it. The
+plugin turns that abort into a cancellation of the Activity each of those nodes is
+waiting on, an Activity node's Activity or an agent node's model call or tool call
+(`activityAsTool`, a `TemporalMCPToolset` tool), and the execution then fails with
+the failed node's failure. The Activity's `cancellationType` sets how long that wait
+lasts, as it does for a node `timeout`. A tool gated with `requireConfirmation` is
+cancellable only once it is approved: a pending confirmation schedules nothing.
+
+An agent node's own `timeout` is the exception: ADK fails the node with
+`NodeTimeoutError` without cancelling the model call it was waiting on (see
+**Agent node timeouts**), so that model Activity runs on until it ends, or until
+the run fails or is cancelled.
+
+### Streaming
+
+Streaming requires `streamingTopic` on `TemporalModel`. Chunks are published via
+`@temporalio/workflow-streams`; the Workflow still receives the complete
+transcript as the Activity result.
+
+```typescript
+const model = new TemporalModel('gemini-2.5-flash', {
+  streamingTopic: 'adk-agent-stream',
+  streamingBatchInterval: '100 milliseconds',
+  activity: {
+    startToCloseTimeout: '5 minutes',
+    heartbeatTimeout: '30 seconds',
+  },
+});
+
+for await (const response of model.generateContentAsync(llmRequest, true)) {
+  // `true` requests ADK SSE streaming. Stream subscribers receive chunks on
+  // `adk-agent-stream`; the Workflow receives the transcript here.
+}
+```
+
+If a batch of chunks cannot be published, the model call fails with
+`STREAM_ERROR_FAILURE_TYPE` (`GoogleAdkStreamError`, exported from
+`@temporalio/google-adk/workflow`) instead of returning as if every chunk was
+delivered. In an ADK agent run it is recorded like a model failure: it fails the
+Workflow, or rejects the Update that ran the turn, unless an
+`onModelErrorCallback` passes it to `markModelFailureHandled`. It is
+non-retryable when a retry would call the model again and fail the same way:
+
+- **A batch over the server's size limits**: 2 MiB per payload and 4 MiB per
+  gRPC message by default. Configure external storage on the Worker and the
+  subscriber's Client so large batches are stored, or keep responses smaller.
+- **A run past its Signal limit.** Each batch is one Signal, and a run accepts
+  10,000 Signals by default, counting the Workflow's other Signals. With the
+  default `streamingBatchInterval` of 100 milliseconds, a run can reach it after
+  about 17 minutes of streaming in total. A long-running streaming Workflow, such as a
+  chat session, should continue-as-new well before that, or use a longer
+  `streamingBatchInterval`.
+- **A batch Workflow Streams gave up on** after its fixed 10-minute retry limit.
+  This needs a model Activity `startToCloseTimeout` over 10 minutes (the default
+  is 1 minute), and then a server outage that long ends here too.
+
+Other failures, such as a shorter server outage, are retried; the retry calls
+the model again and publishes its stream again.
+
+### Testing
+
+Import test doubles from the `./testing` entry point to unit-test agents
+without a live model or MCP server:
+
+```typescript
+import { fakeModelProvider, mockMCPToolset } from '@temporalio/google-adk/testing';
+
+const plugin = new GoogleAdkPlugin({
+  modelProvider: fakeModelProvider(),
+  mcpToolsets: {
+    weather: mockMCPToolset(
+      [
+        /* tool defs */
+      ],
+      { resources: [{ name: 'readme', contents: [{ uri: 'file:///readme.md', text: '# Hi' }] }] }
+    ),
+  },
+});
+```
+
+## Telemetry and observability
+
+ADK instruments its agent loop with OpenTelemetry. Under this plugin that loop
+runs inside the Workflow sandbox, so its spans are created there too, and **by
+default they are silently dropped**: nothing registers a tracer provider inside
+the sandbox, and a provider configured in the worker process (e.g. `NodeSDK`)
+does not reach it.
+
+To export them, compose with the SDK's OpenTelemetry integration
+([`@temporalio/interceptors-opentelemetry`](https://github.com/temporalio/sdk-typescript/tree/main/contrib/interceptors-opentelemetry)),
+placed before this plugin:
+
+```typescript
+import { OpenTelemetryPlugin } from '@temporalio/interceptors-opentelemetry';
+
+const worker = await Worker.create({
+  // ...
+  plugins: [new OpenTelemetryPlugin({ resource, spanProcessor }), new GoogleAdkPlugin()],
+});
+```
+
+You then get ADK's spans — `invocation`, `invoke_agent <name>`, `call_llm`, and
+for the workflow runtime `invoke_workflow <name>`, `execute_node <name>`,
+`execute_node_attempt <name>` — nested under the same trace as the interceptor's
+own `RunWorkflow` / `StartActivity` spans. Export is replay-gated, so replaying a
+Workflow's history does not re-emit them.
+
+Cautions:
+
+- Do **not** register a custom telemetry sink with `callDuringReplay: true` —
+  every replayed workflow task would then re-emit the agent-loop spans,
+  over-counting each operation once per replay.
+- The replay gate makes span export at-least-once, not exactly-once: a workflow
+  task **retry** (a task that failed or timed out and re-executes) is not a
+  replay, so its spans are re-emitted. Retries are rare in normal operation, but
+  don't build alerting that assumes exact span counts.
+- ADK attaches its `adk.workflow.*` / `adk.node.*` attributes to the _active_
+  span, and no OpenTelemetry context manager runs inside the sandbox, so those
+  attributes are absent; span names and counts are reliable.
+- The agent-loop spans carry prompt content as span attributes, and ADK's
+  `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` does not suppress it inside the
+  sandbox. Point the span processor somewhere approved for prompt content, or
+  strip those attributes there.
+- Custom payload/failure converter modules (`payloadConverterPath` /
+  `failureConverterPath`) evaluate **before** the plugin's polyfill loader. If
+  such a module imports `@google/adk` / `@google/genai`, import
+  `@temporalio/google-adk/workflow` first: it installs the sandbox
+  polyfills ADK needs.
+
+## Determinism notes
+
+- ADK generates ids — event, invocation and session ids, function-call ids,
+  `RequestInput` interrupt ids — with `randomUUID()`, which reads the `crypto`
+  global first. The plugin installs one in the sandbox (which has none of its
+  own, and would be overridden if it grew one) — `randomUUID` and
+  `getRandomValues` only, no `subtle` — whose values come from a **named
+  workflow random stream**: replay-stable, and independent of the Workflow's own
+  `Math.random()` sequence. (ADK's own `node:crypto` import, and the `uuid`
+  package's, are redirected to the same stream; the ids are identical either
+  way.) The global is bundle-wide: your Workflow code and other bundled packages
+  see that `crypto` too. Its
+  values are **not cryptographically random**; nor is ADK's OAuth2 `state`,
+  which is one reason credential flows are unsupported there.
+- ADK's node retry backoff and timeouts are durable timers; the retry jitter is
+  drawn from the Workflow's `Math.random()`.
+- ADK resumes a paused run from the session events: completed nodes are
+  fast-forwarded, a dynamic node's body re-runs.
+
+## Not supported in Workflows
+
+- **Credential requests** (`adk_request_credential`). `pendingHitlRequests` drops
+  them: answering one would put a secret into an Update payload that is persisted
+  in Workflow history, and ADK's OAuth2 `state` is predictable in a Workflow.
+  Acquire credentials on the Worker — in an Activity, or in an MCP toolset factory.
+- **Live / bidirectional streaming**: `Runner.runLive`, `StreamingMode.BIDI` and
+  `BaseLlm.connect` (`TemporalModel.connect` throws `GoogleAdkUnsupported`; ADK
+  itself rejects `StreamingMode.BIDI` in `runAsync`).
+- **Node-only ADK services.** The Workflow bundle uses ADK's browser-safe
+  `common` surface — the module set behind its web entry, taken from the
+  per-file ESM build. It type-checks against ADK's full typings, but these are
+  `undefined` at run time in a
+  Workflow: the MCP classes (`MCPToolset`, `MCPSessionManager` — use
+  `TemporalMCPToolset`), a2a, `DatabaseSessionService`, `GcsArtifactService` /
+  `FileArtifactService`, the local code executors (`UnsafeLocalCodeExecutor`,
+  `AgentEngineSandboxCodeExecutor`), telemetry setup, `LocalEnvironment`, the
+  agent registry. Present but non-functional there: the skills loaders and
+  `ApigeeLlm` (routed to `TemporalModel` by default).
+  `BuiltInCodeExecutor` does work — it only adds Gemini's code-execution tool to
+  the request the model Activity carries.
+- **Thread-pool tool execution** and any ADK extension point that performs I/O;
+  move it behind an Activity.
+
+## Operational notes
+
+- Register `GoogleAdkPlugin` on the Worker. Passing it directly to `Client` does
+  not register the model/MCP Activities. If composing plugins, place
+  observability and governance plugins before this one.
+- The plugin registers Activities named `adk-invokeModel` and
+  `adk-invokeModelStreaming`, plus `<name>-listTools`, `<name>-callTool`,
+  `<name>-listResources` and `<name>-readResource` for each MCP toolset. A
+  different Activity with one of these names now fails with
+  `Duplicate registration of Activity '<name>'`; earlier versions kept the last
+  one without a warning. If it is registered before `GoogleAdkPlugin` (in the
+  Worker's `activities` or by an earlier plugin), `Worker.create` fails. If a
+  plugin applied after `GoogleAdkPlugin` replaces one, `worker.run()` fails
+  before the Worker polls. `Worker.create` applies the Worker's `plugins` in
+  order, then the `NativeConnection`'s. A plugin applied after `GoogleAdkPlugin`
+  that wraps these Activities counts as replacing them; wrap Activity execution
+  with an Activity interceptor (`interceptors.activity`) instead.
+- To fix a collision with your own Activity or another integration's MCP server
+  name, rename one of them, or run the other integration on its own Worker and
+  task queue. Two `GoogleAdkPlugin`s on one Worker must be the same instance or
+  be built from one options object; two without a `modelProvider` also work
+  when every shared toolset name uses the same factory function. Anything else
+  is refused, such as one `modelProvider` in two options objects (two equal
+  object literals, for example) or a plugin without a `modelProvider` next to
+  one with it. Use one `GoogleAdkPlugin` with every MCP toolset instead: its
+  `modelProvider` receives each model name, so one provider can serve several
+  models. Two instances built from one options object are also refused when
+  `setActivityOptions` gave their Activities different metadata objects.
+  `modelProvider` is read once, when the plugin is constructed, and is called
+  as a method of the options object.
+- Model calls use Temporal retries. The plugin disables nested GenAI SDK retries
+  for model requests and honors `retry-after` where available.
+- `heartbeatTimeout` defaults to 10 seconds for the model and MCP Activities. It
+  detects a dead worker, not a stalled call: they heartbeat on a timer at half that
+  timeout — a hung call included — and a streaming model call also heartbeats per
+  chunk. A cancel reaches a running call only through a heartbeat. In Temporal
+  Cloud each heartbeat that reaches the service is an Action: with the default, at
+  most one every 8 seconds of a running call. Set `heartbeatTimeout: 0` to turn the
+  timer off. The bound on a stalled call is `startToCloseTimeout`, one minute by
+  default.
+- Streaming topic delivery is at-least-once. The deterministic Workflow value is
+  the Activity result, not the stream side channel.
+- ADK's own log lines from inside a Workflow (ADK 2.1 and later: an `[ADK]`
+  warning that `Workflow` graphs are experimental, plugin registrations) reach
+  the Worker log through the sandbox console, with the Workflow's context, once
+  per run that touches them. They are harmless.
+- Cancelling a Workflow cancels its in-flight model and MCP Activities. Both pass
+  the Activity's cancellation signal down to the model / MCP client, and once that
+  signal has fired the resulting error is raised as a cancellation instead of
+  being classified as a model or MCP failure, so the attempt ends cancelled rather
+  than being retried.
+
+## Troubleshooting
+
+- A Workflow that resolves a model **name** ADK does not know (a third-party
+  `BaseLlm` you registered on the Worker only) throws `Model … not found` inside
+  the sandbox. Wrap it: `model: new TemporalModel('my-model')`, and let
+  `GoogleAdkPluginOptions.modelProvider` build it on the Worker.
+- `X is not a constructor` / `X is not a function` for an ADK symbol inside a
+  Workflow means the symbol is one of the node-only services above: the Workflow
+  bundle resolves ADK's `common` surface, which omits it. Use it worker-side.
+- A cryptic sandbox error during a model call (`fetch is not defined`, or a
+  `… is not a function` from a worker-only module such as `google-auth-library`)
+  means a `BaseLlm` performed I/O inside the Workflow — for instance
+  `autoRouteModels: false` with a raw Gemini string, or a custom `BaseLlm`
+  instance placed directly on an agent. Route it through `TemporalModel`.
+- `Cannot find module 'uuid'` from inside `@google/adk`, on the Worker or in a
+  client that imports its Workflow module, means ADK was loaded under a strict
+  package layout before the plugin could answer that import. `Cannot find
+  package 'uuid' imported from …/@google/adk/…` (`ERR_MODULE_NOT_FOUND`) means
+  an ES module imported ADK, whose loader the plugin does not hook. See
+  [Install](#install) for the import order and for the layout fix.
+
+## License
+
+MIT

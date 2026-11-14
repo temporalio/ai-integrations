@@ -1,7 +1,7 @@
 # pyright: reportUnusedClass=false
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, cast
@@ -142,7 +142,7 @@ class _MCPConnectionPool:
         server: str,
         *,
         factory_argument: Any,
-    ) -> AsyncIterator[_MCPBackend]:
+    ) -> AsyncGenerator[_MCPBackend, None]:
         if factory_argument is not None:
             factory = cast(Callable[[Any], _MCPBackend], self._factories[server])
             async with factory(factory_argument) as backend:

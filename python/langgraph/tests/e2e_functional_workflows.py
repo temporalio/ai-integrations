@@ -20,6 +20,13 @@ class SimpleFunctionalE2EWorkflow:
 
 
 @workflow.defn
+class ContextFunctionalWorkflow:
+    @workflow.run
+    async def run(self, name: str, context: dict[str, Any] | None) -> dict:
+        return await entrypoint(name).ainvoke(10, context=context)
+
+
+@workflow.defn
 class SlowFunctionalWorkflow:
     def __init__(self) -> None:
         self.app = entrypoint("e2e_slow_functional")

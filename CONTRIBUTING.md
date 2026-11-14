@@ -11,16 +11,13 @@ workflow.
 
 ## Pull requests
 
-- Ordinary PRs are squash-merged. Issue and PR templates are the organization defaults from
+- PRs are squash-merged. Issue and PR templates are the organization defaults from
   `temporalio/.github`.
-- PRs that import or re-sync commits reachable from an SDK repository's default branch are labelled
-  `history-import` and merged with **"Create a merge commit"**, never squash or rebase. Work from
-  an unmerged or closed upstream PR is ordinary PR work and must not carry that label, regardless
-  of its commit count or trailers. Adaptation changes go in separate commits after a real import;
-  documented local-only divergences are preserved across later re-syncs as described in AGENTS.md.
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status`,
   `Check for CODEOWNERS` and `opengrep/scan` are the required checks, plus one code-owner
   approval. No secrets are needed: provider behavior uses deterministic local test doubles.
+- Plugins match their framework's behavior (see "Plugin behavior" in `AGENTS.md`). Say in the PR
+  when the framework's docs contradict its code, and when a change can alter recorded histories.
 
 ## Adding a Python plugin
 
@@ -29,17 +26,9 @@ uv run --project scripts --locked python scripts/new_python_plugin.py <name> --d
 ```
 
 The scaffolder copies `python/_template`, prints the remaining manual steps, and no workflow
-edits are needed: CI discovers plugins from `plugin.toml`. To migrate an existing plugin with its
-history, follow [`scripts/migrate/README.md`](scripts/migrate/README.md).
+edits are needed: CI discovers plugins from `plugin.toml`.
 
 ## Contributor License Agreement
 
 All contributors must complete the Temporal Contributor License Agreement (CLA)
 before changes can be merged. A link to the CLA will be posted in the pull request.
-
-## Releasing
-
-Release tags are authoritative: keep the committed Python version at `0.0.0`, dry-run the intended
-`python/<name>/v<version>` tag from `main`, then create the protected tag without a version-only PR.
-Follow the runbook in AGENTS.md ("Releases"). Release notes are generated from commit messages, so
-write commit subjects you would want users to read.

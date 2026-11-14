@@ -1,0 +1,288 @@
+# @temporalio/langsmith — LangSmith tracing for Temporal
+
+Release stage: Public Preview.
+
+This plugin makes [LangSmith](https://docs.smith.langchain.com/) observability
+work inside Temporal Workflows and Activities **without changing your existing
+instrumentation**. Code you already trace with LangSmith's native `traceable`
+keeps working when you move it into a Workflow or Activity body — you only add
+the plugin to your `Client` and `Worker`.
+
+This plugin is built on Temporal's Plugin API, which is experimental; its APIs
+may change in a future release.
+
+It handles the parts that are otherwise hard:
+
+- **Replay safety.** Workflows replay history; a naive tracer re-emits every run
+  on every replay and floods your project with duplicates. This plugin emits
+  runs with deterministic IDs out-of-isolate via a Temporal Sink that does not
+  fire during replay.
+- **Run parenting across boundaries.** A trace started on the client threads
+  through `workflow → activity → child-workflow → Nexus` so the runs nest the
+  way you expect, instead of fragmenting into disconnected roots.
+
+## Install
+
+```bash
+npm install @temporalio/langsmith langsmith
+```
+
+`langsmith` is a peer dependency — install the version your project already uses.
+
+## Enable tracing
+
+Tracing is **off by default**, matching the `langsmith` library: the plugin
+emits nothing unless LangSmith tracing is enabled in the worker/client process
+environment. Enable it with LangSmith's standard environment variables:
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY="<your key>"
+```
+
+The plugin reads the same flags LangSmith itself uses (`LANGSMITH_TRACING` /
+`LANGSMITH_TRACING_V2` and their `LANGCHAIN_` aliases); with none set to `true`,
+the plugin starts no new traces. As in LangSmith, a trace that arrives in
+Temporal headers from a traced caller continues either way.
+
+## Hello world
+
+Your existing LangSmith instrumentation does not change. Here a `traceable`
+runs inside an Activity:
+
+```typescript
+// activities.ts
+import { traceable } from 'langsmith/traceable';
+
+const callModel = traceable(
+  async (prompt: string) => {
+    // ... your real model call ...
+    return `answer to: ${prompt}`;
+  },
+  { name: 'inner_llm_call' }
+);
+
+export async function answer(prompt: string): Promise<string> {
+  return callModel(prompt);
+}
+```
+
+```typescript
+// workflows.ts
+import { proxyActivities } from '@temporalio/workflow';
+import type * as activities from './activities';
+
+const { answer } = proxyActivities<typeof activities>({
+  startToCloseTimeout: '1 minute',
+});
+
+export async function GreetingWorkflow(prompt: string): Promise<string> {
+  return answer(prompt);
+}
+```
+
+The only new code is the plugin registration on the `Client` and the `Worker`:
+
+```typescript
+// worker.ts
+import { Worker } from '@temporalio/worker';
+import { Client } from '@temporalio/client';
+import { Client as LangSmithClient } from 'langsmith';
+import { LangSmithPlugin } from '@temporalio/langsmith';
+import * as activities from './activities';
+
+const langsmith = new LangSmithClient(); // reads LANGSMITH_API_KEY from the env
+
+// In TypeScript the Client and Worker are configured independently, so add the
+// plugin to each. (Construct one plugin instance and share it.)
+const plugin = new LangSmithPlugin({ client: langsmith, addTemporalRuns: true });
+
+const client = new Client({ plugins: [plugin] });
+
+const worker = await Worker.create({
+  taskQueue: 'greeting',
+  workflowsPath: require.resolve('./workflows'),
+  activities,
+  plugins: [plugin],
+});
+
+await worker.run();
+```
+
+```typescript
+// starter.ts — start the workflow from inside your own trace
+import { traceable } from 'langsmith/traceable';
+
+const pipeline = traceable(
+  async () => {
+    return client.workflow.execute(GreetingWorkflow, {
+      taskQueue: 'greeting',
+      workflowId: 'greeting-1',
+      args: ['hello'],
+    });
+  },
+  { name: 'user_pipeline' }
+);
+
+await pipeline();
+```
+
+With `addTemporalRuns: true`, the resulting trace nests like this:
+
+```
+user_pipeline
+  StartWorkflow:GreetingWorkflow
+  RunWorkflow:GreetingWorkflow
+    StartActivity:answer
+    RunActivity:answer
+      inner_llm_call
+```
+
+Set `addTemporalRuns: false` (the default) to emit only your own `traceable`
+runs — the trace context still propagates across boundaries, so they nest
+correctly, but no `StartWorkflow:` / `RunActivity:` scaffolding is added:
+
+```
+user_pipeline
+  inner_llm_call
+```
+
+## Options
+
+| Option            | Default           | Meaning                                                                                                                                        |
+| ----------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `client`          | `new Client()`    | The LangSmith client runs are emitted to. Lives only in the worker/client process — it is never serialized or sent across a Temporal boundary. |
+| `addTemporalRuns` | `false`           | Emit first-class runs for Temporal operations (`StartWorkflow:`, `RunActivity:`, `HandleSignal:`, …) in addition to your `traceable` runs.     |
+| `projectName`     | LangSmith default | Default LangSmith project for new root traces. An inherited destination takes precedence.                                                       |
+| `address`         | —                 | Agent/environment destination, mutually exclusive with `projectName`. Requires LangSmith's workspace-enabled beta feature.                    |
+| `tags`            | —                 | Tags attached to every run the plugin emits.                                                                                                   |
+| `metadata`        | —                 | Metadata merged into every run the plugin emits. It is sent unchanged and travels in Temporal headers, so keep secrets out of it.              |
+
+The LangSmith API key is never accepted as a plugin option and never crosses a
+Temporal boundary. Supply a pre-constructed `Client` (which reads
+`LANGSMITH_API_KEY` from the process environment) or let the plugin build a
+default client from the environment.
+
+## Agent and environment destinations
+
+With LangSmith 0.10.13 or later, send traces to an agent's environment:
+
+```typescript
+import { AgentAddress } from 'langsmith';
+import { LangSmithPlugin } from '@temporalio/langsmith';
+
+const plugin = new LangSmithPlugin({
+  address: new AgentAddress('support', 'staging'),
+});
+```
+
+Register the plugin on the Client and Worker as in the quick start. `address`
+and `projectName` are mutually exclusive. Agent addressing is a LangSmith beta
+feature that must be enabled for the workspace.
+
+When upgrading from LangSmith 0.10.8, replace `address.agent(...)` with
+`new AgentAddress(...)`. Addresses are objects in application code; tracing
+headers retain their LRN string format, including headers in existing histories.
+This is a breaking change for Workflows that pass address strings as recorded
+inputs to LangSmith calls. Let those executions finish on the previous plugin
+and LangSmith versions, or keep them on their previous Worker Deployment Version
+when deploying the upgrade.
+
+Native `traceable(fn, { address: ... })` and runtime traceable configuration
+also select destinations for new root traces in Workflows, Activities, and
+Nexus handlers. Child runs
+inherit their parent's destination, following LangSmith's native rules. Plugin
+defaults apply when a new root names no destination.
+Destinations follow the trace through Activities, child Workflows, and Nexus,
+including with `addTemporalRuns: false`.
+
+## Write replicas
+
+LangSmith write replicas configured on `traceable` or through
+`LANGSMITH_RUNS_ENDPOINTS` follow the trace across Temporal boundaries:
+
+```typescript
+const pipeline = traceable(runWorkflow, {
+  replicas: [
+    { projectName: 'primary', primary: true },
+    { projectName: 'audit' },
+    { address: new AgentAddress('support', 'production') },
+  ],
+});
+```
+
+A primary replica retains the original run IDs. Secondary replicas use
+LangSmith's deterministic destination-specific IDs, with corresponding parent
+links and completion updates. Replaying Workflow history publishes no extra
+copies.
+
+Only destination identifiers, routing flags, and sanitized replica updates
+cross Temporal boundaries. Each client/worker configures its own credentials;
+matching project destinations in its local `LANGSMITH_RUNS_ENDPOINTS` supply
+their own connection settings. API keys, ingestion URLs, and client objects
+stay outside persisted trace headers.
+
+## Where `traceable` works
+
+`traceable` from `langsmith/traceable` works **unchanged** in every position
+below. Each row is exercised by the plugin's test suite.
+
+| Position                                         | Works? | Notes                                                                                                                                                              |
+| ------------------------------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Client side, before `client.workflow.start(...)` | ✅     | The trace propagates into the workflow; `RunWorkflow:` nests under your run.                                                                                       |
+| Inside an **Activity** body                      | ✅     | Runs in the real worker process. Nests under `RunActivity:` (or under the propagated parent when `addTemporalRuns: false`).                                        |
+| Inside a **Workflow** body                       | ✅     | Replay-safe: deterministic IDs, emitted out-of-isolate, suppressed on replay. Works whether or not a parent trace is propagated in.                                |
+| Inside **signal / query / update** handlers      | ✅     | Handler-body `traceable` runs nest under the handler's run (workflow-body semantics). Temporal-internal queries (`__temporal*`, `__stack_trace`) are never traced. |
+
+Inside a Workflow, parent resolution rides the SDK-provided `AsyncLocalStorage`
+the worker injects onto the workflow-sandbox global, so context propagates
+across `await` boundaries and `Promise.all(...)` fan-out exactly as it does
+outside the isolate — the same deterministic run tree replays identically.
+
+Native `RunTree` instances work in Workflow code too:
+
+- Run IDs are the same on replay.
+- End times come from the Worker's clock. Start times do too, unless the run
+  was rebuilt by a replay before it ended; then they come from Workflow time.
+- A run's end is never sent twice.
+
+## Process-wide effects to be aware of
+
+- **Workflow context provider.** Loading the plugin's workflow interceptor
+  module installs a global LangSmith async-context provider inside the workflow
+  isolate (via `AsyncLocalStorageProviderSingleton.initializeGlobalInstance`),
+  backed by the SDK-provided `AsyncLocalStorage`. This is what lets unchanged
+  `traceable` calls find their parent inside a Workflow. It is scoped to the
+  workflow bundle and does not affect your client/worker process context.
+- **Worker routing defaults.** The plugin wraps LangSmith's destination and
+  shared-client hooks. Defaults apply only within parentless Activity and
+  Nexus handlers when `addTemporalRuns: false`; each call carries its own
+  destination, client, and replicas in async context. No placeholder run is
+  installed. Explicit run configuration and native child inheritance take
+  precedence.
+
+## Composing with other plugins
+
+Register observability **first** (outermost) so it observes everything beneath
+it, then governance, then agent-framework plugins:
+
+```typescript
+const worker = await Worker.create({
+  taskQueue: 'tq',
+  workflowsPath: require.resolve('./workflows'),
+  activities,
+  plugins: [
+    new LangSmithPlugin({ client: langsmith }), // observability — first
+    // new GovernancePlugin(...),
+    // new AgentFrameworkPlugin(...),
+  ],
+});
+```
+
+The plugin is safe to register on both the `Client` and the `Worker`; it
+de-duplicates its own interceptors and sinks, so a worker built from a
+plugin-configured client will not double-instrument.
+
+## License
+
+MIT

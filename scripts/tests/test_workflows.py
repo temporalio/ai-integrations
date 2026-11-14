@@ -1,4 +1,4 @@
-"""Static checks on the workflow files: SHA-pinned actions, no secrets, least-privilege permissions."""
+"""Static workflow checks: pinned actions, isolated publishing secrets, least privilege."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import release_tool
 import yaml
 
 REPO = Path(__file__).resolve().parents[2]
@@ -41,20 +43,208 @@ def test_workflows_parse_and_have_no_secrets(path: Path) -> None:
     doc = yaml.safe_load(path.read_text())
     assert isinstance(doc, dict) and "jobs" in doc
     text = path.read_text()
-    assert "secrets." not in text.replace("secrets: inherit", "secrets.INHERIT"), f"{path.name} must not use repository secrets"
+    if path.name == "release-java.yml":
+        allowed = {"stage": {"CENTRAL_USERNAME", "CENTRAL_PASSWORD", "GPG_PRIVATE_KEY", "GPG_PASSPHRASE"},
+                   "publish": {"CENTRAL_USERNAME", "CENTRAL_PASSWORD"}}
+        for name, job in doc["jobs"].items():
+            found = set(re.findall(r"secrets\.([A-Z_]+)", yaml.dump(job)))
+            assert found == allowed.get(name, set()), f"{name}: unexpected Maven credentials"
+            if found:
+                assert job["environment"] == {"stage": "maven-central-staging", "publish": "maven-central"}[name]
+                assert "needs.prepare.outputs.publish == 'true'" in job["if"]
+    else:
+        assert "secrets." not in text, f"{path.name} must not use stored publishing credentials"
     assert "secrets: inherit" not in text, f"{path.name} must not inherit secrets"
     assert "cancel-in-progress: true" not in text, f"{path.name} must not cancel in-progress runs (required checks)"
+
+
+def test_non_ga_releases_use_environments_without_required_reviewers() -> None:
+    java = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())["jobs"]
+    assert java["prepare"]["outputs"]["maturity"] == "${{ steps.tag.outputs.maturity }}"
+    # The credential environments track staging and publication separately.
+    # The approval-only environment protects GA releases without gating non-GA ones.
+    assert java["publish"]["environment"] == "maven-central"
+    assert java["stage"]["environment"] == "maven-central-staging"
+    assert java["approve"]["environment"] == "maven-central-approval"
+    assert set(java["approve"]["needs"]) == {"prepare", "stage"}
+    assert java["approve"]["permissions"] == {}
+    python = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+    assert python["publish-testpypi"]["environment"] == "testpypi"
+    assert python["publish-pypi"]["environment"]["name"] == "pypi"
+    go = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())["jobs"]
+    assert all("environment" not in job for job in go.values())
+
+
+@pytest.mark.parametrize("maturity,requires_approval", [
+    ("pre-release", False), ("public-preview", False), ("generally-available", True),
+    ("", True), ("unknown", True),
+])
+def test_java_publication_requires_successful_staging_and_applicable_approval(maturity: str, requires_approval: bool) -> None:
+    jobs = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())["jobs"]
+
+    def allows(job: str, *, approval: str = "skipped", stage: str = "success", prepare: str = "success",
+               publish: str = "true", prerelease: str = "false", cancelled: bool = False) -> bool:
+        needs = SimpleNamespace(
+            prepare=SimpleNamespace(result=prepare, outputs=SimpleNamespace(
+                maturity=maturity, publish=publish, prerelease=prerelease,
+            )),
+            stage=SimpleNamespace(result=stage),
+            approve=SimpleNamespace(result=approval),
+        )
+        # These conditions use comparisons and boolean operators shared by both languages.
+        # Evaluate the workflow's actual expressions so skipped dependencies cannot silently
+        # block non-GA publication or let failed/rejected approvals through.
+        expression = jobs[job]["if"].replace("&&", " and ").replace("||", " or ").replace("!cancelled()", "not cancelled")
+        return eval(expression, {"__builtins__": {}}, {"needs": needs, "cancelled": cancelled})
+
+    assert allows("approve") == requires_approval
+    assert allows("publish") == (not requires_approval)
+    assert allows("publish", approval="success")
+    for approval in ("failure", "cancelled"):
+        assert not allows("publish", approval=approval)
+    for stage in ("failure", "skipped", "cancelled"):
+        assert not allows("publish", stage=stage, approval="success")
+    assert not allows("publish", prepare="failure", approval="success")
+    assert not allows("publish", cancelled=True, approval="success")
+    for job in ("approve", "publish"):
+        assert not allows(job, publish="false", approval="success")
+        assert not allows(job, prerelease="true", approval="success")
 
 
 def test_ci_status_is_the_fan_in() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     status = doc["jobs"]["ci-status"]
     assert status["if"] == "always()"
-    assert set(status["needs"]) == {"changes", "conventions", "python", "java"}
-    assert doc["jobs"]["python"]["uses"] == "./.github/workflows/_python-plugin.yml"
-    assert "needs.changes.result == 'success'" in doc["jobs"]["python"]["if"]
-    assert doc["jobs"]["java"]["uses"] == "./.github/workflows/_java-plugin.yml"
-    assert "needs.changes.result == 'success'" in doc["jobs"]["java"]["if"]
+    assert set(status["needs"]) == {"changes", "conventions", "python", "java", "go", "typescript"}
+    for language in ("python", "java", "go", "typescript"):
+        job = doc["jobs"][language]
+        assert job["uses"] == f"./.github/workflows/_{language}-plugin.yml"
+        assert "needs.changes.result == 'success'" in job["if"]
+        assert f"needs.changes.outputs.{language} != '[]'" in job["if"]
+
+
+def test_tooling_installs_pnpm_for_cooldown_regressions() -> None:
+    workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
+    steps = workflow["jobs"]["conventions"]["steps"]
+    setup = next(step for step in steps if step.get("uses", "").startswith("pnpm/action-setup@"))
+    tests = next(step for step in steps if step.get("name") == "Tooling unit tests")
+    assert setup["with"]["version"] == "10.27.0"
+    assert steps.index(setup) < steps.index(tests)
+
+
+def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
+    workflow = yaml.safe_load((REPO / ".github/workflows/_typescript-plugin.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    setup_node = next(step for step in steps if step.get("uses", "").startswith("actions/setup-node@"))
+    assert setup_node["with"]["check-latest"] is True
+    test = next(step for step in steps if step.get("name") == "Lint and test")
+    build = next(step for step in steps if step.get("name") == "Build and verify npm package")
+    assert steps.index(test) < steps.index(build)
+    assert "make lint && make test" in test["run"]
+    assert "check_npm_package.py" in build["run"] and "smoke.mjs" in build["run"]
+    assert build["if"] == "matrix.dist"
+    sync = next(step for step in steps if step.get("name") == "Sync dependencies")
+    assert "make sync-latest" in sync["run"] and "make sync" in sync["run"]
+
+
+@pytest.mark.parametrize("language,sync_name", [("python", "Sync environment"), ("typescript", "Sync dependencies")])
+def test_cooldown_is_checked_before_installing_the_committed_lock(language: str, sync_name: str) -> None:
+    workflow = yaml.safe_load((REPO / f".github/workflows/_{language}-plugin.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    check = next(step for step in steps if step.get("name") == "Check dependency resolution under the cooldown")
+    sync = next(step for step in steps if step.get("name") == sync_name)
+    assert check["if"] == "matrix.dist && inputs.deps == 'locked'"
+    assert check["run"] == 'cd "$PLUGIN_DIR" && make check-deps'
+    assert steps.index(check) < steps.index(sync)
+    assert "locked) make sync ;;" in sync["run"]
+    assert "latest) make sync-latest ;;" in sync["run"]
+
+
+def test_go_release_reuses_the_full_matrix_and_verifies_the_same_commit() -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    assert doc[True]["push"]["tags"] == ["go/*/v*"]
+    assert doc[True]["release"]["types"] == ["published"]
+    assert doc["permissions"] == {}
+    # prepare also reads the plugin's nightly issue; nothing else in a Go release needs more than contents.
+    assert all(job["permissions"] == ({"contents": "read", "issues": "read"} if name == "prepare" else {"contents": "read"})
+               for name, job in doc["jobs"].items())
+    test = doc["jobs"]["test"]
+    assert test["uses"] == "./.github/workflows/_go-plugin.yml"
+    assert test["with"] == {"plugin": "${{ needs.prepare.outputs.plugin }}", "deps": "locked", "ref": "${{ needs.prepare.outputs.sha }}"}
+    verify = doc["jobs"]["verify"]
+    assert verify["needs"] == ["prepare", "test"]
+    assert verify["if"] == "needs.prepare.outputs.verify == 'true'"
+    checkout = next(step for step in verify["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"]["ref"] == "${{ needs.prepare.outputs.sha }}"
+    reusable = yaml.safe_load((REPO / ".github/workflows/_go-plugin.yml").read_text())
+    for job in reusable["jobs"].values():
+        checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        assert checkout["with"]["ref"] == "${{ inputs.ref || github.sha }}"
+
+
+@pytest.mark.parametrize("ref_type,dry_run,verify", [
+    ("tag", "false", "true"), ("tag", "true", "false"), ("branch", "false", "false"),
+    ("branch", "true", "false"), ("tag", "", "false"), ("tag", "False", "false"),
+])
+def test_go_release_dry_runs_do_not_verify_a_public_module(tmp_path: Path, ref_type: str, dry_run: str, verify: str) -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    gate = next(step for step in doc["jobs"]["prepare"]["steps"] if step.get("id") == "gate")
+    output = tmp_path / "output"
+    env = dict(os.environ, REF_TYPE=ref_type, DRY_RUN=dry_run, GITHUB_OUTPUT=str(output))
+    result = subprocess.run(["bash", "-c", gate["run"]], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == f"verify={verify}\n"
+
+
+@pytest.mark.parametrize("ref_type,ref_name,tag,allowed", [
+    ("tag", "go/fake/v0.1.0", "", True), ("tag", "go/fake/v0.1.0", "go/fake/v0.1.0", True),
+    ("tag", "go/fake/v0.1.0", "go/other/v0.1.0", False), ("branch", "main", "", False),
+    ("branch", "main", "go/fake/v0.1.0", True),
+])
+def test_go_release_dispatch_ref_must_match_the_tag(ref_type: str, ref_name: str, tag: str, allowed: bool) -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    step = next(step for step in doc["jobs"]["prepare"]["steps"] if step.get("name") == "Dispatch inputs are consistent with the ref")
+    env = dict(os.environ, REF_TYPE=ref_type, REF_NAME=ref_name, INPUT_TAG=tag)
+    result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+    assert (result.returncode == 0) == allowed, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("on_main,ref_type,allowed", [(True, "tag", True), (False, "tag", False), (False, "branch", True)])
+def test_go_release_source_must_be_main_reachable_for_tag_runs(plugin_repo: Path, tmp_path: Path, on_main: bool, ref_type: str, allowed: bool) -> None:
+    from conftest import commit_all, git
+
+    git(plugin_repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    if not on_main:
+        (plugin_repo / "README.md").write_text("feature branch\n")
+        commit_all(plugin_repo, "Feature")
+    tag = "go/fake/v0.1.0"
+    git(plugin_repo, "tag", "-a", tag, "-m", "Go release")
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    source = next(step for step in doc["jobs"]["prepare"]["steps"] if step.get("id") == "source")
+    output = tmp_path / "output"
+    env = dict(os.environ, REF_TYPE=ref_type, TAG=tag, GITHUB_OUTPUT=str(output))
+    result = subprocess.run(["bash", "-c", source["run"]], env=env, cwd=plugin_repo, capture_output=True, text=True)
+    assert (result.returncode == 0) == allowed, result.stdout + result.stderr
+    if allowed:
+        assert output.read_text() == f"sha={git(plugin_repo, 'rev-parse', 'HEAD')}\n"
+
+
+@pytest.mark.parametrize("language,skip_when", [
+    ("python", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
+    ("typescript", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
+    ("java", "github.event_name != 'workflow_dispatch' || inputs.deployment-id == ''"),
+    # A Go tag is public once it exists, so only the branch dry run before tagging can stop it.
+    ("go", "github.ref_type != 'tag' && github.event_name == 'workflow_dispatch'"),
+])
+def test_releases_check_the_nightly_run_after_the_version_policy(language: str, skip_when: str) -> None:
+    prepare = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]["prepare"]
+    assert prepare["permissions"]["issues"] == "read"
+    names = [step.get("name", "") for step in prepare["steps"]]
+    assert names.index("Nightly run is green") == names.index("Version policy") + 1
+    step = prepare["steps"][names.index("Nightly run is green")]
+    assert step["if"] == skip_when
+    assert step["env"] == {"GH_TOKEN": "${{ github.token }}", "TAG": "${{ steps.tag.outputs.tag }}"}
+    assert step["run"].endswith('release_tool.py check-nightly --tag "$TAG"')
 
 
 def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
@@ -91,7 +281,7 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
             continue
         for step in job.get("steps", []):
             assert "github.ref_name" not in yaml.dump(step.get("env", {})), f"{name}: read the parsed tag, not the ref name"
-    assert doc["concurrency"]["group"] == "release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
+    assert doc["concurrency"]["group"] == "${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
 
 
 def test_published_release_is_verified_before_uploads_and_linked_from_deployment() -> None:
@@ -111,8 +301,9 @@ def test_published_release_is_verified_before_uploads_and_linked_from_deployment
     assert summary["if"] == verify["if"]
 
 
-def test_publication_does_not_modify_the_reviewed_github_release() -> None:
-    jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+@pytest.mark.parametrize("language", ["python", "typescript", "java", "go"])
+def test_publication_does_not_modify_the_reviewed_github_release(language: str) -> None:
+    jobs = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]
     for job in jobs.values():
         assert job.get("permissions", {}).get("contents") != "write"
         for step in job.get("steps", []):
@@ -120,19 +311,15 @@ def test_publication_does_not_modify_the_reviewed_github_release() -> None:
             assert "publish-release" not in step.get("run", "")
 
 
-def test_release_smoke_is_strict_unless_the_sdk_still_bundles_the_plugin() -> None:
+def test_release_smoke_verifies_tested_artifacts() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
-    # smoke.py: "0" is strict; only allow-final = false (the plugin the SDK still ships) may overlap.
-    expected = "${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}"
     for job in ("smoke-testpypi", "smoke-pypi"):
         smoke = [s for s in doc["jobs"][job]["steps"] if "smoke_from_index.sh" in s.get("run", "")]
-        assert len(smoke) == 1 and smoke[0]["env"]["ALLOW_OVERLAP_WITH_CORE"] == expected, job
         assert smoke[0]["env"]["REQUIRES_PYTHON"] == "${{ needs.prepare.outputs.requires_python }}", job
         verify = [s for s in doc["jobs"][job]["steps"] if "verify-index-files" in s.get("run", "")]
         assert len(verify) == 1, f"{job} must prove the index serves the tested artifacts"
         index = job.split("-", 1)[1]
         assert f"--index {index}" in verify[0]["run"]
-    assert doc["jobs"]["prepare"]["outputs"]["allow_final"] == "${{ steps.tag.outputs.allow_final }}"
 
 
 def test_release_publishes_the_tested_artifacts() -> None:
@@ -182,24 +369,23 @@ def test_release_publication_gate(ref_type: str, recovery: str, skip: str, publi
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     output = tmp_path / "outputs"
     env = dict(os.environ, REF_TYPE=ref_type, RECOVERY=recovery, SKIP_PUBLISH=skip,
-               PRERELEASE="false", ALLOW_FINAL="true", OVERRIDE="false", GITHUB_OUTPUT=str(output))
+               PRERELEASE="false", OVERRIDE="false", GITHUB_OUTPUT=str(output))
     subprocess.run(["bash", "-c", gate["run"]], env=env, check=True, capture_output=True, text=True)
     assert f"publish={'true' if publish else 'false'}\n" in output.read_text()
 
 
-@pytest.mark.parametrize("prerelease,allow_final,override,publish_pypi", [
-    ("false", "true", "false", True), ("false", "true", "true", True),
-    ("true", "true", "false", False), ("true", "true", "true", True),
-    ("true", "false", "false", False), ("true", "false", "true", False),
+@pytest.mark.parametrize("prerelease,override,publish_pypi", [
+    ("false", "false", True), ("false", "true", True),
+    ("true", "false", False), ("true", "true", True),
 ])
-def test_registry_routing_uses_version_and_cutover_policy(
-    prerelease: str, allow_final: str, override: str, publish_pypi: bool, tmp_path: Path,
+def test_registry_routing_uses_version_and_dispatch_override(
+    prerelease: str, override: str, publish_pypi: bool, tmp_path: Path,
 ) -> None:
     jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
     gate = next(s for s in jobs["prepare"]["steps"] if s.get("id") == "gate")
     output = tmp_path / "outputs"
     env = dict(os.environ, REF_TYPE="tag", RECOVERY="", SKIP_PUBLISH="false", PRERELEASE=prerelease,
-               ALLOW_FINAL=allow_final, OVERRIDE=override, GITHUB_OUTPUT=str(output))
+               OVERRIDE=override, GITHUB_OUTPUT=str(output))
     subprocess.run(["bash", "-c", gate["run"]], env=env, check=True, capture_output=True, text=True)
     assert f"publish_pypi={'true' if publish_pypi else 'false'}\n" in output.read_text()
 
@@ -213,8 +399,9 @@ def test_release_recovery_rejects_dispatch_outside_main(ref_type: str, ref_name:
     assert result.returncode == 1 and "recovery must be dispatched on main" in result.stdout
 
 
-def test_release_checkouts_do_not_persist_credentials() -> None:
-    doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
+@pytest.mark.parametrize("language", ["python", "java"])
+def test_release_checkouts_do_not_persist_credentials(language: str) -> None:
+    doc = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())
     for name, job in doc["jobs"].items():
         for step in job.get("steps", []):
             if "actions/checkout@" in step.get("uses", ""):
@@ -263,3 +450,55 @@ def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> No
         assert '-PspringBootVersion=$SPRING_BOOT_VERSION' in step['run']
     assert '--write-locks' not in test['run'] + build['run']
     assert steps.index(resolve) < steps.index(test) < steps.index(build)
+
+
+def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())
+    jobs = doc["jobs"]
+    assert doc[True]["release"]["types"] == ["published"]
+    assert "push" not in doc[True], "publishing the reviewed release creates the tag and starts staging"
+    assert doc["concurrency"]["group"] == "${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
+    prepare = jobs["prepare"]
+    assert prepare["if"] == "github.event_name != 'release' || startsWith(github.event.release.tag_name, 'java/')"
+    tag = next(s for s in prepare["steps"] if s.get("id") == "tag")
+    assert tag["env"]["TAG"] == "${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
+    verify = next(s for s in prepare["steps"] if "check-published-release" in s.get("run", ""))
+    assert verify["if"] == "steps.gate.outputs.publish == 'true'"
+    assert verify["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert verify["env"]["TAG"] == "${{ steps.tag.outputs.tag }}"
+    assert jobs["test"]["uses"] == "./.github/workflows/_java-plugin.yml"
+    assert jobs["test"]["with"]["version"] == "${{ needs.prepare.outputs.version }}"
+    assert set(jobs["stage"]["needs"]) == {"prepare", "test"}
+    assert jobs["stage"]["if"] == "needs.prepare.outputs.publish == 'true'"
+    assert set(jobs["publish"]["needs"]) == {"prepare", "stage", "approve"}
+    assert "!cancelled()" in jobs["publish"]["if"]
+    assert "needs.stage.result == 'success'" in jobs["publish"]["if"]
+    assert "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'" in jobs["publish"]["if"]
+    for name in ("stage", "publish"):
+        steps = jobs[name]["steps"]
+        downloads = [s["with"]["name"] for s in steps if "download-artifact@" in s.get("uses", "")]
+        assert downloads == ["dist-java-${{ needs.prepare.outputs.plugin }}", "central-deployment-${{ needs.prepare.outputs.plugin }}"]
+        assert not any("gradlew" in s.get("run", "") for s in steps), "publish jobs must not rebuild"
+    recover = next(s for s in jobs["stage"]["steps"] if s.get("name") == "Recover saved deployment on a failed-job rerun")
+    assert "continue-on-error" not in recover
+    assert recover["if"] == "steps.recovery.outputs.restore_state == 'true'"
+    check = next(s for s in jobs["stage"]["steps"] if s.get("id") == "recovery")
+    assert "check-java-stage-recovery" in check["run"]
+    assert check["env"]["RUN_ATTEMPT"] == "${{ github.run_attempt }}"
+    assert check["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert jobs["stage"]["permissions"]["actions"] == "read"
+    command = next(s for s in jobs["stage"]["steps"] if s.get("id") == "staging")
+    assert jobs["stage"]["name"] == release_tool.JAVA_STAGE_JOB
+    assert command["name"] == release_tool.JAVA_STAGE_STEP
+    assert command["env"]["RECOVER_ONLY"] == "${{ steps.recovery.outputs.recover_only }}"
+    assert "--recover-only" in command["run"]
+    steps = jobs["stage"]["steps"]
+    assert steps.index(check) < steps.index(recover) < steps.index(command)
+    preserve = next(s for s in jobs["stage"]["steps"] if s.get("name") == "Preserve signed bundle and deployment ID for recovery")
+    assert preserve["if"] == "always() && (steps.staging.outcome == 'success' || steps.staging.outcome == 'failure' || steps.staging.outcome == 'cancelled')"
+    assert preserve["with"]["overwrite"] is True
+    for name in ("stage", "publish"):
+        command = next(s for s in jobs[name]["steps"] if "maven_release.py" in s.get("run", ""))
+        assert f"maven_release.py {name}" in command["run"] and "--smoke" in command["run"]
+    gate = next(s for s in jobs["prepare"]["steps"] if s.get("id") == "gate")
+    assert '[ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" = "false" ]' in gate["run"]

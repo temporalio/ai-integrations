@@ -7,6 +7,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.temporal.failure.ApplicationFailure;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import javax.annotation.Nullable;
 
 /**
@@ -108,7 +109,13 @@ public final class ChatModelTypes {
       @JsonProperty("metadata") ChatResponseMetadata metadata) {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public record Generation(@JsonProperty("message") Message message) {}
+    public record Generation(
+        @JsonProperty("message") Message message,
+        @JsonProperty("finish_reason") String finishReason) {
+      public Generation(Message message) {
+        this(message, null);
+      }
+    }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -144,6 +151,7 @@ public final class ChatModelTypes {
    * @param toolCallId tool call ID this message responds to (for TOOL role)
    * @param toolCalls tool calls requested by the model (for ASSISTANT role)
    * @param mediaContents optional media attachments
+   * @param metadata optional assistant metadata, including provider continuation state
    */
   @JsonInclude(JsonInclude.Include.NON_NULL)
   @JsonIgnoreProperties(ignoreUnknown = true)
@@ -156,7 +164,18 @@ public final class ChatModelTypes {
           @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
           List<ToolCall> toolCalls,
       @JsonProperty("media") @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
-          List<MediaContent> mediaContents) {
+          List<MediaContent> mediaContents,
+      @JsonProperty("metadata") Map<String, Object> metadata) {
+    public Message(
+        String content,
+        Role role,
+        String name,
+        String toolCallId,
+        List<ToolCall> toolCalls,
+        List<MediaContent> mediaContents) {
+      this(content, role, name, toolCallId, toolCalls, mediaContents, null);
+    }
+
     public Message(String content, Role role) {
       this(content, role, null, null, null, null);
     }
@@ -237,13 +256,14 @@ public final class ChatModelTypes {
    * Model options for the chat request.
    *
    * <p>When {@code chatOptionsClass} and {@code chatOptionsJson} are both non-null, the activity
-   * side attempts to rehydrate the caller's exact {@link
-   * org.springframework.ai.chat.prompt.ChatOptions} subclass by loading the class and
-   * JSON-deserializing the blob. That path carries every field the caller set, including
-   * provider-specific ones like OpenAI {@code reasoning_effort} or Anthropic thinking-budget
-   * settings. If class loading or deserialization fails, or if the workflow side couldn't serialize
-   * the caller's options in the first place, the common scalar fields on this record are used as a
-   * fallback.
+   * side attempts to rehydrate the caller's {@link
+   * org.springframework.ai.chat.prompt.ChatOptions.Builder} by loading the class and
+   * JSON-deserializing the blob. ChatClient customizers remain unbuilt until they are merged with
+   * the selected worker model's defaults; directly supplied ChatOptions are also supported. That
+   * path carries every field the caller set, including provider-specific ones like OpenAI {@code
+   * reasoning_effort} or Anthropic thinking-budget settings. If class loading or deserialization
+   * fails, or if the workflow side couldn't serialize the caller's options in the first place, the
+   * common scalar fields on this record are used as a fallback.
    */
   @JsonInclude(JsonInclude.Include.NON_NULL)
   @JsonIgnoreProperties(ignoreUnknown = true)

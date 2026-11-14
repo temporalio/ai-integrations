@@ -1,0 +1,14 @@
+[plugin]
+name = "vercel-ai-sdk"
+language = "typescript"
+coordinate = "@temporalio/vercel-ai-sdk"
+registry = "npm"
+root-api = "@temporalio/vercel-ai-sdk"
+maturity = "generally-available"
+docs = "https://docs.temporal.io/develop/typescript/integrations/ai-sdk"
+
+[ci]
+runtime-versions = ["22", "24"]
+
+[smoke]
+imports = ["@temporalio/vercel-ai-sdk"]

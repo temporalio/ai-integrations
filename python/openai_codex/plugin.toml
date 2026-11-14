@@ -1,0 +1,16 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "openai_codex"
+language = "python"
+coordinate = "temporalio-openai-codex"
+registry = "pypi"
+root-api = "temporalio.openai_codex"
+maturity = "pre-release"
+docs = "https://docs.temporal.io/develop/python/integrations/openai-codex"
+
+[ci]
+runtime-versions = ["3.11", "3.15"]
+
+[smoke]
+imports = []

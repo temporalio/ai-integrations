@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from collections.abc import AsyncGenerator
 from functools import partial
@@ -36,7 +35,7 @@ def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register markers retained by the upstream-owned test suite."""
+    """Register markers used by the test suite."""
     config.addinivalue_line(
         "markers",
         "requires_local_server: test requires behavior specific to the local dev server",
@@ -48,32 +47,16 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     if hasattr(session.config, "workerinput"):
         return
     plugin = load_plugin_meta(PLUGIN_ROOT)
-    allow_overlap = (not plugin.allow_final) or os.environ.get(
-        "ALLOW_OVERLAP_WITH_CORE"
-    ) == "1"
     try:
         check_provenance(
             plugin.coordinate,
             plugin.package_relpath,
-            allow_overlap=allow_overlap,
-            warn=lambda message: print(f"provenance: {message}"),
         )
     except ProvenanceError as exc:
         pytest.exit(f"provenance guard failed: {exc}", returncode=1)
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create the session event loop."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()  # type: ignore[reportDeprecated]
-    yield loop
-    try:
-        loop.close()
-    except TypeError:
-        raise
-
-
-@pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
+@pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     """Start the pinned local Temporal development server."""
     environment = await start_local_with_retry(
@@ -86,7 +69,7 @@ async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     await environment.shutdown()
 
 
-@pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
+@pytest_asyncio.fixture
 async def client(env: WorkflowEnvironment) -> Client:
     """Return the local environment's client."""
     return env.client

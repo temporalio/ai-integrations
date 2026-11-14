@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import gc
 import inspect
-import sys
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -24,9 +23,6 @@ import pytest
 
 from temporalio.testing import WorkflowEnvironment
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 
@@ -81,12 +77,11 @@ class BackendWorkflow:
         return f"{sync_out}|{async_out}|{deleted}"
 
 
-# Bind deepagents symbols off the module importorskip returns: a static
-# `from deepagents import ...` cannot resolve on Python 3.10 (deepagents
-# needs >= 3.11), and with the package absent the type checkers mis-resolve
-# the name against this same-named test directory.
+# Resolve framework symbols through the imported module to avoid confusing
+# the top-level package with this same-named test directory.
 _deepagents_mod = pytest.importorskip("deepagents")
 _backends_mod = pytest.importorskip("deepagents.backends")
+_protocol_mod = pytest.importorskip("deepagents.backends.protocol")
 create_deep_agent = _deepagents_mod.create_deep_agent
 FilesystemBackend = _backends_mod.FilesystemBackend
 LocalShellBackend = _backends_mod.LocalShellBackend
@@ -152,6 +147,96 @@ async def test_temporal_backend_op_activity(env: WorkflowEnvironment) -> None:
     # One activity per op — the sync read, the async aread, and the optional
     # adelete all cross.
     assert counts[BACKEND_OP] == 3, counts
+
+
+TEXT_FILE = ("/notes.txt", b"hello\n")
+# A PNG header: not valid UTF-8, so it cannot ride as text either.
+BINARY_FILE = ("/image.png", b"\x89PNG\r\n\x1a\n")
+
+
+class FileBytesBackend:
+    """Stores uploaded files and serves them back, refusing anything but bytes.
+
+    ``upload_files`` takes ``bytes`` and ``download_files`` returns ``bytes``
+    (deepagents' memory middleware decodes what it downloads), so a file's
+    content must cross the activity boundary as ``bytes`` both ways."""
+
+    def __init__(self) -> None:
+        self._files: dict[str, bytes] = {}
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[Any]:
+        responses = []
+        for path, content in files:
+            if not isinstance(content, bytes):
+                raise TypeError(f"{path} arrived as {type(content).__name__}")
+            self._files[path] = content
+            responses.append(_protocol_mod.FileUploadResponse(path=path))
+        return responses
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[Any]:
+        return self.upload_files(files)
+
+    def download_files(self, paths: list[str]) -> list[Any]:
+        return [
+            _protocol_mod.FileDownloadResponse(path=path, content=self._files[path])
+            for path in paths
+        ]
+
+    async def adownload_files(self, paths: list[str]) -> list[Any]:
+        return self.download_files(paths)
+
+
+@workflow.defn
+class FileBytesWorkflow:
+    @workflow.run
+    async def run(self) -> list[list[str]]:
+        backend = TemporalBackend(
+            FileBytesBackend(),
+            activity_options={
+                "start_to_close_timeout": timedelta(seconds=10),
+                "retry_policy": RetryPolicy(maximum_attempts=1),
+            },
+        )
+        files = [TEXT_FILE, BINARY_FILE]
+        uploaded = await backend.aupload_files(files)
+        downloaded = await backend.adownload_files([path for path, _ in files])
+        sync_downloaded = await backend.download_files([BINARY_FILE[0]])
+        return [
+            [type(response).__name__, response.path, str(response.error)]
+            for response in uploaded
+        ] + [
+            [
+                type(response).__name__,
+                type(response.content).__name__,
+                response.content.hex(),
+            ]
+            for response in [*downloaded, *sync_downloaded]
+        ]
+
+
+@pytest.mark.asyncio
+async def test_file_bytes_cross_the_activity_boundary_both_ways(
+    env: WorkflowEnvironment,
+) -> None:
+    async with Worker(
+        env.client,
+        task_queue="da-backend-bytes",
+        workflows=[FileBytesWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        out = await env.client.execute_workflow(
+            FileBytesWorkflow.run,
+            id=f"da-backend-bytes-{uuid.uuid4()}",
+            task_queue="da-backend-bytes",
+        )
+
+    assert out == [
+        ["FileUploadResponse", TEXT_FILE[0], "None"],
+        ["FileUploadResponse", BINARY_FILE[0], "None"],
+        ["FileDownloadResponse", "bytes", TEXT_FILE[1].hex()],
+        ["FileDownloadResponse", "bytes", BINARY_FILE[1].hex()],
+        ["FileDownloadResponse", "bytes", BINARY_FILE[1].hex()],
+    ]
 
 
 def test_temporal_backend_mirrors_inner_delete_support() -> None:

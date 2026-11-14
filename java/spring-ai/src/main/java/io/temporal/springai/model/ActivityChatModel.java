@@ -1,12 +1,11 @@
 package io.temporal.springai.model;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.temporal.activity.ActivityOptions;
 import io.temporal.common.RetryOptions;
 import io.temporal.springai.activity.ChatModelActivity;
 import io.temporal.springai.plugin.SpringAiPlugin;
 import io.temporal.springai.plugin.SpringAiPluginOptions;
+import io.temporal.springai.util.ChatOptionsCodec;
 import io.temporal.workflow.Workflow;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -16,6 +15,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.springframework.ai.chat.messages.*;
+import org.springframework.ai.chat.metadata.ChatGenerationMetadata;
 import org.springframework.ai.chat.metadata.ChatResponseMetadata;
 import org.springframework.ai.chat.metadata.DefaultUsage;
 import org.springframework.ai.chat.metadata.RateLimit;
@@ -32,6 +32,8 @@ import org.springframework.core.io.ByteArrayResource;
 import org.springframework.util.CollectionUtils;
 import org.springframework.util.MimeType;
 import reactor.core.publisher.Flux;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.json.JsonMapper;
 
 /**
  * A {@link ChatModel} implementation that delegates to a Temporal activity.
@@ -76,22 +78,7 @@ public class ActivityChatModel implements ChatModel {
    * output goes into a {@code String} field of {@link ChatModelTypes.ModelOptions}, which
    * Temporal's own data converter then handles as normal.
    */
-  private static final ObjectMapper OPTIONS_MAPPER =
-      new ObjectMapper().addMixIn(ToolCallingChatOptions.class, ToolCallingChatOptionsMixin.class);
-
-  /**
-   * Jackson mixin that skips {@link ToolCallingChatOptions}'s tool-callback bag on serialization.
-   * Tool definitions cross the activity boundary via {@link ChatModelTypes.FunctionTool} — the
-   * actual callbacks are re-stubbed on the activity side — so we don't need to ship them, and their
-   * concrete implementations (method tool callbacks, activity proxies, etc.) are not
-   * Jackson-friendly.
-   */
-  @com.fasterxml.jackson.annotation.JsonIgnoreProperties({
-    "toolCallbacks",
-    "toolNames",
-    "toolContext"
-  })
-  private abstract static class ToolCallingChatOptionsMixin {}
+  private static final JsonMapper OPTIONS_MAPPER = ChatOptionsCodec.mapper();
 
   /** Default timeout for chat model activity calls (2 minutes). */
   public static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(2);
@@ -117,7 +104,6 @@ public class ActivityChatModel implements ChatModel {
   @Nullable private final String modelName;
   private final ActivityOptions baseOptions;
   private final ToolCallingManager toolCallingManager;
-  private final ToolExecutionEligibilityPredicate toolExecutionEligibilityPredicate;
 
   /** Use one of the {@link #forDefault()} / {@link #forModel(String)} factories. */
   private ActivityChatModel(
@@ -128,7 +114,6 @@ public class ActivityChatModel implements ChatModel {
     this.modelName = modelName;
     this.baseOptions = baseOptions;
     this.toolCallingManager = ToolCallingManager.builder().build();
-    this.toolExecutionEligibilityPredicate = new DefaultToolExecutionEligibilityPredicate();
   }
 
   /**
@@ -267,8 +252,8 @@ public class ActivityChatModel implements ChatModel {
   }
 
   @Override
-  public ChatOptions getDefaultOptions() {
-    return ToolCallingChatOptions.builder().build();
+  public ChatOptions getOptions() {
+    return new WorkflowChatOptions();
   }
 
   @Override
@@ -285,24 +270,8 @@ public class ActivityChatModel implements ChatModel {
     // Convert activity output to ChatResponse
     ChatResponse response = toResponse(output);
 
-    // Handle tool calls if the model requested them
-    if (prompt.getOptions() != null
-        && toolExecutionEligibilityPredicate.isToolExecutionRequired(
-            prompt.getOptions(), response)) {
-      var toolExecutionResult = toolCallingManager.executeToolCalls(prompt, response);
-
-      if (toolExecutionResult.returnDirect()) {
-        return ChatResponse.builder()
-            .from(response)
-            .generations(ToolExecutionResult.buildGenerations(toolExecutionResult))
-            .build();
-      }
-
-      // Send tool results back to the model
-      return internalCall(
-          new Prompt(toolExecutionResult.conversationHistory(), prompt.getOptions()));
-    }
-
+    // Spring AI 2's ChatClient ToolCallingAdvisor drives the loop on the workflow
+    // thread. A ChatModel returns the raw response and never executes tools itself.
     return response;
   }
 
@@ -338,9 +307,13 @@ public class ActivityChatModel implements ChatModel {
       String chatOptionsClass = null;
       String chatOptionsJson = null;
       try {
-        chatOptionsJson = OPTIONS_MAPPER.writeValueAsString(opts);
-        chatOptionsClass = opts.getClass().getName();
-      } catch (JsonProcessingException e) {
+        Object serializedOptions =
+            opts instanceof WorkflowChatOptions workflowOptions
+                ? workflowOptions.activityOptions()
+                : opts;
+        chatOptionsJson = OPTIONS_MAPPER.writeValueAsString(serializedOptions);
+        chatOptionsClass = serializedOptions.getClass().getName();
+      } catch (JacksonException e) {
         log.debug(
             "Could not JSON-serialize ChatOptions of type {}; activity will fall back to"
                 + " common-field path. Cause: {}",
@@ -427,7 +400,8 @@ public class ActivityChatModel implements ChatModel {
                 null,
                 null,
                 toolCalls,
-                mediaContents));
+                mediaContents,
+                assistantMessage.getMetadata()));
       }
       case TOOL -> {
         ToolResponseMessage toolMessage = (ToolResponseMessage) message;
@@ -461,7 +435,15 @@ public class ActivityChatModel implements ChatModel {
   private ChatResponse toResponse(ChatModelTypes.ChatModelActivityOutput output) {
     List<Generation> generations =
         output.generations().stream()
-            .map(gen -> new Generation(toAssistantMessage(gen.message())))
+            .map(
+                gen -> {
+                  AssistantMessage message = toAssistantMessage(gen.message());
+                  return gen.finishReason() != null
+                      ? new Generation(
+                          message,
+                          ChatGenerationMetadata.builder().finishReason(gen.finishReason()).build())
+                      : new Generation(message);
+                })
             .collect(Collectors.toList());
 
     var builder = ChatResponse.builder().generations(generations);
@@ -549,7 +531,7 @@ public class ActivityChatModel implements ChatModel {
 
     return AssistantMessage.builder()
         .content(message.rawContent())
-        .properties(Map.of())
+        .properties(message.metadata() != null ? message.metadata() : Map.of())
         .toolCalls(toolCalls)
         .media(media)
         .build();

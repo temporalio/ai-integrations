@@ -1,0 +1,1040 @@
+"""Resuming a serialized ``RunState`` inside a workflow.
+
+The Agents SDK resumes a ``RunState`` with the agent objects stored in the state, which are
+the caller's own agents. The plugin routes model resolution through
+``RunConfig.model_provider`` so those agents still call the model as Temporal activities.
+"""
+
+import asyncio
+import contextvars
+import gc
+import json
+import uuid
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import timedelta
+from typing import Any, Literal
+
+import pytest
+from agents import (
+    Agent,
+    AgentOutputSchemaBase,
+    Handoff,
+    Model,
+    ModelResponse,
+    ModelSettings,
+    ModelTracing,
+    RunConfig,
+    RunContextWrapper,
+    RunHooks,
+    Runner,
+    RunResult,
+    RunResultStreaming,
+    RunState,
+    Tool,
+    TResponseInputItem,
+    Usage,
+    function_tool,
+    handoff,
+)
+from agents.items import TResponseStreamEvent
+from agents.run_config import CallModelData, ModelInputData
+from agents.tool_context import ToolContext
+from openai.types.responses import (
+    Response,
+    ResponseCompletedEvent,
+    ResponseUsage,
+)
+from openai.types.responses.response_usage import (
+    InputTokensDetails,
+    OutputTokensDetails,
+)
+
+from temporalio import workflow
+from temporalio.client import Client
+from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.openai_agents import ModelActivityParameters, ModelSummaryProvider
+from temporalio.openai_agents._openai_runner import (
+    TemporalOpenAIRunner,
+    _convert_agent,
+)
+from temporalio.openai_agents._temporal_model_provider import (
+    _CaptureAgentFilter,  # pyright: ignore[reportPrivateUsage]
+    _TemporalModelProvider,  # pyright: ignore[reportPrivateUsage]
+    capture_scope,
+    install_model_provider,  # pyright: ignore[reportPrivateUsage]
+)
+from temporalio.openai_agents._temporal_model_stub import (
+    _TemporalModelStub,  # pyright: ignore[reportPrivateUsage]
+)
+from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
+from tests.helpers import new_worker
+
+
+@function_tool(needs_approval=True)
+async def transfer_funds(amount: int) -> str:
+    """Move money between accounts."""
+    return f"transferred {amount}"
+
+
+class ScriptedModel(Model):
+    """Model whose reply is chosen by ``reply(system_instructions, input)``.
+
+    Records every call so tests can inspect what reached the model activity.
+    """
+
+    __test__ = False
+
+    def __init__(
+        self,
+        reply: Callable[[str | None, str | list[TResponseInputItem]], ModelResponse],
+    ) -> None:
+        self.reply = reply
+        self.seen_instructions: list[str | None] = []
+        self.seen_model_settings: list[ModelSettings] = []
+
+    def _next(
+        self, system_instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        self.seen_instructions.append(system_instructions)
+        return self.reply(system_instructions, input)
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        self.seen_model_settings.append(model_settings)
+        return self._next(system_instructions, input)
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        self.seen_model_settings.append(model_settings)
+        response = self._next(system_instructions, input)
+        yield ResponseCompletedEvent(
+            response=Response(
+                id="resp_test",
+                created_at=0,
+                model="test",
+                object="response",
+                output=list(response.output),
+                parallel_tool_calls=True,
+                tool_choice="auto",
+                tools=[],
+                usage=ResponseUsage(
+                    input_tokens=1,
+                    output_tokens=1,
+                    total_tokens=2,
+                    input_tokens_details=InputTokensDetails.model_validate(
+                        {"cached_tokens": 0, "cache_write_tokens": 0}
+                    ),
+                    output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+                ),
+            ),
+            sequence_number=0,
+            type="response.completed",
+        )
+
+
+def _has_tool_output(
+    input: str | list[TResponseInputItem], call_id: str | None = None
+) -> bool:
+    return isinstance(input, list) and any(
+        isinstance(item, dict)
+        and item.get("type") == "function_call_output"
+        and (call_id is None or item.get("call_id") == call_id)
+        for item in input
+    )
+
+
+def _banker_reply(
+    _instructions: str | None, input: str | list[TResponseInputItem]
+) -> ModelResponse:
+    """Banker calls ``transfer_funds`` until it sees the tool output."""
+    if _has_tool_output(input, "call-transfer"):
+        return ResponseBuilders.output_message("Transfer complete.")
+    return ResponseBuilders.tool_call(
+        '{"amount": 5}', "transfer_funds", call_id="call-transfer"
+    )
+
+
+def _triage_reply(
+    instructions: str | None, input: str | list[TResponseInputItem]
+) -> ModelResponse:
+    """Triage hands off to the Banker; the Banker then behaves as in ``_banker_reply``."""
+    if instructions == "Hand off to the Banker.":
+        return ResponseBuilders.tool_call(
+            "{}", "transfer_to_banker", call_id="call-handoff"
+        )
+    return _banker_reply(instructions, input)
+
+
+def _run_again_reply(
+    instructions: str | None, input: str | list[TResponseInputItem]
+) -> ModelResponse:
+    """Like ``_triage_reply``, but a request with "again" gets new tool call IDs.
+
+    A real model gives every call its own ID, so only a permanent approval covers it.
+    """
+    suffix = "-again" if "again" in json.dumps(input) else ""
+    if instructions == "Hand off to the Banker.":
+        return ResponseBuilders.tool_call(
+            "{}", "transfer_to_banker", call_id=f"call-handoff{suffix}"
+        )
+    if _has_tool_output(input, f"call-transfer{suffix}"):
+        return ResponseBuilders.output_message("Transfer complete.")
+    return ResponseBuilders.tool_call(
+        '{"amount": 5}', "transfer_funds", call_id=f"call-transfer{suffix}"
+    )
+
+
+def _make_banker() -> Agent[None]:
+    return Agent[None](
+        name="Banker",
+        instructions="Move money when asked.",
+        tools=[transfer_funds],
+    )
+
+
+def _make_triage(use_handoff_object: bool) -> Agent[None]:
+    banker = _make_banker()
+    return Agent[None](
+        name="Triage",
+        instructions="Hand off to the Banker.",
+        handoffs=[handoff(banker) if use_handoff_object else banker],
+    )
+
+
+class YieldingHooks(RunHooks[None]):
+    """Hooks that suspend between the input filter and the model call."""
+
+    async def on_llm_start(
+        self,
+        context: RunContextWrapper[None],
+        agent: Agent[None],
+        system_prompt: str | None,
+        input_items: list[TResponseInputItem],
+    ) -> None:
+        await asyncio.sleep(0)
+
+
+async def _run(
+    agent: Agent[None],
+    input: str | RunState[None],
+    *,
+    streamed: bool,
+    run_config: RunConfig | None = None,
+    hooks: RunHooks[None] | None = None,
+    # The SDK also accepts a run's RunContextWrapper here, which keeps its approvals,
+    # but the parameter is typed as the user's context.
+    context: Any = None,
+) -> RunResult | RunResultStreaming:
+    if not streamed:
+        return await Runner.run(
+            agent, input, run_config=run_config, hooks=hooks, context=context
+        )
+    result = Runner.run_streamed(
+        agent, input, run_config=run_config, hooks=hooks, context=context
+    )
+    async for _ in result.stream_events():
+        pass
+    return result
+
+
+async def _approve_and_resume(
+    agent: Agent[None],
+    state: RunState[None],
+    *,
+    streamed: bool,
+    run_config: RunConfig | None = None,
+    hooks: RunHooks[None] | None = None,
+) -> list[str]:
+    for interruption in state.get_interruptions():
+        state.approve(interruption)
+    resumed = await _run(
+        agent, state, streamed=streamed, run_config=run_config, hooks=hooks
+    )
+    return [
+        str(resumed.final_output),
+        *[str(item.output) for item in resumed.new_items if hasattr(item, "output")],
+    ]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff_object", [False, True])
+async def test_converted_handoff_restores_tool_use_after_resume(
+    streamed: bool, use_handoff_object: bool
+) -> None:
+    banker = _make_banker()
+    banker.model_settings.tool_choice = "required"
+    triage = Agent[None](
+        name="Triage",
+        handoffs=[handoff(banker) if use_handoff_object else banker],
+    )
+    state = RunState(
+        context=RunContextWrapper(context=None),
+        original_input="Move 5 dollars.",
+        starting_agent=banker,
+        max_turns=10,
+    )
+    state.set_tool_use_tracker_snapshot({"Banker": ["transfer_funds"]})
+    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    restored = await RunState.from_string(converted, state.to_string())
+    model = ScriptedModel(
+        lambda _instructions, _input: ResponseBuilders.output_message(
+            "Transfer complete."
+        )
+    )
+    result = await _run(
+        converted, restored, streamed=streamed, run_config=RunConfig(model=model)
+    )
+    assert result.final_output == "Transfer complete."
+    assert model.seen_model_settings[0].tool_choice is None
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("shared_target", ["agent", "tool", "both"])
+async def test_shared_handoff_target_restores_after_approval(
+    streamed: bool, shared_target: Literal["agent", "tool", "both"]
+) -> None:
+    banker = _make_banker()
+    other = Agent[None](name="Other", instructions="Other", handoffs=[handoff(banker)])
+    triage = Agent[None](name="Triage", instructions="Triage", handoffs=[other])
+    if shared_target in ("agent", "both"):
+        triage.handoffs.append(banker)
+    if shared_target in ("tool", "both"):
+        triage.tools.append(
+            banker.as_tool(tool_name="ask_banker", tool_description="Ask Banker")
+        )
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions == "Triage":
+            return ResponseBuilders.tool_call(
+                "{}", "transfer_to_other", call_id="triage-other"
+            )
+        if instructions == "Other":
+            return ResponseBuilders.tool_call(
+                "{}", "transfer_to_banker", call_id="other-banker"
+            )
+        return _banker_reply(instructions, input)
+
+    config = RunConfig(model=ScriptedModel(reply))
+    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    result = await _run(
+        converted, "Move 5 dollars.", streamed=streamed, run_config=config
+    )
+    assert len(result.interruptions) == 1
+    restored = await RunState.from_string(triage, result.to_state().to_string())
+    assert await _approve_and_resume(
+        triage, restored, streamed=streamed, run_config=config
+    ) == ["Transfer complete.", "transferred 5"]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_shared_handoff_target_tool_restores_nested_approval(
+    streamed: bool,
+) -> None:
+    banker = _make_banker()
+    triage = Agent[None](
+        name="Triage",
+        instructions="Triage",
+        handoffs=[handoff(banker)],
+        tools=[banker.as_tool(tool_name="ask_banker", tool_description="Ask Banker")],
+    )
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions != "Triage":
+            return _banker_reply(instructions, input)
+        if _has_tool_output(input, "ask-banker"):
+            return ResponseBuilders.output_message("Done.")
+        return ResponseBuilders.tool_call(
+            '{"input": "Move 5 dollars."}', "ask_banker", call_id="ask-banker"
+        )
+
+    config = RunConfig(model=ScriptedModel(reply))
+    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    result = await _run(
+        converted, "Move 5 dollars.", streamed=streamed, run_config=config
+    )
+    assert len(result.interruptions) == 1
+    restored = await RunState.from_string(triage, result.to_state().to_string())
+    resumed = await _approve_and_resume(
+        triage, restored, streamed=streamed, run_config=config
+    )
+    assert resumed[0] == "Done."
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("change", ["instructions", "tools"])
+@pytest.mark.parametrize("graph", ["target", "downstream", "shared_cycle"])
+async def test_handoff_callback_updates_cached_graph(
+    streamed: bool,
+    change: Literal["instructions", "tools"],
+    graph: Literal["target", "downstream", "shared_cycle"],
+) -> None:
+    banker = Agent[None](name="Banker", instructions="Before callback.")
+    target = (
+        banker
+        if graph == "target"
+        else Agent[None](name="Other", instructions="Other", handoffs=[banker])
+    )
+    handoff_count = 0
+
+    async def configure_target(_context: RunContextWrapper[None]) -> None:
+        nonlocal handoff_count
+        handoff_count += 1
+        if change == "instructions":
+            banker.instructions = f"After callback {handoff_count}."
+        else:
+            banker.tools = [transfer_funds]
+
+    triage = Agent[None](
+        name="Triage",
+        instructions="Triage",
+        handoffs=[handoff(target, on_handoff=configure_target)],
+    )
+    if graph == "shared_cycle":
+        banker.handoffs = [triage]
+        triage.handoffs.append(banker)
+        triage.tools = [
+            banker.as_tool(tool_name="ask_banker", tool_description="Ask Banker")
+        ]
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions == "Triage":
+            return ResponseBuilders.tool_call(
+                "{}", f"transfer_to_{target.name.lower()}", call_id="triage-target"
+            )
+        if instructions == "Other":
+            return ResponseBuilders.tool_call(
+                "{}", "transfer_to_banker", call_id="triage-banker"
+            )
+        if change == "tools":
+            return _banker_reply(instructions, input)
+        return ResponseBuilders.output_message(instructions or "")
+
+    config = RunConfig(model=ScriptedModel(reply))
+    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    for invocation in range(1, 3):
+        result = await _run(
+            converted, "Move 5 dollars.", streamed=streamed, run_config=config
+        )
+        if change == "instructions":
+            assert result.final_output == f"After callback {invocation}."
+        else:
+            assert len(result.interruptions) == 1
+            restored = await RunState.from_string(triage, result.to_state().to_string())
+            assert await _approve_and_resume(
+                triage, restored, streamed=streamed, run_config=config
+            ) == ["Transfer complete.", "transferred 5"]
+
+
+@workflow.defn
+class ResumeRunStateWorkflow:
+    """Interrupt for approval, restore the state from its string, approve and resume."""
+
+    @workflow.init
+    def __init__(
+        self, streamed: bool, use_handoff: str, run_again: bool = False
+    ) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(
+        self, streamed: bool, use_handoff: str, run_again: bool = False
+    ) -> list[str]:
+        agent = (
+            _make_banker()
+            if use_handoff == "none"
+            else _make_triage(use_handoff == "object")
+        )
+        result = await _run(agent, "Move 5 dollars.", streamed=streamed)
+        assert len(result.interruptions) == 1
+        assert result.last_agent.name == "Banker"
+        state = await RunState.from_string(agent, result.to_state().to_string())
+        if not run_again:
+            return await _approve_and_resume(agent, state, streamed=streamed)
+        # Approve for good, then run the same agent again with the same context.
+        state.approve(state.get_interruptions()[0], always_approve=True)
+        resumed = await _run(agent, state, streamed=streamed)
+        again = await _run(
+            agent,
+            "Move 5 dollars again.",
+            streamed=streamed,
+            context=resumed.context_wrapper,
+        )
+        return [
+            str(again.final_output),
+            *[str(item.output) for item in again.new_items if hasattr(item, "output")],
+        ]
+
+
+@workflow.defn
+class ResumeAcrossContinueAsNewWorkflow:
+    """Carry the serialized state through ``continue_as_new`` and resume it there."""
+
+    @workflow.run
+    async def run(self, state_string: str | None) -> list[str]:
+        agent = _make_banker()
+        if state_string is None:
+            result = await Runner.run(agent, "Move 5 dollars.")
+            workflow.continue_as_new(result.to_state().to_string())
+        state = await RunState.from_string(agent, state_string)
+        return [
+            f"continued={workflow.info().continued_run_id is not None}",
+            *await _approve_and_resume(agent, state, streamed=False),
+        ]
+
+
+@workflow.defn
+class ResumeWithInputFilterWorkflow:
+    """Resume a state with the user's own ``call_model_input_filter``."""
+
+    def __init__(self) -> None:
+        self.filter_agents: list[str] = []
+
+    @workflow.run
+    async def run(self, kind: str, resume: bool) -> list[str]:
+        def tag(data: CallModelData[Any]) -> ModelInputData:
+            self.filter_agents.append(data.agent.name)
+            return ModelInputData(
+                input=data.model_data.input,
+                instructions=f"{data.model_data.instructions} [filtered]",
+            )
+
+        async def async_tag(data: CallModelData[Any]) -> ModelInputData:
+            await asyncio.sleep(0)
+            return tag(data)
+
+        config = RunConfig(
+            call_model_input_filter=async_tag if kind == "async" else tag
+        )
+        agent = _make_banker()
+        result = await Runner.run(agent, "Move 5 dollars.", run_config=config)
+        if not resume:
+            return [*self.filter_agents]
+        state = await RunState.from_string(agent, result.to_state().to_string())
+        await _approve_and_resume(agent, state, streamed=False, run_config=config)
+        return [*self.filter_agents]
+
+
+@workflow.defn
+class ConcurrentNestedResumeWorkflow:
+    """Resume two saved states concurrently from tools that share the parent's run config."""
+
+    @workflow.run
+    async def run(self) -> str:
+        agents = [
+            Agent[None](
+                name=name,
+                instructions=f"You are {name}.",
+                tools=[transfer_funds],
+            )
+            for name in ("Alpha", "Beta")
+        ]
+        results = await asyncio.gather(
+            *[Runner.run(agent, "Move 5 dollars.") for agent in agents]
+        )
+        states = [
+            await RunState.from_string(agent, result.to_state().to_string())
+            for agent, result in zip(agents, results)
+        ]
+
+        def resume_tool(agent: Agent[None], state: RunState[None]) -> Tool:
+            @function_tool(name_override=f"resume_{agent.name.lower()}")
+            async def resume(ctx: ToolContext[None]) -> str:
+                """Approve and resume the saved run."""
+                for interruption in state.get_interruptions():
+                    state.approve(interruption)
+                result = await Runner.run(
+                    agent, state, run_config=ctx.run_config, hooks=YieldingHooks()
+                )
+                return str(result.final_output)
+
+            return resume
+
+        orchestrator = Agent[None](
+            name="Orchestrator",
+            instructions="You are Orchestrator.",
+            tools=[resume_tool(a, s) for a, s in zip(agents, states)],
+        )
+        result = await Runner.run(orchestrator, "Resume both.")
+        return str(result.final_output)
+
+
+@workflow.defn
+class ConcurrentAgentToolsWorkflow:
+    """Run two agents-as-tools concurrently within one run (fresh, not resumed)."""
+
+    @workflow.run
+    async def run(self) -> str:
+        helpers = [
+            Agent[None](name=name, instructions=f"You are {name}.")
+            for name in ("Alpha", "Beta")
+        ]
+        orchestrator = Agent[None](
+            name="Orchestrator",
+            instructions="You are Orchestrator.",
+            tools=[
+                helper.as_tool(
+                    tool_name=f"ask_{helper.name.lower()}",
+                    tool_description=f"Ask {helper.name}",
+                )
+                for helper in helpers
+            ],
+        )
+        result = await Runner.run(orchestrator, "Ask both.")
+        return str(result.final_output)
+
+
+def _orchestrator_reply(tool_names: list[str]) -> Callable[..., ModelResponse]:
+    """Orchestrator calls all ``tool_names`` in one response, then finishes."""
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions != "You are Orchestrator.":
+            return _banker_reply(instructions, input)
+        if _has_tool_output(input):
+            return ResponseBuilders.output_message("done")
+        return ModelResponse(
+            output=[
+                item
+                for name in tool_names
+                for item in ResponseBuilders.tool_call(
+                    '{"input": "hi"}' if name.startswith("ask") else "{}",
+                    name,
+                    call_id=f"call-{name}",
+                ).output
+            ],
+            usage=Usage(),
+            response_id=None,
+        )
+
+    return reply
+
+
+class AgentAndInstructions(ModelSummaryProvider):
+    def provide(
+        self,
+        agent: Agent[Any] | None,
+        instructions: str | None,
+        input: str | list[TResponseInputItem],
+    ) -> str:
+        return f"{agent.name if agent else None}|{instructions}"
+
+
+@function_tool
+async def lookup() -> str:
+    """Look something up."""
+    return "found"
+
+
+@function_tool(failure_error_function=None)
+async def explode() -> str:
+    """Raise out of the run."""
+    raise ValueError("boom")
+
+
+@function_tool(failure_error_function=None)
+async def cancel_run() -> str:
+    """Cancel the run from inside a tool."""
+    raise asyncio.CancelledError
+
+
+def _multi_turn_reply(
+    instructions: str | None, input: str | list[TResponseInputItem]
+) -> ModelResponse:
+    """Call ``lookup`` first, then finish, or raise on the second turn as instructed."""
+    if _has_tool_output(input):
+        if instructions == "Fail on turn two.":
+            return ResponseBuilders.tool_call("{}", "explode", call_id="call-explode")
+        if instructions == "Cancel on turn two.":
+            return ResponseBuilders.tool_call("{}", "cancel_run", call_id="call-cancel")
+        return ResponseBuilders.output_message("done")
+    return ResponseBuilders.tool_call("{}", "lookup", call_id="call-lookup")
+
+
+_CAPTURE_VAR_NAME = "temporal_openai_agents_current_agent"
+
+_MODE_INSTRUCTIONS = {
+    "error": "Fail on turn two.",
+    "cancelled": "Cancel on turn two.",
+}
+
+
+async def _run_once(mode: str, agent: Agent[None], config: RunConfig) -> None:
+    if mode == "streamed_cancel":
+        result = Runner.run_streamed(agent, "Go.", run_config=config)
+        async for event in result.stream_events():
+            if event.type == "run_item_stream_event" and event.name == "tool_output":
+                result.cancel()
+    elif mode == "streamed":
+        result = Runner.run_streamed(agent, "Go.", run_config=config)
+        async for _ in result.stream_events():
+            pass
+    else:
+        await Runner.run(agent, "Go.", run_config=config)
+
+
+@workflow.defn
+class RepeatedRunsWorkflow:
+    """Run agents back to back in one workflow task, then inspect what its context retains."""
+
+    @workflow.init
+    def __init__(self, mode: str, runs: int) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self, mode: str, runs: int) -> dict[str, int]:
+        agent_refs: list[weakref.ReferenceType[Agent[Any]]] = []
+
+        def record(data: CallModelData[Any]) -> ModelInputData:
+            agent_refs.append(weakref.ref(data.agent))
+            return data.model_data
+
+        config = RunConfig(call_model_input_filter=record)
+        failures = 0
+        for _ in range(runs):
+            agent = Agent[None](
+                name="Looker",
+                instructions=_MODE_INSTRUCTIONS.get(mode, "Look it up."),
+                tools=[lookup, explode, cancel_run],
+            )
+            try:
+                await _run_once(mode, agent, config)
+            except (Exception, asyncio.CancelledError):
+                failures += 1
+            del agent
+        # Let task cleanup callbacks release the final failed or cancelled run.
+        await asyncio.sleep(0)
+        gc.collect()
+        context = contextvars.copy_context()
+        return {
+            "failures": failures,
+            "model_calls": len(agent_refs),
+            "context_vars": sum(1 for var in context if var.name == _CAPTURE_VAR_NAME),
+            "context_agents": sum(isinstance(v, Agent) for v in context.values()),
+            "live_agents": sum(ref() is not None for ref in agent_refs),
+        }
+
+
+ALL_WORKFLOWS = [
+    ResumeRunStateWorkflow,
+    ResumeAcrossContinueAsNewWorkflow,
+    ResumeWithInputFilterWorkflow,
+    ConcurrentNestedResumeWorkflow,
+    ConcurrentAgentToolsWorkflow,
+    RepeatedRunsWorkflow,
+]
+
+
+async def _execute(
+    client: Client,
+    model: Model,
+    workflow_run: Any,
+    *args: object,
+    summary_override: ModelSummaryProvider | None = None,
+) -> tuple[Any, list[str]]:
+    """Run a workflow and return its result and the activity summaries from its history."""
+    async with AgentEnvironment(
+        model=model,
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+            summary_override=summary_override,
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, *ALL_WORKFLOWS) as worker:
+            handle = await client.start_workflow(
+                workflow_run,
+                args=args,
+                id=f"resume-run-state-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            result = await handle.result(follow_runs=True)
+            summaries = [
+                json.loads(e.user_metadata.summary.data)
+                async for e in handle.fetch_history_events()
+                if e.HasField("activity_task_scheduled_event_attributes")
+            ]
+            return result, summaries
+
+
+async def test_resume_run_state_from_string(client: Client):
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_banker_reply),
+        ResumeRunStateWorkflow.run,
+        False,
+        "none",
+    )
+    assert result == ["Transfer complete.", "transferred 5"]
+
+
+async def test_resume_run_state_from_string_streamed(client: Client):
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_banker_reply),
+        ResumeRunStateWorkflow.run,
+        True,
+        "none",
+    )
+    assert result == ["Transfer complete.", "transferred 5"]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff", ["agent", "object"])
+async def test_resume_run_state_after_handoff(
+    client: Client, streamed: bool, use_handoff: str
+):
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_triage_reply),
+        ResumeRunStateWorkflow.run,
+        streamed,
+        use_handoff,
+    )
+    assert result == ["Transfer complete.", "transferred 5"]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff", ["none", "agent", "object"])
+async def test_always_approve_covers_later_runs_of_the_same_agent(
+    client: Client, streamed: bool, use_handoff: str
+):
+    # The SDK keeps a permanent approval on the agent that owns the tool, so the
+    # plugin must run the caller's agent, not a copy of it.
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_run_again_reply),
+        ResumeRunStateWorkflow.run,
+        streamed,
+        use_handoff,
+        True,
+    )
+    assert result == ["Transfer complete.", "transferred 5"]
+
+
+async def test_resume_run_state_across_continue_as_new(client: Client):
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_banker_reply),
+        ResumeAcrossContinueAsNewWorkflow.run,
+        None,
+    )
+    assert result == ["continued=True", "Transfer complete.", "transferred 5"]
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("resume", [False, True])
+async def test_user_input_filter_is_forwarded(client: Client, kind: str, resume: bool):
+    model = ScriptedModel(_banker_reply)
+    filter_agents, _ = await _execute(
+        client, model, ResumeWithInputFilterWorkflow.run, kind, resume
+    )
+    expected_agents = ["Banker", "Banker"] if resume else ["Banker"]
+    assert filter_agents == expected_agents
+    assert model.seen_instructions == ["Move money when asked. [filtered]"] * len(
+        expected_agents
+    )
+
+
+async def test_activity_summary_names_each_concurrently_resumed_agent(client: Client):
+    result, summaries = await _execute(
+        client,
+        ScriptedModel(_orchestrator_reply(["resume_alpha", "resume_beta"])),
+        ConcurrentNestedResumeWorkflow.run,
+        summary_override=AgentAndInstructions(),
+    )
+    assert result == "done"
+    assert sorted(summaries) == sorted(
+        [
+            "Orchestrator|You are Orchestrator.",
+            "Orchestrator|You are Orchestrator.",
+            *[f"{name}|You are {name}." for name in ("Alpha", "Beta")] * 2,
+        ]
+    )
+
+
+async def test_activity_summary_names_each_concurrent_agent_tool(client: Client):
+    result, summaries = await _execute(
+        client,
+        ScriptedModel(_orchestrator_reply(["ask_alpha", "ask_beta"])),
+        ConcurrentAgentToolsWorkflow.run,
+        summary_override=AgentAndInstructions(),
+    )
+    assert result == "done"
+    assert sorted(summaries) == sorted(
+        [
+            "Orchestrator|You are Orchestrator.",
+            "Alpha|You are Alpha.",
+            "Beta|You are Beta.",
+            "Orchestrator|You are Orchestrator.",
+        ]
+    )
+
+
+async def test_default_summary_is_agent_name_after_resume(client: Client):
+    _, summaries = await _execute(
+        client, ScriptedModel(_banker_reply), ResumeRunStateWorkflow.run, False, "none"
+    )
+    assert summaries == ["Banker", "Banker"]
+
+
+def _call_data(agent: Agent[Any]) -> CallModelData[Any]:
+    return CallModelData(
+        model_data=ModelInputData(input=[], instructions="base"),
+        agent=agent,
+        context=None,
+    )
+
+
+async def test_capture_filter_returns_user_result_unchanged():
+    agent = _make_banker()
+    returned = ModelInputData(input=[], instructions="from user")
+    seen: list[CallModelData[Any]] = []
+
+    def sync_filter(data: CallModelData[Any]) -> ModelInputData:
+        seen.append(data)
+        return returned
+
+    async def async_filter(_data: CallModelData[Any]) -> ModelInputData:
+        return returned
+
+    provider = _TemporalModelProvider(ModelActivityParameters())
+    data = _call_data(agent)
+
+    sync_config = provider.install(RunConfig(call_model_input_filter=sync_filter))
+    assert sync_config.call_model_input_filter is not None
+    assert sync_config.call_model_input_filter(data) is returned
+    assert seen == [data]
+
+    async_config = provider.install(RunConfig(call_model_input_filter=async_filter))
+    assert async_config.call_model_input_filter is not None
+    awaitable = async_config.call_model_input_filter(data)
+    assert isinstance(awaitable, Awaitable)
+    assert await awaitable is returned
+
+    no_filter = provider.install(RunConfig())
+    assert no_filter.call_model_input_filter is not None
+    assert no_filter.call_model_input_filter(data) is data.model_data
+
+    # A Model object would run in the Workflow, so it is refused before the call.
+    agent.model = ScriptedModel(_banker_reply)
+    with pytest.raises(ValueError, match="model name to be a string"):
+        no_filter.call_model_input_filter(_call_data(agent))
+
+
+def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs():
+    target = Agent(name="target", model=ScriptedModel(_banker_reply))
+    middle = Agent(name="middle", handoffs=[target])
+    starting = Agent(name="starting", handoffs=[middle])
+    middle.handoffs.append(starting)  # a loop must not recurse forever
+    runner = TemporalOpenAIRunner(ModelActivityParameters())
+    with pytest.raises(ValueError, match="model name to be a string"):
+        runner._prepare_workflow_run(starting, {})
+
+
+async def test_capture_filter_resolves_agent_lazily_and_is_installed_once():
+    agent = _make_banker()
+    params = ModelActivityParameters()
+    config = install_model_provider(params, RunConfig())
+    provider = config.model_provider
+    assert isinstance(provider, _TemporalModelProvider)
+    stub = provider.get_model("gpt-4o")
+    assert isinstance(stub, _TemporalModelStub)
+    assert stub._current_agent is not None  # pyright: ignore[reportPrivateUsage]
+    assert stub._current_agent() is None  # pyright: ignore[reportPrivateUsage]
+
+    assert config.call_model_input_filter is not None
+    config.call_model_input_filter(_call_data(agent))
+    assert stub._current_agent() is agent  # pyright: ignore[reportPrivateUsage]
+
+    # A nested run reuses the parent's provider and filter instead of wrapping them again.
+    nested = install_model_provider(params, config)
+    assert nested.model_provider is provider
+    assert isinstance(nested.call_model_input_filter, _CaptureAgentFilter)
+    assert nested.call_model_input_filter.wrapped is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "runs", "failures"),
+    [
+        ("run", 20, 0),
+        ("streamed", 20, 0),
+        ("error", 20, 20),
+        ("cancelled", 5, 5),
+        ("streamed_cancel", 5, 5),
+    ],
+)
+async def test_finished_runs_leave_no_agent_in_workflow_context(
+    client: Client, mode: str, runs: int, failures: int
+):
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_multi_turn_reply),
+        RepeatedRunsWorkflow.run,
+        mode,
+        runs,
+    )
+    assert result["failures"] == failures
+    assert result["model_calls"] >= runs
+    retained = {k: result[k] for k in ("context_vars", "context_agents", "live_agents")}
+    assert retained == {"context_vars": 0, "context_agents": 0, "live_agents": 0}
+
+
+def test_capture_scope_restores_the_callers_context():
+    outer_agent, inner_agent = _make_banker(), _make_triage(False)
+    config = install_model_provider(ModelActivityParameters(), RunConfig())
+    provider = config.model_provider
+    assert isinstance(provider, _TemporalModelProvider)
+    stub = provider.get_model("gpt-4o")
+    assert isinstance(stub, _TemporalModelStub)
+    current_agent = stub._current_agent  # pyright: ignore[reportPrivateUsage]
+    assert current_agent is not None
+    assert config.call_model_input_filter is not None
+    capture = config.call_model_input_filter
+
+    def captured_vars() -> list[contextvars.ContextVar[Any]]:
+        return [
+            var for var in contextvars.copy_context() if var.name == _CAPTURE_VAR_NAME
+        ]
+
+    def check() -> None:
+        assert captured_vars() == []
+        with pytest.raises(RuntimeError):
+            with capture_scope():
+                capture(_call_data(outer_agent))
+                with capture_scope():
+                    assert current_agent() is None
+                    capture(_call_data(inner_agent))
+                    assert current_agent() is inner_agent
+                assert current_agent() is outer_agent
+                raise RuntimeError
+        assert captured_vars() == []
+
+    contextvars.Context().run(check)

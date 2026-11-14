@@ -1,0 +1,13 @@
+{
+  "extends": [
+    "@tsconfig/node20/tsconfig.json",
+    "../../../_shared/tsconfig.json"
+  ],
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./lib"
+  },
+  "include": [
+    "src/**/*.ts"
+  ]
+}

@@ -1,0 +1,141 @@
+import type { ProviderV4 } from '@ai-sdk/provider';
+import { SimplePlugin } from '@temporalio/plugin';
+import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
+import type { Duration } from '@temporalio/common/lib/time';
+import { createActivities, _evictMcpConnectionsForServer } from './activities';
+import type { CreateActivitiesOptions } from './activities';
+import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
+import type { McpClientFactories } from './mcp';
+
+/**
+ * Options for the AI SDK plugin
+ */
+export interface AiSdkPluginOptions {
+  modelProvider: ProviderV4;
+
+  /**
+   * This object contains a mapping of server names to functions which create MCP clients.
+   * Any TemporalMCPClient used in a workflow should have its associated servername listed in this object.
+   */
+  mcpClientFactories?: McpClientFactories;
+
+  /**
+   * How long an idle worker-process MCP connection is kept open (and reused across `listTools`/`callTool`
+   * activity invocations) before it's closed. Accepts a millisecond number or duration string (e.g.
+   * `'5 minutes'`), like `startToCloseTimeout`. Defaults to 5 minutes.
+   *
+   * Pass `0` to disable connection reuse and restore the original create-then-close-per-call behavior,
+   * for MCP servers/transports that don't tolerate a reused or concurrent session.
+   */
+  mcpConnectionIdleTimeout?: Duration;
+
+  /**
+   * Downloads a prompt file or image URL that the model does not support, before the
+   * model activity calls the model. Defaults to `createDownload()` from `ai`.
+   */
+  download?: CreateActivitiesOptions['download'];
+}
+
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * A Temporal plugin that integrates AI SDK providers for use in workflows.
+ * This plugin creates activities that allow workflows to invoke AI models.
+ *
+ * Workflow code should import from `@temporalio/vercel-ai-sdk/workflow` (not the package root) so the
+ * workflow bundle doesn't pull in the worker-side activities and their disallowed imports.
+ */
+export class AiSdkPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
+  private readonly activities: object;
+
+  constructor(options: AiSdkPluginOptions) {
+    const mcpServerNames = Object.keys(options.mcpClientFactories ?? {});
+    const activities = createActivities(options.modelProvider, options.mcpClientFactories, {
+      mcpConnectionIdleTimeout: options.mcpConnectionIdleTimeout,
+      download: options.download,
+    });
+    super({
+      name: 'AiSDKPlugin',
+      activities,
+      runContext: async (next) => {
+        try {
+          await next();
+        } finally {
+          // Close any worker-process MCP connections opened lazily by the listTools/callTool activities.
+          for (const name of mcpServerNames) {
+            await _evictMcpConnectionsForServer(name);
+          }
+        }
+      },
+    });
+    this.activities = activities;
+  }
+
+  /**
+   * Adds the model and MCP Activities to the Worker.
+   *
+   * @throws TypeError if the Worker already has a different Activity with one
+   * of these names: a caller Activity, another integration's Activity, or an
+   * `AiSdkPlugin` with a different `modelProvider`, `download`, MCP client
+   * factory or `mcpConnectionIdleTimeout`.
+   */
+  override configureWorker(options: WorkerOptions): WorkerOptions {
+    refuseReplacedActivities('AiSdkPlugin', options.activities, this.activities);
+    return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this
+   * one replaced one of its Activities with a different one. `Worker.create`
+   * applies the Worker's plugins in order, then the `NativeConnection`'s.
+   */
+  override runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    // Not async: when the check passes, the Worker starts in this tick, as
+    // `Worker.runUntil` needs (see `refuseLaterReplacement`).
+    return (
+      refuseLaterReplacement('AiSdkPlugin', worker, this.activities, next) ??
+      super.runWorker(worker, next)
+    );
+  }
+
+  override configureBundler(options: BundleOptions): BundleOptions {
+    // Prepend a polyfill-installer module to the webpack `entry` array so it
+    // evaluates before any other module in the Workflow bundle. Webpack 5
+    // emits multi-entry scripts that execute in array order at script-load,
+    // so this guarantees the Web-API globals (`TransformStream`, `Headers`,
+    // ...) exist before `ai` is evaluated (it defines `class ... extends
+    // TransformStream` at module scope), making the relative import order of
+    // `@temporalio/vercel-ai-sdk/workflow` and `ai` in workflow code irrelevant.
+    const polyfillPath = require.resolve('./preload-polyfills');
+    const baseOptions = super.configureBundler(options);
+    const existingHook = baseOptions.webpackConfigHook;
+    return {
+      ...baseOptions,
+      webpackConfigHook: (config) => {
+        const cfg = existingHook ? existingHook(config) : config;
+        const existingEntry = cfg.entry;
+        const entries = Array.isArray(existingEntry)
+          ? existingEntry
+          : existingEntry !== undefined
+            ? [existingEntry as string]
+            : [];
+        // Webpack refuses a repeated entry, and another AiSdkPlugin may have added it.
+        if (entries.includes(polyfillPath)) return cfg;
+        return { ...cfg, entry: [polyfillPath, ...entries] };
+      },
+    };
+  }
+}

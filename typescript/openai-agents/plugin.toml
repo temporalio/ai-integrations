@@ -1,0 +1,14 @@
+[plugin]
+name = "openai-agents"
+language = "typescript"
+coordinate = "@temporalio/openai-agents"
+registry = "npm"
+root-api = "@temporalio/openai-agents"
+maturity = "generally-available"
+docs = "https://docs.temporal.io/develop/typescript/integrations/openai-agents"
+
+[ci]
+runtime-versions = ["22", "24"]
+
+[smoke]
+imports = ["@temporalio/openai-agents"]

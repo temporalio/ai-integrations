@@ -1,0 +1,14 @@
+[plugin]
+name = "strands-agents"
+language = "typescript"
+coordinate = "@temporalio/strands-agents"
+registry = "npm"
+root-api = "@temporalio/strands-agents"
+maturity = "pre-release"
+docs = "https://docs.temporal.io/develop/typescript/integrations/strands-agents"
+
+[ci]
+runtime-versions = ["22", "24"]
+
+[smoke]
+imports = ["@temporalio/strands-agents"]

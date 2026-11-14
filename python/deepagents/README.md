@@ -46,7 +46,7 @@ class ResearchAgent:
         # create_temporal_deep_agent wraps deepagents' create_deep_agent and
         # scopes this agent's model-call activity options explicitly.
         agent = create_temporal_deep_agent(
-            model="anthropic:claude-sonnet-4-5",
+            model="anthropic:claude-sonnet-5-5",
             system_prompt="You are a careful research assistant.",
             activity_options={"start_to_close_timeout": timedelta(minutes=5)},
         )
@@ -130,6 +130,7 @@ from datetime import timedelta
 from langchain_core.tools import tool
 from temporalio import activity
 from temporalio.deepagents import activity_as_tool, tool_as_activity
+from temporalio.workflow import ActivityConfig
 
 
 @activity.defn
@@ -146,7 +147,8 @@ def web_search(query: str) -> str:
 
 # An existing Temporal activity, exposed to the agent as a tool:
 weather_tool = activity_as_tool(
-    get_weather, start_to_close_timeout=timedelta(seconds=30)
+    get_weather,
+    activity_options=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
 )
 # A LangChain tool whose body does I/O, moved into an activity:
 search_tool = tool_as_activity(
@@ -159,19 +161,61 @@ search_tool])`. An unwrapped, non-builtin tool runs in-workflow and the plugin
 warns at construction, so the choice is never silent. Deep Agents' pure
 built-ins (`write_todos`, state-backed file tools) stay in-workflow by design.
 
+`activity_as_tool` takes every activity option through `activity_options`, an
+`ActivityConfig`: timeouts (`start_to_close_timeout` or
+`schedule_to_close_timeout` is required), `retry_policy`, `summary` (default
+`"tool:<name>"`), `activity_id`, and routing such as `task_queue`. Route a slow
+tool to its own workers with `task_queue="weather-tools"` (a worker registered
+for `get_weather` must then poll that queue), or set `heartbeat_timeout` for an
+activity that heartbeats, so a lost worker is noticed at the heartbeat instead
+of at start-to-close. `arg` and `args` are reserved: the tool builds them from
+the model's call.
+
+Call `tool_as_activity(...)` at module import or worker startup on **every
+activity worker** that can receive `deepagents.invoke_tool`. Registration is
+process-local; calling it only inside a workflow does not register the tool in
+another process. With `activity_as_tool(...)`, register the underlying Temporal
+activity on every worker polling its task queue.
+
+A wrapped tool gets LangChain messages in its arguments as message objects, as
+it does without Temporal. For example, `state["messages"]` from `InjectedState`
+holds `HumanMessage` and `AIMessage` objects, not dicts. This covers the message
+classes in `langchain_core.messages` and their chunks; a subclass you define
+still arrives as a dict. Values inside a message, such as a `ToolMessage`
+artifact, keep their JSON form, so a `Document` artifact arrives as a dict.
+Update activity workers before or together with workflow workers: an older
+activity worker still passes the messages to the tool as dicts.
+
 ## Durable file and shell backends
 
-Wrap a real-I/O backend (`FilesystemBackend` / `LocalShellBackend` /
-`StoreBackend`) in `TemporalBackend` and the agent's *built-in* file and shell
-tools execute as durable `deepagents.backend_op` Activities instead of touching
-disk from workflow code:
+Use `TemporalBackend("name", ...)` for a real-I/O backend
+(`FilesystemBackend` / `LocalShellBackend` / a remote sandbox). The agent's
+*built-in* file and shell tools execute as durable `deepagents.backend_op`
+Activities. Each activity worker constructs the backend from the configuration
+sent with the operation, so multiple worker processes and serverless workers
+can execute it independently:
 
 ```python
 from datetime import timedelta
 
 from deepagents.backends import FilesystemBackend
 from temporalio import workflow
-from temporalio.deepagents import TemporalBackend, create_temporal_deep_agent
+from temporalio.deepagents import (
+    DeepAgentsPlugin,
+    TemporalBackend,
+    create_temporal_deep_agent,
+)
+from temporalio.workflow import ActivityConfig
+
+
+# Configure this plugin on every worker polling backend activities.
+plugin = DeepAgentsPlugin(
+    backends={
+        "filesystem": lambda root_dir: FilesystemBackend(
+            root_dir=root_dir, virtual_mode=True
+        ),
+    }
+)
 
 
 @workflow.defn
@@ -179,11 +223,15 @@ class FilesystemAgent:
     @workflow.run
     async def run(self, root_dir: str) -> str:
         backend = TemporalBackend(
-            FilesystemBackend(root_dir=root_dir, virtual_mode=True),
-            activity_options={"start_to_close_timeout": timedelta(seconds=30)},
+            "filesystem",
+            factory_argument=root_dir,
+            backend_type=FilesystemBackend,
+            activity_options=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=30)
+            ),
         )
         agent = create_temporal_deep_agent(
-            model="anthropic:claude-sonnet-4-5",
+            model="anthropic:claude-sonnet-5-5",
             backend=backend,
         )
         result = await agent.ainvoke(
@@ -191,6 +239,36 @@ class FilesystemAgent:
         )
         return result["messages"][-1].content
 ```
+
+Add `plugin` to the Client or Worker as in the Hello world example.
+`activity_options` accepts the SDK's `ActivityConfig`, a typed dictionary for
+timeouts, retry policy and task queue routing. Existing dictionary literals also
+work.
+`backend_type` advertises the backend's delete and shell capabilities and method
+signatures without constructing it in the workflow. For a sandbox, pass
+`metadata={"id": sandbox_id}` if workflow code needs its `id`.
+
+For a remote sandbox, register a factory that reconnects using a serializable
+sandbox ID, and pass that ID as `factory_argument`. This follows the MCP plugins'
+named factory pattern: the lambda stays on the activity worker; only its name
+and argument cross the activity boundary. A factory can accept one positional
+argument (`None` by default), or no arguments when everything is configured on
+the worker, for example
+`{"filesystem": lambda: FilesystemBackend(root_dir="/shared")}`. Factories may be
+synchronous or asynchronous and run once per activity attempt. Operations and
+retries must reconnect to the same external state. Synchronous factory
+construction runs in a thread with the activity context preserved; returned
+awaitables run on the activity event loop. Changes held only in a
+backend instance's memory do not survive between calls. A local filesystem
+path must be accessible to every activity worker that can receive the operation,
+or the backend activities must be routed to a task queue whose workers share
+that filesystem. The factory argument is recorded in workflow history;
+credentials and live connections belong in the worker-side factory.
+
+`TemporalBackend(existing_backend, ...)` also works when the workflow and its
+backend activities execute in the same process. It holds the backend in a
+process-local registry, so use a named backend factory when activities can run
+in another process.
 
 State-only backends (the default) need no wrapping — they are pure workflow
 state, replayed deterministically.
@@ -219,7 +297,7 @@ class ApprovalAgent:
     @workflow.run
     async def run(self, request: str) -> str:
         agent = create_temporal_deep_agent(
-            model="anthropic:claude-sonnet-4-5",
+            model="anthropic:claude-sonnet-5-5",
             interrupt_on={"book_trip": True},
             checkpointer=InMemorySaver(),
         )
@@ -283,7 +361,7 @@ from temporalio.deepagents import run_deep_agent
 class LongResearchAgent:
     @workflow.run
     async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
-        agent = create_deep_agent(model="anthropic:claude-sonnet-4-5")
+        agent = create_deep_agent(model="anthropic:claude-sonnet-5-5")
         return await run_deep_agent(
             agent,
             input,
@@ -294,12 +372,22 @@ class LongResearchAgent:
 Pass `continue_as_new_after=N` instead to trigger on a fixed history-event
 count.
 
-- **Carries forward:** the accumulated messages. Repeated identical calls are
+- **Carries forward:** the accumulated messages and the agent's state files
+  (the graph's `files` state, where the default `StateBackend` keeps what
+  `write_file` writes). Messages of the classes in `langchain_core.messages`
+  come back in the next run as the same class (a `ToolMessage` stays a
+  `ToolMessage`). Both ride in the continue-as-new input, so large files count
+  toward its payload size limit; keep large files in a durable backend such as
+  `TemporalBackend`. Repeated identical calls are
   NOT deduplicated: a call the agent re-issues after the boundary runs its own
   Activity, so a genuinely new identical request is never served a stale prior
   result. Your `@workflow.run` must accept `state_snapshot=None` as shown.
-- **Does not carry forward:** anything held only in an in-memory checkpointer's
-  own structures beyond the messages/todos snapshot. The default in-workflow
+- **Does not carry forward:** todos as state. `TodoListMiddleware` marks
+  `todos` as `OmitFromInput`, so the graph drops it from input and the next
+  run starts with none; the agent's earlier `write_todos` calls are still in
+  the carried messages. Nor does anything
+  held only in an in-memory checkpointer's own structures beyond the messages
+  and files snapshot. The default in-workflow
   `InMemorySaver` is rehydrated for free by deterministic replay; a durable
   checkpointer that does its own I/O is not replay-safe from inside a workflow,
   and the plugin warns if you pass one — prefer the snapshot + continue-as-new
@@ -314,6 +402,31 @@ auto-routed through an Activity. The wrapper only rewrites arguments when called
 worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
+
+Each plugin instance registers four Activities: `deepagents.invoke_model`,
+`deepagents.invoke_model_streaming`, `deepagents.invoke_tool` and
+`deepagents.backend_op`. Use one `DeepAgentsPlugin` per Worker: one
+`model_provider` receives every model name, so it can serve several models, and
+`backends` takes every factory. The same instance on both the Client and the
+Worker works. So do one instance on the Client and one on the Worker built with
+the same `model_provider` and `backends` factories (the same objects) and the
+same `streaming_batch_interval`; two default instances match. Any other second
+instance fails at Worker start with a `ValueError` that names
+`DeepAgentsPlugin`. With one instance on each side, the Worker instance does
+not add an Activity whose name is already
+registered, and still registered after its own step, by the same function, the
+Client instance's copy of the same built-in Activity, or a wrapper of either
+that sets `__wrapped__` (as `functools.wraps` does).
+A dynamic Activity counts the same way, with the dynamic slot as its name.
+An Activity registered under another name, such as a wrapper with an alias,
+does not count. So the Worker keeps what the Client side
+registered, including a wrapper a later Client plugin put around it if that
+wrapper sets `__wrapped__`, and any
+other Activity given to the Worker instance is still added. Any other repeated
+Activity name fails at Worker start with `ValueError: More than one activity
+named ...`, as it does without the plugin. That includes a caller Activity
+with one of these names. A second, different
+dynamic Activity fails with `TypeError: More than one dynamic activity`.
 
 ## Composing with other plugins
 

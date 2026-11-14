@@ -7,6 +7,7 @@ variable propagation (see langgraph.config.get_config).
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import timedelta
 from typing import Any
@@ -30,19 +31,23 @@ from pytest import raises
 from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.langgraph import LangGraphPlugin, entrypoint
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 from tests.e2e_functional_entrypoints import (
     add_ten,
     ask_human,
     continue_as_new_entrypoint,
+    describe_values,
     double_value,
     expensive_task_a,
     expensive_task_b,
     expensive_task_c,
     get_task_execution_counts,
     interrupt_entrypoint,
+    make_values,
     partial_execution_entrypoint,
+    read_context,
     reset_task_execution_counts,
     simple_functional_entrypoint,
     slow_entrypoint,
@@ -51,9 +56,11 @@ from tests.e2e_functional_entrypoints import (
     step_3,
     step_4,
     step_5,
+    typed_values_entrypoint,
     waiting_task,
 )
 from tests.e2e_functional_workflows import (
+    ContextFunctionalWorkflow,
     ContinueAsNewFunctionalWorkflow,
     ContinueAsNewInput,
     PartialExecutionInput,
@@ -61,6 +68,7 @@ from tests.e2e_functional_workflows import (
     SimpleFunctionalE2EWorkflow,
     SlowFunctionalWorkflow,
 )
+from tests.test_two_nodes import Context, DictContext, ModelContext
 
 _DEFAULT_ACTIVITY_OPTIONS = {"start_to_close_timeout": timedelta(seconds=30)}
 
@@ -126,6 +134,67 @@ class InterruptV2FunctionalWorkflow:
 
 
 class TestFunctionalAPIBasicExecution:
+    async def test_context(self, client: Client) -> None:
+        context_task = task(read_context)
+
+        def make_entrypoint(schema: type[Any] | None):
+            @lg_entrypoint(context_schema=schema)
+            async def run(value: int) -> dict:
+                return await context_task(value)
+
+            return run
+
+        cases: list[tuple[str, type[Any] | None, dict[str, Any] | None, str, str]] = [
+            ("dataclass", Context, {"user_id": "alice"}, "Context", "alice"),
+            (
+                "model",
+                ModelContext,
+                {"userId": "bob", "tenant": {"name": "acme"}},
+                "ModelContext",
+                "bob:acme",
+            ),
+            ("dictionary", DictContext, {"user_id": "carol"}, "dict", "carol"),
+            ("none", None, None, "NoneType", ""),
+        ]
+        plugin = LangGraphPlugin(
+            entrypoints={name: make_entrypoint(schema) for name, schema, *_ in cases},
+            tasks=[context_task],
+            activity_options=_execute_in_activity("read_context"),
+            default_activity_options=_DEFAULT_ACTIVITY_OPTIONS,
+        )
+        client_config = client.config()
+        client_config["data_converter"] = pydantic_data_converter
+        client = Client(**client_config)
+        task_queue = f"functional-context-{uuid4()}"
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[ContextFunctionalWorkflow],
+            plugins=[plugin],
+        ):
+            handles = await asyncio.gather(
+                *(
+                    client.start_workflow(
+                        ContextFunctionalWorkflow.run,
+                        args=[name, context],
+                        id=f"functional-context-{uuid4()}",
+                        task_queue=task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+                    for name, _, context, *_ in cases
+                )
+            )
+            results = await asyncio.gather(*(handle.result() for handle in handles))
+        for result, (_, _, _, context_type, user_id) in zip(results, cases):
+            assert result == {
+                "value": 10,
+                "user_id": user_id,
+                "context_type": context_type,
+            }
+        replayer = Replayer(workflows=[ContextFunctionalWorkflow], plugins=[plugin])
+        for handle in handles:
+            await replayer.replay_workflow(await handle.fetch_history())
+
     @pytest.mark.parametrize(
         "workflow_cls,entrypoint_func,entrypoint_name,tasks,expected_result",
         [
@@ -143,8 +212,26 @@ class TestFunctionalAPIBasicExecution:
                 [triple_value, add_five],
                 35,
             ),
+            (
+                SimpleFunctionalE2EWorkflow,
+                typed_values_entrypoint,
+                "e2e_simple_functional",
+                [make_values, describe_values],
+                [
+                    {
+                        "score": "Score",
+                        "label": "Label",
+                        # The converter can't rebuild a Protocol field, so this
+                        # stays a dict.
+                        "envelope": "dict",
+                        "message": "AIMessage",
+                        "data": "bytes",
+                    }
+                ]
+                * 2,
+            ),
         ],
-        ids=["v1", "v2"],
+        ids=["v1", "v2", "typed-values"],
     )
     async def test_simple_entrypoint(
         self,
@@ -153,7 +240,7 @@ class TestFunctionalAPIBasicExecution:
         entrypoint_func: Any,
         entrypoint_name: str,
         tasks: list,
-        expected_result: int,
+        expected_result: Any,
     ) -> None:
         task_queue = f"e2e-functional-{uuid4()}"
 
@@ -188,7 +275,7 @@ class TestFunctionalAPIContinueAsNew:
         """10 * 3 = 30 -> + 100 = 130 -> * 2 = 260. Each task executes once."""
         reset_task_execution_counts()
 
-        tasks = [expensive_task_a, expensive_task_b, expensive_task_c]
+        tasks: list[Any] = [expensive_task_a, expensive_task_b, expensive_task_c]
         task_queue = f"e2e-continue-as-new-{uuid4()}"
 
         async with Worker(
@@ -216,7 +303,7 @@ class TestFunctionalAPIContinueAsNew:
                 execution_timeout=timedelta(seconds=60),
             )
 
-        assert result["result"] == 260
+        assert result == {"result": 260, "task_b_type": "Score"}
 
         counts = get_task_execution_counts()
         assert counts.get("task_a", 0) == 1, (

@@ -1,0 +1,16 @@
+[plugin]
+name = "google-adk"
+language = "typescript"
+coordinate = "@temporalio/google-adk"
+registry = "npm"
+root-api = "@temporalio/google-adk"
+maturity = "public-preview"
+docs = "https://docs.temporal.io/develop/typescript/integrations/google-adk-agents"
+
+[ci]
+# The minimum cell runs the Node floor itself (the latest 22.17.x): @google/adk
+# 2.1 and later depend on @mikro-orm/core 7, which requires Node >= 22.17.0.
+runtime-versions = ["22.17", "24"]
+
+[smoke]
+imports = ["@temporalio/google-adk"]

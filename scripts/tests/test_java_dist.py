@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import struct
+import subprocess
 import zipfile
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
-
 from check_java_dist import check
+from smoke_java import smoke
 
 
 def publication(tmp_path: Path) -> Path:
@@ -33,6 +35,22 @@ def publication(tmp_path: Path) -> Path:
 def test_valid_publication(tmp_path: Path) -> None:
     check(publication(tmp_path), '1.41.0-RC1')
 
+
+@pytest.mark.parametrize('repository', [None, 'https://repo.example.test/maven'])
+def test_successful_consumer_smoke_returns_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    repository: str | None,
+) -> None:
+    plugin = publication(tmp_path)
+    run = Mock(return_value=subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr('smoke_java.subprocess.run', run)
+
+    smoke(plugin, '1.41.0-RC1', repository)
+
+    run.assert_called_once()
+    assert run.call_args.kwargs['check'] is True
+    assert run.call_args.kwargs['cwd'] == plugin.resolve()
+    assert capsys.readouterr().out == 'OK: clean consumer installed io.temporal:example:1.41.0-RC1\n'
 
 @pytest.mark.parametrize('version', ['1.1.+', 'latest.release', 'latest.integration'])
 def test_publication_rejects_gradle_only_dependency_versions(tmp_path: Path, version: str) -> None:

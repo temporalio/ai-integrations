@@ -1,0 +1,139 @@
+package googleadk
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+)
+
+// Activity type names registered worker-side by Activities.Register and
+// dispatched by name from the workflow side.
+const (
+	InvokeModelActivityName         = "googleadk.InvokeModel"
+	ListMcpToolsActivityName        = "googleadk.ListMcpTools"
+	CallMcpToolActivityName         = "googleadk.CallMcpTool"
+	ResolveA2AAgentCardActivityName = "googleadk.ResolveA2AAgentCard"
+	SendA2AMessageActivityName      = "googleadk.SendA2AMessage"
+	CancelA2ATaskActivityName       = "googleadk.CancelA2ATask"
+)
+
+// Stable ApplicationError.Type strings. Callers classify failures on these
+// rather than string-matching err.Error(); IsNonRetryable reports whether
+// Temporal will stop retrying.
+const (
+	// ErrorTypeModel tags failures originating from a model.LLM call.
+	ErrorTypeModel = "googleadk.ModelError"
+	// ErrorTypeTool tags failures originating from a tool execution.
+	ErrorTypeTool = "googleadk.ToolError"
+	// ErrorTypeMCP tags failures originating from an MCP list/call.
+	ErrorTypeMCP = "googleadk.McpError"
+	// ErrorTypeStream tags a streaming model call whose responses could not
+	// all be published to its Workflow Streams topic.
+	ErrorTypeStream = "googleadk.StreamError"
+	// ErrorTypeA2A tags failures originating from an A2A card fetch, message
+	// or cancellation.
+	ErrorTypeA2A = "googleadk.A2AError"
+)
+
+const (
+	defaultModelTimeout     = 2 * time.Minute
+	defaultToolTimeout      = 1 * time.Minute
+	defaultHeartbeatTimeout = 10 * time.Second
+)
+
+// errMissingContext is returned on the workflow side when the run context was
+// not produced by NewContext. It surfaces at the first workflow turn rather than
+// as an obscure activity-side failure.
+var errMissingContext = errors.New(
+	"googleadk: run context is missing the Temporal workflow bridge; " +
+		"pass googleadk.NewContext(ctx) as the context to runner.Runner.Run")
+
+// resolveToolActivityOptions fills in the tool-Activity defaults: a one-minute
+// StartToCloseTimeout and the fallback task queue when unset.
+func resolveToolActivityOptions(ao workflow.ActivityOptions, taskQueue string) workflow.ActivityOptions {
+	if ao.StartToCloseTimeout == 0 {
+		ao.StartToCloseTimeout = defaultToolTimeout
+	}
+	if ao.TaskQueue == "" {
+		ao.TaskQueue = taskQueue
+	}
+	return ao
+}
+
+// resolveHeartbeatTimeout gives one of the plugin's own Activities a 10-second
+// HeartbeatTimeout when unset. They heartbeat on a timer while they run, so a
+// cancel reaches a running call, and a lost worker is noticed, within about
+// that long. A negative HeartbeatTimeout turns heartbeats off.
+func resolveHeartbeatTimeout(ao workflow.ActivityOptions) workflow.ActivityOptions {
+	switch {
+	case ao.HeartbeatTimeout == 0:
+		ao.HeartbeatTimeout = defaultHeartbeatTimeout
+	case ao.HeartbeatTimeout < 0:
+		ao.HeartbeatTimeout = 0
+	}
+	return ao
+}
+
+// toolSummary builds the Temporal UI summary for a tool Activity from the live
+// agent context (which knows the agent name) and the tool name.
+func toolSummary(ctx interface{ AgentName() string }, toolName string) string {
+	if ctx != nil {
+		if name := ctx.AgentName(); name != "" {
+			return fmt.Sprintf("%s: %s", name, toolName)
+		}
+	}
+	return toolName
+}
+
+// IsNonRetryable reports whether err is a Temporal ApplicationError marked
+// non-retryable. Callers use it to classify model/tool/MCP failures without
+// string-matching the error message.
+func IsNonRetryable(err error) bool {
+	var appErr *temporal.ApplicationError
+	if errors.As(err, &appErr) {
+		return appErr.NonRetryable()
+	}
+	return false
+}
+
+// retryableHTTPStatus reports whether a call that failed with an HTTP status
+// may succeed on a retry: 408, 409, 429 and 5xx may, other statuses may not.
+func retryableHTTPStatus(code int) bool {
+	return code == 408 || code == 409 || code == 429 || (code >= 500 && code < 600)
+}
+
+// isEmptyResponse reports whether err, or any error it wraps through either
+// Unwrap form (as errors.Join and multiple %w produce), is ADK's untyped
+// "empty response".
+func isEmptyResponse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err.Error() == "empty response" {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return isEmptyResponse(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if isEmptyResponse(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// newApplicationError builds a typed Temporal ApplicationError. retryable=false
+// marks the error non-retryable so Temporal stops retrying.
+func newApplicationError(errType string, retryable bool, cause error, format string, args ...any) error {
+	return temporal.NewApplicationErrorWithOptions(
+		fmt.Sprintf(format, args...),
+		errType,
+		temporal.ApplicationErrorOptions{NonRetryable: !retryable, Cause: cause},
+	)
+}

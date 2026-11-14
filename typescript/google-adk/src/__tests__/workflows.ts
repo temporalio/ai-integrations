@@ -1,0 +1,1270 @@
+/**
+ * Workflow definitions used by the E2E tests. These run inside the Temporal
+ * Workflow sandbox: they construct real `@google/adk` objects (the ADK
+ * `BaseLlm` subclass `TemporalModel`, `BaseToolset` subclass `TemporalMCPToolset`,
+ * `LongRunningFunctionTool`) and invoke their native entry points. The plugin
+ * routes the model/MCP I/O to Activities.
+ */
+
+// In the Workflow bundle this resolves to the plugin's deterministic `net`
+// shim; on the worker (test files import this module for workflow references)
+// it is the real builtin.
+import { isIP } from 'node:net';
+
+import {
+  BasePlugin,
+  createEvent,
+  FunctionTool,
+  generateClientFunctionCallId,
+  InMemoryRunner,
+  isFinalResponse,
+  LlmAgent,
+  LongRunningFunctionTool,
+  RequestInput,
+  stringifyContent,
+  Workflow,
+  type Context,
+  type LlmAgentConfig,
+  type LlmRequest,
+  type LlmResponse,
+} from '@google/adk';
+import { Type } from '@google/genai';
+import { ActivityFailure, ApplicationFailure, type Duration } from '@temporalio/common';
+import {
+  ActivityCancellationType,
+  CancellationScope,
+  condition,
+  continueAsNew,
+  createNexusServiceClient,
+  defineSignal,
+  defineUpdate,
+  executeChild,
+  isCancellation,
+  proxyActivities,
+  setHandler,
+  sleep,
+  upsertMemo,
+} from '@temporalio/workflow';
+import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
+
+import {
+  markModelFailureHandled,
+  TemporalModel,
+  TemporalMCPToolset,
+  activityAsTool,
+  type TemporalMCPToolsetOptions,
+  type TemporalModelOptions,
+} from '../workflow';
+import { randomFillSync } from '../crypto-shim';
+
+// Mirrors `@google/adk` >= 1.5.0 `tools/load_web_page.js` (on the barrel
+// path), which parses its blocked-CIDR tables at module load, calling
+// `net.isIP` in the process. Keeping the same top-level shape here makes every
+// E2E bundle in this suite fail at Workflow load if the `net` shim regresses.
+const BLOCKED_IPV6_CIDR_BASES = ['::', '::1', '64:ff9b:1::', '100::', '2001:db8::', 'fc00::', 'fe80::', 'ff00::'];
+const blockedIpv6BaseVersions = BLOCKED_IPV6_CIDR_BASES.map((address) => isIP(address));
+
+/** Build a minimal, serializable LlmRequest for a single user turn. */
+function makeRequest(text: string): LlmRequest {
+  return {
+    model: 'fake-model',
+    contents: [{ role: 'user', parts: [{ text }] }],
+    config: {},
+    toolsDict: {},
+    liveConnectConfig: {},
+  } as LlmRequest;
+}
+
+function collectText(parts: Array<{ text?: string }> | undefined): string {
+  let text = '';
+  for (const part of parts ?? []) {
+    if (part.text) text += part.text;
+  }
+  return text;
+}
+
+/** One model call through the plugin; returns the concatenated text. */
+export async function singleModelCall(prompt: string): Promise<string> {
+  const llm = new TemporalModel('fake-model');
+  let text = '';
+  for await (const response of llm.generateContentAsync(makeRequest(prompt))) {
+    text += collectText(response.content?.parts);
+  }
+  return text;
+}
+
+/** N sequential model calls; returns how many responses were produced. */
+export async function countModelCalls(n: number): Promise<number> {
+  const llm = new TemporalModel('fake-model');
+  let responses = 0;
+  for (let i = 0; i < n; i++) {
+    for await (const _response of llm.generateContentAsync(makeRequest(`turn-${i}`))) {
+      responses++;
+    }
+  }
+  return responses;
+}
+
+/**
+ * A model call with a very short timeout against a deliberately slow model, with
+ * `heartbeatTimeout: 0` turning the default heartbeat timeout off.
+ */
+export async function modelCallWithTimeout(): Promise<string> {
+  // `maximumAttempts: 1` so the start-to-close timeout fails the Workflow on the
+  // first attempt instead of retrying forever.
+  const llm = new TemporalModel('slow-model', {
+    activity: {
+      startToCloseTimeout: '1 second',
+      heartbeatTimeout: 0,
+      retry: { maximumAttempts: 1 },
+    },
+  });
+  let text = '';
+  for await (const response of llm.generateContentAsync(makeRequest('hi'))) {
+    text += collectText(response.content?.parts);
+  }
+  return text;
+}
+
+/**
+ * One model call against a model that rejects with an `AbortError` when the
+ * Activity's cancellation signal fires, under a retry policy that would keep
+ * retrying an ordinary failure. Cancelling the Workflow must end the Activity
+ * cancelled on its first attempt rather than failing and retrying it.
+ *
+ * `WAIT_CANCELLATION_COMPLETED` is what makes the outcome observable: under the
+ * default `TRY_CANCEL` the Workflow stops waiting the moment it requests the
+ * cancel, so it closes before the Activity ever reports how it ended. The
+ * `heartbeatTimeout` is what makes it prompt: an Activity is told about a cancel
+ * in its heartbeat response, and the plugin heartbeats at half that timeout. Six
+ * seconds keeps the cancel under three while leaving a slow CI worker three more
+ * before the heartbeat itself would time out.
+ */
+export async function cancellableModelCall(): Promise<string> {
+  const llm = new TemporalModel('abort-model', {
+    activity: {
+      startToCloseTimeout: '20 seconds',
+      heartbeatTimeout: '6 seconds',
+      retry: { maximumAttempts: 3, initialInterval: '1 second' },
+      cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    },
+  });
+  let text = '';
+  for await (const response of llm.generateContentAsync(makeRequest('hi'))) {
+    text += collectText(response.content?.parts);
+  }
+  return text;
+}
+
+/**
+ * An MCP tool call, through the plugin's `<name>-callTool` Activity for the
+ * `stub` server, that only cancellation can end: the stub's `hang` tool never
+ * replies. Same Activity options as {@link cancellableModelCall}, so the Workflow
+ * waits for the cancel to land and history shows how the Activity ended.
+ */
+export async function cancellableMcpCall(): Promise<unknown> {
+  const { 'stub-callTool': callTool } = proxyActivities<{
+    'stub-callTool': (args: { toolName: string; args: Record<string, unknown> }) => Promise<unknown>;
+  }>({
+    startToCloseTimeout: '20 seconds',
+    heartbeatTimeout: '6 seconds',
+    retry: { maximumAttempts: 3, initialInterval: '1 second' },
+    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+  });
+  return await callTool({ toolName: 'hang', args: {} });
+}
+
+/** A model call whose backing model raises a non-retryable (4xx) error. */
+export async function modelCallError(): Promise<string> {
+  const llm = new TemporalModel('boom', { activity: { retry: { maximumAttempts: 1 } } });
+  let text = '';
+  for await (const response of llm.generateContentAsync(makeRequest('explode'))) {
+    text += collectText(response.content?.parts);
+  }
+  return text;
+}
+
+/**
+ * Sequential model calls covering every `summary` resolution branch, in this
+ * order: a top-level string, `activity.summary` alone, neither (the generic
+ * auto-generated label), and both set (the top-level string wins). Returns the
+ * number of responses produced.
+ */
+export async function modelCallsWithSummaryVariants(): Promise<number> {
+  const models = [
+    new TemporalModel('fake-model', { summary: 'custom-model-summary' }),
+    new TemporalModel('fake-model', { activity: { summary: 'activity-summary' } }),
+    new TemporalModel('fake-model'),
+    new TemporalModel('fake-model', { summary: 'top-level-summary', activity: { summary: 'activity-summary' } }),
+  ];
+  let responses = 0;
+  for (const llm of models) {
+    for await (const _response of llm.generateContentAsync(makeRequest('hi'))) {
+      responses++;
+    }
+  }
+  return responses;
+}
+
+/** Streaming (SSE) model call; returns concatenated chunk text + chunk count. */
+export async function streamingModelCall(
+  batchInterval: Duration = '50 milliseconds'
+): Promise<{ text: string; chunks: number }> {
+  const llm = new TemporalModel('fake-model', {
+    streamingTopic: 'adk-test-stream',
+    streamingBatchInterval: batchInterval,
+    activity: { heartbeatTimeout: '5 seconds' },
+  });
+  let text = '';
+  let chunks = 0;
+  for await (const response of llm.generateContentAsync(makeRequest('stream please'), true)) {
+    text += collectText(response.content?.parts);
+    chunks++;
+  }
+  return { text, chunks };
+}
+
+export const closeStream = defineSignal('closeStream');
+
+/**
+ * Streaming model call that hosts a `WorkflowStream` and stays alive until
+ * `closeStream`, so an external subscriber can drain the published chunks.
+ */
+export async function streamingModelCallSubscribed(
+  batchInterval?: Duration
+): Promise<{ text: string; chunks: number }> {
+  new WorkflowStream();
+  let closed = false;
+  setHandler(closeStream, () => {
+    closed = true;
+  });
+  const out = await streamingModelCall(batchInterval);
+  await condition(() => closed);
+  return out;
+}
+
+/** A streaming model call with no `streamingTopic` configured (must fail). */
+export async function streamingModelCallNoTopic(): Promise<string> {
+  const llm = new TemporalModel('fake-model');
+  let text = '';
+  for await (const response of llm.generateContentAsync(makeRequest('stream please'), true)) {
+    text += collectText(response.content?.parts);
+  }
+  return text;
+}
+
+/** Attempt a BIDI live connection inside the Workflow (must fail). */
+export async function modelConnectInWorkflow(): Promise<string> {
+  const llm = new TemporalModel('fake-model');
+  await llm.connect(makeRequest('hi'));
+  return 'unreachable';
+}
+
+/** Discover MCP tools and assert the full schema crossed the boundary. */
+export async function mcpListTools(): Promise<{
+  count: number;
+  firstName: string;
+  hasParameters: boolean;
+}> {
+  const toolset = new TemporalMCPToolset({ name: 'testServer' });
+  const tools = await toolset.getTools();
+  const first = tools[0];
+  const declaration = first?._getDeclaration();
+  return {
+    count: tools.length,
+    firstName: first?.name ?? '',
+    hasParameters: declaration?.parameters !== undefined,
+  };
+}
+
+/** Call an MCP tool through the plugin; returns the tool result. */
+export async function mcpCallTool(value: string): Promise<unknown> {
+  const toolset = new TemporalMCPToolset({ name: 'testServer' });
+  const tools = await toolset.getTools();
+  const tool = tools.find((t) => t.name === 'echo');
+  if (!tool) {
+    throw new Error('echo tool not found');
+  }
+  return tool.runAsync({ args: { value }, toolContext: {} as never });
+}
+
+/**
+ * Calls the `testServer-callTool` Activity directly with a tool name the server
+ * does not expose, exercising the Activity-side not-found path.
+ */
+export async function mcpCallUnknownTool(): Promise<unknown> {
+  const activities = proxyActivities<{
+    'testServer-callTool': (args: { toolName: string; args: Record<string, unknown> }) => Promise<unknown>;
+  }>({
+    startToCloseTimeout: '1 minute',
+    retry: { maximumAttempts: 1 },
+  });
+  return activities['testServer-callTool']({ toolName: 'does-not-exist', args: {} });
+}
+
+/** MCP discovery + tool call with a caller-supplied `activity.summary`. */
+export async function mcpCallToolWithActivitySummary(value: string): Promise<unknown> {
+  const toolset = new TemporalMCPToolset({
+    name: 'testServer',
+    activity: { summary: 'mcp-activity-summary' },
+  });
+  const tools = await toolset.getTools();
+  const tool = tools.find((t) => t.name === 'echo');
+  if (!tool) {
+    throw new Error('echo tool not found');
+  }
+  return tool.runAsync({ args: { value }, toolContext: {} as never });
+}
+
+/**
+ * MCP discovery under the three ways a toolset can reshape the advertised tool
+ * names: a `toolFilter`, a `prefix`, and both at once. Returns the advertised
+ * names each configuration produced.
+ */
+export async function mcpToolNameVariants(): Promise<{ filtered: string[]; prefixed: string[]; both: string[] }> {
+  async function advertisedNames(options: TemporalMCPToolsetOptions): Promise<string[]> {
+    const toolset = new TemporalMCPToolset(options);
+    const tools = await toolset.getTools();
+    return tools.map((t) => t.name);
+  }
+  return {
+    filtered: await advertisedNames({ name: 'testServer', toolFilter: ['echo'] }),
+    prefixed: await advertisedNames({ name: 'testServer', prefix: 'srv' }),
+    both: await advertisedNames({ name: 'testServer', toolFilter: ['srv_echo'], prefix: 'srv' }),
+  };
+}
+
+/**
+ * The plugin's central use case: an ordinary ADK agent whose only tool is a
+ * registered Temporal Activity, driven by the SDK's own runner. The model's
+ * first turn emits a `functionCall`, ADK dispatches it through
+ * {@link activityAsTool} — one Activity — and the runner appends the result to
+ * the session so a second model turn sees it. Returns that turn's text.
+ */
+export async function agentToolLoopWorkflow(prompt: string): Promise<string> {
+  const agent = new LlmAgent({
+    name: 'assistant',
+    model: new TemporalModel('fake-model'),
+    instruction: 'You are a helpful assistant.',
+    tools: [
+      activityAsTool({
+        name: 'lookupOrder',
+        description: 'Look up an order by id.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: { orderId: { type: Type.STRING, description: 'The order to look up.' } },
+          required: ['orderId'],
+        },
+      }),
+    ],
+  });
+  const runner = new InMemoryRunner({ agent });
+
+  let finalText = '';
+  for await (const event of runner.runEphemeral({
+    userId: 'test-user',
+    newMessage: { role: 'user', parts: [{ text: prompt }] },
+  })) {
+    if (isFinalResponse(event)) {
+      finalText = stringifyContent(event);
+    }
+  }
+  return finalText;
+}
+
+export const approveSignal = defineSignal<[string]>('approve');
+export const approveUpdate = defineUpdate<string, [string]>('approveUpdate');
+
+/**
+ * HITL: a `LongRunningFunctionTool` whose `execute` (running in the Workflow
+ * body) awaits a Temporal Signal or Update carrying the human's result.
+ */
+export async function hitlWorkflow(): Promise<string> {
+  let result: string | undefined;
+  setHandler(approveSignal, (value) => {
+    result = value;
+  });
+  setHandler(approveUpdate, (value) => {
+    result = value;
+    return value;
+  });
+
+  const tool = new LongRunningFunctionTool({
+    name: 'humanApproval',
+    description: 'Wait for a human approval.',
+    execute: async () => {
+      await condition(() => result !== undefined);
+      return result;
+    },
+  });
+
+  const out = await tool.runAsync({ args: {}, toolContext: {} as never });
+  return out as string;
+}
+
+/**
+ * A combined scenario for the replay test: two sequential model calls followed
+ * by an MCP tool discovery + call. Produces a history with `adk-invokeModel` ×2,
+ * `testServer-listTools`, and `testServer-callTool` so replay exercises both
+ * boundaries against a single recorded history.
+ */
+export async function replayScenario(): Promise<string> {
+  const llm = new TemporalModel('fake-model');
+  let text = '';
+  for (let i = 0; i < 2; i++) {
+    for await (const response of llm.generateContentAsync(makeRequest(`turn-${i}`))) {
+      text += collectText(response.content?.parts);
+    }
+  }
+
+  const toolset = new TemporalMCPToolset({ name: 'testServer' });
+  const tools = await toolset.getTools();
+  const echo = tools.find((t) => t.name === 'echo');
+  if (echo) {
+    const out = (await echo.runAsync({
+      args: { value: 'world' },
+      toolContext: {} as never,
+    })) as { echoed?: string };
+    text += out.echoed ?? '';
+  }
+  return text;
+}
+
+/**
+ * Native ADK integration: build a real `LlmAgent` whose model is a
+ * `TemporalModel`, then drive it with the SDK's own `InMemoryRunner.runEphemeral`
+ * loop inside the Workflow and return the agent's final text response. The user
+ * writes ordinary ADK code — the plugin transparently routes every model turn
+ * the runner makes through the `adk-invokeModel` Activity, so durability requires
+ * no rewrite of the agent or the runner.
+ */
+export async function agentRunnerWorkflow(prompt: string): Promise<string> {
+  const agent = new LlmAgent({
+    name: 'assistant',
+    model: new TemporalModel('fake-model'),
+    instruction: 'You are a helpful assistant.',
+  });
+  const runner = new InMemoryRunner({ agent });
+
+  let finalText = '';
+  for await (const event of runner.runEphemeral({
+    userId: 'test-user',
+    newMessage: { role: 'user', parts: [{ text: prompt }] },
+  })) {
+    if (isFinalResponse(event)) {
+      finalText = stringifyContent(event);
+    }
+  }
+  return finalText;
+}
+
+/**
+ * Two sequential agent turns through the native runner loop, for the telemetry
+ * test. Produces a history with two `adk-invokeModel` Activities across three
+ * (or more) workflow tasks — so a cache-disabled worker replays the first
+ * turn's code on later tasks, while ADK's spans must be exported exactly once
+ * per real turn.
+ */
+export async function agentRunnerTwoTurnsWorkflow(prompt: string): Promise<string> {
+  const agent = new LlmAgent({
+    name: 'assistant',
+    model: new TemporalModel('fake-model'),
+    instruction: 'You are a helpful assistant.',
+  });
+  const runner = new InMemoryRunner({ agent });
+
+  const texts: string[] = [];
+  for (let turn = 0; turn < 2; turn++) {
+    for await (const event of runner.runEphemeral({
+      userId: 'test-user',
+      newMessage: { role: 'user', parts: [{ text: `${prompt}-${turn}` }] },
+    })) {
+      if (isFinalResponse(event)) {
+        texts.push(stringifyContent(event));
+      }
+    }
+  }
+  return texts.join('|');
+}
+
+/** Per-turn Activity options for the runner fixtures below: fail on the first attempt. */
+const SINGLE_ATTEMPT: TemporalModelOptions = { activity: { retry: { maximumAttempts: 1 } } };
+
+/**
+ * One runner-driven agent turn through `model`, returning the turn's final text —
+ * empty when the turn produced none. With `graph`, the agent runs as the only node of an
+ * ADK `Workflow`.
+ */
+async function runAgentTurn(
+  model: TemporalModel,
+  prompt: string,
+  plugins?: BasePlugin[],
+  agentOptions?: Pick<LlmAgentConfig, 'tools' | 'beforeModelCallback'>,
+  graph = false
+): Promise<string> {
+  const agent = new LlmAgent({
+    name: 'assistant',
+    model,
+    instruction: 'You are a helpful assistant.',
+    ...agentOptions,
+  });
+  const root = graph ? new Workflow({ name: 'turn', edges: [['START', agent]] }) : agent;
+  const runner = new InMemoryRunner({ agent: root, plugins });
+
+  let finalText = '';
+  for await (const event of runner.runEphemeral({
+    userId: 'test-user',
+    newMessage: { role: 'user', parts: [{ text: prompt }] },
+  })) {
+    if (isFinalResponse(event)) {
+      finalText = stringifyContent(event);
+    }
+  }
+  return finalText;
+}
+
+/** One runner turn through `model`, retries off. */
+export async function agentRunnerOneTurn(model: string, prompt: string): Promise<string> {
+  return runAgentTurn(new TemporalModel(model, SINGLE_ATTEMPT), prompt);
+}
+
+/** A failing runner turn, then a slow one, so a cancellation lands after an absorbed failure. */
+export async function agentRunnerFailThenSlowModel(prompt: string): Promise<string> {
+  const failed = await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), prompt);
+  const cancelled = await runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), prompt);
+  return `${failed}|${cancelled}`;
+}
+
+/** An ADK plugin that substitutes a response for a failed model call. */
+class RecoveringPlugin extends BasePlugin {
+  constructor() {
+    super('recovering');
+  }
+
+  override async onModelErrorCallback({ error }: { error: Error }): Promise<LlmResponse | undefined> {
+    markModelFailureHandled(error);
+    return createEvent({
+      author: 'assistant',
+      content: { role: 'model', parts: [{ text: 'recovered' }] },
+      turnComplete: true,
+    });
+  }
+}
+
+/** A failing runner turn whose `onModelErrorCallback` recovers from the failure. */
+export async function agentRunnerRecoversFromModelError(prompt: string): Promise<string> {
+  return runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), prompt, [new RecoveringPlugin()]);
+}
+
+/** A failing runner turn nothing recovers, then one whose `onModelErrorCallback` does. */
+export async function agentRunnerRecoversOnlyTheSecondFailure(prompt: string): Promise<string> {
+  const unrecovered = await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), prompt);
+  const recovered = await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), prompt, [new RecoveringPlugin()]);
+  return `${unrecovered}|${recovered}`;
+}
+
+/**
+ * A runner turn whose `onModelErrorCallback` recovers, against a model slow enough that
+ * the failure it recovers from is the Workflow's own cancellation.
+ */
+export async function agentRunnerRecoversFromCancelledModel(prompt: string): Promise<string> {
+  return runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), prompt, [new RecoveringPlugin()]);
+}
+
+/**
+ * Records `name` as the Workflow's `stage` memo, which the tests read with `describe()`.
+ * Querying a Worker with no Workflow cache slows the Workflow itself, by up to a Workflow
+ * Task timeout, enough to change what a timeout in it decides.
+ */
+function setStage(name: string): void {
+  upsertMemo({ stage: name });
+}
+
+interface BlockingActivities {
+  cancellableActivity(): Promise<string>;
+  echoId(id: string): Promise<string>;
+}
+
+/** An ADK plugin whose `beforeModelCallback` runs `check`. */
+class PolicyPlugin extends BasePlugin {
+  constructor(private readonly check: () => Promise<undefined>) {
+    super('policy');
+  }
+
+  override async beforeModelCallback(): Promise<undefined> {
+    return this.check();
+  }
+}
+
+/** Where a {@link blockedTurn} waits. */
+export type BlockedTurnKind = 'tool' | 'agent' | 'plugin' | 'model' | 'predicate' | 'predicate-activity';
+
+/**
+ * How the tool or callback of a {@link blockedTurn} waits: as it is (`plain`); inside
+ * `CancellationScope.nonCancellable(() => CancellationScope.withTimeout('1 second', ...))`
+ * (`shielded`); the same, then a cleanup in the non-cancellable scope that holds the
+ * timeout's error until {@link adkDoneSignal} (`shielded-cleanup`); as it is, rethrowing its
+ * error wrapped in a new `Error` with the original as `cause` (`rewrapped`); as it is, but on
+ * a child Workflow that fails with its own cancelled Activity (`child`, see
+ * {@link childTimedOutActivity}); as it is, but in another `FunctionTool` that the tool or
+ * callback runs through `runAsync`, the tool with its own tool context (`nested`); or not at
+ * all, throwing an ordinary error instead (`throws`).
+ */
+export type BlockedTurnWait = 'plain' | 'shielded' | 'shielded-cleanup' | 'rewrapped' | 'child' | 'nested' | 'throws';
+
+/**
+ * A child Workflow whose first Activity its 1-second timeout scope cancels, so it fails with
+ * that `ActivityFailure` (whose `activityId` is '1', as the parent's first Activity's is).
+ */
+export async function childTimedOutActivity(): Promise<string> {
+  const { cancellableActivity } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  return CancellationScope.withTimeout('1 second', () => cancellableActivity());
+}
+
+/**
+ * A runner turn that waits until it is cancelled, with nothing cancellable after the wait:
+ * in a `LongRunningFunctionTool` waiting in Workflow code for an approval that never comes
+ * (`tool`), in a `beforeModelCallback`, the agent's own or an ADK plugin's, awaiting a policy
+ * Activity that runs until it is cancelled (`agent`, `plugin`), in a `FunctionTool`'s async
+ * `requireConfirmation` predicate waiting the way the tool or the callbacks do (`predicate`,
+ * `predicate-activity`, always `plain`), or in a slow model call (`model`, always `plain`). With `nexusEndpoint`, the tool or callback waits instead for a
+ * Nexus operation on that endpoint, whose task queue no Worker polls, so the operation never
+ * starts. `stage` is told when the wait starts, and when a `shielded-cleanup` wait's cleanup
+ * does. With `graph`, the agent runs as the only node of an ADK `Workflow`.
+ */
+function blockedTurn(
+  kind: BlockedTurnKind,
+  stage: (name: string) => void,
+  wait: BlockedTurnWait = 'plain',
+  nexusEndpoint?: string,
+  graph = false
+): Promise<string> {
+  if (kind === 'model') {
+    stage('blocked');
+    return runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), 'hi', undefined, undefined, graph);
+  }
+  let released = false;
+  if (wait === 'shielded-cleanup') {
+    setHandler(adkDoneSignal, () => {
+      released = true;
+    });
+  }
+  const shaped = (body: () => Promise<void>) => async (toolContext?: Context): Promise<void> => {
+    stage('blocked');
+    if (wait === 'throws') throw new Error('policy refused the request');
+    if (wait === 'plain' || wait === 'child') return body();
+    if (wait === 'nested') {
+      const inner = new FunctionTool({
+        name: 'inner_wait',
+        description: 'Wait inside another tool.',
+        execute: async () => {
+          await body();
+          return {};
+        },
+      });
+      await inner.runAsync({ args: {}, toolContext: toolContext as Context });
+      return;
+    }
+    if (wait === 'rewrapped') {
+      try {
+        return await body();
+      } catch (err) {
+        throw new Error('approval aborted', { cause: err });
+      }
+    }
+    await CancellationScope.nonCancellable(async () => {
+      try {
+        await CancellationScope.withTimeout('1 second', body);
+      } finally {
+        if (wait === 'shielded-cleanup') {
+          stage('cleanup');
+          await condition(() => released);
+        }
+      }
+    });
+  };
+  const unstartedNexusOperation = async (): Promise<void> => {
+    const client = createNexusServiceClient({
+      endpoint: nexusEndpoint ?? '',
+      service: { name: 'blocking', operations: { wait: { name: 'wait' } } } as never,
+    });
+    await client.executeOperation('wait' as never, undefined as never, { cancellationType: 'TRY_CANCEL' });
+  };
+  const failingChild = async (): Promise<void> => {
+    await executeChild(childTimedOutActivity);
+  };
+  if (kind === 'predicate' || kind === 'predicate-activity') {
+    const { cancellableActivity } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+    const tool = new FunctionTool({
+      name: 'wait_approval',
+      description: 'Run once a policy check allows it.',
+      execute: async () => ({ status: 'approved' }),
+      requireConfirmation: async (_args, toolContext) => {
+        // As for `tool`, the turn ends on the tool's response, so no model call follows.
+        toolContext!.actions.skipSummarization = true;
+        stage('blocked');
+        if (kind === 'predicate') await condition(() => false);
+        else await cancellableActivity();
+        return false;
+      },
+    });
+    return runAgentTurn(
+      new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT),
+      'hi',
+      undefined,
+      { tools: [tool] },
+      graph
+    );
+  }
+  if (kind === 'tool') {
+    const waitForApproval = shaped(
+      wait === 'child'
+        ? failingChild
+        : nexusEndpoint === undefined
+          ? () => condition(() => false)
+          : unstartedNexusOperation
+    );
+    const tool = new LongRunningFunctionTool({
+      name: 'wait_approval',
+      description: 'Wait for a person to approve.',
+      execute: async (_args, toolContext) => {
+        // From ADK 2.3 the tool's error goes to the model as a function response; this ends
+        // the turn on that response instead, so no model call follows on any ADK release.
+        toolContext!.actions.skipSummarization = true;
+        await waitForApproval(toolContext);
+        return { status: 'approved' };
+      },
+    });
+    return runAgentTurn(
+      new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT),
+      'hi',
+      undefined,
+      { tools: [tool] },
+      graph
+    );
+  }
+  const { cancellableActivity } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  const runCheck = shaped(
+    wait === 'child'
+      ? failingChild
+      : nexusEndpoint === undefined
+        ? async () => {
+            await cancellableActivity();
+          }
+        : unstartedNexusOperation
+  );
+  const check = async (): Promise<undefined> => {
+    await runCheck();
+    return undefined;
+  };
+  const model = new TemporalModel('fake-model', SINGLE_ATTEMPT);
+  return kind === 'plugin'
+    ? runAgentTurn(model, 'hi', [new PolicyPlugin(check)], undefined, graph)
+    : runAgentTurn(model, 'hi', undefined, { beforeModelCallback: check }, graph);
+}
+
+/** A {@link blockedTurn} in the main function. */
+export async function agentRunnerBlockedTurn(
+  kind: BlockedTurnKind,
+  wait: BlockedTurnWait = 'plain',
+  nexusEndpoint?: string
+): Promise<string> {
+  return blockedTurn(kind, setStage, wait, nexusEndpoint);
+}
+
+/**
+ * A Signal handler runs a {@link blockedTurn} (through a `LongRunningFunctionTool` unless
+ * `kind` says otherwise, as a one-node ADK graph with `graph`), after a failing model turn
+ * when `failFirst` is set and followed by a step of its own (a one-second `sleep`) when
+ * `ownStep` is set, and then marks the turn ended. The main function waits, shielded from
+ * cancellation, for that mark, then cleans up through two Activities with a wait for
+ * {@link adkDoneSignal} between them.
+ */
+export async function agentRunnerSignalTurnThenCleanup(
+  failFirst = false,
+  kind: BlockedTurnKind = 'tool',
+  graph = false,
+  ownStep = false
+): Promise<string> {
+  let turnEnded = false;
+  let released = false;
+  setHandler(adkStartSignal, async () => {
+    if (failFirst) await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi');
+    await blockedTurn(kind, setStage, 'plain', undefined, graph);
+    if (ownStep) await sleep('1 second');
+    turnEnded = true;
+  });
+  setHandler(adkDoneSignal, () => {
+    released = true;
+  });
+  const { echoId } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  await CancellationScope.nonCancellable(async () => {
+    await condition(() => turnEnded);
+    await echoId('one');
+    setStage('held');
+    await condition(() => released);
+    await echoId('two');
+  });
+  return 'cleaned up';
+}
+
+/**
+ * A Signal handler runs a {@link blockedTurn} (as a one-node ADK graph with `graph`) while
+ * the main function waits for it, still cancellable, so when the Workflow is cancelled the
+ * main function ends first: it lets the cancellation through (`raise`) or catches it and
+ * returns (`return`).
+ */
+export async function agentRunnerSignalTurnAfterMainEnds(
+  kind: BlockedTurnKind,
+  onCancel: 'raise' | 'return',
+  graph = false
+): Promise<string> {
+  let turnEnded = false;
+  setHandler(adkStartSignal, async () => {
+    await blockedTurn(kind, setStage, 'plain', undefined, graph);
+    turnEnded = true;
+  });
+  try {
+    await condition(() => turnEnded);
+  } catch (err) {
+    if (onCancel === 'return' && isCancellation(err)) return 'caught';
+    throw err;
+  }
+  return 'turn ended';
+}
+
+/**
+ * A runner turn whose `beforeModelCallback` keeps the error of one policy Activity, runs a
+ * second, and rethrows the first, both under one `activityId` when `reuse` is set (allowed
+ * once the first has closed: each waits for its cancellation to complete). With
+ * `execution-first`, the first waits until the Workflow's cancellation cancels it and the
+ * second is a shielded cleanup that its 1-second timeout scope cancels; with
+ * `timeout-first`, the first is that shielded wait and the second waits until the
+ * Workflow's cancellation cancels it. `stage` is `blocked` once the wait the cancellation
+ * must reach has started; the turn then returns `caught`.
+ */
+export async function agentRunnerRetainedActivityError(
+  order: 'execution-first' | 'timeout-first',
+  reuse: boolean
+): Promise<string> {
+  const policy = (activityId: string) =>
+    proxyActivities<BlockingActivities>({
+      startToCloseTimeout: '1 minute',
+      heartbeatTimeout: '5 seconds',
+      cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+      activityId,
+    }).cancellableActivity;
+  const waitForCancel = async (activityId: string): Promise<void> => {
+    setStage('blocked');
+    await policy(activityId)();
+  };
+  const timedOut = async (activityId: string): Promise<void> => {
+    await CancellationScope.nonCancellable(() =>
+      CancellationScope.withTimeout('1 second', () => policy(activityId)())
+    );
+  };
+  const [first, second] = order === 'execution-first' ? [waitForCancel, timedOut] : [timedOut, waitForCancel];
+  const check = async (): Promise<undefined> => {
+    let kept: unknown;
+    try {
+      await first('policy');
+    } catch (err) {
+      kept = err;
+    }
+    try {
+      await second(reuse ? 'policy' : 'policy-2');
+    } catch {
+      // Handled: only the first Activity's error leaves the callback.
+    }
+    throw kept;
+  };
+  await runAgentTurn(new TemporalModel('fake-model', SINGLE_ATTEMPT), 'hi', undefined, {
+    beforeModelCallback: check,
+  });
+  return 'caught';
+}
+
+/**
+ * One turn that runs a `FunctionTool`, frozen when `frozen` is set, reporting afterwards
+ * whether its `execute` ran and is still the function it was built with, and whether its
+ * `requireConfirmation` predicate, written as a `function`, ran with the tool as `this`.
+ */
+export async function agentRunnerToolKeepsItsExecute(frozen = false): Promise<{
+  ran: boolean;
+  same: boolean;
+  name: string;
+  length: number;
+  predicateOnTool: boolean;
+}> {
+  let ran = false;
+  async function approve(_args: unknown, _context: unknown): Promise<{ status: string }> {
+    ran = true;
+    return { status: 'approved' };
+  }
+  let predicateOnTool = false;
+  const tool = new FunctionTool({
+    name: 'wait_approval',
+    description: 'Approve.',
+    execute: approve,
+    requireConfirmation(this: unknown) {
+      predicateOnTool = this === tool;
+      return false;
+    },
+  });
+  if (frozen) Object.freeze(tool);
+  await runAgentTurn(new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT), 'hi', undefined, {
+    tools: [tool],
+  });
+  const execute = (tool as unknown as { execute: (...args: unknown[]) => unknown }).execute;
+  return { ran, same: execute === approve, name: execute.name, length: execute.length, predicateOnTool };
+}
+
+/**
+ * Starts a failing Activity (`activity`), or a `FunctionTool` run whose `execute` throws
+ * (`tool`), that it never awaits, then waits. The SDK fails the Workflow Task for the
+ * unhandled failure, and the plugin must leave that to it.
+ */
+export async function unhandledFailure(what: 'activity' | 'tool' = 'activity'): Promise<string> {
+  if (what === 'tool') {
+    const tool = new FunctionTool({
+      name: 'boom_tool',
+      description: 'Fails.',
+      execute: async () => {
+        throw new Error('tool boom');
+      },
+    });
+    void tool.runAsync({ args: {}, toolContext: {} as never });
+  } else {
+    const { failingActivity } = proxyActivities<{ failingActivity(): Promise<never> }>({
+      startToCloseTimeout: '1 minute',
+      retry: { maximumAttempts: 1 },
+    });
+    void failingActivity();
+  }
+  await sleep('2 seconds');
+  return 'completed';
+}
+
+/**
+ * A {@link blockedTurn} that its 1-second timeout scope cancels, then a wait outside ADK
+ * whose cancellation the Workflow catches and finishes on.
+ */
+export async function agentRunnerTimedOutTurnThenCaughtCancel(kind: BlockedTurnKind): Promise<string> {
+  await CancellationScope.withTimeout('1 second', () => blockedTurn(kind, setStage));
+  setStage('after-turn');
+  try {
+    await condition(() => false);
+  } catch (err) {
+    if (isCancellation(err)) return 'caught';
+    throw err;
+  }
+  return 'not cancelled';
+}
+
+/**
+ * A wait outside ADK whose cancellation the Workflow catches, then a {@link blockedTurn},
+ * shielded from that cancellation, that its own 1-second timeout scope cancels.
+ */
+export async function agentRunnerCaughtCancelThenTimedOutTurn(kind: BlockedTurnKind): Promise<string> {
+  setStage('waiting');
+  try {
+    await condition(() => false);
+    return 'not cancelled';
+  } catch (err) {
+    if (!isCancellation(err)) throw err;
+  }
+  await CancellationScope.nonCancellable(() =>
+    CancellationScope.withTimeout('1 second', () => blockedTurn(kind, setStage))
+  );
+  return 'caught';
+}
+
+/**
+ * A {@link blockedTurn} whose tool or callback shields its own wait, which a 1-second
+ * timeout scope then cancels (`shielded`, `shielded-cleanup`), then a wait outside ADK whose
+ * cancellation the Workflow catches and finishes on.
+ */
+export async function agentRunnerShieldedWaitThenCaughtCancel(
+  kind: BlockedTurnKind,
+  wait: BlockedTurnWait,
+  nexusEndpoint?: string
+): Promise<string> {
+  await blockedTurn(kind, setStage, wait, nexusEndpoint);
+  setStage('after-turn');
+  try {
+    await condition(() => false);
+  } catch (err) {
+    if (isCancellation(err)) return 'caught';
+    throw err;
+  }
+  return 'not cancelled';
+}
+
+/**
+ * A wait outside ADK whose cancellation the Workflow catches, then a {@link blockedTurn}
+ * whose callback throws an ordinary error at once, before anything cancellable runs.
+ */
+export async function agentRunnerCaughtCancelThenFailingTurn(kind: BlockedTurnKind): Promise<string> {
+  setStage('waiting');
+  try {
+    await condition(() => false);
+    return 'not cancelled';
+  } catch (err) {
+    if (!isCancellation(err)) throw err;
+  }
+  await blockedTurn(kind, setStage, 'throws');
+  return 'caught';
+}
+
+/**
+ * Runs an Activity (so its id is '1'), catches the Workflow's cancellation in a wait outside
+ * ADK, then runs a {@link blockedTurn}, shielded from that cancellation, whose tool or
+ * callback awaits a child Workflow that fails with its own cancelled Activity '1'.
+ */
+export async function agentRunnerCaughtCancelThenChildFailure(kind: BlockedTurnKind): Promise<string> {
+  const { echoId } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  await echoId('first');
+  setStage('waiting');
+  try {
+    await condition(() => false);
+    return 'not cancelled';
+  } catch (err) {
+    if (!isCancellation(err)) throw err;
+  }
+  await CancellationScope.nonCancellable(() => blockedTurn(kind, setStage, 'child'));
+  return 'caught';
+}
+
+/** A runner turn whose caller-supplied `summary` callback throws before the Activity. */
+export async function agentRunnerThrowingSummary(prompt: string): Promise<string> {
+  const model = new TemporalModel('fake-model', {
+    ...SINGLE_ATTEMPT,
+    summary: () => {
+      throw ApplicationFailure.nonRetryable('summary callback exploded', 'TestSummaryFailure');
+    },
+  });
+  return runAgentTurn(model, prompt);
+}
+
+/**
+ * A runner turn against a model too slow for its 1-second timeout scope. ADK absorbs the
+ * scope's cancellation, so the turn returns no text rather than throwing, and the Workflow
+ * falls back to its own value.
+ */
+export async function agentRunnerTurnUnderTimeoutScope(prompt: string): Promise<string> {
+  const text = await CancellationScope.withTimeout('1 second', () =>
+    runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), prompt)
+  );
+  return text || 'timed out';
+}
+
+/** A turn aborted by its timeout scope, then a turn that really fails. */
+export async function agentRunnerFailureAfterTimeoutScope(prompt: string): Promise<string> {
+  const aborted = await CancellationScope.withTimeout('1 second', () =>
+    runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), prompt)
+  );
+  const failed = await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), prompt);
+  return `${aborted}|${failed}`;
+}
+
+/**
+ * A direct (non-runner) model call whose Activity fails and whose caller handles it.
+ * Returns the caught failure's type, so the Workflow's result witnesses what it caught.
+ */
+export async function caughtModelCallError(): Promise<string> {
+  const llm = new TemporalModel('boom', SINGLE_ATTEMPT);
+  let text = '';
+  try {
+    for await (const response of llm.generateContentAsync(makeRequest('explode'))) {
+      text += collectText(response.content?.parts);
+    }
+  } catch (err) {
+    if (err instanceof ActivityFailure && err.cause instanceof ApplicationFailure) {
+      return err.cause.type ?? 'untyped';
+    }
+    throw err;
+  }
+  return text;
+}
+
+export const adkChatUpdate = defineUpdate<string, [string]>('adkChat');
+export const adkDoneSignal = defineSignal<[]>('adkDone');
+
+/**
+ * The update-driven agent shape: the main function parks while each Update runs one
+ * agent turn against the model it names.
+ */
+export async function agentRunnerUpdateDriven(): Promise<void> {
+  let done = false;
+  setHandler(adkChatUpdate, (model) => runAgentTurn(new TemporalModel(model, SINGLE_ATTEMPT), 'hi'));
+  setHandler(adkDoneSignal, () => {
+    done = true;
+  });
+  await condition(() => done);
+}
+
+/**
+ * A runner turn followed by `continueAsNew` to `nextModel` — the shape a long-running
+ * agent uses to trim its history.
+ */
+export async function agentRunnerContinueAsNew(model: string, nextModel?: string): Promise<string> {
+  const text = await runAgentTurn(new TemporalModel(model, SINGLE_ATTEMPT), 'hi');
+  if (nextModel !== undefined) {
+    await continueAsNew<typeof agentRunnerContinueAsNew>(nextModel);
+  }
+  return text;
+}
+
+export const adkRecoverSignal = defineSignal<[]>('adkRecover');
+
+/**
+ * A turn against a model that answers, so it emits the second `adk-invokeModel` Activity
+ * the tests wait on to know the failing turn is behind them.
+ */
+async function answeringTurn(): Promise<string> {
+  return runAgentTurn(new TemporalModel('fake-model'), 'hi');
+}
+
+/**
+ * A failing main-function turn nothing recovers, plus a Signal handler that runs its own
+ * failing turn and recovers from that one.
+ */
+export async function agentRunnerFailureThenRecoveringSignal(): Promise<string> {
+  let recovered = false;
+  setHandler(adkRecoverSignal, async () => {
+    await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi', [new RecoveringPlugin()]);
+    recovered = true;
+  });
+  await runAgentTurn(
+    new TemporalModel('slow-model', { activity: { startToCloseTimeout: '1 second', retry: { maximumAttempts: 1 } } }),
+    'hi'
+  );
+  const answered = await answeringTurn();
+  await condition(() => recovered);
+  return answered;
+}
+
+export const adkStartSignal = defineSignal<[]>('adkStart');
+
+/**
+ * A Signal handler that starts a failing turn without awaiting it, so the handler returns
+ * before the failure lands, while the main function stays parked until the turn is over.
+ */
+export async function agentRunnerUnawaitedSignalTurn(): Promise<string> {
+  let finished = false;
+  setHandler(adkStartSignal, () => {
+    void runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi').then(() => {
+      finished = true;
+    });
+  });
+  await condition(() => finished);
+  return 'joined';
+}
+
+export const adkAwaitSignal = defineSignal<[]>('adkAwait');
+
+/**
+ * A Signal handler that awaits its own failing turn while the main function parks for good,
+ * so the Signal's frame is the only one that can raise what that turn absorbed.
+ */
+export async function agentRunnerAwaitedSignalTurn(): Promise<void> {
+  setHandler(adkAwaitSignal, async () => {
+    await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi');
+  });
+  await condition(() => false);
+}
+
+interface CompensationActivities {
+  compensate(): Promise<void>;
+}
+
+/**
+ * A failing main-function turn inside a `try`/`finally` that compensates through an
+ * Activity, then a park long enough to take a Signal while the main function still runs.
+ */
+export async function agentRunnerFailureWithCompensation(): Promise<string> {
+  let nudged = false;
+  setHandler(adkDoneSignal, () => {
+    nudged = true;
+  });
+  const { compensate } = proxyActivities<CompensationActivities>({ startToCloseTimeout: '10 seconds' });
+  try {
+    await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi');
+    await answeringTurn();
+    await sleep('2 seconds');
+    return nudged ? 'nudged' : 'quiet';
+  } finally {
+    await compensate();
+  }
+}
+
+export const adkContinueUpdate = defineUpdate<string, []>('adkContinue');
+
+/**
+ * A failing main-function turn, then a park, while an Update continues as new to a model
+ * that answers.
+ */
+export async function agentRunnerContinueAsNewFromUpdate(model: string): Promise<string> {
+  let done = false;
+  setHandler(adkContinueUpdate, async () => {
+    await continueAsNew<typeof agentRunnerContinueAsNewFromUpdate>('fake-model');
+    return 'continued';
+  });
+  setHandler(adkDoneSignal, () => {
+    done = true;
+  });
+  const failed = await runAgentTurn(new TemporalModel(model, SINGLE_ATTEMPT), 'hi');
+  const answered = await answeringTurn();
+  await condition(() => done);
+  return `${failed}|${answered}`;
+}
+
+/** `net` shim classifications computed at module load and at run time. */
+export async function netShimProbe(): Promise<{ loadTime: number[]; runtime: number[] }> {
+  return {
+    loadTime: blockedIpv6BaseVersions,
+    runtime: ['127.0.0.1', '::ffff:127.0.0.1', 'not-an-ip'].map((address) => isIP(address)),
+  };
+}
+
+interface ProbeActivities {
+  echoId(id: string): Promise<string>;
+}
+
+/**
+ * Generates ADK ids (which use ADK's `randomUUID`) across two Workflow Tasks
+ * and sends them through an Activity, so a replay that regenerated them
+ * differently would fail with a non-determinism error.
+ */
+export async function cryptoShimProbe(): Promise<{
+  before: string;
+  callId: string;
+  after: string;
+  direct: string;
+  bytes: string;
+  filled: string;
+}> {
+  const { echoId } = proxyActivities<ProbeActivities>({ startToCloseTimeout: '10 seconds' });
+  const before = new RequestInput({}).interruptId;
+  const callId = generateClientFunctionCallId();
+  await echoId(before);
+  await sleep('1 ms');
+  const after = new RequestInput({}).interruptId;
+  await echoId(after);
+  // The sandbox `crypto` global itself — what ADK's id generator and `uuid`'s
+  // browser build read — and the `randomFillSync` that `uuid`'s node build
+  // imports from the shim as `node:crypto`.
+  const direct = globalThis.crypto.randomUUID();
+  const bytes = hex(globalThis.crypto.getRandomValues(new Uint8Array(8)));
+  const filled = hex(randomFillSync(new Uint8Array(6), 2, 3));
+  await echoId(direct);
+  await echoId(`${bytes}:${filled}`);
+  return { before, callId, after, direct, bytes, filled };
+}
+
+function hex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ADK 2.0 workflow-runtime fixtures; bundled through this module.
+export * from './graph-workflows';

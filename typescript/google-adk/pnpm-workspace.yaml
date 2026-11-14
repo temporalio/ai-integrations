@@ -1,0 +1,15 @@
+onlyBuiltDependencies:
+  - "@temporalio/core-bridge"
+  - esbuild
+  - protobufjs
+
+# Minimum release age, in minutes (2 weeks)
+minimumReleaseAge: 20160
+
+# Allow depending on just published Temporal packages
+minimumReleaseAgeExclude:
+  - '@temporalio/*'
+
+  # Exact security fixes; all other third-party releases keep the two-week cooldown.
+  - hono@4.13.16
+  - '@hono/node-server@2.1.6'

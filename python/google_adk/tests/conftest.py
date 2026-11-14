@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from collections.abc import AsyncGenerator
 from functools import partial
 from pathlib import Path
 
-# ADK lazily imports this provider even for local models. Load its large OpenAI
-# type tree before workflow tasks start so cold imports cannot trip the SDK's
-# two-second deadlock detector (particularly under Python 3.10).
-import openai  # noqa: E402,F401  # pyright: ignore[reportUnusedImport]
 import opentelemetry._logs._internal
 import opentelemetry.metrics
 import opentelemetry.metrics._internal
@@ -42,32 +37,16 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     if hasattr(session.config, "workerinput"):
         return
     plugin = load_plugin_meta(PLUGIN_ROOT)
-    allow_overlap = (not plugin.allow_final) or os.environ.get(
-        "ALLOW_OVERLAP_WITH_CORE"
-    ) == "1"
     try:
         check_provenance(
             plugin.coordinate,
             plugin.package_relpath,
-            allow_overlap=allow_overlap,
-            warn=lambda message: print(f"provenance: {message}"),
         )
     except ProvenanceError as exc:
         pytest.exit(f"provenance guard failed: {exc}", returncode=1)
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create the session event loop."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()  # type: ignore[reportDeprecated]
-    yield loop
-    try:
-        loop.close()
-    except TypeError:
-        raise
-
-
-@pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
+@pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     """Start the pinned local Temporal development server."""
     environment = await start_local_with_retry(
@@ -80,7 +59,7 @@ async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     await environment.shutdown()
 
 
-@pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]
+@pytest_asyncio.fixture
 async def client(env: WorkflowEnvironment) -> Client:
     """Return the local environment's client."""
     return env.client

@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import importlib
+import inspect
+from collections.abc import Mapping
 from datetime import timedelta
 from functools import wraps
 from typing import Any, Callable
@@ -40,6 +42,9 @@ INVOKE_MODEL = "deepagents.invoke_model"
 INVOKE_MODEL_STREAMING = "deepagents.invoke_model_streaming"
 INVOKE_TOOL = "deepagents.invoke_tool"
 BACKEND_OP = "deepagents.backend_op"
+
+CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
+"""``ApplicationError.type`` of a model call the provider rejected as too long."""
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +90,12 @@ class ToolActivityInput:
     tool_call_id: str
     args: dict[str, Any]
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # The path and class name of each LangChain message in ``args``, from
+    # ``_serde.find_tool_arg_messages``. Input from older workflow code lacks it
+    # and passes through unchanged.
+    arg_messages: list[tuple[list[str | int], str]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -99,11 +110,15 @@ class BackendOpInput:
     """A single filesystem / shell / store operation for a wrapped backend."""
 
     backend_ref: str
-    """Key identifying which registered backend to act on."""
+    """Backend reference; instance wrappers resolve it in the local registry."""
     op: str
     """Backend method name, e.g. ``ls`` / ``read_file`` / ``write_file`` / ``execute``."""
     args: list[Any] = dataclasses.field(default_factory=list)
     kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    backend_factory: str | None = None
+    """Worker-configured factory name; when set, bypasses the local registry."""
+    factory_argument: Any = None
+    """Serializable argument passed to the factory on each activity attempt."""
 
 
 @dataclasses.dataclass
@@ -203,9 +218,108 @@ def _translate_api_error(exc: Exception) -> ApplicationError | None:
     )
 
 
+# HTTP statuses and messages that mark a provider's context overflow, as in Deep
+# Agents' summarization middleware since 0.7.14. Its check is private and older
+# 0.7 releases lack it, so the plugin keeps its own copy.
+_CONTEXT_OVERFLOW_STATUSES = frozenset({400, 413, 422})
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "contextwindowexceedederror",
+    "maximum context length",
+    "exceeds the context window",
+    "exceeds the available context size",
+    "context window exceeded",
+    "context limit exceeded",
+    "input tokens exceed the configured limit",
+    "prompt is too long",
+)
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """Return whether the provider rejected the request as too long.
+
+    LangChain's ``ContextOverflowError`` covers the typed overflow errors, with
+    or without an HTTP status. An OpenAI-compatible server such as vLLM returns
+    an ordinary 400 instead, so an error with one of the statuses above whose
+    message names an overflow counts too.
+    """
+    from langchain_core.exceptions import ContextOverflowError
+
+    if isinstance(exc, ContextOverflowError):
+        return True
+    if getattr(exc, "status_code", None) not in _CONTEXT_OVERFLOW_STATUSES:
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _context_overflow_error(exc: Exception) -> ApplicationError | None:
+    """Mark a provider's context-window overflow so the workflow can recover.
+
+    Deep Agents' summarization middleware summarizes older messages and retries
+    when a model call fails with ``ContextOverflowError``. The provider's
+    exception is only available here, so classify it here and give the failure
+    a type the workflow side rebuilds the overflow from. Retrying the same
+    request cannot succeed, so it is non-retryable.
+    """
+    if not _is_context_overflow(exc):
+        return None
+    return ApplicationError(
+        str(exc), type=CONTEXT_OVERFLOW_ERROR_TYPE, non_retryable=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # The activities
 # ---------------------------------------------------------------------------
+
+
+class _BackendFactory:
+    """Invoke a worker-side backend factory with zero or one argument."""
+
+    def __init__(self, name: str, factory: Callable[..., Any]) -> None:
+        self._name = name
+        self._factory = factory
+        self._accepts_argument = False
+        try:
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError):
+            return
+        self._accepts_argument = any(
+            parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
+            )
+            for parameter in signature.parameters.values()
+        )
+        try:
+            signature.bind(None) if self._accepts_argument else signature.bind()
+        except TypeError as exc:
+            raise TypeError(
+                f"Backend factory {name!r} must accept zero arguments or one "
+                "positional factory_argument."
+            ) from exc
+
+    def __call__(self, argument: Any) -> Any:
+        if self._accepts_argument:
+            return self._factory(argument)
+        if argument is not None:
+            raise ApplicationError(
+                f"Backend factory {self._name!r} declares no parameters, so it "
+                "cannot receive a factory_argument; declare one positional "
+                "parameter to accept it.",
+                type="DeepAgentsInvalidBackendFactoryArgument",
+                non_retryable=True,
+            )
+        return self._factory()
+
+
+# Binding options that a provider's ``bind_tools`` converts to its own format
+# (Anthropic turns ``"any"`` into ``{"type": "any"}``, OpenAI into
+# ``"required"``). Passing them to ``.bind()`` instead skips that conversion.
+_TOOL_BIND_KWARGS = ("tool_choice", "parallel_tool_calls")
 
 
 def _default_model_provider(model_name: str) -> Any:
@@ -215,9 +329,7 @@ def _default_model_provider(model_name: str) -> Any:
     logical attempt fans out into nested retry storms that Temporal can neither
     see nor bound.
     """
-    # importlib: `langchain` (unlike langchain-core) is absent on Python 3.10
-    # environments where the deepagents extra cannot install; a static import
-    # here fails type-checking there.
+    # Load the provider factory when a model is requested.
     init_chat_model = importlib.import_module("langchain.chat_models").init_chat_model
 
     return init_chat_model(model_name, max_retries=0)
@@ -234,18 +346,27 @@ class DeepAgentActivities:
         self,
         *,
         model_provider: Callable[[str], Any] | None = None,
+        backends: Mapping[str, Callable[..., Any]] | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
     ) -> None:
-        """Store the worker-side model provider + streaming configuration."""
+        """Store worker-side model and backend factories and streaming settings."""
         self._model_provider = model_provider or _default_model_provider
+        self._backends = {
+            name: _BackendFactory(name, factory)
+            for name, factory in (backends or {}).items()
+        }
         self._streaming_batch_interval = streaming_batch_interval
 
     def _build_bound_model(self, input: ModelActivityInput) -> Any:
         model = self._model_provider(input.model_name)
+        bind_kwargs = dict(input.bind_kwargs)
         if input.tool_schemas:
-            model = model.bind_tools(input.tool_schemas)
-        if input.bind_kwargs:
-            model = model.bind(**input.bind_kwargs)
+            tool_kwargs = {
+                k: bind_kwargs.pop(k) for k in _TOOL_BIND_KWARGS if k in bind_kwargs
+            }
+            model = model.bind_tools(input.tool_schemas, **tool_kwargs)
+        if bind_kwargs:
+            model = model.bind(**bind_kwargs)
         return model
 
     @activity.defn(name=INVOKE_MODEL)
@@ -258,6 +379,9 @@ class DeepAgentActivities:
         try:
             message = await model.ainvoke(messages, config=config)
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
@@ -300,6 +424,9 @@ class DeepAgentActivities:
                         topic.publish(_serde.dump_object(chunk))
                     final = chunk if final is None else final + chunk
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
@@ -320,14 +447,15 @@ class DeepAgentActivities:
         if tool is None:
             raise ApplicationError(
                 f"Tool {input.tool_name!r} is not registered on this worker. "
-                f"Wrap it with tool_as_activity(...) or activity_as_tool(...).",
+                "Call tool_as_activity(...) at startup on every activity worker, "
+                "or expose a registered activity with activity_as_tool(...).",
                 type="DeepAgentsUnknownTool",
                 non_retryable=True,
             )
         config = _serde.rebuild_runnable_config(input.config)
         tool_call = {
             "name": input.tool_name,
-            "args": input.args,
+            "args": _serde.load_tool_arg_messages(input.args, input.arg_messages),
             "id": input.tool_call_id,
             "type": "tool_call",
         }
@@ -337,13 +465,30 @@ class DeepAgentActivities:
     @activity.defn(name=BACKEND_OP)
     @_auto_heartbeater
     async def backend_op(self, input: BackendOpInput) -> BackendOpOutput:
-        """Run one operation against a registered (real-I/O) backend."""
+        """Run one operation against a factory-built or registered backend."""
         from temporalio.deepagents._tools import lookup_backend
 
-        backend = lookup_backend(input.backend_ref)
+        if input.backend_factory is not None:
+            factory = self._backends.get(input.backend_factory)
+            if factory is None:
+                raise ApplicationError(
+                    f"Backend factory {input.backend_factory!r} is not configured "
+                    "on this worker. Configure DeepAgentsPlugin(backends=...) "
+                    "on every activity worker.",
+                    type="DeepAgentsUnknownBackendFactory",
+                    non_retryable=True,
+                )
+            # Preserve the activity context without blocking heartbeat tasks.
+            backend = await asyncio.to_thread(factory, input.factory_argument)
+            if inspect.isawaitable(backend):
+                backend = await backend
+        else:
+            backend = lookup_backend(input.backend_ref)
         if backend is None:
             raise ApplicationError(
-                f"Backend {input.backend_ref!r} is not registered on this worker.",
+                f"Backend {input.backend_ref!r} is not registered on this worker. "
+                "Use TemporalBackend with a named worker-side factory for "
+                "operations that may run in another process.",
                 type="DeepAgentsUnknownBackend",
                 non_retryable=True,
             )
@@ -354,7 +499,10 @@ class DeepAgentActivities:
                 type="DeepAgentsUnknownBackendOp",
                 non_retryable=True,
             )
-        result = method(*input.args, **input.kwargs)
+        result = method(
+            *_serde.load_backend_result(input.args),
+            **_serde.load_backend_result(input.kwargs),
+        )
         if asyncio.iscoroutine(result):
             result = await result
         # Protocol results are plain dataclasses whose attributes the

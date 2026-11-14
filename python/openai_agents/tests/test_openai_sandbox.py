@@ -58,6 +58,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ReadResult,
     ResumeSessionArgs,
     RunningArgs,
+    SessionResult,
     StartArgs,
     StopArgs,
     WriteArgs,
@@ -67,6 +68,9 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
 )
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
+)
+from temporalio.openai_agents.sandbox._temporal_sandbox_session import (
+    TemporalSandboxSession,
 )
 from temporalio.openai_agents.sandbox._temporal_worker_env_value import (
     _resolvable_worker_env_vars,
@@ -328,6 +332,45 @@ class _MockSandboxClient(BaseSandboxClient[BaseSandboxClientOptions | None]):
 
     def deserialize_session_state(self, payload: dict[str, Any]) -> SandboxSessionState:
         return SandboxSessionState.model_validate(payload)
+
+
+async def test_start_and_stop_propagate_state_across_activity_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class ChangingSession(_MockSandboxSession):
+        async def start(self) -> None:
+            await super().start()
+            self.state.workspace_root_ready = True
+
+        async def stop(self) -> None:
+            await super().stop()
+            self.state.workspace_root_ready = False
+
+    inner = ChangingSession()
+    provider = SandboxClientProvider("mock", _MockSandboxClient(inner))
+    activities = _activity_map(provider)
+    state = _make_state()
+    session = TemporalSandboxSession(
+        "mock", ActivityConfig(start_to_close_timeout=timedelta(seconds=30)), state
+    )
+
+    async def execute_activity(
+        name: str, *, arg: Any, result_type: Any, **_kwargs: Any
+    ):
+        assert result_type is SessionResult
+        args_type = StartArgs if name.endswith("_start") else StopArgs
+        # Activities run on another process; mutations to the argument cannot
+        # reach the workflow unless they are returned in the activity result.
+        remote_args = args_type.model_validate(arg.model_dump(mode="json"))
+        remote_result = await activities[name](remote_args)
+        return SessionResult.model_validate(remote_result.model_dump(mode="json"))
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    await session.start()
+    assert session.state.workspace_root_ready is True
+    await session.stop()
+    assert session.state.workspace_root_ready is False
+    assert inner.start_calls == inner.stop_calls == 1
 
 
 # ── SandboxClientProvider unit tests (delegation) ──

@@ -198,9 +198,13 @@ class ChatModelActivityImplTest {
     verify(mockModel).call(captor.capture());
     Prompt prompt = captor.getValue();
 
-    // Verify tool execution is disabled (workflow handles it)
+    // The Activity sends definitions only. Its callbacks reject execution;
+    // the workflow's ChatClient advisor owns the actual tool invocation.
     assertInstanceOf(ToolCallingChatOptions.class, prompt.getOptions());
-    assertFalse(ToolCallingChatOptions.isInternalToolExecutionEnabled(prompt.getOptions()));
+    ToolCallingChatOptions options = (ToolCallingChatOptions) prompt.getOptions();
+    assertEquals(1, options.getToolCallbacks().size());
+    assertThrows(
+        UnsupportedOperationException.class, () -> options.getToolCallbacks().get(0).call("{}"));
   }
 
   @Test

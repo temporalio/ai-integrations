@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "incremental": true,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "sourceMap": true,
+    "experimentalDecorators": true,
+    "noUncheckedIndexedAccess": true,
+    "types": [
+      "node"
+    ]
+  }
+}

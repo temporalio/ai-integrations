@@ -12,14 +12,16 @@ import os
 import shutil
 import subprocess
 import tempfile
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 
 def smoke(plugin_dir: Path, version: str, repository: str | None = None) -> None:
     plugin_dir = plugin_dir.resolve()
     meta = tomllib.loads((plugin_dir / 'plugin.toml').read_text())
     group, artifact = meta['plugin']['coordinate'].split(':')
+    modules = [(group, artifact)]
     with tempfile.TemporaryDirectory(prefix='java-consumer-') as directory:
         consumer = Path(directory)
         if repository is None:
@@ -29,15 +31,18 @@ def smoke(plugin_dir: Path, version: str, repository: str | None = None) -> None
                 if path.suffix in {'.jar', '.pom', '.module'}:
                     shutil.copyfile(path, repo / path.name)
             repository = (consumer / 'repository').as_uri()
-        dependencies = [f'{group}:{artifact}:{version}', *meta.get('smoke', {}).get('dependencies', [])]
+        dependency = f'{group}:{artifact}:{version}'
+        dependencies = [dependency, *meta.get('smoke', {}).get('dependencies', [])]
         quoted_deps = '\n'.join('    implementation ' + json.dumps(dep) for dep in dependencies)
+        includes = '; '.join(f'includeModule({json.dumps(g)}, {json.dumps(a)})' for g, a in modules)
+        excludes = '; '.join(f'excludeModule({json.dumps(g)}, {json.dumps(a)})' for g, a in modules)
         (consumer / 'settings.gradle').write_text("rootProject.name = 'isolated-consumer'\n")
         # Credentials stay in environment variables, not generated files or CLI arguments.
         (consumer / 'build.gradle').write_text('''plugins { id 'application' }
 repositories {
     maven {
         url = uri(''' + json.dumps(repository) + ''')
-        content { includeModule(''' + json.dumps(group) + ', ' + json.dumps(artifact) + ''') }
+        content { ''' + includes + ''' }
         if (System.getenv('CENTRAL_BEARER')) {
             credentials(HttpHeaderCredentials) {
                 name = 'Authorization'
@@ -47,7 +52,7 @@ repositories {
         }
     }
     mavenCentral {
-        content { excludeModule(''' + json.dumps(group) + ', ' + json.dumps(artifact) + ''') }
+        content { ''' + excludes + ''' }
     }
 }
 dependencies {

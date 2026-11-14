@@ -9,22 +9,17 @@ LangChain and guards on its import.
 
 from __future__ import annotations
 
-import sys
 import uuid
 from datetime import timedelta
 
 import pytest
 
-from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 from temporalio import workflow
 from temporalio.client import WorkflowFailureError
 from temporalio.deepagents import DeepAgentsPlugin, DeepAgentsWorkflowError
 from temporalio.deepagents._activity import _translate_api_error
 from temporalio.exceptions import ApplicationError
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 

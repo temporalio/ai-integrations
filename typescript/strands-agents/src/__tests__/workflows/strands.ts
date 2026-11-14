@@ -1,0 +1,680 @@
+// eslint-disable-next-line import/no-unassigned-import
+import '../../load-polyfills';
+import { z } from 'zod';
+import {
+  AfterToolCallEvent,
+  AfterToolsEvent,
+  BeforeInvocationEvent,
+  SlidingWindowConversationManager,
+  tool,
+  type BaseModelConfig,
+  type InterruptResponseContent,
+  type InterruptResponseContentData,
+  type JSONValue,
+  type Message,
+} from '@strands-agents/sdk';
+import { InMemoryStorage } from '@strands-agents/sdk/storage';
+import {
+  ContextOffloader,
+  InMemoryStorage as LegacyInMemoryStorage,
+} from '@strands-agents/sdk/vended-plugins/context-offloader';
+import {
+  ActivityCancellationType,
+  ActivityFailure,
+  allHandlersFinished,
+  ApplicationFailure,
+  continueAsNew,
+  defineSignal,
+  defineUpdate,
+  DeterminismViolationError,
+  proxyActivities,
+  setHandler,
+  condition,
+  workflowInfo,
+  type ActivityOptions,
+} from '@temporalio/workflow';
+import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
+import {
+  TemporalAgent,
+  TemporalMCPClient,
+  TemporalModel,
+  type ActivityAsToolOptions,
+  type TemporalAgentOptions,
+  workflow as strandsWorkflow,
+} from '../..';
+
+export async function helloAgent(prompt: string): Promise<string> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  const result = await agent.invoke(prompt);
+  return result.toString();
+}
+
+/** Exercise signal composition for direct invokes, including aborts before and after composition. */
+export async function agentWithCancelSignal(mode: 'active' | 'pre-aborted' | 'hook'): Promise<{
+  stopReason: string;
+  isAbortSignal: boolean;
+}> {
+  const controller = new AbortController();
+  const signal = mode === 'pre-aborted' ? AbortSignal.abort('already cancelled') : controller.signal;
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  if (mode === 'hook') {
+    agent.addHook(BeforeInvocationEvent, () => controller.abort('cancelled in hook'));
+  }
+  const result = await agent.invoke('hello', { cancelSignal: signal });
+  return { stopReason: result.stopReason, isAbortSignal: agent.cancelSignal instanceof AbortSignal };
+}
+
+/** Refuse a native timeout before it can make workflow commands depend on wall-clock time. */
+export async function abortSignalTimeout(): Promise<string> {
+  try {
+    AbortSignal.timeout(500);
+  } catch (error) {
+    if (!(error instanceof DeterminismViolationError)) throw error;
+    await proxyActivities<{ auditTool(message: string): Promise<void> }>({
+      startToCloseTimeout: '10 seconds',
+    }).auditTool(error.message);
+    return error.message;
+  }
+  return 'AbortSignal.timeout() did not throw';
+}
+
+/** Exercise Strands' own offloader and storage inside the Workflow isolate. */
+export async function contextOffloaderAgent(
+  storageKind: 'memory' | 'default' | 'legacy',
+  evictAfterCycles: number | null
+): Promise<{ replies: string[]; keys?: string[]; error?: { name: string; message: string } }> {
+  const storage = storageKind === 'memory' ? new InMemoryStorage() : undefined;
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } },
+    tools: [strandsWorkflow.activityAsTool('loadDocument', { description: 'Load a large document' })],
+    plugins: [
+      new ContextOffloader({
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- Exercise the unsupported legacy backend.
+        ...(storageKind === 'legacy' ? { storage: new LegacyInMemoryStorage() } : storage ? { storage } : {}),
+        maxResultTokens: 100,
+        previewTokens: 10,
+        evictAfterCycles,
+      }),
+    ],
+  });
+  const replies: string[] = [];
+  try {
+    replies.push((await agent.invoke('load the document and retrieve its full content')).toString());
+    replies.push((await agent.invoke('next turn')).toString());
+  } catch (err) {
+    const { name, message } = err as Error;
+    return { replies, error: { name, message } };
+  }
+  return { replies, ...(storage ? { keys: await storage.list('') } : {}) };
+}
+
+/**
+ * Runs one agent turn whose model activity heartbeats, with the given cancellation type, so a
+ * workflow cancel during the model call reaches the model.
+ */
+export async function cancellableAgent(cancellationType: ActivityCancellationType): Promise<string> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    activityOptions: { startToCloseTimeout: '30 seconds', heartbeatTimeout: '5 seconds', cancellationType },
+  });
+  const result = await agent.invoke('hello');
+  return result.toString();
+}
+
+/**
+ * Runs each prompt as a turn of one agent with Strands' proactive compression, then returns the
+ * config the agent's model reports in workflow code.
+ */
+export async function compressionAgent(prompts: string[]): Promise<BaseModelConfig> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    conversationManager: new SlidingWindowConversationManager({ proactiveCompression: true }),
+  });
+  for (const prompt of prompts) {
+    await agent.invoke(prompt);
+  }
+  return agent.model.getConfig();
+}
+
+/**
+ * Runs the prompt twice on one agent and returns each reply, or the activity error that ended the
+ * turn, and the config the agent's model reports in workflow code.
+ */
+export async function retryConfigAgent(prompt: string): Promise<{ turns: string[]; config: BaseModelConfig }> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  const turns: string[] = [];
+  for (let i = 0; i < 2; i++) {
+    try {
+      turns.push((await agent.invoke(prompt)).toString());
+    } catch (err) {
+      turns.push(`error: ${(err as ActivityFailure).cause?.message}`);
+    }
+  }
+  return { turns, config: agent.model.getConfig() };
+}
+
+// Retry a failed model activity quickly, and not forever.
+const STATEFUL_ACTIVITY_OPTIONS: ActivityOptions = {
+  startToCloseTimeout: '15 seconds',
+  retry: { initialInterval: '100 milliseconds', backoffCoefficient: 1, maximumAttempts: 50 },
+};
+
+/**
+ * Runs two turns on one agent with the `stateful` worker model and returns the agent's message
+ * count after each turn, or the error that ended the run. `models-queue` runs the model activities
+ * on the `-models` task queue.
+ */
+export async function statefulAgent(
+  mode: 'plain' | 'streaming' | 'manager' | 'models-queue'
+): Promise<number[] | string> {
+  void new WorkflowStream();
+  const agent = new TemporalAgent({
+    model: 'stateful',
+    printer: false,
+    activityOptions: {
+      ...STATEFUL_ACTIVITY_OPTIONS,
+      ...(mode === 'models-queue' ? { taskQueue: `${workflowInfo().taskQueue}-models` } : {}),
+    },
+    ...(mode === 'streaming' ? { streamingTopic: 'model' } : {}),
+    ...(mode === 'manager' ? { conversationManager: new SlidingWindowConversationManager() } : {}),
+  });
+  const messagesAfterTurn: number[] = [];
+  try {
+    for (const prompt of ['turn one', 'turn two']) {
+      await agent.invoke(prompt);
+      messagesAfterTurn.push(agent.messages.length);
+    }
+  } catch (err) {
+    return (err as Error).message;
+  }
+  return messagesAfterTurn;
+}
+
+export interface StatefulChatInput {
+  prompts: string[];
+  messages?: Message[];
+  modelState?: Record<string, JSONValue>;
+}
+
+/**
+ * The README's continue-as-new handoff with the `stateful` worker model: one turn per run. Returns
+ * the last run's message count, or the error that ended the turn.
+ */
+export async function statefulChatAgent(input: StatefulChatInput): Promise<number | string> {
+  const agent = new TemporalAgent({
+    model: 'stateful',
+    printer: false,
+    activityOptions: STATEFUL_ACTIVITY_OPTIONS,
+    messages: input.messages,
+    modelState: input.modelState,
+  });
+  try {
+    await agent.invoke(input.prompts[0]!);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  if (input.prompts.length > 1) {
+    await continueAsNew<typeof statefulChatAgent>({
+      prompts: input.prompts.slice(1),
+      messages: agent.messages,
+      modelState: agent.modelState.getAll(),
+    });
+  }
+  return agent.messages.length;
+}
+
+/**
+ * Same as {@link helloAgent} but omits `model:` so the plugin's single-factory
+ * default kicks in. Exercises the fallback that picks the only registered
+ * factory's key as the implicit default.
+ */
+export async function defaultModelAgent(prompt: string): Promise<string> {
+  const agent = new TemporalAgent({ printer: false });
+  const result = await agent.invoke(prompt);
+  return result.toString();
+}
+
+export async function activityToolAgent(
+  prompt: string,
+  toolOptions: ActivityAsToolOptions = { description: 'Get the weather for a city' }
+): Promise<string> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: [
+      strandsWorkflow.activityAsTool('getWeather', {
+        ...toolOptions,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            location: { type: 'string' },
+          },
+          required: ['location'],
+        },
+        activityOptions: { startToCloseTimeout: '10 seconds' },
+      }),
+    ],
+  });
+  const result = await agent.invoke(prompt);
+  return result.toString();
+}
+
+/** Run two calls of one subagent, exposing its state before each call and its actual tool results. */
+export async function agentToolAgent(mode: 'default' | 'reset' | 'preserve' | 'implicit'): Promise<{
+  reply: string;
+  appStates: Record<string, JSONValue>[];
+  toolResults: Array<{ status: string; text: string }>;
+}> {
+  const subagent = new TemporalAgent({
+    name: 'specialist',
+    model: 'specialist',
+    printer: false,
+    appState: { calls: 0 },
+    messages: [
+      { role: 'user', content: [{ text: 'baseline prompt' }] },
+      { role: 'assistant', content: [{ text: 'baseline reply' }] },
+    ],
+  });
+  const appStates: Record<string, JSONValue>[] = [];
+  subagent.addHook(BeforeInvocationEvent, () => {
+    appStates.push(subagent.appState.getAll());
+    subagent.appState.set('calls', Number(subagent.appState.get('calls')) + 1);
+    subagent.appState.set('duringCall', 'added');
+  });
+  const wrapped =
+    mode === 'implicit'
+      ? subagent
+      : mode === 'default'
+        ? subagent.asTool()
+        : subagent.asTool({ preserveContext: mode === 'preserve' });
+  const agent = new TemporalAgent({ model: 'parent', printer: false, tools: [wrapped] });
+  const toolResults: Array<{ status: string; text: string }> = [];
+  agent.addHook(AfterToolCallEvent, (event) => {
+    toolResults.push({
+      status: event.result.status,
+      text: event.result.content.map((block) => (block.type === 'textBlock' ? block.text : '')).join(''),
+    });
+  });
+  const result = await agent.invoke('ask the specialist twice');
+  return { reply: result.toString(), appStates, toolResults };
+}
+
+/**
+ * Runs an agent with `tools` and returns, for each tool call that failed, the text the model gets
+ * and the message of the error attached to the result for hooks.
+ */
+async function failedToolCalls(
+  prompt: string,
+  tools: TemporalAgentOptions['tools']
+): Promise<Array<{ text: string; error?: string }>> {
+  const failed: Array<{ text: string; error?: string }> = [];
+  const agent = new TemporalAgent({ model: 'test', printer: false, tools });
+  agent.addHook(AfterToolCallEvent, (event) => {
+    if (event.result.status === 'error') {
+      const block = event.result.content[0];
+      failed.push({ text: block?.type === 'textBlock' ? block.text : '', error: event.result.error?.message });
+    }
+  });
+  await agent.invoke(prompt);
+  return failed;
+}
+
+export async function failingActivityToolAgent(prompt: string): Promise<Array<{ text: string; error?: string }>> {
+  return failedToolCalls(prompt, [
+    strandsWorkflow.activityAsTool('getWeather', {
+      description: 'Get the weather for a city',
+      inputSchema: { type: 'object', properties: { location: { type: 'string' } }, required: ['location'] },
+      activityOptions: { startToCloseTimeout: '10 seconds' },
+    }),
+  ]);
+}
+
+export async function failingMcpToolAgent(
+  prompt: string,
+  server: string
+): Promise<Array<{ text: string; error?: string }>> {
+  return failedToolCalls(prompt, [
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } }),
+  ]);
+}
+
+export async function mcpAgent(prompt: string, server = 'testServer', cacheTools?: boolean): Promise<string> {
+  const mcp = new TemporalMCPClient({
+    server,
+    activityOptions: { startToCloseTimeout: '10 seconds' },
+    cacheTools,
+  });
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: [mcp],
+  });
+  const result = await agent.invoke(prompt);
+  return result.toString();
+}
+
+/**
+ * An agent with one `TemporalMCPClient` per server, and the `echo` and `take_note` tools when `local`
+ * is set. With `replace` set to `[name, round]`, an `AfterToolsEvent` hook puts a local tool under
+ * `name` after that tool round. Each MCP activity is tried once. Returns the agent's answer, or a
+ * refusal's message, and then the agent's tool names.
+ */
+export async function mcpServersAgent(
+  prompt: string,
+  servers: string[],
+  local = false,
+  replace?: [string, number],
+  prefix?: string
+): Promise<string> {
+  const clients = servers.map(
+    (server) =>
+      new TemporalMCPClient({
+        server,
+        prefix,
+        activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } },
+      })
+  );
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: local ? [echoTool, noteTool, ...clients] : clients,
+  });
+  if (replace) {
+    const [name, round] = replace;
+    const standIn = tool({ name, description: name, inputSchema: z.object({}), callback: () => 'local' });
+    let rounds = 0;
+    agent.addHook(AfterToolsEvent, (event) => {
+      if (++rounds === round) event.agent.toolRegistry.addOrReplace([standIn]);
+    });
+  }
+  let result: string;
+  try {
+    result = (await agent.invoke(prompt)).toString();
+  } catch (err) {
+    const cause = (err as Error).cause as Error | undefined;
+    result = `refused: ${(err as Error).message}${cause ? ` (${cause.message})` : ''}`;
+  }
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Servers `a` and `b`, told apart with `prefix`. `a` rejects tools whose server name starts with
+ * `cho`; `b` lets through `other` and tools whose server name starts with `ec`, except the one the
+ * agent sees as `b_echo`.
+ */
+export async function mcpPrefixedServersAgent(prompt: string): Promise<string> {
+  const activityOptions = { startToCloseTimeout: '10 seconds' } as const;
+  const a = new TemporalMCPClient({ server: 'a', prefix: 'a', activityOptions, toolFilters: { rejected: [/cho/] } });
+  const b = new TemporalMCPClient({
+    server: 'b',
+    prefix: 'b',
+    activityOptions,
+    toolFilters: { allowed: ['other', /ec/], rejected: [(tool) => tool.name === 'b_echo'] },
+  });
+  const agent = new TemporalAgent({ model: 'test', printer: false, tools: [a, b] });
+  const result = (await agent.invoke(prompt)).toString();
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Two agents at once: `first` with the servers `a` and `b`, and `second` with the server `c` and an
+ * `auditHook` activity after each tool round. Its histories recorded on main pin when each
+ * re-listing is scheduled against the other agent's activities.
+ */
+export async function mcpAgentsSideBySide(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const first = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  const second = new TemporalAgent({ model: 'second', printer: false, tools: [client('c')] });
+  second.addHook(
+    AfterToolsEvent,
+    strandsWorkflow.activityAsHook('auditHook', {
+      activityInput: () => 'after tools',
+      activityOptions: { startToCloseTimeout: '10 seconds' },
+    })
+  );
+  const results = await Promise.all([first.invoke(prompt), second.invoke(prompt)]);
+  return results.map(String).join(', ');
+}
+
+/**
+ * An agent with the servers `a` and `b`, and a hook added after construction that, at the first tool
+ * round, starts a coroutine beside the re-listing: it lists `z`, awaits `null` twice and lists `y`.
+ * Its history recorded on main pins when the re-listing of `a` is scheduled against `y`'s listing.
+ */
+export async function mcpAgentBesideCoroutine(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const agent = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  let side: Promise<void> | undefined;
+  agent.addHook(AfterToolsEvent, () => {
+    side ??= (async () => {
+      await client('z').listTools();
+      await null;
+      await null;
+      await client('y').listTools();
+    })();
+  });
+  const result = await agent.invoke(prompt);
+  await side;
+  return String(result);
+}
+
+const noteTool = tool({
+  name: 'take_note',
+  description: 'Take a note',
+  inputSchema: z.object({}),
+  callback: () => 'noted',
+});
+
+const echoTool = tool({
+  name: 'echo',
+  description: 'Echo back the input text',
+  inputSchema: z.object({ text: z.string() }),
+  // Prefix the result with a marker the stub model never emits, so a test can
+  // tell the callback's output apart from the scripted tool-call input.
+  callback: ({ text }) => `echoed: ${text}`,
+});
+
+export async function inWorkflowToolAgent(prompt: string): Promise<string> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: [echoTool],
+  });
+  const result = await agent.invoke(prompt);
+  return result.toString();
+}
+
+export async function hooksAgent(prompt: string): Promise<string[]> {
+  const firedEvents: string[] = [];
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: [echoTool],
+  });
+  // Sync hook — deterministic per-workflow state mutation.
+  agent.addHook(AfterToolCallEvent, (event) => {
+    firedEvents.push(event.toolUse.name);
+  });
+  // Activity-as-hook — dispatches `auditTool` activity.
+  agent.addHook(
+    AfterToolCallEvent,
+    strandsWorkflow.activityAsHook('auditTool', {
+      activityInput: (event) => event.toolUse.name,
+      activityOptions: { startToCloseTimeout: '10 seconds' },
+    })
+  );
+  await agent.invoke(prompt);
+  return firedEvents;
+}
+
+const PersonInfo = z.object({
+  name: z.string(),
+  age: z.number(),
+  occupation: z.string(),
+});
+
+export async function structuredOutputAgent(prompt: string): Promise<unknown> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    structuredOutputSchema: PersonInfo,
+  });
+  const result = await agent.invoke(prompt);
+  return result.structuredOutput;
+}
+
+/**
+ * Calls an activity that fails once per message, then fails with how workflow code decoded each
+ * activity failure, so a test can check how the failures are stored and decoded.
+ */
+export async function failActivities(messages: string[]): Promise<never> {
+  const { failingActivity } = proxyActivities<{ failingActivity(message: string): Promise<void> }>({
+    startToCloseTimeout: '10 seconds',
+    retry: { maximumAttempts: 1 },
+  });
+  const decoded: unknown[] = [];
+  for (const message of messages) {
+    await failingActivity(message).catch((err: unknown) => {
+      const cause = err instanceof ActivityFailure ? err.cause : undefined;
+      decoded.push(
+        cause instanceof ApplicationFailure
+          ? { type: cause.type, nonRetryable: cause.nonRetryable, details: cause.details }
+          : null
+      );
+    });
+  }
+  // Failing, rather than returning, also stores a workflow failure, which the bundle's failure
+  // converter encodes.
+  throw ApplicationFailure.create({ message: 'workflow failed', nonRetryable: true, details: decoded });
+}
+
+/** Runs each prompt as a turn of one agent, then returns the last reply and how many messages the agent kept. */
+export async function turnsAgent(prompts: string[]): Promise<[string, number]> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  let reply = '';
+  for (const prompt of prompts) {
+    reply = (await agent.invoke(prompt)).toString();
+  }
+  return [reply, agent.messages.length];
+}
+
+export const finishSignal = defineSignal('finish');
+
+/**
+ * Waits for the `finish` Signal and, one microtask later, schedules `finished` if every handler has
+ * finished by then and `unfinished` if not, so its history depends on when the handler finishes.
+ */
+export async function handlerTiming(): Promise<void> {
+  const activities = proxyActivities<{ finished(): Promise<void>; unfinished(): Promise<void> }>({
+    startToCloseTimeout: '10 seconds',
+  });
+  let signaled = false;
+  setHandler(finishSignal, () => {
+    signaled = true;
+  });
+  await condition(() => signaled);
+  await Promise.resolve();
+  await (allHandlersFinished() ? activities.finished() : activities.unfinished());
+}
+
+export const turnUpdate = defineUpdate<string, [string]>('turn');
+export const doneSignal = defineSignal('done');
+
+/** Runs each `turn` update as a turn of one agent, until the `done` signal. */
+export async function updateTurnsAgent(): Promise<string> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  let done = false;
+  setHandler(turnUpdate, async (prompt) => (await agent.invoke(prompt)).toString());
+  setHandler(doneSignal, () => {
+    done = true;
+  });
+  await condition(() => done);
+  return 'finished';
+}
+
+export const approveSignal = defineSignal<[string]>('approve');
+
+export async function interruptAgent(prompt: string, activityName = 'deleteThing'): Promise<string> {
+  // One approval per pause, in the order they arrive.
+  const approvals: string[] = [];
+  setHandler(approveSignal, (response: string) => {
+    approvals.push(response);
+  });
+
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: [
+      strandsWorkflow.activityAsTool(activityName, {
+        description: 'Delete a thing',
+        inputSchema: {
+          type: 'object',
+          properties: { name: { type: 'string' } },
+          required: ['name'],
+        },
+        activityOptions: { startToCloseTimeout: '10 seconds' },
+      }),
+    ],
+  });
+
+  let result = await agent.invoke(prompt);
+  while (result.stopReason === 'interrupt') {
+    await condition(() => approvals.length > 0);
+    const response = approvals.shift() as string;
+    const responses: InterruptResponseContentData[] = (result.interrupts ?? []).map((i) => ({
+      type: 'interruptResponse',
+      interruptResponse: { interruptId: i.id, response },
+    }));
+    result = await agent.invoke(responses as InterruptResponseContent[]);
+  }
+  return result.toString();
+}
+
+export async function streamingAgent(prompt: string): Promise<string> {
+  // Constructing the stream installs the publish/poll handlers the client uses
+  // to drain the `model` topic; nothing in this function reads from it.
+  void new WorkflowStream();
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    streamingTopic: 'model',
+  });
+  const result = await agent.invoke(prompt);
+  return result.toString();
+}
+
+/**
+ * Streams one model call whose activity heartbeats and waits for its cancellation to complete, so
+ * a workflow cancel reaches the model call and the workflow ends with the activity's result.
+ */
+export async function cancellableModelCall(streaming: boolean): Promise<string[]> {
+  if (streaming) void new WorkflowStream();
+  const model = new TemporalModel({
+    modelName: 'test',
+    streamingTopic: streaming ? 'model' : undefined,
+    activityOptions: {
+      startToCloseTimeout: '30 seconds',
+      heartbeatTimeout: '5 seconds',
+      cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    },
+  });
+  const types: string[] = [];
+  for await (const event of model.stream([])) {
+    types.push(event.type);
+  }
+  return types;
+}

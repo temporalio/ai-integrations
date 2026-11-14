@@ -2,13 +2,13 @@
 """Emit the GitHub Actions test matrix for one plugin.
 
 Reads `[ci] runtime-versions` from the plugin's plugin.toml (first = minimum,
-last = maximum supported interpreter) and emits the same matrix for every run,
+last = maximum supported runtime) and emits the same matrix for every run,
 pull requests included:
 
   ubuntu-latest x {min, max}, macos-latest and windows-latest at max
 
-`dist` is true only for the ubuntu/max cell, which also builds and uploads the
-distributions. Output: matrix={"include":[...]}.
+`dist` marks the ubuntu/max cell: Python builds and uploads distributions there,
+and Go runs race detection there. Output: matrix={"include":[...]}.
 """
 
 from __future__ import annotations

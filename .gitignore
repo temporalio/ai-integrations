@@ -1,25 +1,25 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.hypothesis/
-dist/
-junit/
 *.log
+dist/
+
+# TypeScript
+node_modules/
+lib/
+*.tsbuildinfo
+.test-results/
+
+# Python
+*.py[cod]
+.coverage
+.coverage.*
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+junit/
+
+# Java
 .gradle/
 build/
-java/_cache/
+java/*/bin/
 java/*/gradle/dependency-locks/*.latest.lockfile
-
-# Editors / OS
-.DS_Store
-.idea/
-.vscode/
-*.swp
-
-# Local-only agent notes (see AGENTS.md)
-CLAUDE.local.md

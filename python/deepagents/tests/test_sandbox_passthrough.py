@@ -13,7 +13,6 @@ path that scopes ``activity_options`` to one agent.
 
 from __future__ import annotations
 
-import sys
 import uuid
 from datetime import timedelta
 
@@ -21,9 +20,6 @@ import pytest
 
 from temporalio.testing import WorkflowEnvironment
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 

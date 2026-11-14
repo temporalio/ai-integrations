@@ -104,8 +104,8 @@ public final class NexusToolUtil {
 
   private static boolean isFunctionalType(Method method) {
     Class<?> returnType = method.getReturnType();
-    return ClassUtils.isAssignable(returnType, Function.class)
-        || ClassUtils.isAssignable(returnType, Supplier.class)
-        || ClassUtils.isAssignable(returnType, Consumer.class);
+    return ClassUtils.isAssignable(Function.class, returnType)
+        || ClassUtils.isAssignable(Supplier.class, returnType)
+        || ClassUtils.isAssignable(Consumer.class, returnType);
   }
 }

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,7 @@ from temporalio.openai_agents.sandbox._temporal_worker_env_value import (
 
 
 @contextmanager
-def _translate_sandbox_errors() -> Iterator[None]:
+def _translate_sandbox_errors() -> Generator[None, None, None]:
     # Temporal retries every activity exception by default, so only a SandboxError
     # the library has classified as terminal (retryable is False) is turned into a
     # non-retryable ApplicationError.
@@ -64,7 +64,7 @@ def _translate_sandbox_errors() -> Iterator[None]:
 @contextmanager
 def _sandbox_activity_scope(
     resolvable_worker_env_vars: frozenset[str] | AllowAllWorkerEnvVars,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     with _resolvable_worker_env_vars_scope(resolvable_worker_env_vars):
         with _translate_sandbox_errors():
             yield
@@ -255,18 +255,22 @@ class SandboxClientProvider:
                 )
 
         @activity.defn(name=f"{prefix}-sandbox_session_start")
-        async def start(args: StartArgs) -> None:
+        async def start(args: StartArgs) -> SessionResult:
             with _sandbox_activity_scope(resolvable):
                 session = await self._session(args)
                 await session.start()
-                return None
+                return SessionResult(
+                    state=session.state, supports_pty=session.supports_pty()
+                )
 
         @activity.defn(name=f"{prefix}-sandbox_session_stop")
-        async def session_stop(args: StopArgs) -> None:
+        async def session_stop(args: StopArgs) -> SessionResult:
             with _sandbox_activity_scope(resolvable):
                 session = await self._session(args)
                 await session.stop()
-                return None
+                return SessionResult(
+                    state=session.state, supports_pty=session.supports_pty()
+                )
 
         @activity.defn(name=f"{prefix}-sandbox_session_shutdown")
         async def session_shutdown(args: StopArgs) -> None:

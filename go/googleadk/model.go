@@ -1,0 +1,705 @@
+package googleadk
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"iter"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
+	"time"
+
+	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/contrib/workflowstreams"
+	"go.temporal.io/sdk/workflow"
+
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/tool"
+	"google.golang.org/genai"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// StreamServer installs the workflow-side stream server that streamed model
+// output lands in. Call it once, near the top of the workflow that drives
+// runner.Run, whenever you set Options.StreamingTopic. The InvokeModel Activity
+// publishes each model chunk back to this workflow (via a Temporal signal), and
+// external consumers (UIs) read the chunks with workflowstreams.Client.Subscribe.
+// Without it the published chunks have nowhere to land. It is a no-op to omit
+// when streaming is disabled; the durable agent loop does not depend on it.
+func StreamServer(ctx workflow.Context) error {
+	_, err := workflowstreams.NewWorkflowStream(ctx, nil)
+	return err
+}
+
+// TemporalModel is a model.LLM that makes an ADK agent's model calls durable:
+// its GenerateContent dispatches to the InvokeModel Activity instead of calling
+// a real model inside the workflow. Set it as your agent's Model; the real
+// model.LLM is reconstructed worker-side by a ModelFactory (see Config.Models /
+// NewActivities) keyed by the model name. Only the model name crosses into the
+// workflow — credentials never leave the worker.
+type TemporalModel struct {
+	name                   string
+	activityOptions        workflow.ActivityOptions
+	summaryFn              func(*model.LLMRequest) string
+	streamingTopic         string
+	streamingBatchInterval time.Duration
+}
+
+// ModelOption customizes a TemporalModel.
+type ModelOption func(*TemporalModel)
+
+// WithModelActivityOptions sets the base Activity options for the InvokeModel
+// Activity (StartToCloseTimeout, RetryPolicy, TaskQueue, ...). A zero
+// StartToCloseTimeout defaults to two minutes, and a zero HeartbeatTimeout to
+// 10 seconds. A negative HeartbeatTimeout turns heartbeats off.
+func WithModelActivityOptions(o workflow.ActivityOptions) ModelOption {
+	return func(m *TemporalModel) { m.activityOptions = o }
+}
+
+// WithModelSummary sets a function that computes the Temporal UI summary for the
+// model Activity from its request. When unset the summary is the model name.
+func WithModelSummary(fn func(*model.LLMRequest) string) ModelOption {
+	return func(m *TemporalModel) { m.summaryFn = fn }
+}
+
+// WithStreaming makes the InvokeModel Activity call the model in streaming mode
+// and publish each chunk to the given workflowstreams topic for external (UI)
+// consumers; the aggregated final response is still returned into the workflow
+// so replay stays deterministic. Call StreamServer(ctx) once in the workflow
+// when you use this. batchInterval coalesces published chunks (zero uses the
+// library default). InvokeModel heartbeats on a timer derived from the heartbeat
+// timeout (see WithModelActivityOptions), so a model that is slow to produce its
+// first chunk is not falsely timed out.
+func WithStreaming(topic string, batchInterval time.Duration) ModelOption {
+	return func(m *TemporalModel) {
+		m.streamingTopic = topic
+		m.streamingBatchInterval = batchInterval
+	}
+}
+
+// NewModel returns a TemporalModel for the given model name. Use it as the Model
+// on your llmagent.Config; the matching real model is built worker-side by a
+// ModelFactory registered in NewActivities, by the application-owned ADK model
+// registry (model.Register), or — for gemini-* names neither of those knows —
+// by a built-in zero-config Gemini fallback.
+func NewModel(name string, opts ...ModelOption) *TemporalModel {
+	m := &TemporalModel{name: name}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
+}
+
+// Name reports the model name. The InvokeModel Activity uses it to resolve the
+// worker-side model. ADK also copies it into LLMRequest.Model, which a
+// BeforeModelCallback may change; the worker-side model then receives the
+// changed name, as it would outside Temporal.
+func (m *TemporalModel) Name() string { return m.name }
+
+// GenerateContent dispatches the model call to the InvokeModel Activity and
+// yields the (aggregated) response. It runs on the workflow side; the real model
+// never executes in-workflow. The stream argument from ADK is honored via the
+// TemporalModel's own streaming configuration (WithStreaming): a single
+// aggregated response is always returned into the workflow for replay safety,
+// while chunks (if streaming) are published to the workflowstreams topic.
+func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {
+		wfCtx, ok := workflowContext(ctx)
+		if !ok {
+			yield(nil, errMissingContext)
+			return
+		}
+		if err := rejectRemoteAgents(ctx, req); err != nil {
+			yield(nil, err)
+			return
+		}
+		ao := m.activityOptions
+		if ao.StartToCloseTimeout == 0 {
+			ao.StartToCloseTimeout = defaultModelTimeout
+		}
+		ao = resolveHeartbeatTimeout(ao)
+		ao.Summary = m.modelSummary(req)
+		actx := workflow.WithActivityOptions(wfCtx, ao)
+
+		in := invokeModelInput{
+			Model:                  &m.name,
+			Request:                req,
+			Stream:                 m.streamingTopic != "",
+			StreamingTopic:         m.streamingTopic,
+			StreamingBatchInterval: m.streamingBatchInterval,
+		}
+		var resp model.LLMResponse
+		if err := workflow.ExecuteActivity(actx, InvokeModelActivityName, in).Get(wfCtx, &resp); err != nil {
+			yield(nil, err)
+			return
+		}
+		yield(&resp, nil)
+	}
+}
+
+// rejectRemoteAgents returns an error when an agent below the agent making
+// this model call, a sub-agent or an agent that one of the call's tools wraps
+// with agenttool, is a remote A2A agent that sends from Workflow code. History
+// does not record those requests, so a replay sends them again.
+func rejectRemoteAgents(ctx context.Context, req *model.LLMRequest) error {
+	if ic, ok := ctx.(agent.InvocationContext); ok && ic.Agent() != nil {
+		if name := findRemoteAgent(ic.Agent().SubAgents()...); name != "" {
+			return remoteAgentError(name)
+		}
+	}
+	// In name order, so the error names the same agent on every replay.
+	for _, name := range slices.Sorted(maps.Keys(req.Tools)) {
+		if wrapsRemoteAgent(req.Tools[name]) {
+			return remoteAgentError(name)
+		}
+	}
+	return nil
+}
+
+// remoteAgentError is the error that refuses the remote A2A agent named name,
+// which sends from Workflow code.
+func remoteAgentError(name string) error {
+	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
+		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
+		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
+		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", name)
+}
+
+// findRemoteAgent returns the name of the first of agents, or of the agents
+// below them, that is a remote A2A agent sending from Workflow code, or "".
+// Below an agent are its sub-agents and the agents that the tools in its Tools
+// wrap with agenttool, but not the agents below a wrapped agent: see
+// wrapsRemoteAgent.
+func findRemoteAgent(agents ...agent.Agent) string {
+	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		if remoteAgentSendsFromWorkflow(reflect.ValueOf(a)) {
+			return a.Name()
+		}
+		// llmagent keeps its tools in internal state, read with reflection.
+		if f := reflectField(reflect.ValueOf(a), "Tools"); f.IsValid() && f.CanInterface() {
+			tools, _ := f.Interface().([]tool.Tool)
+			for _, t := range tools {
+				if wrapsRemoteAgent(t) {
+					return t.Name()
+				}
+			}
+		}
+		if name := findRemoteAgent(a.SubAgents()...); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// wrapsRemoteAgent reports whether t was built by ADK's agenttool.New around a
+// remote A2A agent that sends from Workflow code. agenttool keeps the agent in
+// an unexported field. Reflection can read its fields but not call its
+// methods, so the agents below it are not seen, such as a remote agent under a
+// sequential, loop or parallel agent that agenttool wraps. An agent on
+// NewModel below it checks its own sub-agents and tools at its model calls.
+func wrapsRemoteAgent(t any) bool {
+	v := reflect.ValueOf(t)
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct ||
+		v.Elem().Type().PkgPath() != "google.golang.org/adk/v2/tool/agenttool" {
+		return false
+	}
+	return remoteAgentSendsFromWorkflow(v.Elem().FieldByName("agent"))
+}
+
+// remoteAgentSendsFromWorkflow reports whether v holds an agent built by
+// remoteagent.NewA2A, which the deprecated agent/remoteagent package also
+// calls, without NewA2AClientProvider, or with a card it fetches without
+// NewA2AAgentCardProvider. ADK keeps the agent type and its A2A config in
+// internal state, so they are read with reflection.
+func remoteAgentSendsFromWorkflow(v reflect.Value) bool {
+	t := reflectField(v, "AgentType")
+	if !t.IsValid() || t.Kind() != reflect.String || t.String() != "RemoteAgent" {
+		return false
+	}
+	cfg := reflectField(reflectField(v, "Config"), "A2A")
+	if !cfg.IsValid() || cfg.IsZero() {
+		return false // a remote agent of another kind, which this check does not know
+	}
+	if !isMethodValue(reflectField(cfg, "ClientProvider"), a2aClientProvider{}.create) {
+		return true
+	}
+	if card := reflectField(cfg, "AgentCard"); card.IsValid() && !card.IsNil() {
+		return false
+	}
+	return !isMethodValue(reflectField(cfg, "AgentCardProvider"), a2aCardProvider{}.resolve)
+}
+
+// reflectField returns the named field of the struct that v holds, following
+// pointers and interfaces, or the zero Value.
+func reflectField(v reflect.Value, name string) reflect.Value {
+	for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	return v.FieldByName(name)
+}
+
+// isMethodValue reports whether v holds the method value fn, for any
+// receiver. Method values of one method share a code pointer.
+func isMethodValue(v reflect.Value, fn any) bool {
+	for v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return false
+		}
+		v = v.Elem()
+	}
+	return v.Kind() == reflect.Func && !v.IsNil() && v.Pointer() == reflect.ValueOf(fn).Pointer()
+}
+
+func (m *TemporalModel) modelSummary(req *model.LLMRequest) string {
+	if m.summaryFn != nil {
+		return m.summaryFn(req)
+	}
+	return "InvokeModel: " + m.name
+}
+
+// invokeModelInput is the serializable payload for the InvokeModel Activity. The
+// live tool references inside Request.Tools are tagged json:"-" by ADK and are
+// dropped automatically; only the model name and serialized tool declarations
+// cross the wire.
+type invokeModelInput struct {
+	// Model is the TemporalModel's name. It selects the worker-side model. It is
+	// nil in inputs scheduled before this field existed; Request.Model is used
+	// then.
+	Model *string
+	// Request is the ADK LLM request, passed to the worker-side model as is.
+	// Request.Config carries the tool declarations the model needs.
+	Request *model.LLMRequest
+	// Stream selects streaming mode (model called with stream=true, chunks
+	// published to StreamingTopic). The aggregated final response is still
+	// returned so replay stays deterministic.
+	Stream bool
+	// StreamingTopic is the workflowstreams topic external consumers subscribe to.
+	StreamingTopic string
+	// StreamingBatchInterval coalesces published chunks. Zero uses the library
+	// default.
+	StreamingBatchInterval time.Duration
+}
+
+// modelName is the name that selects the worker-side model: the
+// TemporalModel's name, or Request.Model in an input scheduled before Model
+// existed.
+func (in invokeModelInput) modelName() string {
+	if in.Model != nil {
+		return *in.Model
+	}
+	return in.Request.Model
+}
+
+// InvokeModel runs a single LLM round-trip worker-side. It reconstructs the
+// model from the registered ModelFactory keyed by the TemporalModel's name,
+// calls it with the request as is, and returns the (aggregated) response. The
+// user's model.LLM is therefore never invoked inside the workflow. Underlying
+// model-SDK retries should be disabled in the factory so Temporal's retry
+// policy is the single source of truth; transient failures are surfaced as
+// retryable ApplicationErrors.
+func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*model.LLMResponse, error) {
+	log := activity.GetLogger(ctx)
+	if in.Request == nil {
+		return nil, newApplicationError(ErrorTypeModel, false, nil, "InvokeModel: nil request")
+	}
+	// The Activity's HeartbeatTimeout (the 10-second default, or one the user set
+	// themselves) counts from Activity start, and a model can legitimately stay
+	// silent past it before its first output (thinking models, large-context
+	// prefill). Heartbeat on a timer for the whole call — model resolution (which
+	// runs user factory code) and both branches — so a healthy-but-slow call is
+	// not heartbeat-timed-out and retried, which would duplicate a paid model call.
+	stopHeartbeats := startPeriodicHeartbeats(ctx)
+	defer stopHeartbeats()
+
+	// Resolve the model worker-side: an explicit ModelFactory (custom credentials,
+	// disabled SDK retries, etc.) wins; otherwise the application-owned ADK model
+	// registry, then the built-in zero-config gemini-* fallback (see
+	// resolveModel). Mirrors adk-python's LLMRegistry.
+	name := in.modelName()
+	llm, err := a.resolveModel(ctx, name)
+	if err != nil {
+		return nil, newApplicationError(ErrorTypeModel, false, err,
+			"resolve model %q (add it to Config.Models or register its provider): %v", name, err)
+	}
+
+	if in.Stream && in.StreamingTopic != "" {
+		log.Debug("invoking model in streaming mode", "model", name, "request_model", in.Request.Model, "topic", in.StreamingTopic)
+		return a.invokeModelStreaming(ctx, llm, in)
+	}
+
+	log.Debug("invoking model", "model", name, "request_model", in.Request.Model)
+	var agg *model.LLMResponse
+	for resp, gerr := range llm.GenerateContent(ctx, in.Request, false) {
+		if gerr != nil {
+			return nil, classifyModelError(gerr)
+		}
+		agg = aggregateResponses(agg, resp)
+	}
+	if agg == nil {
+		return nil, newApplicationError(ErrorTypeModel, true, nil,
+			"model %q returned no response", name)
+	}
+	return agg, nil
+}
+
+// startPeriodicHeartbeats records Activity heartbeats on a fixed interval until
+// the returned stop function is called. The interval is half the Activity's
+// HeartbeatTimeout; when no heartbeat timeout is set it does
+// nothing. A model can legitimately take longer than the heartbeat timeout to
+// produce its first output (thinking models, large-context prefill), so
+// heartbeating only on chunk arrival would let the server time out and retry a
+// healthy — and paid — model call. The SDK throttles outgoing heartbeats to
+// 80% of the heartbeat timeout, so the short interval does not spam the server.
+// The first heartbeat comes half the timeout in, still inside it, so a call
+// shorter than that sends none.
+func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
+	timeout := activity.GetInfo(ctx).HeartbeatTimeout
+	if timeout <= 0 {
+		return func() {}
+	}
+	interval := timeout / 2
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				activity.RecordHeartbeat(ctx)
+			}
+		}
+	}()
+	// stop joins the goroutine so no heartbeat can race past Activity completion.
+	return func() { close(done); <-stopped }
+}
+
+// invokeModelStreaming calls the model with stream=true, publishes each chunk to
+// the workflowstreams topic for external (UI) consumers, and returns the
+// aggregated final response into the workflow. Liveness heartbeating is handled
+// by the caller's periodic heartbeater (see InvokeModel), not per chunk.
+func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (result *model.LLMResponse, err error) {
+	log := activity.GetLogger(ctx)
+	opts := workflowstreams.Options{}
+	if in.StreamingBatchInterval > 0 {
+		opts.BatchInterval = in.StreamingBatchInterval
+	}
+	// The streaming client publishes chunks to external (UI) consumers and needs
+	// a live Temporal server. If it cannot be constructed (e.g. in a unit-test
+	// environment without a server), we degrade gracefully: chunks are not
+	// published, but the aggregated final response is still returned into the
+	// workflow, so the agent loop and replay stay correct.
+	var topic *workflowstreams.TopicHandle
+	if wsc, cerr := workflowstreams.NewClientFromActivity(ctx, opts); cerr != nil {
+		log.Warn("streaming client unavailable; not publishing chunks", "error", cerr)
+	} else {
+		// Close sends the last batch. If it fails, subscribers did not get every
+		// chunk, so the call fails instead of returning as if they had. A model
+		// error stays the call's error, and a cancelled or timed-out Activity
+		// reports that instead. The result is dropped with it, so the SDK does
+		// not encode a reply it then discards.
+		defer func() {
+			if cerr := wsc.Close(ctx); cerr != nil && err == nil {
+				if ctx.Err() != nil {
+					result, err = nil, ctx.Err()
+				} else {
+					result, err = nil, streamPublishError(in, cerr)
+				}
+			}
+		}()
+		topic = wsc.Topic(in.StreamingTopic)
+	}
+
+	var agg *model.LLMResponse
+	for resp, gerr := range llm.GenerateContent(ctx, in.Request, true) {
+		if gerr != nil {
+			return nil, classifyModelError(gerr)
+		}
+		if topic != nil {
+			topic.Publish(resp, false)
+		}
+		agg = aggregateResponses(agg, resp)
+	}
+	if agg == nil {
+		return nil, newApplicationError(ErrorTypeModel, true, nil,
+			"model %q returned no streamed response", in.modelName())
+	}
+	// Mark the aggregate complete: it is the single response handed back into the
+	// workflow regardless of how many chunks were streamed to the topic.
+	agg.Partial = false
+	agg.TurnComplete = true
+	return agg, nil
+}
+
+// aggregateResponses folds streamed responses into one. A NON-partial response
+// is authoritative for content: per ADK's contract (model.LLMResponse.Partial)
+// the runner fully processes only non-partial events, and Gemini's streaming
+// iterator ends with a non-partial response already carrying the fully
+// aggregated text and function calls — so its content REPLACES anything
+// accumulated from partial display chunks, and a stream carrying several
+// non-partial responses keeps every part. Partial chunks folding onto a
+// partial-built aggregate concatenate text so the returned response carries the
+// full message even when the model never sends a terminal aggregate. For every
+// metadata field the latest chunk that sets it wins — all of them are folded
+// (not just usage/finish/grounding) because a model commonly emits citations,
+// logprobs, transcriptions, custom metadata, or an error/finish only on a later
+// chunk, and Gemini's terminal aggregate omits fields (e.g. ModelVersion) that
+// earlier chunks carried. (Partial/TurnComplete are managed by the streaming
+// caller; internally agg.Partial tracks whether the aggregate is partial-built.)
+func aggregateResponses(agg, next *model.LLMResponse) *model.LLMResponse {
+	if next == nil {
+		return agg
+	}
+	if agg == nil {
+		// Deep-copy on the first fold so later appendText/metadata folds never
+		// mutate the model's own response buffer. A shallow struct copy would
+		// leave cp.Content (and its Parts) aliased to next.Content, so the next
+		// chunk's appendText would corrupt the source ("a" -> "ab"). The copy
+		// retains next.Partial, which then tracks whether the aggregate was
+		// built from partial chunks.
+		cp := *next
+		cp.Content = cloneContent(next.Content)
+		return &cp
+	}
+	switch {
+	case next.Content == nil:
+		// Nothing content-wise; metadata still folds below.
+	case !next.Partial && agg.Partial:
+		// Authoritative response supersedes content accumulated from partial
+		// display chunks: folding it in would duplicate the text and drop
+		// function-call parts. Metadata still folds below, so fields the
+		// terminal response omits (Gemini's aggregate carries no ModelVersion)
+		// survive from earlier chunks. Deep copy: the caller mutates the
+		// aggregate afterwards, and the published chunks alias the original.
+		agg.Content = cloneContent(next.Content)
+		agg.Partial = false
+	case !next.Partial:
+		// A further authoritative response in the same stream (a model that
+		// yields complete responses without marking partials): keep every part,
+		// mirroring how ADK's flow fully processes each non-partial event.
+		agg.Content = appendParts(agg.Content, next.Content)
+	case agg.Partial:
+		// Partial chunk onto a partial-built aggregate: concatenate text. Once
+		// the aggregate is authoritative, later partials are display-only and
+		// their content is ignored (no case matches).
+		if agg.Content == nil {
+			// Clone rather than alias: a later chunk's appendText must not
+			// reach back into the model's buffer.
+			agg.Content = cloneContent(next.Content)
+		} else if text := concatText(next.Content); text != "" {
+			appendText(agg.Content, text)
+		}
+	}
+	if next.UsageMetadata != nil {
+		agg.UsageMetadata = next.UsageMetadata
+	}
+	if next.GroundingMetadata != nil {
+		agg.GroundingMetadata = next.GroundingMetadata
+	}
+	if next.FinishReason != "" {
+		agg.FinishReason = next.FinishReason
+	}
+	if next.ModelVersion != "" {
+		agg.ModelVersion = next.ModelVersion
+	}
+	if next.CitationMetadata != nil {
+		agg.CitationMetadata = next.CitationMetadata
+	}
+	if next.LogprobsResult != nil {
+		agg.LogprobsResult = next.LogprobsResult
+	}
+	if next.CustomMetadata != nil {
+		agg.CustomMetadata = next.CustomMetadata
+	}
+	if next.InputTranscription != nil {
+		agg.InputTranscription = next.InputTranscription
+	}
+	if next.OutputTranscription != nil {
+		agg.OutputTranscription = next.OutputTranscription
+	}
+	if next.AvgLogprobs != 0 {
+		agg.AvgLogprobs = next.AvgLogprobs
+	}
+	if next.ErrorCode != "" {
+		agg.ErrorCode = next.ErrorCode
+	}
+	if next.ErrorMessage != "" {
+		agg.ErrorMessage = next.ErrorMessage
+	}
+	if next.Interrupted {
+		agg.Interrupted = true
+	}
+	if next.SessionResumptionHandle != "" {
+		agg.SessionResumptionHandle = next.SessionResumptionHandle
+	}
+	return agg
+}
+
+// cloneContent returns a deep-enough copy of c for streaming aggregation: a
+// fresh *genai.Content with a fresh Parts slice whose first text part can be
+// appended to without touching the source. The Part structs are copied by value
+// so mutating cp's text part leaves the model's buffer untouched.
+func cloneContent(c *genai.Content) *genai.Content {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	if c.Parts != nil {
+		cp.Parts = make([]*genai.Part, len(c.Parts))
+		for i, p := range c.Parts {
+			if p == nil {
+				continue
+			}
+			pc := *p
+			cp.Parts[i] = &pc
+		}
+	}
+	return &cp
+}
+
+// appendParts appends deep-enough copies of next's parts onto agg (a clone of
+// next when agg is nil): each non-partial response is a complete event in ADK's
+// contract, so a stream carrying several keeps all their parts.
+func appendParts(agg, next *genai.Content) *genai.Content {
+	if next == nil {
+		return agg
+	}
+	if agg == nil {
+		return cloneContent(next)
+	}
+	agg.Parts = append(agg.Parts, cloneContent(next).Parts...)
+	return agg
+}
+
+func concatText(c *genai.Content) string {
+	if c == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, p := range c.Parts {
+		if p != nil {
+			sb.WriteString(p.Text)
+		}
+	}
+	return sb.String()
+}
+
+func appendText(c *genai.Content, text string) {
+	for _, p := range c.Parts {
+		// Append onto the first text part to keep one coherent message.
+		if p != nil && p.FunctionCall == nil && p.FunctionResponse == nil {
+			p.Text += text
+			return
+		}
+	}
+	c.Parts = append(c.Parts, &genai.Part{Text: text})
+}
+
+// classifyModelError maps a model-call failure to Temporal's retry contract. An
+// error with an HTTP status is classified by it (408/409/429 and 5xx retryable,
+// other 4xx non-retryable); anything without a status is treated as a
+// retryable transient fault, except ADK's "empty response".
+func classifyModelError(err error) error {
+	code := apiErrorCode(err)
+	retryable := true
+	if code != 0 {
+		retryable = retryableHTTPStatus(code)
+	} else {
+		// ADK's Gemini model returns this untyped error for a reply with no
+		// candidates, as for a blocked prompt. Natively the agent gets it
+		// once; a retry would send the same request again.
+		retryable = !isEmptyResponse(err)
+	}
+	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
+}
+
+// streamPublishError fails a streaming call whose chunks did not all reach the
+// topic. A retry calls the model again, so the error is non-retryable when the
+// retry would fail the same way: the server refused the batch as invalid (over
+// the payload size limit, or past the run's Signal limit), the batch is over
+// the server's gRPC message limit, or the stream client gave up on it after
+// retrying for its MaxRetryDuration. Other failures, such as a server outage,
+// stay retryable.
+func streamPublishError(in invokeModelInput, err error) error {
+	var invalid *serviceerror.InvalidArgument
+	var timeout *workflowstreams.FlushTimeoutError
+	retryable := !errors.As(err, &invalid) && !errors.As(err, &timeout) && !isMessageTooLarge(err)
+	return newApplicationError(ErrorTypeStream, retryable, err,
+		"model %q: publish streamed responses to topic %q: %v", in.modelName(), in.StreamingTopic, err)
+}
+
+// isMessageTooLarge reports a request the server refused as larger than its
+// gRPC message limit, the check the Go SDK's own retry interceptor uses to stop
+// retrying. Rate limiting uses the same code with other messages.
+func isMessageTooLarge(err error) bool {
+	return status.Code(err) == codes.ResourceExhausted && strings.Contains(status.Convert(err).Message(), "larger than max")
+}
+
+// apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK
+// returns sometimes by value and sometimes by pointer, or else from another
+// provider SDK's error (see statusCodeField).
+func apiErrorCode(err error) int {
+	var ptr *genai.APIError
+	if errors.As(err, &ptr) && ptr != nil {
+		return ptr.Code
+	}
+	var val genai.APIError
+	if errors.As(err, &val) {
+		return val.Code
+	}
+	if code := statusCodeField(err); code >= 400 {
+		return code
+	}
+	return 0
+}
+
+// statusCodeField returns the first non-zero int StatusCode field in err's
+// tree, as openai-go's *openai.Error has (ADK's OpenAI model wraps it), or 0
+// if there is none. It follows both Unwrap forms (errors.Join and multiple %w
+// produce the second), depth first, as errors.As does. Reading the field by
+// name avoids importing each provider's SDK.
+func statusCodeField(err error) int {
+	if err == nil {
+		return 0
+	}
+	if v := reflect.Indirect(reflect.ValueOf(err)); v.Kind() == reflect.Struct {
+		if sf, ok := v.Type().FieldByName("StatusCode"); ok {
+			if f, ferr := v.FieldByIndexErr(sf.Index); ferr == nil && f.CanInt() && f.Int() != 0 {
+				return int(f.Int())
+			}
+		}
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return statusCodeField(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if code := statusCodeField(e); code != 0 {
+				return code
+			}
+		}
+	}
+	return 0
+}

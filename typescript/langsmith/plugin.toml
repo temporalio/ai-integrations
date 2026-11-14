@@ -1,0 +1,14 @@
+[plugin]
+name = "langsmith"
+language = "typescript"
+coordinate = "@temporalio/langsmith"
+registry = "npm"
+root-api = "@temporalio/langsmith"
+maturity = "public-preview"
+docs = "https://docs.temporal.io/develop/typescript/integrations/langsmith"
+
+[ci]
+runtime-versions = ["22", "24"]
+
+[smoke]
+imports = ["@temporalio/langsmith"]

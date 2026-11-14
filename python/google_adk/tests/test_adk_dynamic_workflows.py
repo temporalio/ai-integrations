@@ -235,8 +235,9 @@ class DynamicResumeWorkflow:
         self._pending: dict[str, HitlRequest] = {}
         self._responses: dict[str, Any] = {}
 
-    @workflow.query
-    def pending_requests(self) -> list[HitlRequest]:
+    @workflow.update
+    async def wait_for_pending(self) -> list[HitlRequest]:
+        await workflow.wait_condition(lambda: bool(self._pending))
         return list(self._pending.values())
 
     @workflow.update
@@ -371,14 +372,7 @@ async def test_dynamic_resume_skips_completed_children(client: Client):
             execution_timeout=timedelta(seconds=60),
         )
 
-        async def _pending() -> list[HitlRequest]:
-            while True:
-                pending = await handle.query(DynamicResumeWorkflow.pending_requests)
-                if pending:
-                    return pending
-                await asyncio.sleep(0.1)
-
-        pending = await asyncio.wait_for(_pending(), timeout=20)
+        pending = await handle.execute_update(DynamicResumeWorkflow.wait_for_pending)
         assert pending[0].kind == "input"
         assert pending[0].interrupt_id == "approval"
         assert pending[0].message == "Approve?"

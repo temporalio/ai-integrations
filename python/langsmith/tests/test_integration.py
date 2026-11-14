@@ -263,6 +263,22 @@ class ActivityFailureWorkflow:
 
 
 @workflow.defn
+class ContinueAsNewWorkflow:
+    @workflow.run
+    async def run(self, iteration: int) -> int:
+        if iteration == 0:
+            workflow.continue_as_new(iteration + 1)
+        return iteration
+
+
+@workflow.defn
+class WaitForeverWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(lambda: False)
+
+
+@workflow.defn
 class BenignErrorWorkflow:
     @workflow.run
     async def run(self) -> str:
@@ -286,6 +302,13 @@ def _make_plugin_and_collector(
     mock_ls_client = make_mock_ls_client(collector)
     plugin = LangSmithPlugin(client=mock_ls_client, **kwargs)
     return plugin, collector, mock_ls_client
+
+
+def _wait_for_tracing_io(plugin: LangSmithPlugin) -> None:
+    """Wait for run updates still queued on the plugin's single-worker executor."""
+    assert plugin.interceptors
+    interceptor: Any = plugin.interceptors[0]
+    interceptor._executor.submit(lambda: None).result()
 
 
 def _make_client_and_collector(
@@ -526,6 +549,74 @@ class TestErrorTracing:
         ]
         assert len(activity_runs) == 1
         assert activity_runs[0].error is None
+        assert activity_runs[0].end_time is not None
+
+    async def test_continue_as_new_ends_run(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """The run that continues as new is ended without an error."""
+        plugin, collector, _ = _make_plugin_and_collector(add_temporal_runs=True)
+        config = client.config()
+        config["plugins"] = [plugin]
+        temporal_client = Client(**config)
+
+        async with new_worker(
+            temporal_client, ContinueAsNewWorkflow, max_cached_workflows=0
+        ) as worker:
+            result = await temporal_client.execute_workflow(
+                ContinueAsNewWorkflow.run,
+                0,
+                id=f"continue-as-new-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+        assert result == 1
+
+        _wait_for_tracing_io(plugin)
+        wf_runs = [
+            r for r in collector.runs if r.name == "RunWorkflow:ContinueAsNewWorkflow"
+        ]
+        assert len(wf_runs) == 2
+        assert all(r.end_time is not None for r in collector.runs)
+        assert all(r.error is None for r in wf_runs)
+        assert [r.outputs for r in wf_runs] == [
+            {"status": "continued_as_new"},
+            {"status": "ok"},
+        ]
+
+    async def test_cancelled_workflow_ends_run(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """A cancelled workflow's run is ended as cancelled, not left open."""
+        plugin, collector, _ = _make_plugin_and_collector(add_temporal_runs=True)
+        config = client.config()
+        config["plugins"] = [plugin]
+        temporal_client = Client(**config)
+
+        async with new_worker(
+            temporal_client, WaitForeverWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await temporal_client.start_workflow(
+                WaitForeverWorkflow.run,
+                id=f"cancelled-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+            await handle.describe()
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+
+        _wait_for_tracing_io(plugin)
+        wf_runs = [
+            r for r in collector.runs if r.name == "RunWorkflow:WaitForeverWorkflow"
+        ]
+        assert len(wf_runs) == 1
+        assert wf_runs[0].end_time is not None
+        assert wf_runs[0].error is None
+        assert wf_runs[0].outputs == {"status": "cancelled"}
 
 
 # ---------------------------------------------------------------------------
@@ -863,7 +954,7 @@ class TestComprehensiveTracing:
 
 
 # ---------------------------------------------------------------------------
-# TestBackgroundIOIntegration — _RootReplaySafeRunTreeFactory + sync @traceable
+# TestBackgroundIOIntegration — native root runs + sync @traceable
 # ---------------------------------------------------------------------------
 
 
@@ -887,11 +978,11 @@ async def _async_calls_sync(prompt: str) -> str:
 
 @workflow.defn
 class FactoryTraceableWorkflow:
-    """Workflow exercising _RootReplaySafeRunTreeFactory with async, sync, and mixed @traceable.
+    """Workflow exercising native roots with async, sync, and mixed @traceable.
 
     Covers three code paths through create_child:
     - async→async nesting
-    - sync→sync nesting (sync @traceable entry to factory)
+    - sync→sync nesting
     - async→sync nesting (cross-boundary case)
     """
 
@@ -912,23 +1003,22 @@ class FactoryTraceableWorkflow:
 class TestBackgroundIOIntegration:
     """Integration tests for workflows using add_temporal_runs=False without external context.
 
-    Exercises the _RootReplaySafeRunTreeFactory path with sync, async, and mixed @traceable
+    Exercises native root creation with sync, async, and mixed @traceable
     nesting. Verifies root-run creation, correct nesting hierarchy, and replay safety.
     """
 
-    async def test_factory_traceable_no_external_context(
+    async def test_traceable_roots_without_external_context(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
     ) -> None:
-        """Exercises _RootReplaySafeRunTreeFactory: add_temporal_runs=False, no external context.
+        """Exercises native roots with add_temporal_runs=False and no external context.
 
         Uses a workflow with async→async, sync→sync, and async→sync @traceable
         nesting, plus an activity with nested @traceable. Verifies:
-        - Each top-level @traceable becomes a root run (factory creates root children)
+        - Each top-level @traceable becomes a root run
         - Nested @traceable calls nest correctly under their parent
         - Activity @traceable also produces correct hierarchy
-        - No phantom factory run appears in collected runs
         - No duplicate run IDs after replay (max_cached_workflows=0)
         """
         temporal_client, collector, _ = _make_client_and_collector(
@@ -972,12 +1062,12 @@ class TestBackgroundIOIntegration:
             f"Duplicate run IDs found (replay issue): {run_ids}"
         )
 
-    async def test_factory_passes_project_name_to_children(
+    async def test_plugin_project_applies_to_roots(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
     ) -> None:
-        """Factory children inherit project_name (session_name) from plugin config."""
+        """Native roots use project_name (session_name) from plugin config."""
         temporal_client, _collector, mock_ls_client = _make_client_and_collector(
             client, add_temporal_runs=False, project_name="my-ls-project"
         )
@@ -1008,10 +1098,10 @@ class TestBackgroundIOIntegration:
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
     ) -> None:
-        """Exercises _ReplaySafeRunTree.create_child with mixed sync/async @traceable.
+        """Exercises native child creation with mixed sync/async @traceable.
 
         With add_temporal_runs=True, the interceptor creates a real
-        _ReplaySafeRunTree as parent. This test verifies create_child
+        RunTree as parent. This test verifies create_child
         propagation works at every level regardless of sync/async, with
         correct parent-child hierarchy and no duplicate run IDs after replay.
         """

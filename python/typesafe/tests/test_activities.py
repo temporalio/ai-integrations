@@ -116,10 +116,13 @@ async def test_http_422_is_non_retryable_through_activity() -> None:
     with pytest.raises(ApplicationError) as err:
         await system_one(
             SystemOneInput(
-                model_name=None, state="state", questions={"s": {"type": "noul"}}
+                model_name=None,
+                state="state",
+                questions={"s": {"type": "noul", "instructions": "Is this spam?"}},
             )
         )
     assert err.value.non_retryable is True
+    assert err.value.type == "TypeSafeRequestValidationError"
 
 
 @pytest.mark.asyncio
@@ -141,7 +144,11 @@ async def test_state_passes_through_untouched() -> None:
     system_one = _activity(support)
     state = {"nested": {"a": 1}, "items": [1, "two", None]}
     await system_one(
-        SystemOneInput(model_name=None, state=state, questions={"n": {"type": "noul"}})
+        SystemOneInput(
+            model_name=None,
+            state=state,
+            questions={"n": {"type": "noul", "instructions": "Is this spam?"}},
+        )
     )
     assert captured[0]["state"] == state
 
@@ -171,7 +178,9 @@ async def test_unnamed_model_input_lets_client_default_answer() -> None:
     system_one = _activity(support)
     await system_one(
         SystemOneInput(
-            model_name=None, state="state", questions={"n": {"type": "noul"}}
+            model_name=None,
+            state="state",
+            questions={"n": {"type": "noul", "instructions": "Is this spam?"}},
         )
     )
     assert captured[0]["model"] == "jev-pin"
@@ -197,7 +206,9 @@ async def test_named_model_input_is_sent_verbatim() -> None:
     system_one = _activity(support)
     await system_one(
         SystemOneInput(
-            state="state", questions={"n": {"type": "noul"}}, model_name="jev-1.13.0"
+            state="state",
+            questions={"n": {"type": "noul", "instructions": "Is this spam?"}},
+            model_name="jev-1.13.0",
         )
     )
     assert captured[0]["model"] == "jev-1.13.0"
@@ -208,7 +219,9 @@ async def _system_one_request_id(client: AsyncTypeSafeClient) -> str | None:
     system_one = _activity(TypeSafeActivities(client))
     result = await system_one(
         SystemOneInput(
-            model_name=None, state="state", questions={"n": {"type": "noul"}}
+            model_name=None,
+            state="state",
+            questions={"n": {"type": "noul", "instructions": "Is this spam?"}},
         )
     )
     return result["request_id"]
@@ -240,7 +253,7 @@ async def test_unregistered_response_model_name_is_non_retryable() -> None:
         await system_one(
             SystemOneInput(
                 state="state",
-                questions={"n": {"type": "noul"}},
+                questions={"n": {"type": "noul", "instructions": "Is this spam?"}},
                 response_model="never-registered",
             )
         )
@@ -273,7 +286,10 @@ async def test_activity_preserves_sdk_client_http_timeout() -> None:
     ) as client:
         await environment.run(
             TypeSafeActivities(client).system_one_activity,
-            SystemOneInput(state="state", questions={"n": {"type": "noul"}}),
+            SystemOneInput(
+                state="state",
+                questions={"n": {"type": "noul", "instructions": "Is this spam?"}},
+            ),
         )
     assert timeouts == [{"connect": 0.25, "read": 7, "write": 7, "pool": 7}]
 

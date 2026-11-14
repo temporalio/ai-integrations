@@ -4,7 +4,7 @@
 #
 # Env: COORDINATE, VERSION, ROOT_API, REQUIRES_PYTHON (required); SMOKE_IMPORTS (comma list);
 #      INDEX_URL (optional; when set, ONLY $COORDINATE is resolved from that index,
-#      every dependency still comes from PyPI); ALLOW_OVERLAP_WITH_CORE.
+#      every dependency still comes from PyPI).
 set -euo pipefail
 : "${COORDINATE:?}" "${VERSION:?}" "${ROOT_API:?}" "${REQUIRES_PYTHON:?}"
 workspace=${GITHUB_WORKSPACE:-$(git rev-parse --show-toplevel)}
@@ -37,5 +37,5 @@ for attempt in $(seq 1 10); do
 done
 args=(--in-env --coordinate "$COORDINATE" --root-api "$ROOT_API")
 [ -n "${SMOKE_IMPORTS:-}" ] && args+=(--imports "$SMOKE_IMPORTS")
-EXPECTED_VERSION="$VERSION" ALLOW_OVERLAP_WITH_CORE="${ALLOW_OVERLAP_WITH_CORE:-0}" \
+EXPECTED_VERSION="$VERSION" \
   uv run --project "$proj" --no-sync python "$workspace/scripts/ci/smoke.py" "${args[@]}"

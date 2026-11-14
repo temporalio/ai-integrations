@@ -1,0 +1,315 @@
+/**
+ * Shared test harness: {@link InMemoryRunCollector} captures every run the plugin
+ * emits, and {@link dumpTraces} renders them as an indented tree for assertions.
+ *
+ * @module
+ */
+
+import { randomUUID } from 'crypto';
+import type { ExecutionContext, TestFn } from 'ava';
+import type { AgentAddress, Client as LangSmithClient } from 'langsmith';
+import { Client } from '@temporalio/client';
+import { TestWorkflowEnvironment } from '@temporalio/testing';
+import { Worker, bundleWorkflowCode, type WorkerOptions, type WorkflowBundle } from '@temporalio/worker';
+
+import { LangSmithPlugin, type LangSmithPluginOptions } from '../index';
+import { startLocalWithRetry } from './helpers/environment';
+
+/** Absolute path to the test workflow bundle (resolved from this module). */
+export const WORKFLOWS_PATH = require.resolve('./workflows/langsmith');
+
+/** Expected tree for `SimpleWorkflow` with `addTemporalRuns: true`: one workflow run and its single activity. */
+export const SIMPLE_TREE = [
+  'StartWorkflow:SimpleWorkflow',
+  'RunWorkflow:SimpleWorkflow',
+  '  StartActivity:simpleActivity',
+  '  RunActivity:simpleActivity',
+].join('\n');
+
+/** A run as captured by {@link InMemoryRunCollector}; superset of create/update fields. */
+export interface CollectedRun {
+  id: string;
+  name: string;
+  run_type?: string;
+  parent_run_id?: string;
+  trace_id?: string;
+  dotted_order?: string;
+  start_time?: number | string;
+  inputs?: Record<string, unknown>;
+  outputs?: Record<string, unknown>;
+  end_time?: number | string;
+  error?: string | null;
+  tags?: string[];
+  extra?: Record<string, unknown>;
+  project_name?: string;
+  session_name?: string;
+  address?: AgentAddress;
+  events?: unknown[];
+}
+
+/** In-memory stand-in for a LangSmith `Client`; records `createRun`s in order and merges `updateRun`s by id. */
+/**
+ * The run IDs in a dotted order, root first, without start times. Start times can differ across replay: live runs use
+ * the Worker's clock and replayed runs use Workflow time. IDs and ancestry stay the same.
+ */
+export function idPath(dottedOrder: string): string[] {
+  return dottedOrder.split('.').map((segment) => segment.slice(-36));
+}
+
+export class InMemoryRunCollector {
+  /** Run ids in first-seen (createRun) order. */
+  readonly createOrder: string[] = [];
+  /** Latest merged state per run id. */
+  readonly byId = new Map<string, CollectedRun>();
+  /** Set by the flush hook test; counts flush invocations. */
+  flushCount = 0;
+
+  createRun = async (run: Record<string, unknown>): Promise<void> => {
+    const id = String(run.id);
+    if (!this.byId.has(id)) {
+      this.createOrder.push(id);
+      this.byId.set(id, { id, name: String(run.name) });
+    }
+    this.byId.set(id, {
+      ...this.byId.get(id)!,
+      ...(run as Partial<CollectedRun>),
+      project_name: (run.project_name ?? run.session_name) as string | undefined,
+      id,
+    });
+  };
+
+  updateRun = async (id: string, update: Record<string, unknown>): Promise<void> => {
+    const existing = this.byId.get(id);
+    if (existing) {
+      this.byId.set(id, { ...existing, ...(update as Partial<CollectedRun>), id });
+    }
+  };
+
+  /** Flush hook used by the plugin's shutdown path; recorded for assertions. */
+  awaitPendingTraceBatches = async (): Promise<void> => {
+    this.flushCount += 1;
+  };
+
+  /** Collected runs in createRun order. */
+  get records(): CollectedRun[] {
+    return this.createOrder.map((id) => this.byId.get(id)!);
+  }
+
+  /** First run with the given display name, if any. */
+  byName(name: string): CollectedRun | undefined {
+    for (const id of this.createOrder) {
+      const run = this.byId.get(id)!;
+      if (run.name === name) {
+        return run;
+      }
+    }
+    return undefined;
+  }
+
+  /** The display name of a run's parent, or undefined for a root / unknown parent. */
+  parentNameOf(name: string): string | undefined {
+    const run = this.byName(name);
+    if (!run?.parent_run_id) {
+      return undefined;
+    }
+    return this.byId.get(run.parent_run_id)?.name;
+  }
+
+  /** Reset between sub-cases that share a process. */
+  clear(): void {
+    this.createOrder.length = 0;
+    this.byId.clear();
+    this.flushCount = 0;
+  }
+
+  /** View this collector as a LangSmith client for the plugin's `client` option. */
+  asClient(): LangSmithClient {
+    return this as unknown as LangSmithClient;
+  }
+}
+
+/** Render collected runs as an indented tree grouped by `parent_run_id`, throwing on a dangling parent. */
+export function dumpTraces(records: CollectedRun[]): string {
+  const byId = new Map<string, CollectedRun>();
+  const order: string[] = [];
+  for (const r of records) {
+    if (!byId.has(r.id)) {
+      byId.set(r.id, r);
+      order.push(r.id);
+    }
+  }
+
+  const children = new Map<string, string[]>();
+  const roots: string[] = [];
+  for (const id of order) {
+    const rec = byId.get(id)!;
+    const parent = rec.parent_run_id;
+    if (parent == null) {
+      roots.push(id);
+    } else if (byId.has(parent)) {
+      const arr = children.get(parent);
+      if (arr) {
+        arr.push(id);
+      } else {
+        children.set(parent, [id]);
+      }
+    } else {
+      throw new Error(`dangling parent_run_id=${parent} for run "${rec.name}" (${id})`);
+    }
+  }
+
+  const lines: string[] = [];
+  const walk = (id: string, depth: number): void => {
+    lines.push('  '.repeat(depth) + byId.get(id)!.name);
+    for (const child of children.get(id) ?? []) {
+      walk(child, depth + 1);
+    }
+  };
+  for (const root of roots) {
+    walk(root, 0);
+  }
+  return lines.join('\n');
+}
+
+/** Options for {@link withTracingWorker}. */
+export interface HarnessArgs<T> {
+  /** Collector to use as the plugin's LangSmith client. */
+  collector: Pick<InMemoryRunCollector, 'asClient'>;
+  /** Plugin options other than `client` (which is the collector). */
+  options?: Omit<LangSmithPluginOptions, 'client'>;
+  /** Activity implementations to register on the worker. */
+  activities: Record<string, (...args: never[]) => unknown>;
+  /** Task queue (defaults to a fixed value). */
+  taskQueue?: string;
+  /** Extra worker options (e.g. `maxCachedWorkflows`). */
+  workerOptions?: Partial<WorkerOptions>;
+  /** Body run with a plugin-enabled client + worker live. */
+  body: (ctx: { client: Client; taskQueue: string; env: TestWorkflowEnvironment }) => Promise<T>;
+}
+
+// One local Temporal server shared by all cases in a file
+let sharedEnv: TestWorkflowEnvironment | undefined;
+
+/** Register a per-file shared `TestWorkflowEnvironment`; `withTracingWorker` will reuse it. */
+export function useSharedEnv(test: TestFn<unknown>): void {
+  test.before(async () => {
+    sharedEnv = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+  });
+  test.after.always(async () => {
+    await sharedEnv?.teardown();
+    sharedEnv = undefined;
+  });
+}
+
+const bundleCache = new Map<string, Promise<WorkflowBundle>>();
+
+/** The env vars LangSmith's default destination and tracing gate read; the bundle bakes them in, so they key the cache. */
+const DESTINATION_ENV_VARS = [
+  'LANGSMITH_PROJECT',
+  'LANGCHAIN_PROJECT',
+  'LANGCHAIN_SESSION',
+  'LANGSMITH_AGENT_ID',
+  'LANGSMITH_AGENT_ENVIRONMENT',
+  'LANGSMITH_TRACING',
+  'LANGSMITH_TRACING_V2',
+  'LANGCHAIN_TRACING_V2',
+  'LANGCHAIN_TRACING',
+];
+
+function getBundle(plugin: LangSmithPlugin, workflowsPath: string, optionsKey: string): Promise<WorkflowBundle> {
+  const envKey = DESTINATION_ENV_VARS.map((name) => process.env[name] ?? '').join('\n');
+  const key = `${workflowsPath}\n${optionsKey}\n${envKey}`;
+  let bundle = bundleCache.get(key);
+  if (!bundle) {
+    // Route through the plugin so the bundle carries its workflow interceptor
+    // module + baked config, exactly as Worker.create would have built it.
+    bundle = bundleWorkflowCode(plugin.configureBundler({ workflowsPath }));
+    bundleCache.set(key, bundle);
+  }
+  return bundle;
+}
+
+export async function withTracingWorker<T>(args: HarnessArgs<T>): Promise<T> {
+  const privateEnv = sharedEnv ? undefined : await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+  const env = sharedEnv ?? privateEnv!;
+  try {
+    const taskQueue = args.taskQueue ?? `langsmith-test-${randomUUID()}`;
+    const plugin = new LangSmithPlugin({ ...args.options, client: args.collector.asClient() });
+
+    const { workflowsPath = WORKFLOWS_PATH, ...restWorkerOpts } = args.workerOptions ?? {};
+    const workflowBundle = await getBundle(plugin, workflowsPath, JSON.stringify(args.options ?? {}));
+
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      namespace: env.namespace,
+      taskQueue,
+      workflowBundle,
+      activities: args.activities,
+      plugins: [plugin],
+      // Avoid waiting for the default 10s sticky execution timeout on worker
+      // transition: these short-lived per-case workers can otherwise stall a
+      // full 10s on task redelivery and, on loaded CI, blow the 120s AVA cap.
+      stickyQueueScheduleToStartTimeout: '1s',
+      ...restWorkerOpts,
+    });
+
+    const client = new Client({
+      connection: env.connection,
+      namespace: env.namespace,
+      plugins: [plugin],
+    });
+
+    return await worker.runUntil(args.body({ client, taskQueue, env }));
+  } finally {
+    if (privateEnv) await privateEnv.teardown();
+  }
+}
+
+/**
+ * Run `workflow` live, then replay its history with a fresh plugin, asserting the run ids it sends to its
+ * `runIds.capture` sink are the same both times and the replay writes nothing. Returns the live result and ids.
+ */
+export async function runAndReplay<R>(
+  t: ExecutionContext,
+  collector: InMemoryRunCollector,
+  workflowsPath: string,
+  workflow: () => Promise<R>
+): Promise<{ result: R; ids: string[] }> {
+  const captures: string[][] = [];
+  const sinks = {
+    runIds: {
+      capture: {
+        fn: (_info: unknown, ids: string[]) => {
+          captures.push(ids);
+        },
+        callDuringReplay: true,
+      },
+    },
+  };
+  const replay = new InMemoryRunCollector();
+  const result = await withTracingWorker({
+    collector,
+    options: { addTemporalRuns: false },
+    activities: {},
+    workerOptions: { workflowsPath, sinks },
+    body: async ({ client, taskQueue }) => {
+      const handle = await client.workflow.start(workflow, {
+        workflowId: `${workflow.name}-${randomUUID()}`, taskQueue,
+        // A Workflow Task error retries forever; time out so it fails the test instead.
+        workflowExecutionTimeout: '30s',
+      });
+      const result = await handle.result();
+      await Worker.runReplayHistory({
+        workflowsPath,
+        plugins: [new LangSmithPlugin({ client: replay.asClient() })],
+        sinks,
+      }, await handle.fetchHistory());
+      return result;
+    },
+  });
+  t.is(captures.length, 2, 'capture the live execution and the replay');
+  const [ids, replayed] = captures as [string[], string[]];
+  t.deepEqual(replayed, ids);
+  t.deepEqual(replay.records, [], 'replay writes nothing');
+  return { result, ids };
+}

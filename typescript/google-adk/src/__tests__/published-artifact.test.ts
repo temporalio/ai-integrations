@@ -1,0 +1,47 @@
+/**
+ * Regression test that consumes the COMPILED `lib` the way a published-package
+ * user does: resolved BY PACKAGE NAME (`@temporalio/google-adk` and its
+ * `/workflow` and `/testing` subpaths) via Node package self-reference, never
+ * via relative `../` source paths.
+ */
+
+import { createRequire } from 'node:module';
+
+import test from 'ava';
+
+test('cjsRequireExposesPublicExports', (t) => {
+  const require = createRequire(__filename);
+
+  const main = require('@temporalio/google-adk');
+  t.is(typeof main.GoogleAdkPlugin, 'function');
+  t.false('MODEL_ERROR_FAILURE_TYPE' in main);
+
+  const workflow = require('@temporalio/google-adk/workflow');
+  t.is(typeof workflow.TemporalModel, 'function');
+  t.is(typeof workflow.TemporalMCPToolset, 'function');
+  t.is(typeof workflow.activityAsTool, 'function');
+  t.is(typeof workflow.activityNode, 'function');
+  t.is(typeof workflow.loadMcpResourceTool, 'function');
+  t.is(typeof workflow.pendingHitlRequests, 'function');
+  t.is(typeof workflow.hitlInputResponse, 'function');
+  t.is(typeof workflow.hitlConfirmationResponse, 'function');
+  t.is(typeof workflow.markModelFailureHandled, 'function');
+  t.is(workflow.MODEL_ERROR_FAILURE_TYPE, 'GoogleAdkModelError');
+  t.is(workflow.MCP_TOOL_NOT_FOUND_FAILURE_TYPE, 'GoogleAdkMCPToolNotFound');
+  t.is(workflow.MCP_ERROR_FAILURE_TYPE, 'GoogleAdkMCPError');
+  t.is(workflow.STREAM_ERROR_FAILURE_TYPE, 'GoogleAdkStreamError');
+  t.is(workflow.STREAMING_TOPIC_REQUIRED_FAILURE_TYPE, 'GoogleAdkStreamingTopicRequired');
+  t.is(workflow.UNSUPPORTED_FAILURE_TYPE, 'GoogleAdkUnsupported');
+  t.is(workflow.MCP_RESOURCES_UNSUPPORTED_FAILURE_TYPE, 'GoogleAdkMCPResourcesUnsupported');
+  t.is(workflow.NODE_TIMEOUT_FAILURE_TYPE, 'GoogleAdkNodeTimeoutError');
+  t.is(workflow.INTENT_MISMATCH_FAILURE_TYPE, 'GoogleAdkIntentMismatchError');
+  t.is(workflow.HITL_RESPONSE_FAILURE_TYPE, 'GoogleAdkHitlResponseError');
+  t.is(workflow.ADK_RUNTIME_FAILURE_TYPES.NodeTimeoutError, 'GoogleAdkNodeTimeoutError');
+  t.false('MCP_TOOLSET_OUTSIDE_WORKFLOW_FAILURE_TYPE' in workflow);
+  t.false('ACTIVITY_TOOL_OUTSIDE_WORKFLOW_FAILURE_TYPE' in workflow);
+  t.false('ACTIVITY_NODE_OUTSIDE_WORKFLOW_FAILURE_TYPE' in workflow);
+
+  const testing = require('@temporalio/google-adk/testing');
+  t.is(typeof testing.fakeModelProvider, 'function');
+  t.is(typeof testing.mockMCPToolset, 'function');
+});

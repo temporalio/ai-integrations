@@ -87,10 +87,14 @@ class _GeminiApiStreamedResponse(BaseModel):
 class _GeminiUploadFileRequest(BaseModel):
     """Serializable activity input for a file upload.
 
-    For file path uploads the path is resolved on the worker.  For
-    in-memory uploads the raw bytes are sent across the activity boundary.
+    For file path uploads the path is resolved on the worker.  In-memory
+    uploads send the content base64-encoded in ``file_base64``: the JSON
+    encoding of ``bytes`` is UTF-8 text, which cannot carry binary content.
+    ``file_bytes`` is read only for activities scheduled by an earlier version,
+    which put the content there; it is never set any more.
     """
 
+    file_base64: str | None = None
     file_bytes: bytes | None = None
     file_path: str | None = None
     config: types.UploadFileConfig | None = None
@@ -112,9 +116,15 @@ class _GeminiRegisterFilesRequest(BaseModel):
 
 
 class _GeminiUploadToFileSearchStoreRequest(BaseModel):
-    """Serializable activity input for uploading a file to a file search store."""
+    """Serializable activity input for uploading a file to a file search store.
+
+    In-memory content is sent base64-encoded in ``file_base64``, like
+    ``_GeminiUploadFileRequest``; ``file_bytes`` is only read for activities
+    scheduled by an earlier version.
+    """
 
     file_search_store_name: str
+    file_base64: str | None = None
     file_bytes: bytes | None = None
     file_path: str | None = None
     config: types.UploadToFileSearchStoreConfig | None = None

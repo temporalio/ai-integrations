@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Literal
@@ -26,7 +26,7 @@ _resolvable_worker_env_vars: ContextVar[frozenset[str] | AllowAllWorkerEnvVars] 
 @contextmanager
 def _resolvable_worker_env_vars_scope(  # type:ignore[reportUnusedFunction]
     names: Collection[str] | AllowAllWorkerEnvVars,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     token = _resolvable_worker_env_vars.set(_snapshot_resolvable_env_vars(names))
     try:
         yield

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Any
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from contextvars import ContextVar
+from typing import Any, get_type_hints
 
 from agents import (
     Agent,
@@ -13,15 +15,22 @@ from agents import (
     Handoff,
     HostedMCPTool,
     ImageGenerationTool,
+    InputGuardrailResult,
+    InputGuardrailTripwireTriggered,
     Model,
     ModelResponse,
+    ModelRetryAdvice,
+    ModelRetryAdviceRequest,
+    ModelRetryNormalizedError,
     ModelSettings,
     ModelTracing,
+    RunResultStreaming,
     Tool,
     TResponseInputItem,
     WebSearchTool,
 )
 from agents.items import TResponseStreamEvent
+from agents.models import get_default_model_settings
 from agents.tool import (
     ApplyPatchTool,
     CustomTool,
@@ -31,6 +40,7 @@ from agents.tool import (
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 from temporalio import workflow
+from temporalio.exceptions import ActivityError
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
@@ -48,6 +58,48 @@ from temporalio.openai_agents._invoke_model_activity import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 
+# The SDK reads an Activity's return type with typing.get_type_hints, which drops
+# the type discriminator that TResponseStreamEvent carries in Annotated. When an
+# event fails strict validation, the converter's lenient fallback then takes the
+# first union member unless this process has cached the discriminator, so another
+# Worker process could read response.completed as another event. The converter
+# gets the full type instead, read from the Activity with Annotated kept.
+_STREAM_EVENTS_TYPE: Any = get_type_hints(
+    ModelActivity.invoke_model_activity_streaming, include_extras=True
+)["return"]
+
+
+class _StreamedRun:
+    """Holds the ``RunResultStreaming`` of the streamed run in progress."""
+
+    result: RunResultStreaming | None = None
+
+
+# Set by the runner around ``Runner.run_streamed``; the run loop task copies it.
+_current_streamed_run: ContextVar[_StreamedRun | None] = ContextVar(
+    "temporal_openai_agents_streamed_run", default=None
+)
+
+
+def _parallel_input_guardrails() -> tuple[RunResultStreaming, asyncio.Task[Any]] | None:
+    """Return the streamed run in progress and its parallel input guardrails task, if any."""
+    streamed_run = _current_streamed_run.get()
+    result = streamed_run.result if streamed_run is not None else None
+    # This and _triggered_input_guardrail read private RunResultStreaming fields with
+    # getattr: if an openai-agents release renames them, the stub stops watching the
+    # guardrails instead of failing every streamed run.
+    task = getattr(result, "_input_guardrails_task", None)
+    if result is None or task is None:
+        return None
+    return result, task
+
+
+def _triggered_input_guardrail(
+    result: RunResultStreaming,
+) -> InputGuardrailResult | None:
+    """Return the parallel input guardrail result that tripped, if any."""
+    return getattr(result, "_triggered_input_guardrail_result", None)
+
 
 class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
     """A stub that allows invoking models as Temporal activities."""
@@ -58,10 +110,14 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         *,
         model_params: ModelActivityParameters,
         agent: Agent[Any] | None,
+        current_agent: Callable[[], Agent[Any] | None] | None = None,
+        current_run_model_settings: Callable[[], ModelSettings | None] | None = None,
     ) -> None:
         self.model_name = model_name
         self.model_params = model_params
         self.agent = agent
+        self._current_agent = current_agent
+        self._current_run_model_settings = current_run_model_settings
 
     def _build_activity_input(
         self,
@@ -172,18 +228,37 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             prompt=prompt,
         )
 
+        agent = self.agent
+        if agent is None and self._current_agent is not None:
+            agent = self._current_agent()
+
+        if self.model_name is None and agent is not None:
+            # Neither the agent nor the run named a model, so the activity's provider
+            # will choose one. Record here, against this worker's environment, whether
+            # the agent's settings are the SDK's implicit defaults for an unnamed model,
+            # plus the run-level overrides, so the activity can align the defaults with
+            # the model it resolves and then re-apply the overrides.
+            activity_input["implicit_model_settings"] = (
+                agent.model_settings == get_default_model_settings()
+            )
+            activity_input["run_model_settings"] = (
+                self._current_run_model_settings()
+                if self._current_run_model_settings is not None
+                else None
+            )
+
         if self.model_params.summary_override:
             summary = (
                 self.model_params.summary_override
                 if isinstance(self.model_params.summary_override, str)
                 else (
                     self.model_params.summary_override.provide(
-                        self.agent, system_instructions, input
+                        agent, system_instructions, input
                     )
                 )
             )
-        elif self.agent:
-            summary = self.agent.name
+        elif agent:
+            summary = agent.name
         else:
             summary = None
 
@@ -242,6 +317,19 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             priority=self.model_params.priority,
         )
 
+    def get_retry_advice(
+        self, request: ModelRetryAdviceRequest
+    ) -> ModelRetryAdvice | None:
+        """Mark a guardrail trip that ``stream_response`` raises as an abort.
+
+        The framework runs ``stream_response`` inside its model retry loop, but raises
+        a native trip outside it, so a ``ModelSettings.retry`` policy is never asked
+        about a trip.
+        """
+        if isinstance(request.error, InputGuardrailTripwireTriggered):
+            return ModelRetryAdvice(normalized=ModelRetryNormalizedError(is_abort=True))
+        return None
+
     async def stream_response(
         self,
         system_instructions: str | None,
@@ -256,9 +344,9 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        # Streaming relies on activity heartbeats to detect a stuck LLM
-        # call and on WorkflowStreamClient.from_within_activity() to signal
-        # partial results back to the workflow. Local activities support
+        # Streaming relies on activity heartbeats to hear a cancel and notice a
+        # lost worker, and on WorkflowStreamClient.from_within_activity() to
+        # signal partial results back to the workflow. Local activities support
         # neither: their result commits with the workflow task, so there
         # is no independent task to heartbeat against or to send signals
         # from.
@@ -294,9 +382,24 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             "streaming_batch_interval": self.model_params.streaming_batch_interval,
         }
 
-        events = await workflow.execute_activity_method(
-            ModelActivity.invoke_model_activity_streaming,
+        # The activity publishes each event to the topic as the model sends it, but the
+        # framework only checks the parallel input guardrails against the events it yields
+        # after the activity returns. So once one of them trips, don't start the activity,
+        # or cancel it: it then publishes an error event and stops. The framework records
+        # the trip before it waits for the other guardrails to clean up, so act on the
+        # record without waiting for the guardrails task to finish.
+        guardrails = _parallel_input_guardrails()
+        if guardrails is not None:
+            triggered = _triggered_input_guardrail(guardrails[0])
+            if triggered is not None:
+                raise InputGuardrailTripwireTriggered(triggered)
+
+        # Scheduled by name, so that result_type applies (a callable's declared
+        # return type would replace it).
+        handle = workflow.start_activity(
+            ModelActivity.invoke_model_activity_streaming.__name__,
             streaming_input,
+            result_type=_STREAM_EVENTS_TYPE,
             summary=summary,
             task_queue=self.model_params.task_queue,
             schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
@@ -308,5 +411,32 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             versioning_intent=self.model_params.versioning_intent,
             priority=self.model_params.priority,
         )
+
+        cancelled_for: list[InputGuardrailResult] = []
+        watcher: asyncio.Task[None] | None = None
+        if guardrails is not None and not guardrails[1].done():
+            result, task = guardrails
+
+            async def cancel_on_tripwire() -> None:
+                await workflow.wait_condition(
+                    lambda: (
+                        _triggered_input_guardrail(result) is not None or task.done()
+                    )
+                )
+                triggered = _triggered_input_guardrail(result)
+                if triggered is not None and not handle.done():
+                    cancelled_for.append(triggered)
+                    handle.cancel()
+
+            watcher = asyncio.create_task(cancel_on_tripwire())
+        try:
+            events: list[TResponseStreamEvent] = await handle
+        except ActivityError:
+            if cancelled_for:
+                raise InputGuardrailTripwireTriggered(cancelled_for[0]) from None
+            raise
+        finally:
+            if watcher is not None:
+                watcher.cancel()
         for event in events:
             yield event

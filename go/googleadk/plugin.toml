@@ -1,0 +1,13 @@
+# Schema: ../../AGENTS.md#repository-invariants.
+
+[plugin]
+name = "googleadk"
+language = "go"
+coordinate = "go.temporal.io/googleadk"
+registry = "goproxy"
+root-api = "googleadk"
+maturity = "public-preview"
+docs = "https://github.com/temporalio/ai-integrations/blob/main/go/googleadk/README.md"
+
+[ci]
+runtime-versions = ["1.26.10", "1.27"]
