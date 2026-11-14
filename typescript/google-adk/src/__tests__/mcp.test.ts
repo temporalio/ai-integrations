@@ -96,6 +96,17 @@ for (const operation of ['listTools', 'callTool', 'listResources', 'readResource
     }
   });
 
+  test(`${operation} passes SSE connection params to ADK`, async (t) => {
+    // ADK fails these itself: 2.3 cannot fetch port 9, and earlier releases never connect.
+    const sse = { type: 'SseConnectionParams', url: 'http://127.0.0.1:9/sse' } as unknown as MCPConnectionParams;
+    const activities = createMCPActivities({ testServer: () => sse });
+    const activity = activities[`testServer-${operation}`] as (args: unknown) => Promise<unknown>;
+    const err = await t.throwsAsync(
+      new MockActivityEnvironment().run(activity, { toolName: 'echo', args: {}, name: 'file:///test' })
+    );
+    t.not((err as ApplicationFailure).type, 'MCPToolsetFactoryTypeError');
+  });
+
   test(`${operation} keeps MCP factory exceptions retryable`, async (t) => {
     const activities = createMCPActivities({ testServer: () => { throw new Error('factory failed'); } });
     const activity = activities[`testServer-${operation}`] as () => Promise<unknown>;

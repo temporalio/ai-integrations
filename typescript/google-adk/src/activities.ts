@@ -200,12 +200,19 @@ function resourceCapable(toolset: BaseToolset, name: string): ResourceCapableToo
   );
 }
 
+// Every `MCPConnectionParams` tag in the supported ADK range. ADK 2.3 adds
+// `SseConnectionParams`; earlier releases leave it to their own session manager.
+const MCP_CONNECTION_PARAMS_TYPES: ReadonlySet<unknown> = new Set([
+  'StdioConnectionParams',
+  'SseConnectionParams',
+  'StreamableHTTPConnectionParams',
+]);
+
 function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<MCPToolsetFactory> {
   const produced = factory();
   if (
     isBaseToolset(produced) ||
-    (produced != null && typeof produced === 'object' &&
-      (produced.type === 'StdioConnectionParams' || produced.type === 'StreamableHTTPConnectionParams'))
+    (produced != null && typeof produced === 'object' && MCP_CONNECTION_PARAMS_TYPES.has(produced.type))
   ) {
     return produced;
   }
