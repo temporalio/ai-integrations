@@ -1,5 +1,7 @@
 package io.temporal.googleadk.workflow;
 
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
 import io.reactivex.rxjava3.core.Scheduler;
 import io.reactivex.rxjava3.disposables.Disposable;
 import io.reactivex.rxjava3.schedulers.Schedulers;
@@ -76,7 +78,15 @@ public final class WorkflowScheduler extends Scheduler {
       if (disposed.get()) {
         return Disposable.disposed();
       }
-      Task task = new Task(run, disposed);
+      Context context = Context.current();
+      Task task =
+          new Task(
+              () -> {
+                try (Scope scope = context.makeCurrent()) {
+                  run.run();
+                }
+              },
+              disposed);
       if (delay <= 0) {
         start(task);
         return task;
