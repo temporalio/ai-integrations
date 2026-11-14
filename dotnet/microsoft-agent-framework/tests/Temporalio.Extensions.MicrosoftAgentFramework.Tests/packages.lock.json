@@ -281,8 +281,8 @@
       },
       "NexusRpc": {
         "type": "Transitive",
-        "resolved": "0.5.0",
-        "contentHash": "Kcb6c8xHvWy+Q3shNro1I1ZFBWKmnJxxumRpo5qoiLpm3mi+a1dh9rxF4ZnJ/3RTSBGD0x5TXNbTaucOuPFWnA=="
+        "resolved": "0.4.0",
+        "contentHash": "2cdRtmwT/vskWqJvojODvR7CpRhLWAnCeVT5Z8sPdRDX8P/Ywpw48T2lqgqhxM8JROfoflHzhSiXo4h1ln3/MQ=="
       },
       "OpenAI": {
         "type": "Transitive",
@@ -325,21 +325,21 @@
       },
       "Temporalio": {
         "type": "Transitive",
-        "resolved": "1.22.0",
-        "contentHash": "pggaD4WmzPg3zuGF5JLmgO3l6F+7WLr0xG5g3XlM3SlBqUMfutTH4NlAJbiR7QlvTxS9aPTtTEOIit+3KcnCmA==",
+        "resolved": "1.20.0",
+        "contentHash": "5Y11I7V2L/EAMczly8sT8b+dhLIiBwUmJSiUbsJOId7r1f2BZJn+2oEo2RUauSwUeIMXXEfvq3Y92BM8RjoqqQ==",
         "dependencies": {
           "Google.Protobuf": "3.26.1",
           "Microsoft.Extensions.Logging.Abstractions": "2.2.0",
-          "NexusRpc": "0.5.0"
+          "NexusRpc": "0.4.0"
         }
       },
       "Temporalio.Extensions.WorkflowStreams": {
         "type": "Transitive",
-        "resolved": "1.22.0",
-        "contentHash": "pdUo8QuAKrofpByM6OcD/5vTF+cT/U6w0mb57/qu5RPJrpbselfjTJ4clgO/UdItjVOY69pCVK2JVn3DMGGFrA==",
+        "resolved": "1.20.0",
+        "contentHash": "PyGsfhM55U4enKcsWQKFfsT8Bsq2HVDMc9OjObJdA4hHKiSqxJ2ko0faKOw7dmCaOprO9AXaBmlPTbP5bggRdg==",
         "dependencies": {
           "Microsoft.Bcl.AsyncInterfaces": "9.0.4",
-          "Temporalio": "1.22.0"
+          "Temporalio": "1.20.0"
         }
       },
       "xunit.analyzers": {
@@ -415,8 +415,8 @@
         "dependencies": {
           "Microsoft.Agents.AI": "[1.26.0, 2.0.0)",
           "ModelContextProtocol.Core": "[2.2.0, )",
-          "Temporalio": "[1.22.0, )",
-          "Temporalio.Extensions.WorkflowStreams": "[1.22.0, )"
+          "Temporalio": "[1.20.0, )",
+          "Temporalio.Extensions.WorkflowStreams": "[1.20.0, )"
         }
       }
     },
@@ -719,8 +719,8 @@
       },
       "NexusRpc": {
         "type": "Transitive",
-        "resolved": "0.5.0",
-        "contentHash": "Kcb6c8xHvWy+Q3shNro1I1ZFBWKmnJxxumRpo5qoiLpm3mi+a1dh9rxF4ZnJ/3RTSBGD0x5TXNbTaucOuPFWnA=="
+        "resolved": "0.4.0",
+        "contentHash": "2cdRtmwT/vskWqJvojODvR7CpRhLWAnCeVT5Z8sPdRDX8P/Ywpw48T2lqgqhxM8JROfoflHzhSiXo4h1ln3/MQ=="
       },
       "OpenAI": {
         "type": "Transitive",
@@ -816,22 +816,22 @@
       },
       "Temporalio": {
         "type": "Transitive",
-        "resolved": "1.22.0",
-        "contentHash": "pggaD4WmzPg3zuGF5JLmgO3l6F+7WLr0xG5g3XlM3SlBqUMfutTH4NlAJbiR7QlvTxS9aPTtTEOIit+3KcnCmA==",
+        "resolved": "1.20.0",
+        "contentHash": "5Y11I7V2L/EAMczly8sT8b+dhLIiBwUmJSiUbsJOId7r1f2BZJn+2oEo2RUauSwUeIMXXEfvq3Y92BM8RjoqqQ==",
         "dependencies": {
           "Google.Protobuf": "3.26.1",
           "Microsoft.Extensions.Logging.Abstractions": "2.2.0",
-          "NexusRpc": "0.5.0"
+          "NexusRpc": "0.4.0"
         }
       },
       "Temporalio.Extensions.WorkflowStreams": {
         "type": "Transitive",
-        "resolved": "1.22.0",
-        "contentHash": "pdUo8QuAKrofpByM6OcD/5vTF+cT/U6w0mb57/qu5RPJrpbselfjTJ4clgO/UdItjVOY69pCVK2JVn3DMGGFrA==",
+        "resolved": "1.20.0",
+        "contentHash": "PyGsfhM55U4enKcsWQKFfsT8Bsq2HVDMc9OjObJdA4hHKiSqxJ2ko0faKOw7dmCaOprO9AXaBmlPTbP5bggRdg==",
         "dependencies": {
           "Microsoft.Bcl.AsyncInterfaces": "9.0.4",
           "System.Text.Json": "9.0.4",
-          "Temporalio": "1.22.0"
+          "Temporalio": "1.20.0"
         }
       },
       "xunit.analyzers": {
@@ -907,8 +907,8 @@
         "dependencies": {
           "Microsoft.Agents.AI": "[1.26.0, 2.0.0)",
           "ModelContextProtocol.Core": "[2.2.0, )",
-          "Temporalio": "[1.22.0, )",
-          "Temporalio.Extensions.WorkflowStreams": "[1.22.0, )"
+          "Temporalio": "[1.20.0, )",
+          "Temporalio.Extensions.WorkflowStreams": "[1.20.0, )"
         }
       }
     }
