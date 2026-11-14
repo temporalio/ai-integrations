@@ -8,14 +8,13 @@
     <Description>Temporal integration for Microsoft Agent Framework (Pre-release)</Description>
     <PackageTags>temporal;workflow;durable-execution;ai;agents;microsoft-agent-framework</PackageTags>
     <PackageProjectUrl>https://github.com/temporalio/ai-integrations/tree/main/dotnet/microsoft-agent-framework</PackageProjectUrl>
-    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Temporalio.Extensions.MicrosoftAgentFramework.Tests" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="../../LICENSE" Pack="true" PackagePath="" />
     <None Include="../../README.md" Pack="true" PackagePath="" />
   </ItemGroup>
   <ItemGroup>

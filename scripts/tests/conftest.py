@@ -195,12 +195,11 @@ def make_dotnet_plugin(
             <Version>0.0.0</Version>
             <IsPackable>true</IsPackable>
             <Description>Fake plugin (Pre-release)</Description>
-            <PackageLicenseFile>LICENSE</PackageLicenseFile>
+            <PackageLicenseExpression>MIT</PackageLicenseExpression>
             <PackageReadmeFile>README.md</PackageReadmeFile>
             <PackageProjectUrl>https://github.com/temporalio/ai-integrations/tree/main/dotnet/{name}</PackageProjectUrl>
           </PropertyGroup>
           <ItemGroup>
-            <None Include="../../LICENSE" Pack="true" PackagePath="" />
             <None Include="../../README.md" Pack="true" PackagePath="" />
           </ItemGroup>
           <ItemGroup>

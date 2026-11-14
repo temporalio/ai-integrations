@@ -16,7 +16,7 @@ ICON = b"\x89PNG fake icon"
 README = b"# fake\n\nhttps://github.com/temporalio/ai-integrations\n"
 
 
-def nuspec(*, version: str = VERSION, license_type: str = "file", groups: tuple[str, ...] = ("net10.0",),
+def nuspec(*, version: str = VERSION, license_type: str = "expression", license_text: str = "MIT", groups: tuple[str, ...] = ("net10.0",),
            temporalio: str | None = "1.22.0", commit: str = COMMIT, icon: str = "icon.png") -> str:
     dependency = f'<dependency id="Temporalio" version="{temporalio}" exclude="Build,Analyzers" />' if temporalio else ""
     dependencies = "".join(f'<group targetFramework="{group}">{dependency}</group>' for group in groups)
@@ -26,7 +26,7 @@ def nuspec(*, version: str = VERSION, license_type: str = "file", groups: tuple[
     <id>{COORDINATE}</id>
     <version>{version}</version>
     <authors>Temporal</authors>
-    <license type="{license_type}">LICENSE</license>
+    <license type="{license_type}">{license_text}</license>
     <icon>{icon}</icon>
     <readme>README.md</readme>
     <repository type="git" url="https://github.com/temporalio/ai-integrations" commit="{commit}" />
@@ -67,7 +67,7 @@ def publication(tmp_path: Path, **nuspec_overrides: object) -> tuple[Path, Path]
     dist = plugin / "dist"
     dist.mkdir()
     write_package(dist / f"{COORDINATE}.{VERSION}.nupkg", nuspec(**nuspec_overrides), {
-        "LICENSE": LICENSE, "README.md": README, "icon.png": ICON,
+        "README.md": README, "icon.png": ICON,
         f"lib/net10.0/{COORDINATE}.dll": b"MZ", f"lib/net10.0/{COORDINATE}.xml": b"<doc/>",
     })
     write_package(dist / f"{COORDINATE}.{VERSION}.snupkg", nuspec(**nuspec_overrides), {f"lib/net10.0/{COORDINATE}.pdb": b"pdb"})
@@ -83,8 +83,9 @@ def test_valid_publication(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
 
 @pytest.mark.parametrize("fault,message", [
     ("version", "nuspec version"),
-    ("license-expression", "license must be"),
-    ("license-drift", "packaged LICENSE differs"),
+    ("license-file", "license must be"),
+    ("license-other", "license must be"),
+    ("license-packed", "LICENSE file is packed"),
     ("readme-drift", "packaged README.md differs"),
     ("icon-drift", "packaged icon.png differs"),
     ("missing-xml", "missing lib/net10.0/Temporalio.Extensions.Fakedotnet.xml"),
@@ -103,7 +104,8 @@ def test_valid_publication(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
 ])
 def test_publication_rejects_invalid_artifacts(tmp_path: Path, fault: str, message: str) -> None:
     overrides: dict[str, object] = {
-        "version": {"version": "0.0.0"}, "license-expression": {"license_type": "expression"},
+        "version": {"version": "0.0.0"}, "license-file": {"license_type": "file", "license_text": "LICENSE"},
+        "license-other": {"license_text": "Apache-2.0"},
         "missing-temporalio": {"temporalio": None}, "open-lower-bound": {"temporalio": "(, 2.0.0)"},
         "group-framework": {"groups": ("netstandard2.0",)}, "commit": {"commit": "feedfacefeedfacefeedfacefeedfacefeedface"},
         "no-commit": {"commit": ""},
@@ -112,8 +114,8 @@ def test_publication_rejects_invalid_artifacts(tmp_path: Path, fault: str, messa
     dist = plugin / "dist"
     nupkg = dist / f"{COORDINATE}.{VERSION}.nupkg"
     snupkg = dist / f"{COORDINATE}.{VERSION}.snupkg"
-    if fault == "license-drift":
-        rewrite(nupkg, add={"LICENSE": b"other license\n"})
+    if fault == "license-packed":
+        rewrite(nupkg, add={"LICENSE": LICENSE})
     elif fault == "readme-drift":
         rewrite(nupkg, add={"README.md": b"# other\n"})
     elif fault == "icon-drift":

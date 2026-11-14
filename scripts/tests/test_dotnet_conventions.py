@@ -66,10 +66,17 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
     "package-id": (lambda r: edit(r, LIB, "<PackageId>Temporalio.Extensions.Fakedotnet</PackageId>", "<PackageId>Temporalio.Other</PackageId>"),
                    "PackageId must be 'Temporalio.Extensions.Fakedotnet'"),
     "version": (lambda r: edit(r, LIB, "<Version>0.0.0</Version>", "<Version>0.1.0</Version>"), "development placeholder"),
-    "license-expression": (
-        lambda r: edit(r, LIB, "<PackageLicenseFile>LICENSE</PackageLicenseFile>",
-                       "<PackageLicenseFile>LICENSE</PackageLicenseFile><PackageLicenseExpression>MIT</PackageLicenseExpression>"),
-        "no PackageLicenseExpression"),
+    "license-file": (
+        lambda r: edit(r, LIB, "<PackageLicenseExpression>MIT</PackageLicenseExpression>",
+                       "<PackageLicenseExpression>MIT</PackageLicenseExpression><PackageLicenseFile>LICENSE</PackageLicenseFile>"),
+        "no PackageLicenseFile"),
+    "license-other": (
+        lambda r: edit(r, LIB, "<PackageLicenseExpression>MIT</PackageLicenseExpression>", "<PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>"),
+        "PackageLicenseExpression must be MIT"),
+    "license-packed": (
+        lambda r: edit(r, LIB, '<None Include="../../README.md" Pack="true" PackagePath="" />',
+                       '<None Include="../../README.md" Pack="true" PackagePath="" /><None Include="../../LICENSE" Pack="true" PackagePath="" />'),
+        "do not pack a LICENSE file"),
     "aot": (lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>", "<IsPackable>true</IsPackable><IsAotCompatible>true</IsAotCompatible>"),
             "IsAotCompatible is not allowed"),
     "weaker-policy": (
@@ -140,7 +147,7 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
     "root-props-version": (lambda r: write_root_props(r, "<Version>0.1.0</Version>"), "Directory.Build.props: Version must be"),
     "root-props-aot": (lambda r: write_root_props(r, "<PublishAot>true</PublishAot>"), "Directory.Build.props: PublishAot is not allowed"),
     "root-props-license-expression": (lambda r: write_root_props(r, "<PackageLicenseExpression>MIT</PackageLicenseExpression>"),
-                                      "Directory.Build.props: ship the license text"),
+                                      "Directory.Build.props: the license belongs in the library csproj"),
     "root-props-packable": (lambda r: write_root_props(r, "<IsPackable>true</IsPackable>"), "would pack the test project too"),
     "nested-props": (lambda r: (r / PLUGIN / "src/Directory.Build.props").write_text("<Project />\n"),
                      "src/Directory.Build.props: a nearer Directory.Build.props replaces the plugin-root one"),

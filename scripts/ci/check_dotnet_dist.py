@@ -3,10 +3,10 @@
 
 The ubuntu/max cell of _dotnet-plugin.yml runs this after `make build`, and the release pipeline
 publishes the same files. Mirrors check_java_dist.py: exactly one `.nupkg` and one `.snupkg` named
-`<coordinate>.<version>`; nuspec identity, authors, file license, packed README, icon, Source Link
+`<coordinate>.<version>`; nuspec identity, authors, the MIT license expression, packed README, icon, Source Link
 repository metadata (the commit must equal --commit when given) and a `Temporalio` dependency with
-a lower bound in one dependency group per csproj target framework; packed LICENSE byte-identical to
-the root LICENSE, README to the plugin README and icon to dotnet/_shared/icon.png; `lib/<tfm>/`
+a lower bound in one dependency group per csproj target framework; no packed LICENSE file (the
+expression covers it), README byte-identical to the plugin README and icon to dotnet/_shared/icon.png; `lib/<tfm>/`
 holds the assembly and its XML documentation; no debug symbols, no test project output and no
 signature in the tested package; the symbol package carries the PDB for every target framework.
 """
@@ -86,7 +86,6 @@ def check(plugin_dir: Path, version: str, dist: Path | None = None, repo_root: P
         raise ValueError(f"publication files differ: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
     frameworks = csproj_frameworks(plugin_dir / "src" / coordinate / f"{coordinate}.csproj")
     packed_files = {
-        "LICENSE": (repo_root / "LICENSE").read_bytes(),
         "README.md": (plugin_dir / "README.md").read_bytes(),
         "icon.png": (repo_root / "dotnet" / "_shared" / "icon.png").read_bytes(),
     }
@@ -98,8 +97,10 @@ def check(plugin_dir: Path, version: str, dist: Path | None = None, repo_root: P
             if nuspec_text(metadata, field) != value:
                 raise ValueError(f"nuspec {field} must be {value!r}, got {nuspec_text(metadata, field)!r}")
         license_element = metadata.find("{*}license")
-        if license_element is None or license_element.get("type") != "file" or (license_element.text or "").strip() != "LICENSE":
-            raise ValueError('nuspec license must be <license type="file">LICENSE</license>')
+        if license_element is None or license_element.get("type") != "expression" or (license_element.text or "").strip() != "MIT":
+            raise ValueError('nuspec license must be <license type="expression">MIT</license>')
+        if "LICENSE" in names:
+            raise ValueError("a LICENSE file is packed; the MIT expression covers the license, so pack none")
         repository = metadata.find("{*}repository")
         if repository is None or repository.get("type") != "git" or repository.get("url") != REPOSITORY_URL or not repository.get("commit"):
             raise ValueError(f"nuspec repository must be type git at {REPOSITORY_URL} with a Source Link commit")
@@ -138,7 +139,7 @@ def check(plugin_dir: Path, version: str, dist: Path | None = None, repo_root: P
         for tfm in frameworks:
             if f"lib/{tfm}/{coordinate}.pdb" not in names:
                 raise ValueError(f"snupkg is missing lib/{tfm}/{coordinate}.pdb")
-    print(f"OK: {coordinate} {version}: package identity, license, README, icon, Source Link, dependencies and symbols")
+    print(f"OK: {coordinate} {version}: package identity, MIT license expression, README, icon, Source Link, dependencies and symbols")
 
 
 def main() -> int:

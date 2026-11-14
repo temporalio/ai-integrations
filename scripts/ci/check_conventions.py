@@ -701,8 +701,8 @@ class Checker:
         if "version" in properties and properties["version"] != DOTNET_DEVELOPMENT_VERSION:
             self.fail(f"{rel}: Version must be the tag-authoritative development placeholder "
                       f"{DOTNET_DEVELOPMENT_VERSION!r} (got {properties['version']!r})")
-        if "packagelicenseexpression" in properties or "packagelicenseurl" in properties:
-            self.fail(f"{rel}: ship the license text; no PackageLicenseExpression or PackageLicenseUrl")
+        if any(name in properties for name in ("packagelicenseexpression", "packagelicensefile", "packagelicenseurl")):
+            self.fail(f"{rel}: the license belongs in the library csproj, not in Directory.Build.props")
         if properties.get("ispackable", "").lower() == "true":
             self.fail(f"{rel}: IsPackable here would pack the test project too; set it in the library csproj")
         self._dotnet_common_rules(plugin, props, parsed, DOTNET_POLICY_PROPERTIES, require_stylecop=False)
@@ -750,14 +750,20 @@ class Checker:
                       f"{DOTNET_DEVELOPMENT_VERSION!r} (got {properties.get('version')!r})")
         if properties.get("ispackable", "").lower() != "true":
             self.fail(f"{rel}: IsPackable must be true")
-        frameworks = [part.strip() for part in properties.get("targetframeworks", "").split(";") if part.strip()]
-        frameworks += [properties["targetframework"]] if properties.get("targetframework") else []
-        if floor and floor not in frameworks:
-            self.fail(f"{rel}: TargetFramework(s) must include {floor} (the [ci] runtime-versions channel)")
-        if properties.get("packagelicensefile") != "LICENSE":
-            self.fail(f"{rel}: PackageLicenseFile must be LICENSE")
-        if "packagelicenseexpression" in properties or "packagelicenseurl" in properties:
-            self.fail(f"{rel}: ship the license text; no PackageLicenseExpression or PackageLicenseUrl")
+        # One framework, tested on every runtime in [ci] runtime-versions: netstandard2.0 like the SDK's own
+        # Extensions packages, or the oldest runtime when a dependency's netstandard2.0 assembly differs from
+        # its net8.0 one (Microsoft.Agents.AI does). A second framework would ship an asset the suite never runs.
+        if "targetframeworks" in properties:
+            self.fail(f"{rel}: the library targets one framework (TargetFramework, not TargetFrameworks); "
+                      "an untested asset is worse than a missing one")
+        elif floor and properties.get("targetframework", "") not in ("netstandard2.0", floor):
+            self.fail(f"{rel}: TargetFramework must be netstandard2.0 or {floor} (the oldest [ci] runtime)")
+        if properties.get("packagelicenseexpression") != "MIT":
+            self.fail(f"{rel}: PackageLicenseExpression must be MIT")
+        if "packagelicensefile" in properties or "packagelicenseurl" in properties:
+            self.fail(f"{rel}: the license is the MIT expression; no PackageLicenseFile or PackageLicenseUrl")
+        if any(name == "none" and "LICENSE" in attrs.get("include", "") for name, attrs in items):
+            self.fail(f"{rel}: do not pack a LICENSE file; PackageLicenseExpression covers it")
         if properties.get("packagereadmefile") != "README.md":
             self.fail(f"{rel}: PackageReadmeFile must be README.md")
         if properties.get("packageprojecturl") != f"{DOTNET_REPOSITORY_TREE}/dotnet/{plugin.name}":
@@ -767,7 +773,7 @@ class Checker:
                       "is not on nuget.org; merge the code into the library or publish it as its own plugin")
         packed = {metadata.get("include", "").replace("\\", "/") for tag, metadata in items
                   if tag == "none" and metadata.get("pack", "").lower() == "true"}
-        for name in ("../../LICENSE", "../../README.md"):
+        for name in ("../../README.md",):
             if name not in packed:
                 self.fail(f"{rel}: must pack {name} (<None Include=\"{name}\" Pack=\"true\" PackagePath=\"\" />)")
         temporalio = next((metadata for tag, metadata in items if tag == "packagereference" and metadata.get("include", "").lower() == "temporalio"), None)
