@@ -13,11 +13,10 @@ import type {
   SandboxSession,
   SandboxSessionState,
 } from '@openai/agents-core/sandbox';
-import { SandboxError } from '@openai/agents-core/sandbox';
+import { SandboxError, isEnvValueReference } from '@openai/agents-core/sandbox';
 import {
+  deserializeHostPathGrantRedactionMetadata,
   isStringRecord,
-  manifestHasInContainerMounts,
-  manifestHasNonResumableMountAuthority,
   rebindPersistedMountCredentials,
   rehydratePersistedEnvironmentForRuntime,
   sanitizeEnvironmentForPersistence,
@@ -25,6 +24,7 @@ import {
 import { ApplicationFailure } from '@temporalio/common';
 import { registerWorkerEnvVarContext } from '../common/worker-env-vars';
 import {
+  SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX,
   SANDBOX_CLIENT_CREATE_SUFFIX,
   SANDBOX_CLIENT_DELETE_SUFFIX,
   SANDBOX_CLIENT_RESUME_SUFFIX,
@@ -56,8 +56,10 @@ import {
   sandboxSpanName,
   serializeSessionEnvelope,
   toSdkStateRecord,
+  withTrustedManifest,
   type EncodedManifest,
   type SandboxApplyManifestInput,
+  type SandboxCanReusePreservedOwnedSessionInput,
   type SandboxCreateSessionInput,
   type SandboxEditorInput,
   type SandboxExecInput,
@@ -207,15 +209,19 @@ export class SandboxClientProvider {
   }
 
   /**
-   * Upstream's runner rebinds a deserialized state's mounts from a trusted manifest before resume, and
-   * backends refuse a state with mounts that wasn't rebound. The Worker trusts the envelope's manifest,
-   * which the Workflow sends.
+   * Backends refuse a resumed state whose mounts or path grant `hostPath`s weren't rebound from a trusted
+   * manifest; the Workflow sends that manifest in the envelope.
    */
   private async resumableState(payload: SerializedSandboxSessionState): Promise<SandboxSessionState> {
-    return rebindPersistedMountCredentials(
-      await this.rehydrateState(payload),
-      decodeManifest(payload.manifest, this._resolvableWorkerEnvVars)
-    );
+    const trusted = decodeManifest(payload.manifest, this._resolvableWorkerEnvVars);
+    const state = rebindPersistedMountCredentials(await this.rehydrateState(payload), trusted);
+    const grants = new Map(trusted.extraPathGrants.map((grant) => [grant.path, grant]));
+    const { extraPathGrants } = state.manifest;
+    for (const [index, grant] of extraPathGrants.entries()) extraPathGrants[index] = grants.get(grant.path) ?? grant;
+    for (const [key, paths] of Object.entries(deserializeHostPathGrantRedactionMetadata(state))) {
+      if ((paths as string[]).every((path) => grants.get(path)?.hostPath !== undefined)) delete state[key];
+    }
+    return state;
   }
 
   private async session(payload: SerializedSandboxSessionState): Promise<SandboxSession> {
@@ -269,8 +275,6 @@ export class SandboxClientProvider {
     return {
       state: serializeSessionEnvelope(sessionId, session.state, await this.providerState(session.state)),
       supportsPty: session.supportsPty?.() ?? false,
-      ...(manifestHasInContainerMounts(session.state.manifest) ? { inContainerMounts: true } : {}),
-      ...(manifestHasNonResumableMountAuthority(session.state.manifest) ? { nonResumableMountAuthority: true } : {}),
     };
   }
 
@@ -332,6 +336,63 @@ export class SandboxClientProvider {
           ? await this.client.serializeSessionState(session.state, input.options)
           : await this.providerState(session.state);
         return serializeSessionEnvelope(input.state.sessionId, session.state, providerState, false);
+      },
+
+      [`${n}${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]: async (
+        input: SandboxCanReusePreservedOwnedSessionInput
+      ): Promise<boolean> => {
+        let state: SandboxSessionState;
+        try {
+          ({ state } = await this.session(
+            input.trustedManifest ? withTrustedManifest(input.state, input.trustedManifest) : input.state
+          ));
+        } catch (err) {
+          // On a cache miss, upstream refuses to resume some sessions, such as one with an in-container mount.
+          if (err instanceof SandboxError && err.retryable === false) return false;
+          throw err;
+        }
+        const trustedManifest =
+          input.trustedManifest && decodeManifest(input.trustedManifest, this._resolvableWorkerEnvVars);
+        // A Docker container keeps the environment it was created with, so it would keep a removed variable.
+        // A session rehydrated on a cache miss has the trusted environment, so the persisted one counts too.
+        if (
+          trustedManifest &&
+          this.client.backendId === 'docker' &&
+          [...Object.keys(state.manifest.environment), ...Object.keys(input.state.manifest.environment)].some(
+            (key) => !(key in trustedManifest.environment)
+          )
+        ) {
+          return false;
+        }
+        if (
+          this.client.canReusePreservedOwnedSession &&
+          !(await this.client.canReusePreservedOwnedSession(state, {
+            clientOptions: input.clientOptions,
+            revalidateManifestEntries: input.revalidateManifestEntries,
+            trustedManifest,
+          }))
+        ) {
+          return false;
+        }
+        // Upstream refuses to resume a live session without a trusted manifest, so there is nothing to refresh.
+        if (!trustedManifest) return true;
+        const { extraPathGrants, remoteMountCommandAllowlist } = state.manifest;
+        extraPathGrants.splice(0, extraPathGrants.length, ...trustedManifest.extraPathGrants);
+        remoteMountCommandAllowlist.splice(
+          0,
+          remoteMountCommandAllowlist.length,
+          ...trustedManifest.remoteMountCommandAllowlist
+        );
+        const environment = { ...state.environment, ...(await trustedManifest.resolveEnvironment()) };
+        for (const [key, value] of Object.entries(state.manifest.environment)) {
+          if (!(key in trustedManifest.environment) && isEnvValueReference(value)) {
+            delete environment[key];
+            delete state.manifest.environment[key];
+          }
+        }
+        Object.assign(state.manifest.environment, trustedManifest.environment);
+        state.environment = environment;
+        return true;
       },
 
       [`${n}${SANDBOX_SESSION_START_SUFFIX}`]: async (input: SandboxLifecycleInput): Promise<void> => {

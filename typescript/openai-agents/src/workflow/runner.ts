@@ -18,7 +18,7 @@ import {
   type StreamedRunResult,
   type TracingConfig,
 } from '@openai/agents-core';
-import { Manifest, SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox';
+import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { CancellationScope } from '@temporalio/workflow';
 import {
@@ -31,13 +31,8 @@ import {
 import { unwrapTemporalFailure } from '../common/errors';
 import { refuseTracingApiKey } from '../common/headers';
 import { ActivityBackedModelProvider } from './activity-backed-model';
-import { getAgentToolRecord } from './agent-tools';
 import { checkAgent } from './check-agent';
-import {
-  validateTemporalSandboxClient,
-  type LiveSandboxSession,
-  type TemporalSandboxClient,
-} from './sandbox-client';
+import { validateTemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
@@ -143,9 +138,6 @@ function definedFields<T extends object>(obj: T | undefined): Partial<T> {
   return result;
 }
 
-/** The sandbox client of the run that returned each state. */
-const sandboxClients = new WeakMap<RunState<any, any>, TemporalSandboxClient>();
-
 /** Whether a `SandboxAgent` is reachable from `agent` through its handoff graph. */
 function hasSandboxAgent(agent: Agent<any, any>, seen: Set<Agent<any, any>> = new Set()): boolean {
   if (agent instanceof SandboxAgent) return true;
@@ -247,15 +239,14 @@ export class TemporalOpenAIRunner {
     }
 
     // Normalized, so a malformed agent graph, such as an `undefined` tool, fails the run.
-    const sandbox = options?.runConfig?.sandbox;
-    let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     try {
-      validateSandboxRunConfig(agent, sandbox);
+      validateSandboxRunConfig(agent, options?.runConfig?.sandbox);
       checkAgent(agent);
-      preparedInput = input instanceof RunState ? await prepareRunState(agent, input, sandbox) : input;
     } catch (error) {
       throw normalizeAgentsRunError(error);
     }
+    // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
+    if (input instanceof RunState) input.clearTrace();
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
@@ -284,11 +275,10 @@ export class TemporalOpenAIRunner {
     const scope = CancellationScope.current();
     try {
       if (options?.stream === true) {
-        const streamed = (await innerRunner.run(agent, preparedInput as any, {
+        const streamed = (await innerRunner.run(agent, input as any, {
           ...sharedRunOptions,
           stream: true,
         })) as StreamedRunResult<TContext, TAgent>;
-        if (sandbox !== undefined) sandboxClients.set(streamed.state, sandbox.client as TemporalSandboxClient);
         // Upstream's stream loop ends through these internal methods, which its typings omit.
         const completion = streamed as unknown as { _done(): void; _raiseError(error: unknown): void };
         const done = completion._done.bind(streamed);
@@ -306,8 +296,7 @@ export class TemporalOpenAIRunner {
         };
         return streamed;
       }
-      const result = (await innerRunner.run(agent, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
-      if (sandbox !== undefined) sandboxClients.set(result.state, sandbox.client as TemporalSandboxClient);
+      const result = (await innerRunner.run(agent, input as any, sharedRunOptions)) as RunResult<any, TAgent>;
       if (scope.consideredCancelled) await scope.cancelRequested;
       return result;
     } catch (error) {
@@ -317,91 +306,6 @@ export class TemporalOpenAIRunner {
       await flushOpenSpans();
     }
   }
-}
-
-/**
- * Fails the run if restoring `input` would move one of its approvals to another agent. Restoring finds
- * an agent through handoffs and the tools `agent.asTool()` returned, so the approval of an agent reached
- * only through a copy of such a tool goes to the parent or to another agent of the same name, and
- * resumed it would stay pending. Checks agent objects, not names, from both `agent` and the state's
- * current agent, so a state whose agents were built again for this run is checked too.
- */
-function checkRestoredInterruptions(agent: Agent<any, any>, input: RunState<any, any>): void {
-  const roots = [agent, input._currentAgent];
-  const restorable = collectAgents(roots, false);
-  const reachable = collectAgents(roots, true);
-  for (const interruption of input.getInterruptions()) {
-    if (restorable.has(interruption.agent) || !reachable.has(interruption.agent)) continue;
-    throw ApplicationFailure.create({
-      message:
-        `The approval for '${interruption.name}' of agent '${interruption.agent.name}' can't be resumed: ` +
-        "this run's sandbox state is restored from its serialized form, which finds a nested agent only " +
-        'through the tool its agent.asTool() returned, not a copy such as a toolNamespace() one. Give the ' +
-        'parent agent the tool agent.asTool() returned.',
-      type: 'AgentsWorkflowError',
-      nonRetryable: true,
-    });
-  }
-}
-
-/**
- * The agents reached from `roots` through handoffs and `asTool()` tools: all of them, or with
- * `throughCopies` false, only the tools `asTool()` returned, as upstream's `RunState` does.
- */
-function collectAgents(roots: Agent<any, any>[], throughCopies: boolean): Set<Agent<any, any>> {
-  const seen = new Set<Agent<any, any>>();
-  const queue = [...roots];
-  for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
-    if (seen.has(next)) continue;
-    seen.add(next);
-    for (const h of next.handoffs ?? []) queue.push(h instanceof Handoff ? h.agent : h);
-    for (const tool of next.tools ?? []) {
-      const record = getAgentToolRecord(tool);
-      if (record !== undefined && (throughCopies || record.tool === tool)) queue.push(record.agent);
-    }
-  }
-  return seen;
-}
-
-/** Resumes a state the runner returned as it is, unless upstream would close a live sandbox and then use it; then closes the sandboxes upstream won't resume and rebuilds the state from its string. */
-async function prepareRunState<TContext, TAgent extends Agent<any, any>>(
-  agent: TAgent,
-  state: RunState<TContext, TAgent>,
-  sandbox: SandboxRunConfig | undefined
-): Promise<RunState<TContext, TAgent>> {
-  let prepared = state;
-  const client = sandboxClients.get(state);
-  if (client !== undefined && state._sandbox !== undefined) {
-    const agents = [...collectAgents([agent], false)];
-    const live = new Set<LiveSandboxSession>();
-    let rebuild = false;
-    for (const entry of Object.values(state._sandbox.sessionsByAgent)) {
-      if (!entry.preservedOwnedSession || entry.reuseLiveSession === false) continue;
-      const session = client._liveSession(entry.sessionState.providerState.sessionId);
-      if (session === undefined) continue;
-      live.add(session);
-      const owner = agents.find((candidate) => candidate.name === entry.currentAgentName) as SandboxAgent | undefined;
-      const trusted = sandbox?.manifest ?? owner?.defaultManifest;
-      const trustedManifest = trusted instanceof Manifest ? trusted : new Manifest(trusted);
-      if (
-        session.nonResumableMountAuthority ||
-        !client.canReusePreservedOwnedSession(session.session.state, { trustedManifest })
-      ) {
-        rebuild = true;
-      }
-    }
-    if (rebuild) {
-      checkRestoredInterruptions(agent, state);
-      const serialized = state.toString();
-      for (const { session, inContainerMounts, nonResumableMountAuthority } of live) {
-        if (inContainerMounts || nonResumableMountAuthority) await client._close(session);
-      }
-      prepared = (await RunState.fromStringWithContext(agent, serialized, state._context)) as RunState<TContext, TAgent>;
-    }
-  }
-  // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
-  prepared.clearTrace();
-  return prepared;
 }
 
 /**

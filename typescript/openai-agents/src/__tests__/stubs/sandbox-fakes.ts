@@ -18,10 +18,11 @@ import {
   type WriteStdinArgs,
 } from '@openai/agents-core/sandbox';
 import {
-  assertMountCredentialsRebound,
+  assertHostPathGrantsRebound,
   deserializeManifest,
   mergeManifestDelta,
   mergeManifestEntryDelta,
+  serializeHostPathGrantRedactionMetadata,
 } from '@openai/agents-core/sandbox/internal';
 import { ApplicationFailure } from '@temporalio/common';
 
@@ -167,6 +168,7 @@ export class FakeSandboxClient implements SandboxClient {
   }
 
   async resume(state: SandboxSessionState): Promise<SandboxSession> {
+    assertHostPathGrantsRebound(state);
     this.resumeCalls += 1;
     this.resumeEnvironments.push(
       Object.fromEntries(
@@ -191,9 +193,11 @@ export class FakeSandboxClient implements SandboxClient {
         ([key]) => !state.manifest.environment[key]?.ephemeral && !isEnvValueReference(state.manifest.environment[key])
       )
     );
-    return Object.keys(environment).length > 0
-      ? { workspacePath: state.workspacePath, environment }
-      : { workspacePath: state.workspacePath };
+    return {
+      ...serializeHostPathGrantRedactionMetadata(state),
+      workspacePath: state.workspacePath,
+      ...(Object.keys(environment).length > 0 ? { environment } : {}),
+    };
   }
 
   async deserializeSessionState(state: Record<string, unknown>): Promise<SandboxSessionState> {
@@ -208,9 +212,8 @@ export class FakeSandboxClient implements SandboxClient {
 type LifecycleSandboxState = SandboxSessionState & { sandboxId: number };
 
 /**
- * A backend of numbered sandboxes that records each one's lifecycle in `events`. As a real backend, it
- * can't use a deleted sandbox, and as upstream's backends, it refuses to resume a session with an
- * in-container mount or a mount it can't verify.
+ * A backend of numbered sandboxes that records each one's lifecycle in `events`. Like a real backend, it
+ * can't use a deleted sandbox.
  */
 export class LifecycleSandboxClient implements SandboxClient {
   readonly backendId = 'lifecycle';
@@ -234,17 +237,10 @@ export class LifecycleSandboxClient implements SandboxClient {
   }
 
   async resume(state: SandboxSessionState): Promise<SandboxSession> {
-    assertMountCredentialsRebound(state);
     const sandboxId = this.use(state as LifecycleSandboxState);
     this.events.push(`resume#${sandboxId}`);
     state.environment = await state.manifest.resolveEnvironment();
     return this.session(state as LifecycleSandboxState);
-  }
-
-  async delete(state: SandboxSessionState): Promise<void> {
-    const { sandboxId } = state as LifecycleSandboxState;
-    this.events.push(`client-delete#${sandboxId}`);
-    this.deleted.add(sandboxId);
   }
 
   async serializeSessionState(state: SandboxSessionState): Promise<Record<string, unknown>> {

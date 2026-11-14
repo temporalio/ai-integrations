@@ -17,7 +17,6 @@ import {
   customHandoffSandboxAgentWithoutConfigWorkflow,
   customHandoffSandboxToolWorkflow,
   sandboxAgentWorkflow,
-  sandboxApprovalMountWorkflow,
   sandboxApprovalSequenceWorkflow,
   sandboxApprovalResumeWorkflow,
   sandboxArchiveLimitsWorkflow,
@@ -225,152 +224,81 @@ for (const [copied, parentName, rebuilt] of [
   );
 }
 
-test('A nested approval behind a copy of an asTool() tool in a sandbox run with an opaque mount fails the resume', async (t) => {
-  const { createWorker, executeWorkflow } = helpers(t);
-  const worker = await createWorker({
-    plugins: [
-      new OpenAIAgentsPlugin({
-        modelProvider: new FakeModelProvider([
-          toolCallResponse('ask_nested', { input: 'q' }),
-          toolCallResponse('confirmAction', { reason: 'approved' }),
-        ]),
-        sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
-      }),
-    ],
-  });
-
-  await worker.runUntil(async () => {
-    const result = await executeWorkflow(sandboxNestedApprovalWorkflow, {
-      args: [true, 'sandbox-parent', false, 'opaque'],
-    });
-    t.regex(result, /^AgentsWorkflowError: The approval for 'confirmAction' of agent 'Nested' can't be resumed/);
-    t.regex(result, /executions=0$/);
-  });
-});
-
-for (const mount of ['none', 'resumable', 'in-container', 'opaque'] as const) {
-  for (const withReference of [false, true]) {
-    const replaced = mount === 'opaque';
-    // Serial: a Worker installs its allowlist process-wide, so a Worker created alongside would switch it off.
-    test.serial(
-      `An approval resume of a sandbox with ${mount === 'none' ? 'no' : mount === 'resumable' ? 'a resumable' : `an ${mount}`} mount${withReference ? ' and a workerEnvValue' : ''} ${replaced ? 'replaces' : 'keeps'} it and leaks none`,
-      async (t) => {
-        const { createWorker, executeWorkflow } = helpers(t);
-        const backend = new LifecycleSandboxClient();
-        const worker = await createWorker({
-          plugins: [
-            new OpenAIAgentsPlugin({
-              modelProvider: new FakeModelProvider([
-                toolCallResponse('run_now', { cmd: 'first' }),
-                toolCallResponse('run_approved', { cmd: 'second' }),
-                textResponse('Done.'),
-              ]),
-              sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
-              resolvableWorkerEnvVars: [APPROVAL_VAR],
-            }),
-          ],
-        });
-
-        process.env[APPROVAL_VAR] = 'resolved-on-worker';
-        try {
-          const output = await worker.runUntil(
-            executeWorkflow(sandboxApprovalMountWorkflow, { args: [mount, withReference ? APPROVAL_VAR : undefined] })
-          );
-          const key = `KEY=${withReference ? 'resolved-on-worker' : ''}`;
-          if (replaced) {
-            // As upstream, a sandbox with a mount upstream can't verify is replaced.
-            t.is(output, `#1 ran first with ${key}\n#2 ran second with ${key}`);
-            t.deepEqual(
-              backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
-              ['create#1', 'delete#1', 'create#2', 'delete#2']
-            );
-          } else {
-            t.is(output, `#1 ran first with ${key}\n#1 ran first,second with ${key}`);
-            t.deepEqual(
-              backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
-              ['create#1', 'delete#1']
-            );
-          }
-          t.deepEqual(backend.liveSandboxes(), []);
-        } finally {
-          delete process.env[APPROVAL_VAR];
-        }
-      }
-    );
-  }
-}
-
-for (const mount of ['resumable', 'in-container'] as const) {
-  // Serial: a Worker installs its allowlist process-wide, so a Worker created alongside would switch it off.
-  test.serial(
-    `A second approval resume, with a new client and another Worker variable, ${mount === 'resumable' ? 'resumes the sandbox with the new variable' : 'replaces a sandbox with an in-container mount'}`,
-    async (t) => {
-      const { createWorker, executeWorkflow } = helpers(t);
-      const backend = new LifecycleSandboxClient();
-      const third = toolCallResponse('run_approved', { cmd: 'third' });
-      Object.assign(third.output[0]!, { callId: 'call_fake_run_approved_third' });
-      const worker = await createWorker({
-        plugins: [
-          new OpenAIAgentsPlugin({
-            modelProvider: new FakeModelProvider([
-              toolCallResponse('run_now', { cmd: 'first' }),
-              toolCallResponse('run_approved', { cmd: 'second' }),
-              third,
-              textResponse('Done.'),
-            ]),
-            sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
-            resolvableWorkerEnvVars: [APPROVAL_VAR, OTHER_APPROVAL_VAR],
-          }),
-        ],
-      });
-
-      process.env[APPROVAL_VAR] = 'resolved-on-worker';
-      process.env[OTHER_APPROVAL_VAR] = 'other-on-worker';
-      try {
-        const output = await worker.runUntil(
-          executeWorkflow(sandboxApprovalSequenceWorkflow, {
-            args: [mount, [APPROVAL_VAR, APPROVAL_VAR, OTHER_APPROVAL_VAR]],
-          })
-        );
-        const events = backend.events.filter((event) => /^(create|resume|delete)/.test(event));
-        if (mount === 'resumable') {
-          t.is(output, '#1 ran first,second,third with KEY=other-on-worker');
-          t.deepEqual(events, ['create#1', 'resume#1', 'delete#1']);
-        } else {
-          t.is(output, '#2 ran third with KEY=other-on-worker');
-          t.deepEqual(events, ['create#1', 'delete#1', 'create#2', 'delete#2']);
-        }
-        t.deepEqual(backend.liveSandboxes(), []);
-      } finally {
-        delete process.env[APPROVAL_VAR];
-        delete process.env[OTHER_APPROVAL_VAR];
-      }
-    }
-  );
-}
-
+// Serial: a Worker installs its allowlist process-wide, so a Worker created alongside would switch it off.
 test.serial(
-  'An approval resume of a sandbox with an opaque mount deletes it through the client when its Worker lost it',
+  'Approval resumes with a new client keep the live sandbox and run it with the Worker variable the manifest names',
   async (t) => {
-    const { createWorker, startWorkflow } = helpers(t);
+    const { createWorker, executeWorkflow } = helpers(t);
     const backend = new LifecycleSandboxClient();
-    const workerWith = (responses: ConstructorParameters<typeof FakeModelProvider>[0]) =>
-      createWorker({
-        maxCachedWorkflows: 0,
-        plugins: [
-          new OpenAIAgentsPlugin({
-            modelProvider: new FakeModelProvider(responses),
-            sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
-          }),
-        ],
-      });
+    const third = toolCallResponse('run_approved', { cmd: 'third' });
+    Object.assign(third.output[0]!, { callId: 'call_fake_run_approved_third' });
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([
+            toolCallResponse('run_now', { cmd: 'first' }),
+            toolCallResponse('run_approved', { cmd: 'second' }),
+            third,
+            textResponse('Done.'),
+          ]),
+          sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
+          resolvableWorkerEnvVars: [APPROVAL_VAR, OTHER_APPROVAL_VAR],
+        }),
+      ],
+    });
 
+    process.env[APPROVAL_VAR] = 'resolved-on-worker';
+    process.env[OTHER_APPROVAL_VAR] = 'other-on-worker';
+    try {
+      const output = await worker.runUntil(
+        executeWorkflow(sandboxApprovalSequenceWorkflow, { args: [[APPROVAL_VAR, APPROVAL_VAR, OTHER_APPROVAL_VAR]] })
+      );
+      t.is(
+        output,
+        [
+          '#1 ran first with KEY=resolved-on-worker',
+          '#1 ran first,second with KEY=resolved-on-worker',
+          '#1 ran first,second,third with KEY=other-on-worker',
+        ].join('\n')
+      );
+      t.deepEqual(
+        backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+        ['create#1', 'delete#1']
+      );
+      t.deepEqual(backend.liveSandboxes(), []);
+    } finally {
+      delete process.env[APPROVAL_VAR];
+      delete process.env[OTHER_APPROVAL_VAR];
+    }
+  }
+);
+
+// Serial: a Worker installs its allowlist process-wide, so a Worker created alongside would switch it off.
+test.serial('An approval resume on a Worker that lost the live sandbox resumes it there and keeps it', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const backend = new LifecycleSandboxClient();
+  const workerWith = (responses: ConstructorParameters<typeof FakeModelProvider>[0]) =>
+    createWorker({
+      maxCachedWorkflows: 0,
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider(responses),
+          sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
+          resolvableWorkerEnvVars: [APPROVAL_VAR],
+        }),
+      ],
+    });
+
+  process.env[APPROVAL_VAR] = 'resolved-on-worker';
+  try {
     const first = await workerWith([
       toolCallResponse('run_now', { cmd: 'first' }),
       toolCallResponse('run_approved', { cmd: 'second' }),
     ]);
     const handle = await first.runUntil(async () => {
-      const handle = await startWorkflow(sandboxApprovalMountWorkflow, { args: ['opaque', undefined, true] });
+      const handle = await startWorkflow(sandboxApprovalSequenceWorkflow, {
+        args: [[APPROVAL_VAR, APPROVAL_VAR], true],
+      });
       while (!(await handle.query(approvalPausedQuery))) await new Promise((resolve) => setTimeout(resolve, 100));
       return handle;
     });
@@ -382,14 +310,16 @@ test.serial(
       return await handle.result();
     });
 
-    t.is(output, '#1 ran first with KEY=\n#2 ran second with KEY=');
+    t.is(output, '#1 ran first with KEY=resolved-on-worker\n#1 ran first,second with KEY=resolved-on-worker');
     t.deepEqual(
-      backend.events.filter((event) => /^(create|resume|delete|client-delete)/.test(event)),
-      ['create#1', 'client-delete#1', 'create#2', 'delete#2']
+      backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+      ['create#1', 'resume#1', 'delete#1']
     );
     t.deepEqual(backend.liveSandboxes(), []);
+  } finally {
+    delete process.env[APPROVAL_VAR];
   }
-);
+});
 
 test("A SandboxAgent that names no model keeps its capabilities' providerData, such as compaction", async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
@@ -594,6 +524,7 @@ for (const [kind, event] of [
         t.is(session.execCalls[0]?.cmd, 'echo hello');
       } else {
         // The nested run checks the sandbox config it uses as it starts; the failure is the tool's output.
+        t.notRegex(output, /the nested SandboxAgent started/);
         t.regex(output, /^An error occurred while running the tool/);
         t.is(client.createCalls.length, 0);
       }
