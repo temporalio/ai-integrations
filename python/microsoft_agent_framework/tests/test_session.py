@@ -26,6 +26,7 @@ from agent_framework import (
 )
 
 from temporalio import workflow
+from temporalio.api.enums.v1 import PendingActivityState
 from temporalio.client import (
     Client,
     WorkflowExecutionStatus,
@@ -203,8 +204,21 @@ async def test_continue_as_new_carries_session(client: Client) -> None:
     assert (await count_scheduled_activities(first_run)).total() == 1
 
 
+async def _wait_for_started_activity(handle: WorkflowHandle) -> None:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        description = await handle.describe()
+        if any(
+            pending.state == PendingActivityState.PENDING_ACTIVITY_STATE_STARTED
+            for pending in description.raw_description.pending_activities
+        ):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the first turn's model Activity never started")
+
+
 async def test_continue_as_new_carries_pending_prompts(client: Client) -> None:
-    slow = SlowFakeChatClient(["First reply.", "Second reply."], delay=0.5)
+    slow = SlowFakeChatClient(["First reply.", "Second reply."], delay=1.0)
     plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": lambda: slow})
     async with new_worker(client, ChatWorkflow, plugin=plugin) as worker:
         handle = await client.start_workflow(
@@ -213,9 +227,10 @@ async def test_continue_as_new_carries_pending_prompts(client: Client) -> None:
             id=workflow_id("chat-pending"),
             task_queue=worker.task_queue,
         )
-        # The second prompt and the end of the chat arrive while the first
-        # turn's model call (0.5 seconds) is still running.
         await handle.signal(ChatWorkflow.user_says, "first question")
+        # The second prompt and the end of the chat arrive while the first
+        # turn's model call (1 second) is running, not before it starts.
+        await _wait_for_started_activity(handle)
         await handle.signal(ChatWorkflow.user_says, "second question")
         await handle.signal(ChatWorkflow.end_chat)
         result = await handle.result()
