@@ -787,6 +787,57 @@ _OptionalDescribedAlias = TypeAliasType(
 _NativeDescribedAlias = getattr(typing, "TypeAliasType", TypeAliasType)(
     "_NativeDescribedAlias", _DescribedResult
 )
+_ForwardDescribedAlias = TypeAliasType("_ForwardDescribedAlias", "_DescribedResult")
+_NativeForwardDescribedAlias = getattr(typing, "TypeAliasType", TypeAliasType)(
+    "_NativeForwardDescribedAlias", "_DescribedResult"
+)
+_ForwardDescribedListAlias = TypeAliasType(
+    "_ForwardDescribedListAlias", list["_DescribedResult"]
+)
+
+
+class _WireMessage(ResponseOutputMessage):
+    @pydantic.model_serializer(mode="wrap")
+    def _to_wire(self, handler: Any) -> Any:
+        data = handler(self)
+        return {"wire_content": data.pop("content"), **data}
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _from_wire(cls, value: Any) -> Any:
+        # Consumes the wire field of the mapping it reads.
+        if isinstance(value, dict):
+            value["content"] = value.pop("wire_content")
+        return value
+
+
+def _wire_message() -> _WireMessage:
+    data = _message().model_dump()
+    return _WireMessage.model_validate({**data, "wire_content": data.pop("content")})
+
+
+class _WireMessageHolder(pydantic.BaseModel):
+    item: _WireMessage
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _pass_on(cls, value: Any) -> Any:
+        # Its fields get the value as Python, not JSON.
+        return value
+
+
+class _WireVariantHolder(pydantic.BaseModel):
+    item: _WireMessage | int
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _pass_on(cls, value: Any) -> Any:
+        return value
+
+
+class _InPlaceTupleResult(pydantic.BaseModel):
+    item: Annotated[tuple[_InPlaceA] | tuple[_LooseA], pydantic.BeforeValidator(tuple)]
+    other: ModelResponse
 
 
 def _extra_side() -> _ExtraSide:
@@ -1363,6 +1414,52 @@ def _is_response(value: Any) -> bool:
             ["record", "output", 0, "content", 0, "annotations"],
             lambda got: isinstance(got, _DescribedResult) and _is_response(got.record),
         ),
+        (
+            _WireMessageHolder(item=_wire_message()),
+            _WireMessageHolder,
+            ["item", "wire_content", 0, "annotations"],
+            lambda got: isinstance(got.item, _WireMessage) and _is_message(got.item),
+        ),
+        (
+            _WireVariantHolder(item=_wire_message()),
+            _WireVariantHolder,
+            ["item", "wire_content", 0, "annotations"],
+            lambda got: isinstance(got.item, _WireMessage) and _is_message(got.item),
+        ),
+        (
+            _InPlaceTupleResult(
+                item=(_InPlaceA(kind="a", record=_response()),), other=_response()
+            ),
+            _InPlaceTupleResult,
+            # Both, so plain validation, whose union shares the tuple's items, fails too.
+            (
+                ["item", 0, "record", "output", 0, "content", 0, "annotations"],
+                ["other", "output", 0, "content", 0, "annotations"],
+            ),
+            lambda got: (
+                isinstance(got.item[0], _InPlaceA) and _is_response(got.item[0].record)
+            ),
+        ),
+        (
+            _DescribedResult(record=_response()),
+            _ForwardDescribedAlias,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _DescribedResult) and _is_response(got.record),
+        ),
+        (
+            _DescribedResult(record=_response()),
+            _NativeForwardDescribedAlias,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _DescribedResult) and _is_response(got.record),
+        ),
+        (
+            [_DescribedResult(record=_response())],
+            _ForwardDescribedListAlias,
+            [0, "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got[0], _DescribedResult) and _is_response(got[0].record)
+            ),
+        ),
     ],
     ids=[
         "extra",
@@ -1432,6 +1529,12 @@ def _is_response(value: Any) -> bool:
         "declared-type-alias",
         "declared-type-alias-of-an-optional",
         "declared-native-type-alias",
+        "openai-model-consuming-its-wire-field-below-a-model-validator",
+        "openai-variant-consuming-its-wire-field-below-a-model-validator",
+        "tuple-variant-changing-its-tag-in-place",
+        "declared-forward-type-alias",
+        "declared-native-forward-type-alias",
+        "declared-forward-type-alias-of-a-list",
     ],
 )
 def test_lenient_caller_model_shapes(

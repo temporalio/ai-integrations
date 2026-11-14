@@ -344,9 +344,39 @@ _TYPE_ALIASES = tuple({TypeAliasType, getattr(typing, "TypeAliasType", TypeAlias
 
 
 def _unalias(type_: typing.Any) -> typing.Any:
-    """The type a named alias, such as ``type Alias = Result``, stands for."""
+    """The type a named alias, such as ``type Alias = Result``, stands for.
+
+    Forward references in it, such as ``type Alias = "Result"``, are resolved in the alias's
+    module, as Pydantic resolves them. One that does not resolve stays as it is.
+    """
     while isinstance(type_, _TYPE_ALIASES):
-        type_ = type_.__value__
+        holder = type(
+            "_AliasValue",
+            (),
+            {
+                "__annotations__": {"value": _forward_refs(type_.__value__)},
+                "__module__": type_.__module__,
+            },
+        )
+        try:
+            type_ = typing.get_type_hints(holder, include_extras=True)["value"]
+        except (NameError, SyntaxError, TypeError):
+            type_ = type_.__value__
+    return type_
+
+
+def _forward_refs(type_: typing.Any) -> typing.Any:
+    """``type_`` with the strings in builtin generics as forward references.
+
+    Before Python 3.11, ``typing.get_type_hints`` resolves ``list[ForwardRef("Result")]`` but
+    not ``list["Result"]``.
+    """
+    if isinstance(type_, str):
+        return typing.ForwardRef(type_)
+    if isinstance(type_, types.GenericAlias):
+        return types.GenericAlias(
+            typing.get_origin(type_), tuple(map(_forward_refs, typing.get_args(type_)))
+        )
     return type_
 
 
@@ -366,12 +396,13 @@ def _lenient_validate(type_: typing.Any, value: typing.Any) -> typing.Any:
         validator = _lenient_validator.__wrapped__(type_)
     else:
         validator = _lenient_validator(type_)
-    # A union that an error other than a validation error interrupts leaves its attempt behind.
-    attempts = _union_attempts.set(())
+    # A union or model that an error other than a validation error interrupts leaves its attempt
+    # behind.
+    attempts = _attempts.set(())
     try:
         return validator.validate_json(json.dumps(value))
     finally:
-        _union_attempts.reset(attempts)
+        _attempts.reset(attempts)
 
 
 # A validator holds its type through its schema and functions, so a weak cache would never
@@ -516,7 +547,8 @@ def _lenient_openai_model(
     model's config, in this validation, so they get the same mode, context, field, data and
     config as when the model validates. With ``check``, it is built only if that value's kind
     and tags fit, and in a union's strict attempt it is not built. Neither choice is behind a
-    function validator, so a JSON value reaches both as JSON, and each gets its own copy of it.
+    function validator, so a JSON value reaches both as JSON, and each gets its own copy of it,
+    also of a value from Python (see ``_own_copy``).
     """
     cs = pydantic_core.core_schema
 
@@ -537,23 +569,51 @@ def _lenient_openai_model(
     }
     if "config" in schema:
         stand_in["config"] = schema["config"]
-    return cs.union_schema(
-        [
-            copy,
-            cs.tagged_union_schema(
-                {
-                    "fallback": cs.no_info_after_validator_function(
-                        lambda state: state.__dict__["built"],
-                        typing.cast(typing.Any, stand_in),
-                    ),
-                    "skip": cs.no_info_plain_validator_function(_next_choice),
-                },
-                discriminator=lambda _: "skip" if _in_strict_attempt() else "fallback",
-            ),
-        ],
-        mode="left_to_right",
-        ref=ref,
+
+    def begin(value: typing.Any) -> typing.Any:
+        _begin_attempt(value, strict=False)
+
+    def validated(value: typing.Any) -> typing.Any:
+        _end_attempt()
+        return value
+
+    def failed(_value: typing.Any) -> typing.Any:
+        _end_attempt()
+        raise pydantic_core.PydanticCustomError(
+            "lenient_model", "The value fits neither the model nor its fallback"
+        )
+
+    # Each choice is defined once, as ``_own_copy`` refers to it twice.
+    strict_ref, fallback_ref = (
+        f"lenient-model:{next(_stand_ins)}:{name}" for name in ("strict", "fallback")
     )
+    fallback = cs.no_info_after_validator_function(
+        lambda state: state.__dict__["built"], typing.cast(typing.Any, stand_in)
+    )
+    union = cs.definitions_schema(
+        cs.union_schema(
+            [
+                cs.no_info_plain_validator_function(begin),
+                cs.no_info_after_validator_function(
+                    validated, _own_copy(cs.definition_reference_schema(strict_ref))
+                ),
+                cs.no_info_after_validator_function(
+                    validated,
+                    _own_copy(
+                        cs.definition_reference_schema(fallback_ref),
+                        lambda _: _in_strict_attempt(),
+                    ),
+                ),
+                cs.no_info_plain_validator_function(failed),
+            ],
+            mode="left_to_right",
+        ),
+        typing.cast(
+            typing.Any,
+            [{**copy, "ref": strict_ref}, {**fallback, "ref": fallback_ref}],
+        ),
+    )
+    return {**union, "ref": ref} if ref is not None else union
 
 
 # Numbers the stand-ins' refs, which must be unique in a schema.
@@ -726,34 +786,79 @@ _SCHEMA_DATA_KEYS = frozenset(
 )
 
 
-class _UnionAttempt:
-    """A lenient union's validation of one value."""
+class _Attempt:
+    """A lenient union's or OpenAI model's validation of one value."""
 
     __slots__ = ("built", "candidates", "received", "sent", "strict")
 
-    def __init__(self, value: typing.Any) -> None:
+    def __init__(self, value: typing.Any, strict: bool) -> None:
         self.received = value
-        # The value before a variant's validator changes it in place.
+        # The value before a choice's validator changes it in place.
         self.sent = _json_copy(value)
-        self.strict = True
+        self.strict = strict
         self.candidates: list[int] = []
         self.built: list[typing.Any] = []
 
 
-# The lenient unions being validated, innermost last.
-_union_attempts: ContextVar[tuple[_UnionAttempt, ...]] = ContextVar(
-    "_union_attempts", default=()
-)
+# The lenient unions and OpenAI models being validated, innermost last.
+_attempts: ContextVar[tuple[_Attempt, ...]] = ContextVar("_attempts", default=())
+
+
+def _begin_attempt(value: typing.Any, strict: bool) -> typing.NoReturn:
+    """Start validating ``value`` and move on to the first choice."""
+    _attempts.set((*_attempts.get(), _Attempt(value, strict)))
+    _next_choice()
+
+
+def _current_attempt() -> _Attempt:
+    return _attempts.get()[-1]
+
+
+def _end_attempt() -> _Attempt:
+    attempts = _attempts.get()
+    _attempts.set(attempts[:-1])
+    return attempts[-1]
 
 
 def _in_strict_attempt() -> bool:
     """Whether a lenient union is validating strictly, so nothing in it falls back."""
-    return any(attempt.strict for attempt in _union_attempts.get())
+    return any(attempt.strict for attempt in _attempts.get())
 
 
 def _next_choice(_value: typing.Any = None) -> typing.NoReturn:
     """Move a left-to-right union on to its next choice."""
     raise pydantic_core.PydanticCustomError("lenient_step", "Not this choice")
+
+
+def _own_copy(
+    choice: typing.Any, skips: Callable[[_Attempt], bool] | None = None
+) -> typing.Any:
+    """``choice`` with a copy of the current attempt's value as it was sent, if from Python.
+
+    A JSON value is a new object in each choice. A value from Python, such as one a validator
+    returns, is the same object in every choice, so one choice's validator that changes it in
+    place, also inside a tuple it was turned into, would change what the next choice gets.
+    """
+    cs = pydantic_core.core_schema
+
+    def choose(value: typing.Any) -> str:
+        current = _current_attempt()
+        if skips is not None and skips(current):
+            return "skip"
+        if value is current.received and type(value) in _COPIED:
+            return "copy"
+        return "input"
+
+    return cs.tagged_union_schema(
+        {
+            "input": choice,
+            "copy": cs.no_info_before_validator_function(
+                lambda _: _json_copy(_current_attempt().sent), choice
+            ),
+            "skip": cs.no_info_plain_validator_function(_next_choice),
+        },
+        discriminator=choose,
+    )
 
 
 def _lenient_union(
@@ -793,24 +898,15 @@ def _lenient_union(
         )
         definitions.append({**lenient, "ref": ref})
 
-    def attempt() -> _UnionAttempt:
-        return _union_attempts.get()[-1]
-
-    def end() -> _UnionAttempt:
-        attempts = _union_attempts.get()
-        _union_attempts.set(attempts[:-1])
-        return attempts[-1]
-
     def begin(value: typing.Any) -> typing.Any:
-        _union_attempts.set((*_union_attempts.get(), _UnionAttempt(value)))
-        _next_choice()
+        _begin_attempt(value, strict=True)
 
     def validated(value: typing.Any) -> typing.Any:
-        end()
+        _end_attempt()
         return value
 
     def prepare(_value: typing.Any) -> typing.Any:
-        current = attempt()
+        current = _current_attempt()
         current.strict = False
         # An enclosing union's strict attempt builds nothing leniently. Otherwise, OpenAI models in
         # a lenient variant build from any object, so only the variants whose kind and tags fit
@@ -824,34 +920,11 @@ def _lenient_union(
         _next_choice()
 
     def record(value: typing.Any) -> typing.Any:
-        attempt().built.append(value)
+        _current_attempt().built.append(value)
         _next_choice()
 
-    def own_copy(
-        variant: typing.Any, skips: Callable[[_UnionAttempt], bool] | None = None
-    ) -> typing.Any:
-        def choose(value: typing.Any) -> str:
-            current = attempt()
-            if skips is not None and skips(current):
-                return "skip"
-            # A JSON value is a new object in each step.
-            if value is current.received and isinstance(value, dict | list):
-                return "copy"
-            return "input"
-
-        return cs.tagged_union_schema(
-            {
-                "input": variant,
-                "copy": cs.no_info_before_validator_function(
-                    lambda _: _json_copy(attempt().sent), variant
-                ),
-                "skip": cs.no_info_plain_validator_function(_next_choice),
-            },
-            discriminator=choose,
-        )
-
     def lenient_step(index: int) -> typing.Any:
-        return own_copy(
+        return _own_copy(
             cs.no_info_after_validator_function(
                 record, cs.definition_reference_schema(variant_refs[index])
             ),
@@ -859,7 +932,7 @@ def _lenient_union(
         )
 
     def finish(_value: typing.Any) -> typing.Any:
-        built = end().built
+        built = _end_attempt().built
         if len(built) != 1:
             raise pydantic_core.PydanticCustomError(
                 "lenient_union", "No single variant fits the value"
@@ -871,7 +944,10 @@ def _lenient_union(
         "choices": [
             (variant, choice[1]) if isinstance(choice, tuple) else variant
             for variant, choice in zip(
-                (own_copy(cs.definition_reference_schema(ref)) for ref in variant_refs),
+                (
+                    _own_copy(cs.definition_reference_schema(ref))
+                    for ref in variant_refs
+                ),
                 schema["choices"],
                 strict=True,
             )
@@ -1010,12 +1086,22 @@ _VALIDATORS = _TRANSFORMS | {"function-after"}
 
 
 def _json_copy(value: typing.Any) -> typing.Any:
-    """A copy of the JSON objects and arrays in ``value``. Other values are shared."""
+    """A copy of the containers in ``value`` that validators can change in place.
+
+    JSON objects and arrays, and the tuples, sets and deques validators turn them into. Other
+    values are shared.
+    """
     if type(value) is dict:
         return {key: _json_copy(item) for key, item in value.items()}
-    if type(value) is list:
-        return [_json_copy(item) for item in value]
+    if type(value) in (list, tuple, collections.deque):
+        return type(value)(_json_copy(item) for item in value)
+    if type(value) is set:
+        return set(value)
     return value
+
+
+# The types ``_json_copy`` copies.
+_COPIED = frozenset({dict, list, tuple, collections.deque, set})
 
 
 def _schema_fields(schema: dict[str, typing.Any]) -> list[tuple[str, typing.Any]]:
