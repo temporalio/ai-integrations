@@ -143,8 +143,10 @@ class PausedBudgetWorkflow:
                 "required": ["title"],
             },
         )
+        # A 2 second budget against a model call that takes milliseconds of
+        # workflow time, so the only thing that can use it up is the pause.
         client = TemporalChatClient(
-            "model", function_invocation_configuration={"max_duration_seconds": 0.5}
+            "model", function_invocation_configuration={"max_duration_seconds": 2.0}
         )
         agent = Agent(
             client=client,
@@ -162,7 +164,7 @@ class PausedBudgetWorkflow:
         ]
         # The pause between the returned call and its answer, longer than the
         # budget, measured on the workflow clock.
-        await workflow.sleep(1)
+        await workflow.sleep(3)
         final = await agent.run(
             [
                 Message(
@@ -214,7 +216,7 @@ async def test_budget_counts_the_pause_on_the_workflow_clock(
         )
         result = await handle.result()
         history = await handle.fetch_history()
-    # The 1 second pause, read through the _tools.time seam, used up the 0.5
+    # The 3 second pause, read through the _tools.time seam, used up the 2
     # second budget: the deferred activity call got the loop's limit result
     # instead of running, and the next model call came with tool_choice="none".
     assert result["returned"] == ["render_chart"]
