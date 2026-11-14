@@ -25,10 +25,11 @@ import sys
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from enum import Enum, IntEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, ClassVar
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from google.adk import Agent, Runner
@@ -58,8 +59,9 @@ from pydantic import BaseModel, Field, TypeAdapter
 
 import temporalio.google_adk.workflow
 from temporalio import activity, workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.opentelemetry import OpenTelemetryPlugin, create_tracer_provider
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.google_adk import (
     GoogleAdkPlugin,
@@ -68,8 +70,13 @@ from temporalio.google_adk import (
     TemporalModel,
 )
 from temporalio.google_adk._model import (
+    StreamingInvokeInput,
+    TemporalLlmRequest,
     _with_serializable_response_schema,
+    invoke_model,
+    invoke_model_streaming,
 )
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Worker
 from temporalio.workflow import ActivityConfig
 from tests.helpers.decorators import WrapOnAccess, passthrough, unwrapped
@@ -163,7 +170,10 @@ class MultiAgentWorkflow:
         writer = LlmAgent(
             name="writer",
             model=TemporalModel(
-                model_name, activity_config=ActivityConfig(summary="Writer Agent")
+                model_name,
+                activity_config=ActivityConfig(
+                    summary="Writer Agent", heartbeat_timeout=None
+                ),
             ),
             instruction="You are a poet. Write a haiku based on the research.",
         )
@@ -260,6 +270,18 @@ class WeatherModel(TestModel):
         return ["weather_model"]
 
 
+async def heartbeat_timeouts(
+    handle: WorkflowHandle[Any, Any],
+) -> list[timedelta | None]:
+    """The heartbeat timeout of each Activity the run scheduled, in order."""
+    return [
+        e.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+        or None
+        async for e in handle.fetch_history_events()
+        if e.HasField("activity_task_scheduled_event_attributes")
+    ]
+
+
 @pytest.mark.parametrize("use_local_model", [True, False])
 @pytest.mark.asyncio
 async def test_single_agent(client: Client, use_local_model: bool):
@@ -301,6 +323,13 @@ async def test_single_agent(client: Client, use_local_model: bool):
             assert result.content is not None
             assert result.content.parts is not None
             assert result.content.parts[0].text == "warm and sunny"
+            # Both model calls get the default heartbeat timeout. The tool is
+            # the user's own Activity, so it gets none.
+            assert await heartbeat_timeouts(handle) == [
+                timedelta(seconds=10),
+                None,
+                timedelta(seconds=10),
+            ]
 
 
 class ResearchModel(TestModel):
@@ -399,6 +428,12 @@ async def test_multi_agent(client: Client, use_local_model: bool):
         print(f"Multi-Agent Workflow result: {result}")
         if use_local_model:
             assert result == "haiku"
+            # The writer's config turns heartbeats off.
+            assert await heartbeat_timeouts(handle) == [
+                timedelta(seconds=10),
+                timedelta(seconds=10),
+                None,
+            ]
 
 
 def example_toolset(_: Any | None) -> McpToolset:
@@ -630,6 +665,69 @@ async def test_single_agent_telemetry(
 async def test_unsetting_timeout():
     model = TemporalModel("", ActivityConfig(start_to_close_timeout=None))
     assert model._activity_config.get("start_to_close_timeout", None) is None
+
+
+class HeartbeatModel(BaseLlm):
+    """Streams three responses, after a heartbeat when ``heartbeated`` is set."""
+
+    heartbeated: ClassVar[asyncio.Event | None] = None
+
+    @classmethod
+    def supported_models(cls) -> list[str]:
+        return ["heartbeat_model"]
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        if self.heartbeated is not None:
+            await self.heartbeated.wait()
+        for text in ("a", "b", "c"):
+            yield LlmResponse(content=Content(role="model", parts=[Part(text=text)]))
+
+
+# The model activities heartbeat on a timer at half the heartbeat timeout, not
+# per response. A call shorter than that sends none, and a slower call, which
+# here waits for a heartbeat, gets them.
+@pytest.mark.parametrize("stream", [False, True], ids=["invoke", "streaming"])
+@pytest.mark.parametrize("slow", [False, True], ids=["fast", "slow"])
+async def test_model_activities_heartbeat_on_a_timer(stream: bool, slow: bool):
+    LLMRegistry.register(HeartbeatModel)
+    heartbeated = asyncio.Event()
+    HeartbeatModel.heartbeated = heartbeated if slow else None
+    heartbeats = 0
+
+    def on_heartbeat(*_: Any) -> None:
+        nonlocal heartbeats
+        heartbeats += 1
+        heartbeated.set()
+
+    client = MagicMock()
+    client.data_converter = pydantic_data_converter
+    client.get_workflow_handle.return_value.signal = AsyncMock()
+    env = ActivityEnvironment(client=client)
+    env.info = replace(env.info, heartbeat_timeout=timedelta(seconds=1))
+    env.on_heartbeat = on_heartbeat
+    request = LlmRequest(
+        model="heartbeat_model",
+        contents=[Content(role="user", parts=[Part(text="hi")])],
+    )
+    if stream:
+        call = env.run(
+            invoke_model_streaming,
+            StreamingInvokeInput(
+                llm_request=request,
+                streaming_topic="events",
+                streaming_batch_interval=timedelta(hours=1),
+                model_name="heartbeat_model",
+            ),
+        )
+    else:
+        call = env.run(
+            invoke_model, TemporalLlmRequest.wrap(request, "heartbeat_model")
+        )
+    responses = await asyncio.wait_for(call, timeout=5)
+    assert len(responses) == 3
+    assert (heartbeats > 0) == slow
 
 
 class SummaryFnModel(TestModel):
