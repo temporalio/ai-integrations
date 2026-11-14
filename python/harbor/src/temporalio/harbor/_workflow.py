@@ -9,15 +9,14 @@ from pathlib import PurePath
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
-from temporalio.exceptions import TimeoutError as ActivityTimeoutError
+from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from harbor.models.job.config import JobConfig, RetryConfig
     from harbor.models.job.result import JobResult, JobStats
     from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
     from harbor.utils.pass_at_k import compute_pass_at_k_by_evals
-    from pydantic import JsonValue, ValidationError
+    from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError
 
     from temporalio.harbor._types import (
         AGGREGATE_JOB,
@@ -31,9 +30,7 @@ with workflow.unsafe.imports_passed_through():
         TemporalJobPlan,
         TrialOutcome,
         TrialPlan,
-        as_outcome,
         check_trial_name,
-        heartbeat_outcome,
     )
 
 # Planning reaches dataset registries, so it retries transient failures, but
@@ -55,6 +52,12 @@ _TRIAL_RETRY = RetryPolicy(
 # Harbor's trial-name suffix: 7 characters of ShortUUID's base57 alphabet.
 _SUFFIX_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _SUFFIX_LENGTH = 7
+
+_OUTCOMES = TypeAdapter(list[TrialOutcome])
+
+# Strict: the SDK takes only a timedelta, and a number of seconds would fail
+# the workflow task instead of the workflow.
+_TIMEOUTS = TypeAdapter(dict[str, timedelta | None], config=ConfigDict(strict=True))
 
 
 def _invalid(function: str, exc: ValidationError) -> ApplicationError:
@@ -90,14 +93,16 @@ async def plan_job(
 
     A ``config`` whose ``job_name`` was never set, such as one built in
     workflow code or received without one, is named here from the
-    workflow's clock, in harbor's format but in UTC, so the name holds
-    across replay; read it from the returned plan's ``config``.
+    workflow's clock, in harbor's format but in UTC, followed by a random
+    suffix, so the name holds across replay and differs between jobs; read
+    it from the returned plan's ``config``.
 
     ``config.retry`` and each agent's ``n_concurrent`` and
     ``concurrency_group`` have no effect; a warning is logged when they are
     set. Temporal retries trials as :func:`temporalio.harbor.execute_trial`
     describes, and the worker's ``max_concurrent_activities`` bounds how many
-    trials run at once.
+    trials run at once. ``config.debug`` has no effect either: see
+    :class:`temporalio.harbor.HarborPlugin` for harbor's logs.
 
     Args:
         config: The job, as it would be given to ``harbor run``.
@@ -117,16 +122,28 @@ async def plan_job(
         ApplicationError: Non-retryable, if ``config`` sets ``source_jobs``
             (a regrade or diff job), which is not supported, if an argument or
             a trial's configuration is invalid, if a trial's name is not a
-            single path component, or if two trials are given the same name.
+            single path component or contains ``:``, or if two trials are
+            given names that differ only in case or not at all.
         ActivityError: If planning failed, including when harbor rejected the
-            job's configuration or ``jobs_dir/job_name`` holds a different one.
+            job's configuration, a task's timeout is not finite, or
+            ``jobs_dir/job_name`` holds a different configuration or lock.
     """
+    try:
+        plan_input = PlanJobInput(
+            config=config, untimed_agent_timeout=untimed_agent_timeout
+        )
+        _TIMEOUTS.validate_python({"start_to_close_timeout": start_to_close_timeout})
+    except ValidationError as exc:
+        raise _invalid("plan_job", exc) from None
+    config = plan_input.config
     if "job_name" not in config.model_fields_set:
         # JobConfig took the default job_name from the clock when workflow
         # code built it, and takes another on every replay.
+        name = workflow.now().strftime("%Y-%m-%d__%H-%M-%S")
         config = config.model_copy(
-            update={"job_name": workflow.now().strftime("%Y-%m-%d__%H-%M-%S")}
+            update={"job_name": f"{name}__{workflow.uuid4().hex[:8]}"}
         )
+        plan_input = plan_input.model_copy(update={"config": config})
     if config.source_jobs:
         raise ApplicationError(
             "jobs derived from source_jobs (regrade or diff) are not supported "
@@ -149,12 +166,6 @@ async def plan_job(
             f"n_concurrent and concurrency_group are ignored for agents {capped}: "
             "the worker's max_concurrent_activities bounds concurrent trials"
         )
-    try:
-        plan_input = PlanJobInput(
-            config=config, untimed_agent_timeout=untimed_agent_timeout
-        )
-    except ValidationError as exc:
-        raise _invalid("plan_job", exc) from None
     planned = await workflow.execute_activity(
         PLAN_JOB,
         plan_input,
@@ -167,6 +178,8 @@ async def plan_job(
     job_id = workflow.uuid4()
     random = workflow.random()
     trials: list[TrialPlan] = []
+    # Case-folded: on macOS and Windows, names that differ only in case share
+    # a directory.
     seen: set[str] = set()
     for attempt in range(config.n_attempts):
         for task, task_name, timeouts in zip(
@@ -211,14 +224,14 @@ async def plan_job(
                         type="ValidationError",
                         non_retryable=True,
                     ) from None
-                if trial.trial_name in seen:
+                if trial.trial_name.casefold() in seen:
                     raise ApplicationError(
-                        f"two trials are named {trial.trial_name!r}; each trial "
-                        "needs its own directory",
+                        f"two trials are named {trial.trial_name!r}, ignoring "
+                        "case; each trial needs its own directory",
                         type="HarborDuplicateTrialName",
                         non_retryable=True,
                     )
-                seen.add(trial.trial_name)
+                seen.add(trial.trial_name.casefold())
                 trials.append(TrialPlan(config=trial, timeout=timeout))
     return TemporalJobPlan(
         id=job_id,
@@ -234,22 +247,6 @@ def _summary(config: TrialConfig) -> str:
     if config.agent.model_name:
         agent = f"{agent}/{config.agent.model_name}"
     return f"{task} · {agent}"
-
-
-def _recorded(error: ActivityError) -> TrialOutcome | None:
-    # A failure the worker raised carries the outcome in its details; a
-    # timeout the server recorded, in the attempt's last heartbeat.
-    cause = error.__cause__
-    while cause is not None:
-        outcome = None
-        if isinstance(cause, ActivityTimeoutError):
-            outcome = heartbeat_outcome(cause.last_heartbeat_details)
-        elif isinstance(cause, ApplicationError) and cause.details:
-            outcome = as_outcome(cause.details[-1])
-        if outcome is not None:
-            return outcome
-        cause = cause.__cause__
-    return None
 
 
 async def execute_trial(
@@ -270,24 +267,27 @@ async def execute_trial(
     records an exception, such as an agent that ran out of time or exited
     with an error: harbor scored it. Temporal retries the trial under
     ``retry_policy`` when it could not run, for example because its task
-    could not be fetched or its environment check failed, when harbor's
-    result shows it failed before its agent started, or when an agent run
-    ended in one of harbor's transient provider errors:
-    ``ApiRateLimitError``, ``ApiOverloadedError``, ``ApiInternalServerError``,
-    ``ApiConnectionClosedError``, ``ApiResponseStalledError`` or
-    ``NetworkConnectionError``. A trial whose name is not a single path
-    component, or that harbor rejects as misconfigured while creating it,
-    for example because an agent option is invalid or a ``${VAR}`` its
-    config names is unset on the worker, or as it starts, before its
-    environment, for example because the agent does not support the skills
-    or MCP servers its config names, fails without a retry. For a trial
-    harbor ran, the error is an ``ApplicationError`` whose type is harbor's
-    exception class name, with the outcome attached; after
-    ``ApiRateLimitError``, the next attempt waits 2 minutes. A worker's
+    could not be fetched or its environment check failed, or when harbor's
+    result shows it failed before its agent started or records an exception
+    harbor's error policy retries, such as a provider's rate limit or
+    outage, except one harbor cannot classify. For
+    a trial harbor ran, the error is an ``ApplicationError`` whose type is
+    harbor's exception class name; after a rate limit, ``ApiRateLimitError``
+    or litellm's ``RateLimitError``, the next attempt waits 2 minutes. The
+    last attempt ``retry_policy`` allows returns harbor's result instead, as
+    harbor does when its own retries run out. A trial whose name is not a
+    single path component, or that harbor rejects as misconfigured while
+    creating it, for example because an agent option is invalid or a
+    ``${VAR}`` its config names is unset on the worker, fails without a
+    retry. A trial harbor rejects as it starts, before its environment, for
+    example because the agent does not support the skills or MCP servers
+    its config names, is not retried either: its result, which records the
+    rejection, comes back. A worker's
     :meth:`temporalio.harbor.TrialHooks.output` can also have Temporal run a
-    trial again. When Temporal stops retrying, the most recent outcome any
-    attempt produced is returned, however the last attempt ended.
+    trial again, or fail it.
 
+    A reward that is not a finite number is recorded as harbor's own
+    verifier records one: as a ``VerifierOutputParseError``, with no rewards.
     The result omits rollout details and agent metadata, which harbor's
     aggregation does not read. Harbor writes the complete result to the trial
     directory on the worker that ran the attempt, and a later attempt of the
@@ -318,34 +318,37 @@ async def execute_trial(
     Raises:
         ApplicationError: Non-retryable, if an argument is invalid, for
             example ``data`` that is not JSON.
-        ActivityError: If Temporal stopped retrying and no attempt produced a
-            result.
+        ActivityError: If the trial's last attempt failed: it could not run
+            the trial, it was lost or timed out, the trial failed without a
+            retry, or a worker's hook failed it.
     """
     try:
+        trial = TrialPlan.model_validate(trial)
         run_input = RunTrialInput(config=trial.config, extra_time=extra_time, data=data)
+        _TIMEOUTS.validate_python(
+            {
+                "start_to_close_timeout": start_to_close_timeout,
+                "heartbeat_timeout": heartbeat_timeout,
+                "schedule_to_close_timeout": schedule_to_close_timeout,
+            }
+        )
     except ValidationError as exc:
         raise _invalid("execute_trial", exc) from None
-    try:
-        return await workflow.execute_activity(
-            RUN_TRIAL,
-            run_input,
-            result_type=TrialOutcome,
-            summary=summary if summary is not None else _summary(trial.config),
-            task_queue=task_queue,
-            start_to_close_timeout=(
-                start_to_close_timeout
-                if start_to_close_timeout is not None
-                else trial.timeout * 1.5 + extra_time
-            ),
-            schedule_to_close_timeout=schedule_to_close_timeout,
-            heartbeat_timeout=heartbeat_timeout,
-            retry_policy=retry_policy if retry_policy is not None else _TRIAL_RETRY,
-        )
-    except ActivityError as error:
-        outcome = _recorded(error)
-        if outcome is None:
-            raise
-        return outcome
+    return await workflow.execute_activity(
+        RUN_TRIAL,
+        run_input,
+        result_type=TrialOutcome,
+        summary=summary if summary is not None else _summary(trial.config),
+        task_queue=task_queue,
+        start_to_close_timeout=(
+            start_to_close_timeout
+            if start_to_close_timeout is not None
+            else trial.timeout * 1.5 + run_input.extra_time
+        ),
+        schedule_to_close_timeout=schedule_to_close_timeout,
+        heartbeat_timeout=heartbeat_timeout,
+        retry_policy=retry_policy if retry_policy is not None else _TRIAL_RETRY,
+    )
 
 
 async def aggregate_job(
@@ -368,7 +371,8 @@ async def aggregate_job(
     Pass every outcome of the job at once: pass@k averages over tasks, so it
     cannot be combined from separately aggregated parts. A planned trial with
     no outcome counts toward ``n_total_trials`` and ``n_pending_trials``, as a
-    trial harbor has not finished.
+    trial harbor has not finished, and leaves the result's ``finished_at``
+    unset.
 
     The returned ``JobResult`` carries every trial's result, so it can exceed
     Temporal's payload size limit if a workflow returns it whole; return its
@@ -386,10 +390,17 @@ async def aggregate_job(
             workflow's.
 
     Raises:
-        ApplicationError: Non-retryable, if an argument is invalid.
+        ApplicationError: Non-retryable, if an argument is invalid, for
+            example an exception in ``outcomes``.
         ActivityError: If the aggregation Activity failed, including when
             harbor rejected the job's configuration.
     """
+    try:
+        plan = TemporalJobPlan.model_validate(plan)
+        outcomes = _OUTCOMES.validate_python(outcomes)
+        _TIMEOUTS.validate_python({"start_to_close_timeout": start_to_close_timeout})
+    except ValidationError as exc:
+        raise _invalid("aggregate_job", exc) from None
     results = [outcome.result for outcome in outcomes]
     stats = JobStats.from_trial_results(
         results,
@@ -421,7 +432,7 @@ async def aggregate_job(
                 id=plan.id,
                 started_at=min(started, default=now),
                 updated_at=now,
-                finished_at=now,
+                finished_at=now if stats.n_pending_trials == 0 else None,
                 n_total_trials=len(plan.trials),
                 stats=stats,
             ),

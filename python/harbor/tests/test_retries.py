@@ -20,9 +20,9 @@ from harbor.models.trial.config import (
     EnvironmentConfig,
     TaskConfig,
     TrialConfig,
+    VerifierConfig,
 )
 from harbor.models.trial.result import TrialResult
-from harbor.trial.trial import Trial
 from pydantic import JsonValue
 
 from temporalio.api.failure.v1 import Failure
@@ -40,8 +40,6 @@ from temporalio.harbor import (
     TrialHooks,
     TrialOutcome,
 )
-from temporalio.harbor._activity import _OUTCOME_MAX
-from temporalio.worker import Worker
 from tests.harbor_fixtures import agents, history, tasks
 from tests.harbor_fixtures.workflows import (
     RetryJob,
@@ -90,14 +88,46 @@ async def test_recorded_failure_is_returned_not_retried(
     assert attempts == [1]
 
 
-def _failing(error: str) -> AgentConfig:
-    return AgentConfig(import_path=agents.FAILING_AGENT, kwargs={"error": error})
+@on_posix
+@pytest.mark.parametrize("make", [tasks.passing, tasks.two_steps])
+async def test_reward_that_is_not_a_number_is_a_verifier_failure(
+    harbor_client: Client, tmp_path: Path, make: Callable[[Path], Path]
+) -> None:
+    config = _trial(make(tmp_path / "tasks"), tmp_path / "trials", "trial__0")
+    config.verifier = VerifierConfig(import_path=agents.NAN_VERIFIER)
+    async with new_worker(harbor_client, RunOneTrial) as worker:
+        handle = await harbor_client.start_workflow(
+            RunOneTrial.run,
+            TrialArgs(config=config, maximum_attempts=2),
+            id=f"trial-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        outcome = await handle.result()
+
+    result = outcome.result
+    for recorded in [result, *(result.step_results or [])]:
+        assert recorded.verifier_result is None
+        assert recorded.exception_info is not None
+        assert recorded.exception_info.exception_type == "VerifierOutputParseError"
+    assert outcome.attempt == 1
+    assert await history.activity_failures(handle) == []
+
+
+def _failing(error: str, **kwargs: str) -> AgentConfig:
+    return AgentConfig(
+        import_path=agents.FAILING_AGENT, kwargs={"error": error, **kwargs}
+    )
 
 
 async def _with_two_attempts(
     client: Client, config: TrialConfig
-) -> tuple[TrialOutcome, list[int], list[Failure]]:
-    """Run the trial allowing two attempts: its outcome, final attempt and failures."""
+) -> tuple[TrialOutcome, list[int], list[Failure], list[Failure]]:
+    """Run the trial allowing two attempts.
+
+    Returns its outcome, its final attempt, the failure history recorded for
+    it, and the failure of the attempt Temporal retried, if it did.
+    """
     async with new_worker(client, RunOneTrial) as worker:
         handle = await client.start_workflow(
             RunOneTrial.run,
@@ -110,6 +140,7 @@ async def _with_two_attempts(
         outcome,
         await history.final_attempts(handle),
         await history.activity_failures(handle),
+        await history.retried_failures(handle),
     )
 
 
@@ -130,6 +161,14 @@ async def _with_two_attempts(
             tasks.LOCAL_ENV,
             "AgentAuthenticationError",
             id="auth-error",
+        ),
+        # Harbor's policy retries it, but cannot say why the agent exited.
+        pytest.param(
+            tasks.passing,
+            _failing("NonZeroAgentExitCodeError"),
+            tasks.LOCAL_ENV,
+            "NonZeroAgentExitCodeError",
+            id="unclassified",
         ),
         # Harbor records each step's agent run on that step, not on the trial.
         pytest.param(
@@ -152,13 +191,20 @@ async def test_failure_after_the_agent_started_is_returned(
     config = _trial(make(tmp_path / "tasks"), tmp_path / "trials", "trial__0")
     config.agent = agent
     config.environment = EnvironmentConfig(import_path=environment)
-    outcome, attempts, failures = await _with_two_attempts(harbor_client, config)
+    outcome, attempts, failures, _ = await _with_two_attempts(harbor_client, config)
 
     assert outcome.result.exception_info is not None
     assert outcome.result.exception_info.exception_type == error
     assert outcome.attempt == 1
     assert attempts == [1]
     assert failures == []
+
+
+def _recorded_types(outcome: TrialOutcome) -> set[str]:
+    # A multi-step trial records each step's exception on that step.
+    result = outcome.result
+    recorded = [result, *(result.step_results or [])]
+    return {r.exception_info.exception_type for r in recorded if r.exception_info}
 
 
 @on_posix
@@ -188,12 +234,16 @@ async def test_failure_before_the_agent_started_is_retried(
 ) -> None:
     config = _trial(make(tmp_path / "tasks"), tmp_path / "trials", "trial__0")
     config.environment = EnvironmentConfig(import_path=environment)
-    outcome, attempts, failures = await _with_two_attempts(harbor_client, config)
+    outcome, attempts, failures, retried = await _with_two_attempts(
+        harbor_client, config
+    )
 
-    # Temporal ran out of attempts; the last attempt's outcome comes back.
+    # The last attempt Temporal allows returns its result, as harbor does.
     assert outcome.attempt == 2
+    assert _recorded_types(outcome) == {error}
     assert attempts == [2]
-    [failure] = failures
+    assert failures == []
+    [failure] = retried
     assert failure.application_failure_info.type == error
     assert not failure.application_failure_info.non_retryable
 
@@ -202,33 +252,29 @@ async def test_failure_before_the_agent_started_is_retried(
 @pytest.mark.parametrize(
     ("make", "error"),
     [
-        *(
-            pytest.param(tasks.passing, error, id=error)
-            for error in (
-                "ApiOverloadedError",
-                "ApiInternalServerError",
-                "ApiConnectionClosedError",
-                "ApiResponseStalledError",
-                "NetworkConnectionError",
-            )
-        ),
+        pytest.param(tasks.passing, "ApiOverloadedError", id="ApiOverloadedError"),
         pytest.param(tasks.two_steps, "ApiOverloadedError", id="steps"),
     ],
 )
-async def test_transient_provider_error_is_retried(
+async def test_error_harbor_retries_is_retried(
     harbor_client: Client, tmp_path: Path, make: Callable[[Path], Path], error: str
 ) -> None:
     config = _trial(make(tmp_path / "tasks"), tmp_path / "trials", "trial__0")
     config.agent = _failing(error)
-    outcome, attempts, failures = await _with_two_attempts(harbor_client, config)
+    outcome, attempts, failures, retried = await _with_two_attempts(
+        harbor_client, config
+    )
 
     assert outcome.attempt == 2
+    assert _recorded_types(outcome) == {error}
     assert attempts == [2]
-    [failure] = failures
+    assert failures == []
+    [failure] = retried
     info = failure.application_failure_info
     assert info.type == error
     assert not info.non_retryable
     assert not info.HasField("next_retry_delay")
+    assert not failure.application_failure_info.details.payloads
 
 
 async def _awaiting_retry(handle: WorkflowHandle[Any, Any]) -> PendingActivityInfo:
@@ -245,13 +291,14 @@ async def _awaiting_retry(handle: WorkflowHandle[Any, Any]) -> PendingActivityIn
 
 
 @on_posix
+@pytest.mark.parametrize("error", ["ApiRateLimitError", "RateLimitError"])
 async def test_rate_limited_trial_is_retried_after_two_minutes(
-    harbor_client: Client, tmp_path: Path
+    harbor_client: Client, tmp_path: Path, error: str
 ) -> None:
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
-    config.agent = _failing("ApiRateLimitError")
+    config.agent = _failing(error)
     async with new_worker(harbor_client, RunOneTrial) as worker:
         handle = await harbor_client.start_workflow(
             RunOneTrial.run,
@@ -271,7 +318,7 @@ async def test_rate_limited_trial_is_retried_after_two_minutes(
     # The server replaces an oversized failure with its own, the original as cause.
     if failure.HasField("server_failure_info"):
         failure = failure.cause
-    assert failure.application_failure_info.type == "ApiRateLimitError"
+    assert failure.application_failure_info.type == error
     assert not failure.application_failure_info.non_retryable
 
 
@@ -339,6 +386,23 @@ class AlwaysRetry(TrialHooks):
         raise self.error()
 
 
+async def _trial_failure(
+    client: Client, args: TrialArgs
+) -> tuple[ActivityError, WorkflowHandle[Any, Any]]:
+    """Run :class:`RunOneTrial`, whose trial fails; return its error and handle."""
+    async with new_worker(client, RunOneTrial) as worker:
+        handle = await client.start_workflow(
+            RunOneTrial.run,
+            args,
+            id=f"trial-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as failure:
+            await handle.result()
+    assert isinstance(failure.value.cause, ActivityError)
+    return failure.value.cause, handle
+
+
 @on_posix
 @pytest.mark.parametrize(
     ("error", "args", "attempt"),
@@ -357,7 +421,7 @@ class AlwaysRetry(TrialHooks):
     ],
     ids=["attempts-exhausted", "non-retryable", "schedule-to-close"],
 )
-async def test_last_outcome_returned_when_temporal_stops_retrying(
+async def test_output_error_fails_the_trial_when_temporal_stops_retrying(
     client: Client,
     tmp_path: Path,
     error: Callable[[], ApplicationError],
@@ -367,15 +431,14 @@ async def test_last_outcome_returned_when_temporal_stops_retrying(
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
-    outcome, attempts = await run_one(
+    raised, handle = await _trial_failure(
         _with(client, AlwaysRetry(error)),
         TrialArgs.model_validate({"config": config, **args}),
     )
 
-    assert outcome.attempt == attempt
-    assert attempts == [attempt]
-    assert outcome.result.verifier_result is not None
-    assert outcome.result.verifier_result.rewards == {"reward": 1.0}
+    assert isinstance(raised.cause, ApplicationError)
+    assert raised.cause.message == error().message
+    assert await history.final_attempts(handle) == [attempt]
 
 
 class BrokenOutput(TrialHooks):
@@ -392,19 +455,10 @@ async def test_output_that_raises_otherwise_is_not_retried(
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
-    hooked = _with(client, BrokenOutput())
-    async with new_worker(hooked, RunOneTrial) as worker:
-        handle = await hooked.start_workflow(
-            RunOneTrial.run,
-            TrialArgs(config=config, maximum_attempts=3),
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        outcome = await handle.result()
+    _, handle = await _trial_failure(
+        _with(client, BrokenOutput()), TrialArgs(config=config, maximum_attempts=3)
+    )
 
-    assert outcome.attempt == 1
-    assert outcome.result.verifier_result is not None
-    assert outcome.result.verifier_result.rewards == {"reward": 1.0}
     assert await history.final_attempts(handle) == [1]
     [failure] = await history.activity_failures(handle)
     assert failure.application_failure_info.type == "HarborOutputFailed"
@@ -440,20 +494,11 @@ async def test_output_that_cannot_be_sent_is_not_retried(
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
-    hooked = _with(client, UnsendableOutput(value))
-    async with new_worker(hooked, RunOneTrial) as worker:
-        handle = await hooked.start_workflow(
-            RunOneTrial.run,
-            TrialArgs(config=config, maximum_attempts=3),
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        outcome = await handle.result()
+    _, handle = await _trial_failure(
+        _with(client, UnsendableOutput(value)),
+        TrialArgs(config=config, maximum_attempts=3),
+    )
 
-    assert outcome.attempt == 1
-    assert outcome.output is None
-    assert outcome.result.verifier_result is not None
-    assert outcome.result.verifier_result.rewards == {"reward": 1.0}
     assert await history.final_attempts(handle) == [1]
     [failure] = await history.activity_failures(handle)
     assert failure.application_failure_info.type == "HarborOutputFailed"
@@ -470,77 +515,21 @@ class RejectWithUnsendableDetails(TrialHooks):
 
 
 @on_posix
-async def test_output_error_that_cannot_be_converted_keeps_the_outcome(
+async def test_output_error_that_cannot_be_converted_is_not_retried(
     client: Client, tmp_path: Path
 ) -> None:
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
-    hooked = _with(client, RejectWithUnsendableDetails())
-    async with new_worker(hooked, RunOneTrial) as worker:
-        handle = await hooked.start_workflow(
-            RunOneTrial.run,
-            TrialArgs(config=config, maximum_attempts=3),
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        outcome = await handle.result()
+    _, handle = await _trial_failure(
+        _with(client, RejectWithUnsendableDetails()),
+        TrialArgs(config=config, maximum_attempts=3),
+    )
 
-    assert outcome.attempt == 1
-    assert outcome.output is None
-    assert outcome.result.verifier_result is not None
-    assert outcome.result.verifier_result.rewards == {"reward": 1.0}
     assert await history.final_attempts(handle) == [1]
     [failure] = await history.activity_failures(handle)
     assert failure.application_failure_info.type == "HarborFailureNotConverted"
     assert failure.application_failure_info.non_retryable
-
-
-class FailAfterLargeOutput(TrialHooks):
-    """Returns an output near the limit, then fails the attempt with a long error."""
-
-    async def output(self, result: TrialResult, context: TrialContext) -> JsonValue:
-        return "x" * (_OUTCOME_MAX - 32 * 1024)
-
-    @contextlib.asynccontextmanager
-    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
-        yield
-        raise ApplicationError(
-            "e" * (256 * 1024), type="UploadFailed", non_retryable=True
-        )
-
-
-@on_posix
-async def test_outcome_without_output_when_the_error_cannot_carry_both(
-    client: Client, tmp_path: Path
-) -> None:
-    config = _trial(
-        tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
-    )
-    hooked = _with(client, FailAfterLargeOutput())
-    async with new_worker(hooked, RunOneTrial) as worker:
-        handle = await hooked.start_workflow(
-            RunOneTrial.run,
-            TrialArgs(config=config, maximum_attempts=3),
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        outcome = await handle.result()
-
-    assert outcome.attempt == 1
-    assert outcome.output is None
-    assert outcome.result.verifier_result is not None
-    assert outcome.result.verifier_result.rewards == {"reward": 1.0}
-    assert await history.final_attempts(handle) == [1]
-    [failure] = await history.activity_failures(handle)
-    info = failure.application_failure_info
-    assert info.type == "UploadFailed"
-    [carried] = hooked.data_converter.payload_converter.from_payloads(
-        list(info.details.payloads)
-    )
-    attached = TrialOutcome.model_validate(carried)
-    assert attached.output is None
-    assert attached.result.id == outcome.result.id
 
 
 class RejectWithItsOwnError(TrialHooks):
@@ -560,17 +549,11 @@ async def test_output_error_reaches_temporal_as_raised(
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
-    hooked = _with(client, RejectWithItsOwnError())
-    async with new_worker(hooked, RunOneTrial) as worker:
-        handle = await hooked.start_workflow(
-            RunOneTrial.run,
-            TrialArgs(config=config, maximum_attempts=3),
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        outcome = await handle.result()
+    _, handle = await _trial_failure(
+        _with(client, RejectWithItsOwnError()),
+        TrialArgs(config=config, maximum_attempts=3),
+    )
 
-    assert outcome.attempt == 1
     [failure] = await history.activity_failures(handle)
     info = failure.application_failure_info
     assert failure.message == "the verifier's answer was rejected"
@@ -592,125 +575,51 @@ class RetryThenLoseCredentials(TrialHooks):
         raise ApplicationError("try once more", type="TryAgain")
 
 
-class HangAfterResult(TrialHooks):
-    """The worker stops answering after harbor produced a result, as a lost worker does."""
+class RetryThenHang(TrialHooks):
+    """Send the first attempt back to Temporal; the worker then stops answering."""
 
     async def output(self, result: TrialResult, context: TrialContext) -> JsonValue:
+        if context.attempt == 1:
+            raise ApplicationError("try once more", type="TryAgain")
         await asyncio.sleep(600)
         return None
 
 
 @on_posix
 @pytest.mark.parametrize(
-    ("hooks", "args", "attempts", "failure"),
+    ("hooks", "args", "failure"),
     [
+        (RetryThenLoseCredentials, {}, "application_failure_info"),
         (
-            RetryThenLoseCredentials,
-            {"maximum_attempts": 2},
-            [2],
-            "application_failure_info",
-        ),
-        (
-            HangAfterResult,
+            RetryThenHang,
             {
-                "maximum_attempts": 1,
-                "start_to_close_timeout": timedelta(seconds=40),
+                "start_to_close_timeout": timedelta(seconds=15),
                 "extra_time": timedelta(minutes=30),
             },
-            [1],
             "timeout_failure_info",
         ),
     ],
-    ids=["worker-raised", "server-timed-out"],
+    ids=["worker-raised", "lost"],
 )
-async def test_outcome_returned_when_the_last_attempt_had_none(
+async def test_last_attempt_without_a_result_fails_the_trial(
     client: Client,
     tmp_path: Path,
     hooks: type[TrialHooks],
     args: dict[str, object],
-    attempts: list[int],
     failure: str,
 ) -> None:
+    # The first attempt's result does not come back in its place.
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
-    hooked = _with(client, hooks())
-    async with new_worker(hooked, RunOneTrial) as worker:
-        handle = await hooked.start_workflow(
-            RunOneTrial.run,
-            TrialArgs.model_validate({"config": config, **args}),
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        outcome = await handle.result()
+    _, handle = await _trial_failure(
+        _with(client, hooks()),
+        TrialArgs.model_validate({"config": config, "maximum_attempts": 2, **args}),
+    )
 
-    # The last attempt ended without a result: it raised before running the
-    # trial, or the server timed it out. The first attempt's outcome comes back.
-    assert outcome.attempt == 1
-    assert outcome.result.verifier_result is not None
-    assert outcome.result.verifier_result.rewards == {"reward": 1.0}
-    assert await history.final_attempts(handle) == attempts
+    assert await history.final_attempts(handle) == [2]
     [recorded] = await history.activity_failures(handle)
     assert recorded.WhichOneof("failure_info") == failure
-
-
-class ShutDownOnRetry(TrialHooks):
-    """Sends the first attempt back to Temporal, then holds the next one open."""
-
-    def __init__(self) -> None:
-        self.retrying = asyncio.Event()
-
-    async def trial_created(self, trial: Trial, context: TrialContext) -> None:
-        if context.attempt > 1:
-            self.retrying.set()
-            await asyncio.sleep(600)
-
-    async def output(self, result: TrialResult, context: TrialContext) -> JsonValue:
-        raise ApplicationError("try once more", type="TryAgain")
-
-
-@on_posix
-async def test_outcome_returned_when_the_worker_shut_down_in_the_last_attempt(
-    client: Client, tmp_path: Path
-) -> None:
-    config = _trial(
-        tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
-    )
-    hooks = ShutDownOnRetry()
-    hooked = _with(client, hooks)
-    worker = Worker(
-        hooked,
-        task_queue=str(uuid.uuid4()),
-        workflows=[RunOneTrial],
-        graceful_shutdown_timeout=timedelta(0),
-    )
-    running = asyncio.create_task(worker.run())
-    try:
-        handle = await hooked.start_workflow(
-            RunOneTrial.run,
-            TrialArgs(config=config, maximum_attempts=2),
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        await asyncio.wait_for(hooks.retrying.wait(), timeout=60)
-    finally:
-        await worker.shutdown()
-        await running
-    # Another worker finishes the workflow once Temporal stops retrying.
-    async with Worker(
-        _with(client, TrialHooks()),
-        task_queue=worker.task_queue,
-        workflows=[RunOneTrial],
-    ):
-        outcome = await handle.result()
-
-    assert outcome.attempt == 1
-    assert outcome.result.verifier_result is not None
-    assert outcome.result.verifier_result.rewards == {"reward": 1.0}
-    assert await history.final_attempts(handle) == [2]
-    [failure] = await history.activity_failures(handle)
-    assert failure.application_failure_info.type == "WorkerShutdown"
-    assert failure.application_failure_info.details.payloads
 
 
 async def test_trial_that_could_not_run_raises(
@@ -816,12 +725,14 @@ async def test_unsupported_agent_capability_is_not_retried(
     harbor_client: Client, tmp_path: Path, agent: Callable[[Path], AgentConfig]
 ) -> None:
     # Harbor checks what the agent supports as the trial starts, before its
-    # environment, so the trial comes back with the error harbor recorded.
+    # environment, and records the error in the trial's result.
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
     )
     config.agent = agent(tmp_path)
-    outcome, attempts, failures = await _with_two_attempts(harbor_client, config)
+    outcome, attempts, failures, retried = await _with_two_attempts(
+        harbor_client, config
+    )
 
     recorded = outcome.result.exception_info
     assert recorded is not None
@@ -830,9 +741,8 @@ async def test_unsupported_agent_capability_is_not_retried(
     assert outcome.result.environment_setup is None
     assert outcome.attempt == 1
     assert attempts == [1]
-    [failure] = failures
-    assert failure.application_failure_info.type == "ValueError"
-    assert failure.application_failure_info.non_retryable
+    assert failures == []
+    assert retried == []
 
 
 @on_posix
@@ -842,6 +752,8 @@ async def test_trial_named_outside_its_directory_is_rejected(
     kept = tmp_path / "trials" / "victim" / "keep.txt"
     kept.parent.mkdir(parents=True)
     kept.write_text("still here")
+    # Deleting job/../victim reaches the victim only once job exists.
+    (tmp_path / "trials" / "job").mkdir()
     config = _trial(
         tasks.passing(tmp_path / "tasks"), tmp_path / "trials" / "job", "../victim"
     )

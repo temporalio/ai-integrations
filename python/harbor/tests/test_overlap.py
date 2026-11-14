@@ -1,4 +1,5 @@
-"""Attempts of one trial on one worker take turns in the trial's directory."""
+"""On one worker, attempts of one trial take turns in its directory, and trials
+of one task take turns fetching it."""
 
 from __future__ import annotations
 
@@ -104,3 +105,80 @@ async def test_later_attempt_waits_then_starts_clean(tmp_path: Path) -> None:
     assert [p.name for p in trials_dir.iterdir()] == ["slow__0"]
     assert not (trials_dir / "slow__0" / "left-behind.txt").exists()
     assert (trials_dir / "slow__0" / "result.json").exists()
+
+
+def _held(tmp_path: Path, trials_dir: Path, name: str) -> TrialConfig:
+    task = tmp_path / "tasks" / "held"
+    if not task.exists():
+        tasks.held(task.parent, tmp_path / "waiting", tmp_path / "release")
+    return TrialConfig(
+        task=TaskConfig(path=task),
+        trial_name=name,
+        trials_dir=trials_dir,
+        agent=AgentConfig(name="oracle"),
+        environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
+    )
+
+
+async def test_same_named_trials_of_two_jobs_run_at_once(tmp_path: Path) -> None:
+    hooks = Recording()
+    activities = HarborActivities(hooks=hooks)
+    running = [
+        asyncio.create_task(
+            _environment(1).run(
+                activities.run_trial,
+                RunTrialInput(
+                    config=_held(tmp_path, tmp_path / job, "held__0"),
+                    extra_time=timedelta(minutes=1),
+                ),
+            )
+        )
+        for job in ("one", "two")
+    ]
+    for _ in range(200):
+        if hooks.events.count("created 1") == 2:
+            break
+        await asyncio.sleep(0.05)
+    together = hooks.events.count("created 1") == 2
+    (tmp_path / "release").touch()
+    for outcome in await asyncio.gather(*running):
+        assert outcome.result.verifier_result is not None
+        assert outcome.result.verifier_result.rewards == {"reward": 1.0}
+
+    assert together
+
+
+async def test_trials_of_one_task_take_turns_creating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    create = Trial.create.__func__
+    creating: list[str] = []
+    most = 0
+
+    async def one_at_a_time(cls: type[Trial], config: TrialConfig) -> Trial:
+        nonlocal most
+        creating.append(config.trial_name)
+        most = max(most, len(creating))
+        try:
+            await asyncio.sleep(0.2)
+            return await create(cls, config)
+        finally:
+            creating.remove(config.trial_name)
+
+    monkeypatch.setattr(Trial, "create", classmethod(one_at_a_time))
+    (tmp_path / "release").touch()
+    activities = HarborActivities(hooks=TrialHooks())
+    await asyncio.gather(
+        *(
+            _environment(1).run(
+                activities.run_trial,
+                RunTrialInput(
+                    config=_held(tmp_path, tmp_path / "trials", f"held__{i}"),
+                    extra_time=timedelta(minutes=1),
+                ),
+            )
+            for i in range(2)
+        )
+    )
+
+    assert most == 1

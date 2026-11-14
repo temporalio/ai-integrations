@@ -3,30 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import contextvars
+import json
+import math
 import shutil
+import threading
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from functools import partial
+from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
 
 import harbor.skills
-from harbor.agents.factory import AgentFactory
-from harbor.agents.installed.base import (
-    ApiConnectionClosedError,
-    ApiInternalServerError,
-    ApiOverloadedError,
-    ApiRateLimitError,
-    ApiResponseStalledError,
-    NetworkConnectionError,
-)
+from harbor.agents.factory import AgentFactory, agent_config_kwargs
+from harbor.agents.installed.base import ApiRateLimitError
 from harbor.environments.factory import EnvironmentFactory
 from harbor.job_plan import JobPlan as HarborJobPlan
 from harbor.models.agent.context import AgentContext
 from harbor.models.job.config import JobConfig
-from harbor.models.job.lock import LOCK_FILENAME, build_job_lock
+from harbor.models.job.lock import LOCK_FILENAME, JobLock, build_job_lock
 from harbor.models.job.result import JobResult
 from harbor.models.task.config import (
     HealthcheckConfig,
@@ -39,11 +39,14 @@ from harbor.models.task.verifier_mode import (
     resolve_step_verifier_mode,
     resolve_task_verifier_mode,
 )
-from harbor.models.trial.config import AgentConfig, TrialConfig
-from harbor.models.trial.result import ExceptionInfo, TrialResult
+from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
+from harbor.models.trial.error_policy import FailureCause
+from harbor.models.trial.result import ExceptionInfo, StepResult, TrialResult
 from harbor.registry.client.base import EmptyDatasetError, UnavailableDatasetTasksError
+from harbor.tasks.client import TaskDownloadResult, TaskIdType
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
 from harbor.trial.trial import Trial
+from harbor.verifier.verifier import VerifierOutputParseError
 from pydantic import ValidationError
 
 from temporalio import activity
@@ -61,7 +64,6 @@ from temporalio.harbor._types import (
     RunTrialInput,
     TrialOutcome,
     check_trial_name,
-    heartbeat_outcome,
 )
 
 _T = TypeVar("_T")
@@ -69,22 +71,12 @@ _T = TypeVar("_T")
 # Harbor's aggregation reads an exception's type, never its text.
 _TEXT_MAX = 8_000
 
-# Temporal's default limit on a payload is 2 MiB. An outcome also travels in
-# heartbeat details, in error details and through a payload codec, so leave
-# room for what each adds.
+# Temporal's default limit on a payload is 2 MiB; leave room for what a
+# payload codec adds.
 _OUTCOME_MAX = 2 * 1024 * 1024 - 64 * 1024
 
-_TRANSIENT = frozenset(
-    error.__name__
-    for error in (
-        ApiRateLimitError,
-        ApiOverloadedError,
-        ApiInternalServerError,
-        ApiConnectionClosedError,
-        ApiResponseStalledError,
-        NetworkConnectionError,
-    )
-)
+# Harbor's, and litellm's.
+_RATE_LIMITED = frozenset({ApiRateLimitError.__name__, "RateLimitError"})
 
 # The text aggregate_job reads from a trial's result, as paths into its JSON
 # form. Redaction leaves it as harbor recorded it.
@@ -141,11 +133,12 @@ def _cap(result: TrialResult) -> TrialResult:
 def _raised(result: TrialResult) -> ExceptionInfo | None:
     """The recorded exception the attempt raises, if any.
 
-    That is the first exception when no agent started, else the first
-    transient provider error. Harbor sets ``agent_execution`` as an agent
-    starts: on the result, or on each step's result for a multi-step trial.
-    Temporal runs the trial again unless harbor rejected the trial's
-    configuration as it started (:func:`_rejected`).
+    That is the first exception when no agent started, else the first that
+    harbor's error policy retries, unless harbor cannot classify it. Harbor
+    sets ``agent_execution`` as an agent starts: on the result, or on each
+    step's result for a multi-step trial. Temporal runs the trial again
+    unless harbor rejected the trial's configuration as it started
+    (:func:`_rejected`).
     """
     steps = result.step_results or []
     recorded = sorted(
@@ -154,7 +147,14 @@ def _raised(result: TrialResult) -> ExceptionInfo | None:
     )
     if all(r.agent_execution is None for r in [result, *steps]):
         return next(iter(recorded), None)
-    return next((exc for exc in recorded if exc.exception_type in _TRANSIENT), None)
+    return next(
+        (
+            exc
+            for exc in recorded
+            if exc.policy.retry and exc.policy.cause != FailureCause.UNCLASSIFIED
+        ),
+        None,
+    )
 
 
 def _rejected(result: TrialResult) -> bool:
@@ -171,6 +171,102 @@ def _rejected(result: TrialResult) -> bool:
         and exc.exception_type == ValueError.__name__
         and result.environment_setup is None
     )
+
+
+def _finite(data: dict[str, Any], result: TrialResult, occurred_at: datetime) -> None:
+    """Record in ``data``, a dump of ``result``, each reward that is not finite.
+
+    Harbor writes such a reward as ``null``. Wherever ``result`` has one, the
+    verifier's result is dropped and, as harbor's own verifier records such a
+    reward, a ``VerifierOutputParseError`` recorded instead.
+    """
+    pairs: list[tuple[dict[str, Any], TrialResult | StepResult]] = [
+        (data, result),
+        *zip(data.get("step_results") or [], result.step_results or []),
+    ]
+    for item, source in pairs:
+        verifier = source.verifier_result
+        rewards = verifier.rewards if verifier is not None else None
+        if rewards and not all(math.isfinite(r) for r in rewards.values()):
+            item["verifier_result"] = None
+            item["exception_info"] = item.get("exception_info") or ExceptionInfo(
+                exception_type=VerifierOutputParseError.__name__,
+                exception_message=f"Non-finite reward in {rewards}",
+                exception_traceback="",
+                occurred_at=occurred_at,
+            ).model_dump(mode="json")
+
+
+def _strings(
+    value: Any, path: tuple[Any, ...] = ()
+) -> Iterator[tuple[tuple[Any, ...], str]]:
+    """Each string in ``value``, with its path."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _strings(item, (*path, key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _strings(item, (*path, index))
+    elif isinstance(value, str):
+        yield path, value
+
+
+def _at(data: Any, path: tuple[Any, ...]) -> Any:
+    """The value at ``path`` in ``data``, or ``None`` if there is none."""
+    for key in path:
+        if isinstance(data, dict):
+            data = data.get(key)
+        elif isinstance(data, list) and isinstance(key, int) and key < len(data):
+            data = data[key]
+        else:
+            return None
+    return data
+
+
+def _recorded(path: Path, result: TrialResult) -> TrialResult:
+    """The result harbor wrote to ``path`` once it removed the trial's secrets.
+
+    A reward that is not finite is recorded as :func:`_finite` describes. The
+    text aggregation reads keeps its value in ``result``, as :func:`_redacted`
+    keeps it, since harbor removes a secret wherever its text appears in the
+    file, names included. That can also leave the file invalid, for example
+    where the secret is part of a UUID, a timestamp or a key. Then the result
+    is ``result``, less what :func:`_strip` drops, with each other string
+    taken from the file where the file holds one in its place, and otherwise
+    replaced with ``[REDACTED]``. As :func:`_redacted` does, each change is
+    kept only where the result still validates with it.
+    """
+    occurred_at = datetime.now(timezone.utc)
+    try:
+        recorded: Any = json.loads(path.read_text())
+    except ValueError:
+        recorded = None
+    kept: Any = _strip(result).model_dump(mode="json")
+    _finite(kept, result, occurred_at)
+    if isinstance(recorded, dict):
+        _finite(recorded, result, occurred_at)
+        for where in _AGGREGATED:
+            parent = _at(recorded, where[:-1])
+            if isinstance(parent, dict) and where[-1] in parent:
+                parent[where[-1]] = _at(kept, where)
+        try:
+            return TrialResult.model_validate(recorded)
+        except ValidationError:
+            pass
+    for where, text in list(_strings(kept)):
+        if where in _AGGREGATED:
+            continue
+        found = _at(recorded, where)
+        scrubbed = found if isinstance(found, str) else "[REDACTED]"
+        if scrubbed == text:
+            continue
+        candidate = _replaced(kept, where, scrubbed)
+        try:
+            TrialResult.model_validate(candidate)
+        except ValidationError:
+            continue
+        kept = candidate
+    return TrialResult.model_validate(kept)
 
 
 def _healthcheck_sec(check: HealthcheckConfig | None) -> float:
@@ -254,37 +350,102 @@ def trial_timeout(
     return timedelta(seconds=total)
 
 
+def _not_finite(value: Any, path: tuple[str, ...] = ()) -> Iterator[str]:
+    """The paths of the times in ``value`` that are infinite or NaN."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _not_finite(item, (*path, str(key)))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _not_finite(item, (*path, str(index)))
+    elif (
+        isinstance(value, float)
+        and not math.isfinite(value)
+        and path[-1].endswith("_sec")
+    ):
+        yield ".".join(path)
+
+
+async def _on_own_loop(make: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
+    """Run harbor's async code on a fresh event loop in a daemon thread."""
+    done: concurrent.futures.Future[_T] = concurrent.futures.Future()
+    context = contextvars.copy_context()  # keeps activity.logger and tracing
+
+    def run() -> None:
+        done.set_running_or_notify_cancel()
+        try:
+            done.set_result(context.run(asyncio.run, make()))
+        except BaseException as exc:
+            done.set_exception(exc)
+
+    threading.Thread(target=run, daemon=True).start()
+    return await asyncio.wrap_future(done)
+
+
 @contextlib.contextmanager
-def _config_errors() -> Iterator[None]:
-    # Harbor rejecting a job's configuration, which no retry fixes.
+def _config_errors(*, lookups: bool = False) -> Iterator[None]:
+    """Fail without a retry when harbor rejects the job's configuration.
+
+    With ``lookups``, a ``ValueError`` raised while handling another error is
+    retried: harbor's registry clients raise one when a lookup fails, and a
+    bare one for a dataset or task that does not exist.
+    """
     try:
         yield
-    except (ValueError, EmptyDatasetError, UnavailableDatasetTasksError) as exc:
-        raise ApplicationError(
-            str(exc), type=type(exc).__name__, non_retryable=True
-        ) from exc
+    except Exception as exc:
+        error: Exception = exc
+        # Harbor downloads tasks in a TaskGroup.
+        while isinstance(error, ExceptionGroup) and len(error.exceptions) == 1:
+            error = error.exceptions[0]
+        if isinstance(error, (EmptyDatasetError, UnavailableDatasetTasksError)) or (
+            isinstance(error, ValueError)
+            and not (lookups and error.__context__ is not None)
+        ):
+            raise ApplicationError(
+                str(error), type=type(error).__name__, non_retryable=True
+            ) from error
+        raise
 
 
 def _check_options(agent: AgentConfig) -> None:
-    model = AgentFactory.get_agent_class_from_config(agent).options_model
-    if model is None:
-        return
-    try:
-        model.model_validate(agent.kwargs)
-    except ValidationError as exc:
-        # An option missing here may come from the worker's environment.
-        problems = [
-            "unknown option '{}'".format(".".join(map(str, e["loc"])))
-            if e["type"] == "extra_forbidden"
-            else "{}: {}".format(".".join(map(str, e["loc"])), e["msg"])
-            for e in exc.errors(include_url=False, include_input=False)
-            if e["type"] != "missing"
-        ]
-        if problems:
-            raise ValueError(
-                f"invalid options for agent {agent.name or agent.import_path!r}: "
-                + "; ".join(problems)
-            ) from None
+    # As harbor's AgentFactory.run_preflight and BaseAgent.parse_options check
+    # them, without the worker's environment.
+    agent_class = AgentFactory.get_agent_class_from_config(agent)
+    kwargs = agent_config_kwargs(agent)
+    for name in ("model_api_key_name", "model_api_format"):
+        kwargs.pop(name, None)
+    problems: list[str] = []
+    if agent_class.options_model is not None:
+        try:
+            agent_class.options_model.model_validate(kwargs)
+        except ValidationError as exc:
+            # An option missing here may come from the worker's environment.
+            problems = [
+                "unknown option '{}'".format(".".join(map(str, e["loc"])))
+                if e["type"] == "extra_forbidden"
+                else "{}: {}".format(".".join(map(str, e["loc"])), e["msg"])
+                for e in exc.errors(include_url=False, include_input=False)
+                if e["type"] != "missing"
+            ]
+    problems += [
+        f"{name} is not supported"
+        for name in ("base_url", "reasoning_effort")
+        if kwargs.get(name) is not None and not getattr(agent_class.capabilities, name)
+    ]
+    if problems:
+        raise ValueError(
+            f"invalid options for agent {agent.name or agent.import_path!r}: "
+            + "; ".join(problems)
+        )
+
+
+def _pinned(
+    task: TaskConfig, downloads: dict[TaskIdType, TaskDownloadResult]
+) -> TaskConfig:
+    commit = downloads[task.get_task_id()].resolved_git_commit_id
+    if task.is_git_task() and commit is not None:
+        return task.model_copy(update={"git_commit_id": commit})
+    return task
 
 
 async def _check_environment(config: TrialConfig) -> None:
@@ -307,6 +468,10 @@ def _resolve_skills(config: TrialConfig) -> None:
         agent.skills = [str(path) for path in resolved]
 
 
+class _HookTimeout(ApplicationError):
+    """A hook ran past what was left of the attempt's ``extra_time``."""
+
+
 class _HookBudget:
     """The time one attempt's hooks may take between them."""
 
@@ -325,7 +490,7 @@ class _HookBudget:
         except TimeoutError:
             if not timeout.expired():
                 raise
-            raise ApplicationError(
+            raise _HookTimeout(
                 f"{self._hooks}.{hook} did not finish within the trial's extra "
                 f"time of {self._extra_time}",
                 type="HarborHookTimeout",
@@ -370,28 +535,6 @@ def _not_converted(context: TrialContext, exc: Exception) -> ApplicationError:
         f"error of trial {context.config.trial_name}",
         type="HarborFailureNotConverted",
         non_retryable=True,
-    )
-
-
-def _interrupted(
-    details: activity.ActivityCancellationDetails | None, context: TrialContext
-) -> ApplicationError:
-    trial = context.config.trial_name
-    if details is not None and details.worker_shutdown:
-        return ApplicationError(
-            f"the worker shut down before trial {trial} finished",
-            type="WorkerShutdown",
-        )
-    if details is not None and details.paused:
-        return ApplicationError(
-            f"the Activity was paused while trial {trial} ran", type="ActivityPause"
-        )
-    if details is not None and details.reset:
-        return ApplicationError(
-            f"the Activity was reset while trial {trial} ran", type="ActivityReset"
-        )
-    return ApplicationError(
-        f"trial {trial} was cancelled, but not by its workflow", type="CancelledError"
     )
 
 
@@ -474,13 +617,8 @@ def _redacted(
     return TrialResult.model_validate(kept)
 
 
-def _failure(
-    exc: Exception,
-    outcome: TrialOutcome | None,
-    hooks: TrialHooks,
-    context: TrialContext,
-) -> Exception:
-    """``exc`` converted and redacted, carrying as much of ``outcome`` as it can."""
+def _failure(exc: Exception, hooks: TrialHooks, context: TrialContext) -> Exception:
+    """``exc`` converted and redacted."""
     info = activity.info()
     converter = activity.payload_converter()
     failure_converter = (
@@ -509,21 +647,6 @@ def _failure(
             replacement,
         )
         return replacement
-
-    def attach(failure: Failure) -> None:
-        if outcome is None or not failure.HasField("application_failure_info"):
-            return
-        payloads = failure.application_failure_info.details.payloads
-        kept = len(payloads)
-        for carried in (outcome, outcome.model_copy(update={"output": None})):
-            try:
-                converted = converter.to_payloads([carried])
-            except Exception:
-                continue
-            payloads.extend(converted)
-            if carried is not outcome or failure.ByteSize() <= _OUTCOME_MAX:
-                return
-            del payloads[kept:]
 
     def plain(failure: Failure) -> None:
         if failure.HasField("encoded_attributes"):
@@ -556,7 +679,6 @@ def _failure(
         except Exception as error:
             # Send none of the attempt's error: its text could not be redacted.
             failure = replaced(error)
-    attach(failure)
     # The worker passes this through its failure converter once more, which
     # encodes the top level's message and stack trace again if it encodes
     # them at all, so the top level goes back as plain text.
@@ -564,7 +686,6 @@ def _failure(
         plain(failure)
     except Exception as error:
         failure = replaced(error)
-        attach(failure)
         with contextlib.suppress(Exception):
             plain(failure)
     return FailureError(failure.message, failure=failure)
@@ -576,7 +697,10 @@ class HarborActivities:
     def __init__(self, *, hooks: TrialHooks) -> None:
         """Run trials with ``hooks`` taking part."""
         self._hooks = hooks
-        self._attempts: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        self._attempts: weakref.WeakValueDictionary[Path, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        self._tasks: weakref.WeakValueDictionary[TaskIdType, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
 
@@ -587,74 +711,115 @@ class HarborActivities:
         Writes the job's ``config.json`` and ``lock.json`` under
         ``jobs_dir/job_name``, and works out each trial's timeout from its
         task's ``task.toml``. Fails without retrying if that directory already
-        has a ``config.json`` that differs from this job's, as harbor does.
+        has a ``config.json`` or ``lock.json`` that differs from this job's,
+        as harbor does.
         """
         config = input.config.model_copy(deep=True)
         with _config_errors():
             for agent in [*config.agents, *filter(None, [config.user_agent])]:
                 _check_options(agent)
             await asyncio.to_thread(HarborJobPlan.resolve_agent_skills, config)
+
+        async def resolve() -> tuple[
+            list[TaskConfig], dict[TaskIdType, TaskDownloadResult]
+        ]:
             task_configs = await HarborJobPlan.resolve_task_configs(config)
-            EnvironmentFactory.validate_resource_policies(config.environment)
+            # Configuration, not a lookup: never retried.
+            with _config_errors():
+                EnvironmentFactory.validate_resource_policies(config.environment)
             await HarborJobPlan.resolve_metrics(config, task_configs)
-            downloads = await HarborJobPlan.cache_tasks(task_configs)
-            trials = HarborJobPlan.build_trial_configs(
-                config, task_configs, job_id=uuid4()
-            )
+            return task_configs, await HarborJobPlan.cache_tasks(task_configs)
 
-            def read_tasks() -> list[TaskDefinition]:
-                return [
-                    TaskDefinition.model_validate_toml(
-                        TaskPaths(
-                            downloads[task.get_task_id()].path
-                        ).config_path.read_text()
-                    )
-                    for task in task_configs
-                ]
+        with _config_errors(lookups=True):
+            task_configs, downloads = await _on_own_loop(resolve)
+        # config.json records each git task's commit, as it records a package
+        # dataset's content hash, so harbor job resume matches the trials.
+        config.tasks = [_pinned(task, downloads) for task in config.tasks]
+        trials = HarborJobPlan.build_trial_configs(config, task_configs, job_id=uuid4())
 
-            definitions = await asyncio.to_thread(read_tasks)
-            n_agents = len(config.agents)
-            timeouts = [
-                [
-                    trial_timeout(
-                        trials[i * n_agents + j], task, input.untimed_agent_timeout
-                    )
-                    for j in range(n_agents)
-                ]
-                for i, task in enumerate(definitions)
+        def read_tasks() -> list[TaskDefinition]:
+            return [
+                TaskDefinition.model_validate_toml(
+                    TaskPaths(
+                        downloads[task.get_task_id()].path
+                    ).config_path.read_text()
+                )
+                for task in task_configs
             ]
-        lock = await asyncio.to_thread(
-            build_job_lock,
-            config=config,
-            trial_configs=trials,
-            task_download_results=downloads,
-        )
+
+        with _config_errors():
+            definitions = await asyncio.to_thread(read_tasks)
+        for task, definition in zip(task_configs, definitions):
+            fields = list(_not_finite(definition.model_dump()))
+            if fields:
+                raise ApplicationError(
+                    f"task {task.get_task_id().get_name()} sets "
+                    f"{', '.join(fields)} to a value that is not finite",
+                    type="HarborInvalidTimeout",
+                    non_retryable=True,
+                )
+        n_agents = len(config.agents)
+        timeouts = [
+            [
+                trial_timeout(
+                    trials[i * n_agents + j], task, input.untimed_agent_timeout
+                )
+                for j in range(n_agents)
+            ]
+            for i, task in enumerate(definitions)
+        ]
+        with _config_errors():
+            lock = await asyncio.to_thread(
+                build_job_lock,
+                config=config,
+                trial_configs=trials,
+                task_download_results=downloads,
+            )
 
         def write() -> None:
             job_dir = config.jobs_dir / config.job_name
             job_dir.mkdir(parents=True, exist_ok=True)
-            path = job_dir / "config.json"
-            if path.exists():
+            config_path = job_dir / "config.json"
+            lock_path = job_dir / LOCK_FILENAME
+            # As harbor does. An equal one may be an earlier attempt's.
+            if config_path.exists():
                 try:
-                    existing = JobConfig.model_validate_json(path.read_text())
+                    existing = JobConfig.model_validate_json(config_path.read_text())
                 except ValueError:
                     existing = None
-                # As harbor does. An equal one may be an earlier attempt's.
-                if existing is None or existing != config:
+                if (
+                    existing is None
+                    or existing.model_copy(update={"jobs_dir": config.jobs_dir})
+                    != config
+                ):
                     raise ApplicationError(
                         f"Job directory {job_dir} already exists with a "
                         "different config.",
                         type="FileExistsError",
                         non_retryable=True,
                     )
-            path.write_text(config.model_dump_json(indent=4, exclude_defaults=True))
-            (job_dir / LOCK_FILENAME).write_text(
-                lock.model_dump_json(indent=4, exclude_none=True)
+            if lock_path.exists():
+                try:
+                    existing_lock = JobLock.model_validate_json(lock_path.read_text())
+                except ValueError:
+                    existing_lock = None
+                if existing_lock is None or existing_lock != lock:
+                    raise ApplicationError(
+                        f"Job directory {job_dir} already has a lock.json that "
+                        "does not match the resolved job lock.",
+                        type="FileExistsError",
+                        non_retryable=True,
+                    )
+                lock.created_at = existing_lock.created_at
+                lock.harbor = existing_lock.harbor
+            config_path.write_text(
+                config.model_dump_json(indent=4, exclude_defaults=True)
             )
+            lock_path.write_text(lock.model_dump_json(indent=4, exclude_none=True))
 
         await asyncio.to_thread(write)
         return PlanJobResult(
-            task_configs=task_configs,
+            task_configs=[_pinned(task, downloads) for task in task_configs],
             task_names=[
                 task.get_task_id().get_name().split("/")[-1] for task in task_configs
             ],
@@ -666,17 +831,8 @@ class HarborActivities:
     async def run_trial(self, input: RunTrialInput) -> TrialOutcome:
         """Run one attempt of a harbor trial.
 
-        Returns the trial's result whenever harbor produced one, even one that
-        records an exception, unless the trial failed before its agent started
-        or its agent's run ended in a transient provider error. Then, as when
-        the trial could not run or :meth:`TrialHooks.scope` or
-        :meth:`TrialHooks.trial_created` raises, it raises for Temporal to run
-        the trial again. It raises without a retry when the trial's name is not
-        a single path component, when harbor rejects the trial's configuration
-        while creating it or as it starts, before its environment, and when
-        :meth:`TrialHooks.redact` raises. An ``ApplicationError`` from
-        :meth:`TrialHooks.output` reaches Temporal as the hook raised it;
-        anything else it raises fails the attempt without a retry.
+        :func:`temporalio.harbor.execute_trial` describes when it returns the
+        trial's result and when it raises.
         """
         info = activity.info()
         hooks = self._hooks
@@ -689,18 +845,11 @@ class HarborActivities:
         # events name the phase.
         phase = "waiting"
         started = time.monotonic()
-        # The most recent outcome of any attempt. Every heartbeat carries it,
-        # so a later attempt, or a timeout the server records, can return it.
-        latest = heartbeat_outcome(info.heartbeat_details)
 
         def beat() -> None:
-            details: dict[str, Any] = {
-                "phase": phase,
-                "elapsed_sec": round(time.monotonic() - started),
-            }
-            if latest is not None:
-                details["outcome"] = latest.model_dump(mode="json")
-            activity.heartbeat(details)
+            activity.heartbeat(
+                {"phase": phase, "elapsed_sec": round(time.monotonic() - started)}
+            )
 
         async def heartbeat(interval: float) -> None:
             # The agent phase can go hours without a harbor event, so beat on a timer.
@@ -722,12 +871,18 @@ class HarborActivities:
             ticker = asyncio.create_task(
                 heartbeat(info.heartbeat_timeout.total_seconds() / 4)
             )
+        policy = info.retry_policy
+        last = (
+            policy is not None
+            and policy.maximum_attempts > 0
+            and info.attempt == policy.maximum_attempts
+        )
         outcome: TrialOutcome | None = None
         try:
             check_trial_name(context.config.trial_name)
             # Held through teardown, so an overlapping attempt of the same
             # trial waits and then starts from an empty directory.
-            lock = self._attempts.setdefault(context.config.trial_name, asyncio.Lock())
+            lock = self._attempts.setdefault(context.trial_dir, asyncio.Lock())
             async with lock:
                 phase = "load"
                 await asyncio.to_thread(
@@ -738,23 +893,35 @@ class HarborActivities:
                 await budget.run("scope", scope.__aenter__())
                 try:
                     await _check_environment(context.config)
+                    # Harbor fetches a git or package task into a directory
+                    # every trial of it on this worker reads.
+                    fetching = self._tasks.setdefault(
+                        context.config.task.get_task_id(), asyncio.Lock()
+                    )
                     with _config_errors():
                         await asyncio.to_thread(_resolve_skills, context.config)
-                        trial = await Trial.create(context.config)
+                        async with fetching:
+                            trial = await Trial.create(context.config)
                     for event in TrialEvent:
                         trial.add_hook(event, track(event))
-                    await budget.run(
-                        "trial_created", hooks.trial_created(trial, context)
-                    )
+                    try:
+                        await budget.run(
+                            "trial_created", hooks.trial_created(trial, context)
+                        )
+                    except BaseException:
+                        # Only trial.run() closes the trial.log Trial.create opened.
+                        trial._close_logger_handler()
+                        raise
                     result = await trial.run()
+                    recorded = await asyncio.to_thread(
+                        _recorded, trial.paths.result_path, result
+                    )
                     # Redacted in full, then shortened: shortening first could
                     # cut a secret in two and leave a part redact cannot match.
                     outcome = TrialOutcome(
-                        result=_cap(_redacted(_strip(result), hooks, context)),
+                        result=_cap(_redacted(_strip(recorded), hooks, context)),
                         attempt=info.attempt,
                     )
-                    latest = outcome
-                    beat()
                     try:
                         output = await budget.run(
                             "output", hooks.output(result, context)
@@ -770,8 +937,7 @@ class HarborActivities:
                             non_retryable=True,
                         ) from hook_exc
                     # What output returns joins the outcome only if Temporal can
-                    # carry it; otherwise the attempt would fail with no outcome
-                    # to return.
+                    # carry it.
                     if output is not None:
                         try:
                             payloads = activity.payload_converter().to_payloads(
@@ -796,8 +962,11 @@ class HarborActivities:
                                 non_retryable=True,
                             )
                         outcome.output = output
-                    raised = _raised(result)
-                    if raised is not None:
+                    raised = _raised(recorded)
+                    # Harbor returns the last attempt's result when its
+                    # retries run out, and a trial it rejected as it started
+                    # gets no retry.
+                    if raised is not None and not (last or _rejected(recorded)):
                         try:
                             message = _redact_strings(
                                 raised.exception_message, hooks, context
@@ -807,16 +976,20 @@ class HarborActivities:
                         raise ApplicationError(
                             message[:_TEXT_MAX],
                             type=raised.exception_type,
-                            non_retryable=_rejected(result),
                             next_retry_delay=(
                                 timedelta(minutes=2)
-                                if raised.exception_type == ApiRateLimitError.__name__
+                                if raised.exception_type in _RATE_LIMITED
                                 else None
                             ),
                         )
                 except BaseException as exc:
                     leave = scope.__aexit__(type(exc), exc, exc.__traceback__)
-                    if not await budget.run("scope", leave):
+                    try:
+                        suppressed = await budget.run("scope", leave)
+                    except _HookTimeout:
+                        # The error already leaving the scope is the attempt's.
+                        suppressed = False
+                    if not suppressed:
                         raise
                 else:
                     await budget.run("scope", scope.__aexit__(None, None, None))
@@ -827,16 +1000,8 @@ class HarborActivities:
                     f"{type(hooks).__name__}.scope suppressed an exception, "
                     f"so trial {context.config.trial_name} produced no result"
                 )
-        except asyncio.CancelledError as exc:
-            # A cancellation the workflow did not ask for keeps the latest outcome.
-            details = activity.cancellation_details()
-            if latest is None or (details is not None and details.cancel_requested):
-                raise
-            raise _failure(
-                _interrupted(details, context), latest, hooks, context
-            ) from exc
         except Exception as exc:
-            raise _failure(exc, latest, hooks, context) from exc
+            raise _failure(exc, hooks, context) from exc
         finally:
             if ticker is not None:
                 ticker.cancel()
@@ -849,9 +1014,9 @@ class HarborActivities:
         Metrics are resolved and computed together because a dataset's metric
         can be a script harbor downloads to this machine and runs with ``uv``.
         """
-        with _config_errors():
-            metrics = await HarborJobPlan.resolve_metrics(
-                input.config, input.task_configs
+        with _config_errors(lookups=True):
+            metrics = await _on_own_loop(
+                partial(HarborJobPlan.resolve_metrics, input.config, input.task_configs)
             )
         result = input.result.model_copy(deep=True)
         for evals_key, rewards in input.rewards.items():

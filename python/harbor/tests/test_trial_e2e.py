@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import uuid
 from pathlib import Path
@@ -20,9 +21,11 @@ from harbor.models.trial.config import (
     TaskConfig,
     TrialConfig,
 )
+from harbor.utils.logger import logger as harbor_logger
 from harbor.viewer.scanner import JobScanner
 
 from temporalio.client import Client
+from temporalio.harbor._plugin import _ForwardHarborLogs
 from tests.harbor_fixtures import agents, history, tasks
 from tests.harbor_fixtures.workflows import RunJob, RunOneTrial, TrialArgs, new_worker
 
@@ -162,3 +165,54 @@ async def test_activity_summaries(harbor_client: Client, tmp_path: Path) -> None
             await handle.result()
             found += await history.summaries(handle, harbor_client.data_converter)
     assert found == ["answers · oracle/none", "grading the answer"]
+
+
+class _Collect(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+async def test_worker_passes_on_harbors_info_logs_only(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    config = TrialConfig(
+        task=TaskConfig(path=tasks.passing(tmp_path / "tasks")),
+        trial_name="answers__0",
+        trials_dir=tmp_path / "trials",
+        agent=AgentConfig(name="oracle"),
+        environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
+    )
+    # What the worker's own handlers, on the root logger, receive.
+    root = logging.getLogger()
+    received = _Collect()
+    level = root.level
+    root.addHandler(received)
+    root.setLevel(logging.DEBUG)
+    try:
+        async with new_worker(harbor_client, RunOneTrial) as worker:
+            await harbor_client.execute_workflow(
+                RunOneTrial.run,
+                TrialArgs(config=config),
+                id=f"trial-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+        async with new_worker(harbor_client):
+            pass
+        harbor_logger.info("passed on")
+    finally:
+        root.removeHandler(received)
+        root.setLevel(level)
+
+    from_harbor = [r for r in received.records if r.name.startswith(harbor_logger.name)]
+    assert [r for r in from_harbor if r.levelno < logging.INFO] == []
+    assert from_harbor[-1].getMessage() == "passed on"
+    trial_log = (tmp_path / "trials" / "answers__0" / "trial.log").read_text()
+    assert "Collecting main service artifacts" in trial_log
+    forwarding = [
+        h for h in harbor_logger.handlers if isinstance(h, _ForwardHarborLogs)
+    ]
+    assert len(forwarding) == 1

@@ -94,6 +94,26 @@ class PlanJob:
 
 
 @workflow.defn
+class PlanTwoUnnamedJobs:
+    """Plan two copies of a job at once; return the names they were given."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> list[str]:
+        plans = await asyncio.gather(plan_job(config), plan_job(config))
+        return [plan.config.job_name for plan in plans]
+
+
+@workflow.defn
+class AggregateExceptions:
+    """Aggregate a list that holds an exception, as gather(return_exceptions=True) can."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> JobResult:
+        plan = await plan_job(config)
+        return await aggregate_job(plan, cast(Any, [RuntimeError("no outcome")]))
+
+
+@workflow.defn
 class PlanAndAggregate:
     """Plan the job and aggregate it without running any trial."""
 
@@ -141,6 +161,29 @@ class PlanCollidingJob:
 
 def _no_name(*_: object) -> Any:
     return None
+
+
+def _case_colliding_name(task: TaskConfig, agent: AgentConfig, attempt: int) -> str:
+    name = f"{cast(Path, task.path).name}__{agent.name}"
+    return name.upper() if attempt else name
+
+
+@workflow.defn
+class PlanCaseCollidingJob:
+    """Plan the job with names that differ between attempts only in case."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> TemporalJobPlan:
+        return await plan_job(config, trial_name=_case_colliding_name)
+
+
+@workflow.defn
+class PlanDriveNameJob:
+    """Plan the job with a naming function that names a Windows drive."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> TemporalJobPlan:
+        return await plan_job(config, trial_name=lambda *_: "C:")
 
 
 @workflow.defn
@@ -237,6 +280,49 @@ class RunTrialWithInvalidData:
             TrialPlan(config=config, timeout=TRIAL_TIMEOUT),
             data=cast(Any, {"run": workflow.uuid4()}),
         )
+
+
+@workflow.defn
+class RunTrialWithSecondsOfExtraTime:
+    """Run a trial with ``extra_time`` given in seconds."""
+
+    @workflow.run
+    async def run(self, config: TrialConfig) -> TrialOutcome:
+        return await execute_trial(
+            TrialPlan(config=config, timeout=TRIAL_TIMEOUT),
+            extra_time=cast(Any, 60),
+        )
+
+
+@workflow.defn
+class PlanWithSecondsOfTimeout:
+    """Plan the job with a ``start_to_close_timeout`` given in seconds."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> TemporalJobPlan:
+        return await plan_job(config, start_to_close_timeout=cast(Any, 600))
+
+
+@workflow.defn
+class RunTrialWithSecondsOfHeartbeat:
+    """Run a trial with a ``heartbeat_timeout`` given in seconds."""
+
+    @workflow.run
+    async def run(self, config: TrialConfig) -> TrialOutcome:
+        return await execute_trial(
+            TrialPlan(config=config, timeout=TRIAL_TIMEOUT),
+            heartbeat_timeout=cast(Any, 120),
+        )
+
+
+@workflow.defn
+class AggregateWithSecondsOfTimeout:
+    """Plan the job, then aggregate it with a ``start_to_close_timeout`` given in seconds."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> JobResult:
+        plan = await plan_job(config)
+        return await aggregate_job(plan, [], start_to_close_timeout=cast(Any, 600))
 
 
 def new_worker(client: Client, *workflows: type, **kwargs: Any) -> Worker:

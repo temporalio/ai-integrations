@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import shutil
+import subprocess
 import sys
 import uuid
 from collections.abc import Callable
@@ -11,10 +14,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
+from harbor.auth import tokens as harbor_tokens
 from harbor.job import Job
 from harbor.models.bridge import BridgeConfig, BridgeKind
 from harbor.models.job.config import DatasetConfig, JobConfig, SourceJobConfig
 from harbor.models.job.lock import JobLock
+from harbor.models.job.result import JobResult
 from harbor.models.registry import DatasetMetadata
 from harbor.models.task.id import LocalTaskId, PackageTaskId
 from harbor.models.trial.config import (
@@ -23,34 +28,43 @@ from harbor.models.trial.config import (
     TaskConfig,
     TrialConfig,
     UserAgentConfig,
+    VerifierConfig,
 )
 from harbor.registry.client import package
 from harbor.registry.client.base import UnavailableDatasetTasksError
 from harbor.tasks.client import BatchDownloadResult, TaskClient, TaskDownloadResult
 from shortuuid import ShortUUID
 
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.harbor._activity import _on_own_loop
 from tests.harbor_fixtures import history, tasks
 from tests.harbor_fixtures.workflows import (
+    AggregateExceptions,
+    AggregateWithSecondsOfTimeout,
     PlanAndAggregate,
     PlanAndAggregateOnce,
+    PlanCaseCollidingJob,
     PlanCollidingJob,
+    PlanDriveNameJob,
     PlanEmptyNameJob,
     PlanEscapingJob,
     PlanInvalidNameJob,
     PlanJob,
     PlanNamedJob,
+    PlanTwoUnnamedJobs,
     PlanWithInvalidTimeout,
+    PlanWithSecondsOfTimeout,
     QueuedJob,
     RunJob,
     RunJobOnQueue,
     RunTrialWithInvalidData,
+    RunTrialWithSecondsOfHeartbeat,
     new_worker,
 )
 
-pytestmark = pytest.mark.skipif(
+on_posix = pytest.mark.skipif(
     sys.platform == "win32",
     reason="the local test environment runs task scripts with bash",
 )
@@ -93,7 +107,25 @@ async def _run(client: Client, workflow_class: type[Any], arg: Any) -> Any:
 
 
 async def test_expansion_matches_harbor(harbor_client: Client, tmp_path: Path) -> None:
-    config = _config(tmp_path)
+    extra = tmp_path / "extra.md"
+    extra.write_text("Answer in English.\n")
+    # Every field harbor maps from the job onto its trials, set.
+    config = _config(
+        tmp_path,
+        install_only=True,
+        user_agent=UserAgentConfig(
+            name="oracle", bridge=BridgeConfig(kind=BridgeKind.ACP)
+        ),
+        agent_timeout_multiplier=2.0,
+        verifier_timeout_multiplier=3.0,
+        agent_setup_timeout_multiplier=0.5,
+        environment_build_timeout_multiplier=0.25,
+        environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV, env={"MODE": "x"}),
+        verifier=VerifierConfig(override_timeout_sec=45.0),
+        artifacts=["/logs/answer.txt"],
+        extra_instruction_paths=[extra],
+        extra_instructions=["Be brief."],
+    )
     job = await Job.create(config.model_copy(deep=True))
     plan = await _run(harbor_client, PlanJob, config)
 
@@ -111,10 +143,10 @@ async def test_expansion_matches_harbor(harbor_client: Client, tmp_path: Path) -
         tmp_path / "jobs" / "expansion"
     }
 
-    # Agent setup at harbor's default, the tasks' agent and verifier, and the
-    # default build, all under the job's multiplier.
+    # The default build, five agent setups at harbor's default for a user
+    # agent, the tasks' agent and the job's verifier, each under its multiplier.
     assert {t.timeout for t in plan.trials} == {
-        timedelta(seconds=(600 + 360 + 60 + 60) * 1.5)
+        timedelta(seconds=600 * 0.25 + 5 * 360 * 0.5 + 60 * 2.0 + 45 * 3.0)
     }
 
     # The job's config and lock, in harbor's formats, where harbor keeps them.
@@ -186,10 +218,34 @@ async def test_planning_retry_finds_the_files_it_wrote(
 async def test_job_directory_configs_compare_as_harbor_compares_them(
     harbor_client: Client, tmp_path: Path
 ) -> None:
-    # Harbor's equality ignores debug.
+    # Harbor's equality ignores debug, and the path a job directory is reached by.
     await _run(harbor_client, PlanJob, _config(tmp_path))
-    plan = await _run(harbor_client, PlanJob, _config(tmp_path, debug=True))
+    plan = await _run(
+        harbor_client,
+        PlanJob,
+        _config(tmp_path, debug=True, jobs_dir=tmp_path / "jobs" / ".." / "jobs"),
+    )
     assert plan.config.debug
+
+
+async def test_job_directory_with_another_lock_fails_planning(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    await _run(harbor_client, PlanJob, _config(tmp_path))
+    lock_json = tmp_path / "jobs" / "expansion" / "lock.json"
+    before = lock_json.read_text()
+    config = _config(tmp_path)
+    # The same config, but a task's content has changed since.
+    (tmp_path / "tasks" / "answers" / "instruction.md").write_text("Say hello.\n")
+
+    cause, handle = await _planning_failure(harbor_client, PlanJob, config)
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.non_retryable
+    assert cause.cause.type == "FileExistsError"
+    assert "lock.json" in cause.cause.message
+    assert await history.final_attempts(handle) == [1]
+    assert lock_json.read_text() == before
 
 
 async def test_untimed_agent_counts_untimed_agent_timeout(
@@ -224,6 +280,7 @@ def _no_file_system_in_workflows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Path, "resolve", guard("Path.resolve", Path.resolve))
 
 
+@on_posix
 async def test_workflow_code_leaves_the_file_system_alone(
     harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -264,6 +321,39 @@ async def test_unknown_agent_option_fails_planning(
     assert await history.final_attempts(handle) == [1]
 
 
+@pytest.mark.parametrize(
+    ("agent", "accepted"),
+    [
+        pytest.param(
+            AgentConfig(
+                name="claude-code", kwargs={"model_api_format": "anthropic_messages"}
+            ),
+            True,
+            id="model-api-format",
+        ),
+        pytest.param(
+            AgentConfig(name="hermes", kwargs={"reasoning_effort": "high"}),
+            False,
+            id="unsupported-capability",
+        ),
+    ],
+)
+async def test_agent_options_are_checked_as_harbor_checks_them(
+    harbor_client: Client, tmp_path: Path, agent: AgentConfig, accepted: bool
+) -> None:
+    config = _config(tmp_path, agents=[agent])
+    if accepted:
+        plan = await _run(harbor_client, PlanJob, config)
+        assert len(plan.trials) == 2 * 2
+        return
+    cause, handle = await _planning_failure(harbor_client, PlanJob, config)
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.non_retryable
+    assert "reasoning_effort" in cause.cause.message
+    assert await history.final_attempts(handle) == [1]
+
+
 async def test_agent_options_are_checked_without_the_workers_environment(
     harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -284,13 +374,34 @@ async def test_agent_options_are_checked_without_the_workers_environment(
 
 
 class _PackageRegistry:
-    def __init__(self, *, empty: bool = False, unavailable: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        empty: bool = False,
+        unavailable: int = 0,
+        missing: bool = False,
+        unreachable: frozenset[int] = frozenset(),
+    ) -> None:
         self.lookups: list[str] = []
+        self.loops: list[asyncio.AbstractEventLoop] = []
+        self.activities: list[str] = []
         self.empty = empty
         self.unavailable = unavailable
+        self.missing = missing
+        self.unreachable = unreachable
 
     async def get_dataset_metadata(self, name: str) -> DatasetMetadata:
         self.lookups.append(name)
+        self.loops.append(asyncio.get_running_loop())
+        self.activities.append(activity.info().activity_type)
+        if len(self.lookups) - 1 in self.unreachable:
+            # As harbor's registry clients report a lookup that failed.
+            try:
+                raise ConnectionError("the registry did not answer")
+            except ConnectionError:
+                raise ValueError(f"Error getting dataset {name}")  # noqa: B904
+        if self.missing:
+            raise ValueError(f"Dataset {name} not found")
         if self.unavailable:
             raise UnavailableDatasetTasksError(name, self.unavailable)
         return DatasetMetadata(
@@ -342,6 +453,286 @@ async def test_empty_dataset_fails_planning(
     assert await history.final_attempts(handle) == [1]
 
 
+def _package_job(tmp_path: Path, name: str = "packaged") -> JobConfig:
+    return JobConfig(
+        job_name=name,
+        jobs_dir=tmp_path / "jobs",
+        datasets=[DatasetConfig(name="org/ds")],
+        environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
+    )
+
+
+@pytest.mark.parametrize(
+    ("registry", "attempts"),
+    [
+        pytest.param({"unreachable": frozenset({0})}, [2], id="lookup-failed"),
+        pytest.param({"missing": True}, [1], id="not-found"),
+    ],
+)
+async def test_registry_lookup_is_retried_unless_not_found(
+    harbor_client: Client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: dict[str, Any],
+    attempts: list[int],
+) -> None:
+    shared = _PackageRegistry(**registry)
+    monkeypatch.setattr(package, "PackageDatasetClient", lambda: shared)
+    _local_packages(monkeypatch, tasks.passing(tmp_path / "tasks"))
+    async with new_worker(harbor_client, PlanJob) as worker:
+        handle = await harbor_client.start_workflow(
+            PlanJob.run,
+            _package_job(tmp_path),
+            id=f"plan-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            execution_timeout=_PLANNED_WITHIN,
+        )
+        try:
+            await handle.result()
+        except WorkflowFailureError as failure:
+            assert isinstance(failure.cause, ActivityError)
+            assert isinstance(failure.cause.cause, ApplicationError)
+            assert failure.cause.cause.non_retryable
+    assert await history.final_attempts(handle) == attempts
+
+
+async def test_registry_lookup_at_aggregation_is_retried(
+    harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Planning looks the dataset up twice; aggregation's lookup fails once.
+    registry = _PackageRegistry(unreachable=frozenset({2}))
+    monkeypatch.setattr(package, "PackageDatasetClient", lambda: registry)
+    _local_packages(monkeypatch, tasks.passing(tmp_path / "tasks"))
+    async with new_worker(harbor_client, PlanAndAggregate) as worker:
+        handle = await harbor_client.start_workflow(
+            PlanAndAggregate.run,
+            _package_job(tmp_path),
+            id=f"aggregate-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            execution_timeout=_PLANNED_WITHIN,
+        )
+        await handle.result()
+    assert await history.final_attempts(handle) == [1, 2]
+
+
+async def test_registry_lookups_run_off_the_event_loop(
+    harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A registry client can block, and every trial on the worker heartbeats
+    # from its event loop.
+    registry = _PackageRegistry()
+    monkeypatch.setattr(package, "PackageDatasetClient", lambda: registry)
+    _local_packages(monkeypatch, tasks.passing(tmp_path / "tasks"))
+    await _run(harbor_client, PlanAndAggregate, _package_job(tmp_path))
+    assert asyncio.get_running_loop() not in registry.loops
+    assert registry.activities == [
+        "harbor.plan_job",
+        "harbor.plan_job",
+        "harbor.aggregate_job",
+    ]
+
+
+async def test_harbor_token_lock_works_on_every_loop(
+    harbor_client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Planning runs harbor on loops of its own, beside the worker's.
+    async def exchange(api_key: str) -> tuple[str, float]:
+        await asyncio.sleep(0.05)
+        return f"token for {api_key}", 3600.0
+
+    monkeypatch.setattr(harbor_tokens, "exchange_api_key", exchange)
+
+    async def refresh_twice_at_once() -> list[str]:
+        harbor_tokens.invalidate_token()
+        return list(
+            await asyncio.gather(
+                harbor_tokens._cache.get_access_token("key"),
+                harbor_tokens._cache.get_access_token("key"),
+            )
+        )
+
+    async with new_worker(harbor_client):
+        expected = ["token for key", "token for key"]
+        assert await _on_own_loop(refresh_twice_at_once) == expected
+        assert await refresh_twice_at_once() == expected
+        assert await _on_own_loop(refresh_twice_at_once) == expected
+
+
+async def test_missing_package_task_fails_planning(
+    harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(package, "PackageDatasetClient", _PackageRegistry)
+
+    async def download_tasks(*_args: Any, **_kwargs: Any) -> BatchDownloadResult:
+        # As harbor downloads package tasks: in a task group.
+        async def missing() -> None:
+            raise ValueError("Task version not found: org/task@sha256:t1")
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(missing())
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(TaskClient, "download_tasks", download_tasks)
+    cause, handle = await _planning_failure(
+        harbor_client, PlanJob, _package_job(tmp_path)
+    )
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.type == "ValueError"
+    assert cause.cause.non_retryable
+    assert await history.final_attempts(handle) == [1]
+
+
+async def test_skill_without_skill_md_fails_planning(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    skill = tmp_path / "skills" / "greeting"
+    skill.mkdir(parents=True)
+    config = _config(tmp_path, agents=[AgentConfig(name="oracle", skills=[str(skill)])])
+    cause, handle = await _planning_failure(harbor_client, PlanJob, config)
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.non_retryable
+    assert await history.final_attempts(handle) == [1]
+
+
+async def test_unknown_environment_import_path_fails_planning(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    config = _config(
+        tmp_path,
+        environment=EnvironmentConfig(
+            import_path="tests.harbor_fixtures.local_env:NoSuchEnvironment"
+        ),
+    )
+    cause, handle = await _planning_failure(harbor_client, PlanJob, config)
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.non_retryable
+    assert "NoSuchEnvironment" in cause.cause.message
+    assert await history.final_attempts(handle) == [1]
+
+
+async def test_infinite_task_timeout_fails_planning(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    task = tasks.passing(tmp_path, "forever")
+    toml = task / "task.toml"
+    toml.write_text(
+        toml.read_text().replace(
+            "[agent]\ntimeout_sec = 60.0", "[agent]\ntimeout_sec = inf"
+        )
+    )
+    config = _config(tmp_path, tasks=[TaskConfig(path=task)])
+    cause, handle = await _planning_failure(harbor_client, PlanJob, config)
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.non_retryable
+    assert "forever" in cause.cause.message
+    assert "agent.timeout_sec" in cause.cause.message
+    assert await history.final_attempts(handle) == [1]
+
+
+def _git_task(tmp_path: Path) -> tuple[TaskConfig, str]:
+    """A task in a new git repository, and the repository's commit."""
+    repo = tmp_path / "repo"
+    tasks.passing(repo)
+    for command in (
+        ["init", "-q"],
+        ["add", "."],
+        ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "task"],
+    ):
+        subprocess.run(["git", *command], cwd=repo, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    task = TaskConfig(
+        git_url=repo.as_uri(), path=Path("answers"), download_dir=tmp_path / "cache"
+    )
+    return task, commit
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+async def test_git_task_is_pinned_to_the_commit_planning_resolved(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    task, commit = _git_task(tmp_path)
+    plan = await _run(harbor_client, PlanJob, _config(tmp_path, tasks=[task]))
+
+    assert [t.git_commit_id for t in plan.task_configs] == [commit]
+    assert {t.config.task.git_commit_id for t in plan.trials} == {commit}
+    lock = JobLock.model_validate_json(
+        (tmp_path / "jobs" / "expansion" / "lock.json").read_text()
+    )
+    assert {t.task.git_commit_id for t in lock.trials} == {commit}
+
+
+@on_posix
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+async def test_harbor_resumes_a_finished_job_with_a_git_task(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    task, _ = _git_task(tmp_path)
+    await _run(harbor_client, RunJob, _config(tmp_path, tasks=[task]))
+
+    # As harbor job resume does: expand config.json again and match each
+    # trial already in the job directory to one of its trials.
+    config_json = tmp_path / "jobs" / "expansion" / "config.json"
+    job = await Job.create(JobConfig.model_validate_json(config_json.read_text()))
+    try:
+        assert job._remaining_trial_configs == []
+    finally:
+        job._close_logger_handlers()
+
+
+async def test_unnamed_jobs_are_named_apart(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    config = _config(tmp_path).model_dump(mode="json", exclude={"job_name"})
+    async with new_worker(harbor_client, PlanTwoUnnamedJobs) as worker:
+        names = await harbor_client.execute_workflow(
+            "PlanTwoUnnamedJobs",
+            config,
+            id=f"plan-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            execution_timeout=_PLANNED_WITHIN,
+            result_type=list[str],
+        )
+    assert len(set(names)) == 2
+    assert all(
+        re.fullmatch(r"\d{4}-\d\d-\d\d__\d\d-\d\d-\d\d__[0-9a-f]{8}", name)
+        for name in names
+    )
+
+
+async def test_aggregating_an_exception_fails_the_workflow(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    cause, _ = await _planning_failure(
+        harbor_client, AggregateExceptions, _config(tmp_path)
+    )
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "ValidationError"
+    assert cause.non_retryable
+    assert "aggregate_job's arguments are not valid" in cause.message
+
+
+async def test_unfinished_job_has_no_finished_at(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    result = await _run(harbor_client, PlanAndAggregate, _config(tmp_path))
+    assert result.stats.n_pending_trials == 8
+    assert result.finished_at is None
+    written = JobResult.model_validate_json(
+        (tmp_path / "jobs" / "expansion" / "result.json").read_text()
+    )
+    assert written.finished_at is None
+
+
 async def test_invalid_trial_config_fails_the_workflow(
     harbor_client: Client, tmp_path: Path
 ) -> None:
@@ -388,6 +779,43 @@ async def test_invalid_arguments_fail_the_workflow(
     assert await history.scheduled(handle) == []
 
 
+@pytest.mark.parametrize(
+    ("workflow_class", "make_arg", "function", "argument"),
+    [
+        (PlanWithSecondsOfTimeout, _config, "plan_job", "start_to_close_timeout"),
+        (
+            RunTrialWithSecondsOfHeartbeat,
+            _one_trial,
+            "execute_trial",
+            "heartbeat_timeout",
+        ),
+        (
+            AggregateWithSecondsOfTimeout,
+            _config,
+            "aggregate_job",
+            "start_to_close_timeout",
+        ),
+    ],
+    ids=["plan_job", "execute_trial", "aggregate_job"],
+)
+async def test_timeout_that_is_not_a_timedelta_fails_the_workflow(
+    harbor_client: Client,
+    tmp_path: Path,
+    workflow_class: type[Any],
+    make_arg: Callable[[Path], Any],
+    function: str,
+    argument: str,
+) -> None:
+    cause, _ = await _planning_failure(
+        harbor_client, workflow_class, make_arg(tmp_path)
+    )
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "ValidationError"
+    assert cause.non_retryable
+    assert f"{function}'s arguments are not valid" in cause.message
+    assert argument in cause.message
+
+
 async def test_concurrency_caps_are_reported_unused(
     harbor_client: Client, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -399,6 +827,7 @@ async def test_concurrency_caps_are_reported_unused(
     assert any("n_concurrent" in r.getMessage() for r in caplog.records)
 
 
+@on_posix
 async def test_every_activity_runs_on_the_given_task_queue(
     harbor_client: Client, tmp_path: Path
 ) -> None:
@@ -534,22 +963,26 @@ async def test_trial_names_can_be_derived(
     ]
 
 
+@pytest.mark.parametrize(
+    "workflow_class",
+    [PlanCollidingJob, PlanCaseCollidingJob],
+    ids=["same", "differ-in-case"],
+)
 async def test_colliding_trial_names_rejected(
-    harbor_client: Client, tmp_path: Path
+    harbor_client: Client, tmp_path: Path, workflow_class: type[Any]
 ) -> None:
-    cause, _ = await _planning_failure(
-        harbor_client, PlanCollidingJob, _config(tmp_path)
-    )
+    cause, _ = await _planning_failure(harbor_client, workflow_class, _config(tmp_path))
     assert isinstance(cause, ApplicationError)
     assert cause.type == "HarborDuplicateTrialName"
 
 
+@pytest.mark.parametrize(
+    "workflow_class", [PlanEscapingJob, PlanDriveNameJob], ids=["parent", "drive"]
+)
 async def test_trial_names_outside_the_job_rejected(
-    harbor_client: Client, tmp_path: Path
+    harbor_client: Client, tmp_path: Path, workflow_class: type[Any]
 ) -> None:
-    cause, _ = await _planning_failure(
-        harbor_client, PlanEscapingJob, _config(tmp_path)
-    )
+    cause, _ = await _planning_failure(harbor_client, workflow_class, _config(tmp_path))
     assert isinstance(cause, ApplicationError)
     assert cause.type == "HarborInvalidTrialName"
     assert cause.non_retryable

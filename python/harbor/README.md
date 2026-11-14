@@ -30,8 +30,8 @@ ones your jobs use on every Worker, for example `uv add 'harbor[daytona]'`.
 ## Usage
 
 Register `HarborPlugin` on the Client. It registers the plugin's Activities on every Worker built
-from that Client, and makes the Client's data converter use Temporal's pydantic payload converter,
-which harbor's models need. A payload codec or failure converter you configure is kept.
+from that Client, and makes the Client's data converter use a pydantic payload converter, which
+harbor's models need. A payload codec or failure converter you configure is kept.
 
 ```python
 from temporalio.client import Client
@@ -70,18 +70,27 @@ class EvalJob:
     @workflow.run
     async def run(self, config: JobConfig) -> JobStats:
         plan = await plan_job(config)
-        outcomes = await asyncio.gather(
-            *(execute_trial(trial) for trial in plan.trials)
-        )
+        in_flight = asyncio.Semaphore(100)
+
+        async def run(trial):
+            async with in_flight:
+                return await execute_trial(trial)
+
+        outcomes = await asyncio.gather(*(run(t) for t in plan.trials))
         result = await aggregate_job(plan, outcomes)
         return result.stats
 ```
 
 A trial that runs and fails comes back as an outcome, as `harbor run` records it. `execute_trial`
-raises only when a trial could not run at all, for example because a `${VAR}` its config names is
-unset on the worker, and then the job fails, as it does in harbor. `aggregate_job` returns harbor's
+raises when a trial's last attempt failed, for example because a `${VAR}` its config names is unset
+on the worker, and then the job fails, as it does in harbor. `aggregate_job` returns harbor's
 `JobResult`, which carries every trial's result, so the workflow returns only its `stats`: a whole
 `JobResult` for a large job can exceed Temporal's 2 MB payload limit.
+
+The semaphore caps the trials in flight. The trials a workflow task starts travel in one message,
+which Temporal limits to 4 MiB, so the cap times the size of one trial's input must stay under
+4 MiB; past it, the dev server terminates the workflow rather than letting it stall. Set the cap to
+at least the total number of Activity slots across your workers, so none sits idle.
 
 Start it with the same `JobConfig` you would give `harbor run`:
 
@@ -108,22 +117,21 @@ job files into the first run's job directory.
 ## What the plugin does
 
 `plan_job(config)` resolves the job's datasets into tasks in an Activity, as harbor's `Job` does.
-That Activity checks each agent's options against the options the agent declares and looks up each
-dataset's metrics, so a misconfigured job fails here, once, without retrying. Options a job leaves
-out, which an agent can read from the worker's environment variables, and sandbox credentials are
-checked on the worker as each trial starts. The workflow then expands each task, for every agent
-and each of the job's `n_attempts`, into a trial, in harbor's order, and gives each trial a name
-that is stable across replay.
+That Activity checks each agent's options against the options the agent declares, resolves its
+skills and looks up each dataset's metrics, so a misconfigured job fails here, once, without
+retrying. Options a job leaves out, which an agent can read from the worker's environment variables,
+and sandbox credentials are checked on the worker as each trial starts. The workflow then expands
+each task, for every agent and each of the job's `n_attempts`, into a trial, in harbor's order, and
+gives each trial a name that is stable across replay.
 
 `execute_trial(trial)` runs one trial as one Activity and returns a `TrialOutcome`.
-`outcome.result` is harbor's `TrialResult`, with rollout details (token IDs and log-probabilities)
-and agent metadata left out and long exception text shortened, because harbor's aggregation never
-reads them and they are most of a result's size. Harbor writes the complete result to the trial
-directory on the worker that ran the attempt, and a later attempt of the trial that uses the same
-directory starts by deleting it. `outcome.output` is what the worker's `TrialHooks.output`
-returned, or `None` when the attempt could not carry it, for example because the hook raised. The
-example below raises to have a trial run again; if it raises for every attempt, `execute_trial`
-returns an outcome whose `output` is `None`.
+`outcome.result` is harbor's `TrialResult` as harbor wrote it to the trial's `result.json`, after
+removing the secrets it knows of, with rollout details (token IDs and log-probabilities) and agent
+metadata left out and long exception text shortened, because harbor's aggregation never reads them
+and they are most of a result's size. The complete result stays in the trial directory on the
+worker that ran the attempt, and a later attempt of the trial that uses the same directory starts
+by deleting it. `outcome.output` is what the worker's `TrialHooks.output` returned. The example
+below raises to have a trial run again; if it raises on the last attempt, `execute_trial` raises.
 
 Harbor's own phase timeouts still apply inside a trial: harbor stops an agent that runs out of time
 and scores what it did. The plan records, for each trial, the sum of those timeouts (environment
@@ -147,21 +155,24 @@ Temporal runs a trial again when:
 
 - it could not run: its task could not be fetched, or harbor's environment preflight failed on the
   worker, for example because a sandbox provider's credentials are missing;
-- harbor's result shows it failed before its agent started, for example because its environment
+- harbor's result shows it failed before any agent started, for example because its environment
   did not start or the agent's setup failed;
-- an agent run ended in one of harbor's transient provider errors. After a rate limit, the next
-  attempt waits 2 minutes.
+- harbor's error policy retries the exception its result records, such as a provider's transient
+  error or a sandbox that ran out of memory. An exception the policy retries only because it
+  cannot classify it, such as an agent that exited with an error, is returned instead. After a rate
+  limit (harbor's `ApiRateLimitError` or litellm's `RateLimitError`), the next attempt waits 2
+  minutes.
 
-A trial harbor rejects as misconfigured fails without a retry: when the worker creates it, for
-example because a `${VAR}` in its config is unset there, or as it starts, before its environment,
-for example because its agent does not support the skills or MCP servers its config names. Harbor
-records the second kind in the trial's result, which `execute_trial` returns. Pass `retry_policy=`
-to `execute_trial` to replace the default policy. A worker can also send a recorded trial back to
-Temporal, for example one whose verifier failed, by raising an `ApplicationError` from
-`TrialHooks.output` (see below).
+On the last attempt its retry policy allows, `execute_trial` returns that attempt's result instead,
+as harbor does when its own retries run out. With unlimited attempts, Temporal keeps retrying.
 
-When Temporal stops retrying a trial, `execute_trial` returns the most recent outcome any attempt
-produced, or raises if no attempt produced one.
+A trial harbor rejects as misconfigured is not retried. When the worker creates it, for example
+because a `${VAR}` in its config is unset there, `execute_trial` raises. When harbor rejects it as
+it starts, before its environment, for example because its agent does not support the skills or MCP
+servers its config names, harbor records the rejection in the trial's result, which `execute_trial`
+returns. Pass `retry_policy=` to `execute_trial` to replace the default policy. A worker can also
+send a recorded trial back to Temporal, for example one whose verifier failed, by raising an
+`ApplicationError` from `TrialHooks.output` (see below).
 
 ## Customizing trials
 
@@ -239,19 +250,22 @@ the workflow gives `execute_trial`; a hook that runs past it fails the attempt, 
 the trial again.
 
 `output` sees the complete result, unredacted. What it returns is stored in workflow history
-without passing through `redact`, so keep it small and free of secrets. `redact` rewrites the text
-of the result and of every error an attempt raises before it reaches workflow history, but some of
-that text reaches history as harbor recorded it; `TrialHooks.redact` says which.
+without passing through `redact`, so keep it small and free of secrets. Harbor removes the secrets
+it knows of from the trial directory, and `redact` then rewrites the text of the result and of
+every error an attempt raises before it reaches workflow history, but some of that text reaches
+history as harbor recorded it; `TrialHooks.redact` says which.
 
 ## Differences from `harbor run`
 
 - `JobConfig.retry` and each agent's `n_concurrent` and `concurrency_group` are ignored, and
   `plan_job` logs a warning when they are set. `n_concurrent_trials` is unused.
+- `JobConfig.debug` is ignored: one worker's logger serves every job, so a per-job setting cannot
+  apply. A Worker passes on harbor's logs at INFO and above; each trial's `trial.log` has its full
+  DEBUG output.
 - Concurrency is bounded per worker process, by `max_concurrent_activities`. Harbor runs 4 trials
   at a time by default, so set it to what one machine and your providers can take.
 - Any worker can run any trial, so local task paths and credentials must exist on every worker.
-- Pass every secret in `env` as `${VAR}`, with the variable set on every worker. A literal value
-  can reach workflow history unmasked.
+- Pass every secret in `env` as `${VAR}`, with the variable set on every worker.
 - Each trial writes its directory on the worker that ran it. `jobs_dir` must be storage that every
   worker shares for harbor's tools (`harbor view`, `harbor upload`, `harbor job resume`) to see the
   whole job.
@@ -262,9 +276,9 @@ that text reaches history as harbor recorded it; `TrialHooks.redact` says which.
 - Jobs derived from source jobs (`JobConfig.source_jobs`), regrade or diff, are not supported.
   `plan_job` rejects them.
 
-One workflow keeps every trial's outcome in its history and every unfinished trial pending.
-Temporal's limits on pending Activities and on message size put the ceiling for one workflow at
-about 2,000 trials; past it, the workflow cannot schedule its trials and makes no progress.
+One workflow keeps every trial's input and outcome in its history. With trials capped in flight as
+in the example above, the limit that remains is Temporal's 50 MB on one workflow's history. A
+payload codec that compresses payloads makes room for more trials.
 
 ## Composing with other plugins
 

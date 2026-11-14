@@ -1,17 +1,20 @@
-"""A harbor agent that answers correctly and records a large transcript."""
+"""Harbor agents, and a verifier, that the suite runs trials with."""
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from harbor.agents.base import BaseAgent
-from harbor.agents.installed import base as installed
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
+from harbor.models.verifier.result import VerifierResult
+from harbor.verifier.base import BaseVerifier
 
 TRANSCRIPT_AGENT = "tests.harbor_fixtures.agents:TranscriptAgent"
 SKILLS_AGENT = "tests.harbor_fixtures.agents:SkillsAgent"
 FAILING_AGENT = "tests.harbor_fixtures.agents:FailingAgent"
+NAN_VERIFIER = "tests.harbor_fixtures.agents:NanVerifier"
 TOKENS = 4_000
 
 
@@ -54,11 +57,18 @@ class SkillsAgent(TranscriptAgent):
 
 
 class FailingAgent(BaseAgent):
-    """Ends every run with the harbor agent error that ``error`` names."""
+    """Ends every run with an exception of the type ``error`` names.
 
-    def __init__(self, *args: Any, error: str, **kwargs: Any) -> None:
+    Harbor classifies an exception by its type's name alone. The message
+    includes the value of the worker's environment variable ``leak`` names.
+    """
+
+    def __init__(
+        self, *args: Any, error: str, leak: str | None = None, **kwargs: Any
+    ) -> None:
         super().__init__(*args, **kwargs)
-        self._error: type[Exception] = getattr(installed, error)
+        self._error = type(error, (Exception,), {})
+        self._leak = f" ({os.environ[leak]})" if leak else ""
 
     @staticmethod
     def name() -> str:
@@ -73,4 +83,13 @@ class FailingAgent(BaseAgent):
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
-        raise self._error(f"the agent's run ended in {self._error.__name__}")
+        raise self._error(
+            f"the agent's run ended in {self._error.__name__}{self._leak}"
+        )
+
+
+class NanVerifier(BaseVerifier):
+    """Grades every trial with a reward that is not a number."""
+
+    async def verify(self) -> VerifierResult:
+        return VerifierResult(rewards={"reward": float("nan")})

@@ -25,7 +25,13 @@ from harbor.trial.multi_step import MultiStepTrial
 from temporalio.client import Client
 from temporalio.harbor._activity import trial_timeout
 from tests.harbor_fixtures import history, tasks
-from tests.harbor_fixtures.workflows import RunOneTrial, TrialArgs, new_worker
+from tests.harbor_fixtures.workflows import (
+    TRIAL_TIMEOUT,
+    RunOneTrial,
+    RunTrialWithSecondsOfExtraTime,
+    TrialArgs,
+    new_worker,
+)
 
 _UNTIMED = timedelta(hours=2)
 
@@ -253,10 +259,13 @@ def test_multi_step_sums_each_step(trial: TrialConfig) -> None:
     assert trial_timeout(trial, task, _UNTIMED) == timedelta(seconds=expected)
 
 
-@pytest.mark.skipif(
+on_posix = pytest.mark.skipif(
     sys.platform == "win32",
     reason="the local test environment runs task scripts with bash",
 )
+
+
+@on_posix
 async def test_activity_timeout_defaults_to_the_trial_timeout(
     harbor_client: Client, tmp_path: Path
 ) -> None:
@@ -303,3 +312,27 @@ async def test_activity_timeout_defaults_to_the_trial_timeout(
         (timedelta(minutes=30 + 1), timedelta(minutes=2)),
         (timedelta(minutes=7), timedelta(minutes=2)),
     ]
+
+
+@on_posix
+async def test_extra_time_in_seconds_is_accepted(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    config = TrialConfig(
+        task=TaskConfig(path=tasks.passing(tmp_path / "tasks")),
+        trial_name="answers__0",
+        trials_dir=tmp_path / "trials",
+        agent=AgentConfig(name="oracle"),
+        environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
+    )
+    async with new_worker(harbor_client, RunTrialWithSecondsOfExtraTime) as worker:
+        handle = await harbor_client.start_workflow(
+            RunTrialWithSecondsOfExtraTime.run,
+            config,
+            id=f"trial-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        await handle.result()
+    [event] = await history.scheduled(handle)
+    timeout = event.activity_task_scheduled_event_attributes.start_to_close_timeout
+    assert timeout.ToTimedelta() == TRIAL_TIMEOUT * 1.5 + timedelta(seconds=60)

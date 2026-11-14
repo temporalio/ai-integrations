@@ -27,7 +27,6 @@ from harbor.models.trial.result import ExceptionInfo, StepResult, TrialResult
 from harbor.trial.trial import Trial
 from pydantic import JsonValue
 
-from temporalio.activity import ActivityCancellationDetails
 from temporalio.api.common.v1 import Payload
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.contrib.pydantic import (
@@ -36,7 +35,7 @@ from temporalio.contrib.pydantic import (
 )
 from temporalio.converter import DefaultFailureConverterWithEncodedAttributes
 from temporalio.exceptions import ActivityError, ApplicationError, FailureError
-from temporalio.harbor import HarborPlugin, TrialContext, TrialHooks, TrialOutcome
+from temporalio.harbor import HarborPlugin, TrialContext, TrialHooks
 from temporalio.harbor._activity import HarborActivities
 from temporalio.harbor._types import RunTrialInput
 from temporalio.testing import ActivityEnvironment
@@ -191,10 +190,14 @@ async def test_redact_reaches_results_errors_and_details(
             id=f"trial-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        outcome = await handle.result()
+        if hooks is RejectMissingReward:
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+        else:
+            outcome = await handle.result()
+            assert outcome.result.exception_info is not None
+            assert "[REDACTED]" in outcome.result.exception_info.exception_message
 
-    assert outcome.result.exception_info is not None
-    assert "[REDACTED]" in outcome.result.exception_info.exception_message
     recorded = await history.recorded_output(handle)
     assert "[REDACTED]" in recorded
     assert all(secret not in recorded for secret in secrets)
@@ -323,14 +326,8 @@ async def test_worker_failure_converter_encodes_every_level(
             id=f"trial-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        if hooks is FailInScope:
-            with pytest.raises(WorkflowFailureError):
-                await handle.result()
-        else:
-            # The hook's non-retryable error carried the outcome back.
-            outcome = await handle.result()
-            assert outcome.result.exception_info is not None
-            assert "[REDACTED]" in outcome.result.exception_info.exception_message
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
 
     [failure] = await history.activity_failures(handle)
     converter = encoding.data_converter.payload_converter
@@ -397,7 +394,7 @@ class RedactFailsOnRetry(Redacting):
         return super().redact(text, context)
 
 
-async def test_failed_redact_keeps_the_last_outcome(
+async def test_failed_redact_of_a_result_sends_none_of_it(
     client: Client, tmp_path: Path
 ) -> None:
     config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials")
@@ -409,9 +406,9 @@ async def test_failed_redact_keeps_the_last_outcome(
             id=f"trial-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        outcome = await handle.result()
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
 
-    assert outcome.attempt == 1
     assert await history.final_attempts(handle) == [2]
     [failure] = await history.activity_failures(handle)
     assert failure.application_failure_info.type == "HarborRedactFailed"
@@ -446,6 +443,149 @@ async def test_hooks_are_bounded_by_extra_time(client: Client, tmp_path: Path) -
     assert isinstance(error.cause, ApplicationError)
     assert error.cause.type == "HarborHookTimeout"
     assert "SlowToCreate.trial_created" in error.cause.message
+
+
+class OverrunThenCleanUp(TrialHooks):
+    """Runs out of extra time in output; the scope then has cleanup to await."""
+
+    @contextlib.asynccontextmanager
+    async def scope(self, context: TrialContext) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await asyncio.sleep(0.1)
+
+    async def output(self, result: TrialResult, context: TrialContext) -> JsonValue:
+        await asyncio.sleep(10)
+        return None
+
+
+async def test_hook_that_overran_is_blamed_not_the_scope(
+    client: Client, tmp_path: Path
+) -> None:
+    config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials")
+    with pytest.raises(FailureError) as raised:
+        await _environment(client).run(
+            HarborActivities(hooks=OverrunThenCleanUp()).run_trial,
+            RunTrialInput(config=config, extra_time=timedelta(seconds=1)),
+        )
+
+    failure = raised.value.failure
+    assert failure is not None
+    assert failure.application_failure_info.type == "HarborHookTimeout"
+    assert "OverrunThenCleanUp.output" in failure.message
+
+
+class FailToAdjust(TrialHooks):
+    """Fails in trial_created, by raising or by running out of time."""
+
+    def __init__(self, hang: bool) -> None:
+        self.hang = hang
+        self.trial: Trial | None = None
+
+    async def trial_created(self, trial: Trial, context: TrialContext) -> None:
+        self.trial = trial
+        if self.hang:
+            await asyncio.sleep(10)
+        raise RuntimeError("could not adjust the trial")
+
+
+@pytest.mark.parametrize("hang", [False, True], ids=["raises", "times-out"])
+async def test_trial_log_closed_when_the_trial_never_runs(
+    client: Client, tmp_path: Path, hang: bool
+) -> None:
+    hooks = FailToAdjust(hang)
+    config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials")
+    with pytest.raises(FailureError):
+        await _environment(client).run(
+            HarborActivities(hooks=hooks).run_trial,
+            RunTrialInput(config=config, extra_time=timedelta(seconds=1)),
+        )
+
+    assert hooks.trial is not None
+    assert hooks.trial.logger.handlers == []
+
+
+_WORKER_SECRET = "sk-worker-0123456789abcdef"
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["AgentAuthenticationError", "ApiOverloadedError"],
+    ids=["returned", "retried"],
+)
+async def test_secret_harbor_scrubbed_stays_on_the_worker(
+    client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    # The agent's error quotes a key it was given; harbor scrubs it from the
+    # trial directory without the worker's redact.
+    monkeypatch.setenv("HARBOR_TEST_SECRET", _WORKER_SECRET)
+    agent = AgentConfig(
+        import_path=agents.FAILING_AGENT,
+        kwargs={"error": error, "leak": "HARBOR_TEST_SECRET"},
+        env={"PROVIDER_API_KEY": "${HARBOR_TEST_SECRET}"},
+    )
+    config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials", agent)
+    run_trial = HarborActivities(hooks=TrialHooks()).run_trial
+    if error == "ApiOverloadedError":
+        with pytest.raises(FailureError) as raised:
+            await _environment(client).run(run_trial, _input(config))
+        assert raised.value.failure is not None
+        text = raised.value.failure.message
+    else:
+        outcome = await _environment(client).run(run_trial, _input(config))
+        assert outcome.result.exception_info is not None
+        text = outcome.result.model_dump_json()
+
+    assert "[REDACTED]" in text
+    assert _WORKER_SECRET not in text
+
+
+async def test_result_harbor_left_invalid_still_comes_back(
+    client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Harbor removes the 3 from every string of result.json, so UUIDs and
+    # timestamps in it no longer validate.
+    monkeypatch.setenv("HARBOR_TEST_SECRET", _WORKER_SECRET)
+    agent = AgentConfig(
+        import_path=agents.FAILING_AGENT,
+        kwargs={"error": "AgentAuthenticationError", "leak": "HARBOR_TEST_SECRET"},
+        env={"PROVIDER_API_KEY": "${HARBOR_TEST_SECRET}", "AUTH_RETRIES": "3"},
+    )
+    config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials", agent)
+    outcome = await _environment(client).run(
+        HarborActivities(hooks=TrialHooks()).run_trial, _input(config)
+    )
+
+    recorded = outcome.result.exception_info
+    assert recorded is not None
+    assert recorded.exception_type == "AgentAuthenticationError"
+    assert "[REDACTED]" in recorded.exception_message
+    assert _WORKER_SECRET not in outcome.result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "extra_env", [{}, {"AUTH_RETRIES": "3"}], ids=["name", "name-and-digits"]
+)
+async def test_harbor_scrub_leaves_the_names_aggregation_reads(
+    client: Client, tmp_path: Path, extra_env: dict[str, str]
+) -> None:
+    # Harbor takes GIT_AUTHOR_NAME for a secret and removes its value, the
+    # task's name, from every string of result.json.
+    agent = AgentConfig(
+        import_path=agents.FAILING_AGENT,
+        kwargs={"error": "AgentAuthenticationError"},
+        env={"GIT_AUTHOR_NAME": "answers", **extra_env},
+    )
+    config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials", agent)
+    outcome = await _environment(client).run(
+        HarborActivities(hooks=TrialHooks()).run_trial, _input(config)
+    )
+
+    written = (tmp_path / "trials" / "answers__0" / "result.json").read_text()
+    assert "answers" not in written
+    assert outcome.result.task_name == "answers"
+    assert outcome.result.trial_name == "answers__0"
 
 
 class QuickOutput(TrialHooks):
@@ -500,9 +640,9 @@ async def test_hooks_share_one_extra_time(client: Client, tmp_path: Path) -> Non
             id=f"trial-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        outcome = await handle.result()
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
 
-    assert outcome.output is None
     [failure] = await history.activity_failures(handle)
     assert failure.application_failure_info.type == "HarborHookTimeout"
     assert "SlowTwice.output" in failure.message
@@ -623,13 +763,15 @@ async def test_redact_sees_text_before_it_is_shortened(
 
     async def run_and_record(trial: Trial) -> TrialResult:
         result = await run(trial)
-        return result.model_copy(
+        result = result.model_copy(
             update={
                 "exception_info": recorded,
                 "step_results": [StepResult(step_name="one", exception_info=recorded)],
                 "agent_execution": result.agent_execution if agent_started else None,
             }
         )
+        trial.paths.result_path.write_text(result.model_dump_json())
+        return result
 
     monkeypatch.setattr(Trial, "run", run_and_record)
     config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials")
@@ -771,17 +913,10 @@ class DecodeAlwaysFails(PydanticPayloadConverter):
         raise RuntimeError("the payload could not be decoded")
 
 
-async def test_error_the_converter_cannot_decode_fails_with_the_outcome(
+async def test_error_the_converter_cannot_decode_is_not_retried(
     client: Client, tmp_path: Path
 ) -> None:
-    earlier = await _environment(client).run(
-        HarborActivities(hooks=TrialHooks()).run_trial,
-        _input(_trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials")),
-    )
     env = ActivityEnvironment(client=_encoding(client, TrialHooks()))
-    env.info = dataclasses.replace(
-        env.info, heartbeat_details=[{"outcome": earlier.model_dump(mode="json")}]
-    )
     env.payload_converter = DecodeAlwaysFails()
     config = _trial(tmp_path / "missing", tmp_path / "trials")
     with pytest.raises(FailureError) as raised:
@@ -792,41 +927,6 @@ async def test_error_the_converter_cannot_decode_fails_with_the_outcome(
     info = failure.application_failure_info
     assert info.type == "HarborFailureNotConverted"
     assert info.non_retryable
-    carried = pydantic_data_converter.payload_converter.from_payloads(
-        list(info.details.payloads)
-    )
-    assert TrialOutcome.model_validate(carried[-1]).result.id == earlier.result.id
-
-
-class RefusesOutcomes(PydanticPayloadConverter):
-    """Cannot convert a trial's outcome, as a converter with a fault does."""
-
-    def to_payloads(self, values: Sequence[Any]) -> list[Payload]:
-        if any(isinstance(value, TrialOutcome) for value in values):
-            raise RuntimeError("the outcome could not be converted")
-        return super().to_payloads(values)
-
-
-async def test_outcome_that_cannot_be_converted_is_left_off_the_error(
-    client: Client, tmp_path: Path
-) -> None:
-    outcome = await _environment(client).run(
-        HarborActivities(hooks=TrialHooks()).run_trial,
-        _input(_trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials")),
-    )
-    env = _environment(client)
-    env.info = dataclasses.replace(
-        env.info, heartbeat_details=[{"outcome": outcome.model_dump(mode="json")}]
-    )
-    env.payload_converter = RefusesOutcomes()
-    config = _trial(tmp_path / "missing", tmp_path / "trials")
-    with pytest.raises(FailureError) as raised:
-        await env.run(HarborActivities(hooks=TrialHooks()).run_trial, _input(config))
-
-    failure = raised.value.failure
-    assert failure is not None
-    assert failure.application_failure_info.type == "FileNotFoundError"
-    assert not failure.application_failure_info.details.payloads
 
 
 class RedactReturnsNone(TrialHooks):
@@ -904,62 +1004,3 @@ async def test_retried_error_fails_as_redact_does(
     assert failure.message == (
         f"RedactFailsOnSecondSight.redact {failed} for trial {config.trial_name}"
     )
-
-
-@pytest.mark.parametrize(
-    ("details", "error"),
-    [
-        pytest.param(
-            ActivityCancellationDetails(cancel_requested=True), None, id="requested"
-        ),
-        pytest.param(
-            ActivityCancellationDetails(paused=True), "ActivityPause", id="paused"
-        ),
-        pytest.param(
-            ActivityCancellationDetails(reset=True), "ActivityReset", id="reset"
-        ),
-        pytest.param(ActivityCancellationDetails(), "CancelledError", id="unrequested"),
-    ],
-)
-async def test_cancellation_keeps_the_outcome_unless_the_workflow_asked(
-    client: Client,
-    tmp_path: Path,
-    details: ActivityCancellationDetails,
-    error: str | None,
-) -> None:
-    earlier = await _environment(client).run(
-        HarborActivities(hooks=TrialHooks()).run_trial,
-        _input(_trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials")),
-    )
-    env = _environment(client)
-    env.info = dataclasses.replace(
-        env.info, heartbeat_details=[{"outcome": earlier.model_dump(mode="json")}]
-    )
-    hooks = Recording()
-    config = _trial(tasks.slow(tmp_path / "tasks", 30), tmp_path / "trials")
-    running = asyncio.create_task(
-        env.run(HarborActivities(hooks=hooks).run_trial, _input(config))
-    )
-    for _ in range(200):
-        if "created 1" in hooks.events:
-            break
-        await asyncio.sleep(0.05)
-    await asyncio.sleep(0.5)
-    env.cancel(details)
-
-    if error is None:
-        with pytest.raises(asyncio.CancelledError):
-            await running
-    else:
-        with pytest.raises(FailureError) as raised:
-            await running
-        failure = raised.value.failure
-        assert failure is not None
-        info = failure.application_failure_info
-        assert info.type == error
-        assert not info.non_retryable
-        carried = pydantic_data_converter.payload_converter.from_payloads(
-            list(info.details.payloads)
-        )
-        assert TrialOutcome.model_validate(carried[-1]).result.id == earlier.result.id
-    assert hooks.events == ["enter 1", "created 1", "exit 1 CancelledError"]

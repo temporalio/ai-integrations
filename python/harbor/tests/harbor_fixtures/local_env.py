@@ -4,9 +4,10 @@ Real environments are containers or remote sandboxes; this one lets the suite
 run genuine harbor trials with no container runtime and no credentials. It
 honors the same contract a bind-mounting environment gives harbor: ``/logs``
 is the trial directory itself, so harbor reads rewards and logs straight from
-it. ``/tests``, ``/solution`` and ``/harbor`` live under a private temporary
-root. Harbor's own commands are rewritten onto those locations; task scripts
-find ``/logs`` through ``$HARBOR_LOGS``.
+it. Every other sandbox path, such as ``/tests`` or ``/solution``, lives under
+a private temporary root. Harbor's own commands are rewritten onto those
+locations, all but ``/dev``; task scripts find ``/logs`` through
+``$HARBOR_LOGS``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import contextlib
 import os
 import re
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -24,9 +26,8 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import EnvironmentCapabilities
 
 _ROOTS = ("/logs", "/tests", "/solution", "/harbor")
-_ROOT_RE = re.compile(
-    r"(?<![\w./])(" + "|".join(re.escape(r) for r in _ROOTS) + r")(?=/|\b)"
-)
+# The first component of an absolute path in a command.
+_ROOT_RE = re.compile(r"(?<![\w./}])/(?!dev(?![\w.-]))[\w.-]+")
 
 
 class LocalEnvironment(BaseEnvironment):
@@ -60,7 +61,7 @@ class LocalEnvironment(BaseEnvironment):
         return self._map(path).resolve() == Path(host_path).resolve()
 
     def _rewrite(self, command: str) -> str:
-        return _ROOT_RE.sub(lambda m: str(self._map(m.group(1))), command)
+        return _ROOT_RE.sub(lambda m: str(self._map(m.group(0))), command)
 
     async def start(self, force_build: bool) -> None:
         for root in _ROOTS:
@@ -86,13 +87,15 @@ class LocalEnvironment(BaseEnvironment):
             env={**os.environ, **(env or {}), "HARBOR_LOGS": str(self._map("/logs"))},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
         except BaseException:
-            # Timed out or cancelled: never leave the command running.
+            # Timed out or cancelled: never leave the command, or anything it
+            # started, running.
             with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
             await proc.wait()
             raise
         assert proc.returncode is not None  # communicate() waited for exit
@@ -117,9 +120,11 @@ class LocalEnvironment(BaseEnvironment):
         shutil.copy2(self._map(source_path), target_path)
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        if self._is_host_path(source_dir, target_dir):
-            return
         source = self._map(source_dir)
+        # /logs is the trial directory, so harbor can collect a directory into
+        # itself.
+        if Path(target_dir).resolve().is_relative_to(source.resolve()):
+            return
         if source.exists():
             shutil.copytree(source, target_dir, dirs_exist_ok=True)
 

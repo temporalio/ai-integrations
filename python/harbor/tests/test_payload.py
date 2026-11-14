@@ -28,10 +28,7 @@ from harbor.utils.pass_at_k import compute_pass_at_k_by_evals
 
 from temporalio.api.common.v1 import Payload
 from temporalio.client import Client
-from temporalio.contrib.pydantic import (
-    PydanticPayloadConverter,
-    pydantic_data_converter,
-)
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import (
     DataConverter,
     DefaultFailureConverterWithEncodedAttributes,
@@ -39,6 +36,8 @@ from temporalio.converter import (
 )
 from temporalio.harbor import HarborPlugin
 from temporalio.harbor._activity import _cap, _strip
+from temporalio.harbor._plugin import _PayloadConverter
+from temporalio.harbor._types import RunTrialInput
 from tests.harbor_fixtures import agents, tasks
 from tests.harbor_fixtures.workflows import (
     PlanJob,
@@ -252,7 +251,7 @@ async def test_plugin_keeps_a_payload_codec(client: Client, tmp_path: Path) -> N
     config["plugins"] = [HarborPlugin()]
     coded = Client(**config)
     assert coded.data_converter.payload_codec is codec
-    assert isinstance(coded.data_converter.payload_converter, PydanticPayloadConverter)
+    assert coded.data_converter.payload_converter_class is _PayloadConverter
 
     job = JobConfig(
         job_name="coded",
@@ -288,11 +287,29 @@ def test_plugin_keeps_a_failure_converter() -> None:
     configured = HarborPlugin().configure_client(
         {"data_converter": converter}  # type: ignore[typeddict-item]
     )["data_converter"]
-    assert configured.payload_converter_class is PydanticPayloadConverter
+    assert configured.payload_converter_class is _PayloadConverter
     assert (
         configured.failure_converter_class
         is DefaultFailureConverterWithEncodedAttributes
     )
+
+
+def test_agent_env_reaches_the_trial_as_set() -> None:
+    # Harbor would mask these for their names.
+    env = {"TOKENIZERS_PARALLELISM": "false", "GIT_AUTHOR_NAME": "evals"}
+    sent = RunTrialInput(
+        config=TrialConfig(
+            task=TaskConfig(path=Path("/tasks/t")),
+            trial_name="t__0",
+            agent=AgentConfig(name="oracle", env=env),
+        ),
+        extra_time=timedelta(minutes=1),
+    )
+    converter = HarborPlugin().configure_client({})["data_converter"]  # type: ignore[typeddict-item]
+    [received] = converter.payload_converter.from_payloads(
+        converter.payload_converter.to_payloads([sent]), [RunTrialInput]
+    )
+    assert received.config.agent.env == env
 
 
 @on_posix

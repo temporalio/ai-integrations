@@ -60,8 +60,9 @@ class TrialHooks:
 
     The Activity returns the redacted result with what :meth:`output` gave.
     It raises instead, and Temporal retries the trial, when the trial could
-    not run for a reason other than its configuration, failed before its
-    agent started, or its agent's run ended in a transient provider error
+    not run or failed before its agent started, for a reason other than its
+    configuration, or its result records an exception that harbor's error
+    policy classifies and retries, unless this is the trial's last attempt
     (see :func:`temporalio.harbor.execute_trial`).
 
     Hooks run on the worker's event loop, beside every other trial the worker
@@ -84,7 +85,9 @@ class TrialHooks:
         harbor could record a result. It reaches Temporal as it leaves the
         scope, so a scope may raise its own exception from it. A scope that
         suppresses an exception fails the attempt anyway when the trial
-        produced no result.
+        produced no result. The scope's exit gets whatever ``extra_time`` the
+        other hooks left; if that runs out while an exception is leaving the
+        scope, that exception reaches Temporal, not the timeout.
 
         The default does nothing.
         """
@@ -109,14 +112,11 @@ class TrialHooks:
 
         To have Temporal run the trial again, raise an ``ApplicationError``;
         its type, message, ``non_retryable`` and ``next_retry_delay`` are
-        yours to choose. The Activity attaches the attempt's outcome to its
-        details, so when Temporal stops retrying,
-        :func:`temporalio.harbor.execute_trial` returns the most recent
-        outcome any attempt produced. Any other exception, or a return value
-        that cannot be converted to JSON or that brings the outcome past
-        about 2 MB, fails the attempt without a retry, and
-        :func:`temporalio.harbor.execute_trial` returns the attempt's outcome
-        without an ``output``.
+        yours to choose. If Temporal does not run the trial again,
+        :func:`temporalio.harbor.execute_trial` raises it as an
+        ``ActivityError``. Any other exception, or a return value that cannot
+        be converted to JSON or that brings the outcome past about 2 MB,
+        fails the attempt without a retry.
 
         The default returns ``None``.
         """
@@ -142,9 +142,7 @@ class TrialHooks:
         harbor recorded when the rewritten text is not valid for it.
 
         If it raises or returns something other than a ``str``, the attempt
-        fails without a retry and sends none of its error's text, and
-        :func:`temporalio.harbor.execute_trial` returns the most recent
-        outcome any attempt produced, if there is one.
+        fails without a retry and sends none of its error's text.
 
         The default returns ``text`` unchanged.
         """

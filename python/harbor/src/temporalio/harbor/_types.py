@@ -6,16 +6,14 @@ this module.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import timedelta
-from typing import Any
 from uuid import UUID
 
 from harbor.models.job.config import DatasetConfig, JobConfig
 from harbor.models.job.result import JobResult
 from harbor.models.trial.config import TaskConfig, TrialConfig
 from harbor.models.trial.result import TrialResult
-from pydantic import BaseModel, JsonValue, ValidationError
+from pydantic import BaseModel, JsonValue
 
 from temporalio.exceptions import ApplicationError
 
@@ -37,9 +35,10 @@ class PlanJobResult(BaseModel):
     """Output of the planning Activity.
 
     ``task_names`` and ``timeouts`` follow ``task_configs``; each task's
-    ``timeouts`` follow the job's agents. ``datasets`` are the job's datasets
-    with each package dataset's ``ref`` pinned to the content hash its tasks
-    were resolved from.
+    ``timeouts`` follow the job's agents. Each git task in ``task_configs`` is
+    pinned to the commit it was resolved to. ``datasets`` are the job's
+    datasets with each package dataset's ``ref`` pinned to the content hash
+    its tasks were resolved from.
     """
 
     task_configs: list[TaskConfig]
@@ -67,9 +66,10 @@ def check_trial_name(name: str) -> None:
     """Fail without a retry unless ``name`` is a single path component.
 
     A trial's name is its directory under ``trials_dir``, which each attempt
-    deletes before it runs.
+    deletes before it runs. ``:`` is rejected because on Windows it names a
+    drive.
     """
-    if name in ("", ".", "..") or "/" in name or "\\" in name:
+    if name in ("", ".", "..") or any(c in name for c in "/\\:"):
         raise ApplicationError(
             f"trial name {name!r} is not a single path component",
             type="HarborInvalidTrialName",
@@ -83,9 +83,10 @@ class TemporalJobPlan(BaseModel):
     Produced by :func:`temporalio.harbor.plan_job`. ``trials`` is what the
     workflow fans out; the rest is what :func:`temporalio.harbor.aggregate_job`
     needs. ``id`` is the job's id, as harbor records it in each trial's
-    ``job_id`` and in the job's result. In ``config``, each package dataset's
-    ``ref`` is pinned to the content hash its tasks were resolved from, and
-    its ``version`` is cleared.
+    ``job_id`` and in the job's result. Each git task is pinned to the commit
+    it was resolved to, as the job's ``lock.json`` records it. In ``config``,
+    each package dataset's ``ref`` is pinned to the content hash its tasks
+    were resolved from, and its ``version`` is cleared.
     """
 
     id: UUID
@@ -108,33 +109,19 @@ class TrialOutcome(BaseModel):
     ``result`` is harbor's result for the trial, passed through
     :meth:`temporalio.harbor.TrialHooks.redact`, less rollout details and
     agent metadata, which harbor's aggregation does not read, and with long
-    exception messages and tracebacks shortened. Harbor writes the complete
-    result to the trial directory on the worker that ran the attempt, and a
-    later attempt of the trial that uses the same directory starts by
-    deleting it. ``attempt`` is the Activity attempt that produced the
-    outcome, counting from 1, which can be earlier than the last attempt
-    Temporal ran. ``output`` is what the worker's
-    :meth:`temporalio.harbor.TrialHooks.output` returned, or ``None`` when
-    the attempt could not carry it, for example because the hook raised.
+    exception messages and tracebacks shortened. It is read from the
+    ``result.json`` harbor writes to the trial directory on the worker that
+    ran the attempt, after harbor removed the secrets it knows of from that
+    directory; the file keeps what the outcome leaves out, and a later
+    attempt of the trial that uses the same directory starts by deleting it.
+    ``attempt`` is the Activity attempt that produced the outcome, counting
+    from 1. ``output`` is what the worker's
+    :meth:`temporalio.harbor.TrialHooks.output` returned.
     """
 
     result: TrialResult
     attempt: int
     output: JsonValue = None
-
-
-def as_outcome(value: Any) -> TrialOutcome | None:
-    """``value`` as a :class:`TrialOutcome`, or ``None`` if it is not one."""
-    try:
-        return TrialOutcome.model_validate(value)
-    except ValidationError:
-        return None
-
-
-def heartbeat_outcome(details: Sequence[Any]) -> TrialOutcome | None:
-    """The outcome a trial Activity's last heartbeat carried, if any."""
-    last = details[-1] if details else None
-    return as_outcome(last.get("outcome")) if isinstance(last, dict) else None
 
 
 class AggregateJobInput(BaseModel):

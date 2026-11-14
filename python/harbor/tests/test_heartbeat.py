@@ -71,6 +71,9 @@ async def _beats(
     result = outcome.result
     assert result.verifier_result is not None
     assert result.verifier_result.rewards == {"reward": 1.0}
+    # Only progress, never the trial's result: the server keeps every pending
+    # Activity's last heartbeat.
+    assert all(set(detail) == {"phase", "elapsed_sec"} for _, detail in beats)
     return beats
 
 

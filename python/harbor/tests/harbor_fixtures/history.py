@@ -27,6 +27,16 @@ async def final_attempts(handle: WorkflowHandle[Any, Any]) -> list[int]:
     ]
 
 
+async def retried_failures(handle: WorkflowHandle[Any, Any]) -> list[Failure]:
+    """The failure of the attempt before each activity's last, when it was retried."""
+    return [
+        event.activity_task_started_event_attributes.last_failure
+        async for event in handle.fetch_history_events()
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED
+        and event.activity_task_started_event_attributes.HasField("last_failure")
+    ]
+
+
 async def summaries(handle: WorkflowHandle[Any, Any], converter: Any) -> list[str]:
     """The summary each scheduled activity carries for the Temporal UI."""
     out = []
