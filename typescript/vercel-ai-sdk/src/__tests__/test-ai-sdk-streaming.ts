@@ -30,7 +30,10 @@ class StreamingTestModel implements LanguageModelV4 {
   readonly provider = 'temporal';
   readonly modelId = 'StreamingTestModel';
 
-  constructor(private readonly parts: LanguageModelV4StreamPart[]) {}
+  constructor(
+    private readonly parts: LanguageModelV4StreamPart[],
+    private readonly stallMs = 0
+  ) {}
 
   get supportedUrls(): Record<string, RegExp[]> {
     return {};
@@ -41,10 +44,11 @@ class StreamingTestModel implements LanguageModelV4 {
   }
 
   async doStream(_options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
-    const parts = this.parts;
+    const { parts, stallMs } = this;
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
-        start(controller) {
+        async start(controller) {
+          if (stallMs) await new Promise((resolve) => setTimeout(resolve, stallMs));
           for (const part of parts) controller.enqueue(part);
           controller.close();
         },
@@ -55,10 +59,10 @@ class StreamingTestModel implements LanguageModelV4 {
   }
 }
 
-function streamingProvider(parts: LanguageModelV4StreamPart[]): ProviderV4 {
+function streamingProvider(parts: LanguageModelV4StreamPart[], stallMs = 0): ProviderV4 {
   return {
     specificationVersion: 'v4',
-    languageModel: (_modelId: string): LanguageModelV4 => new StreamingTestModel(parts),
+    languageModel: (_modelId: string): LanguageModelV4 => new StreamingTestModel(parts, stallMs),
     embeddingModel: (_modelId: string): EmbeddingModelV4 => {
       throw new Error('Not implemented');
     },
@@ -87,20 +91,24 @@ function recordingClient(published: unknown[][]): Client {
 }
 
 async function runStreamingActivity(
-  parts: LanguageModelV4StreamPart[]
-): Promise<{ result: InvokeModelResult; published: unknown[][] }> {
-  const activities = createActivities(streamingProvider(parts)) as {
+  parts: LanguageModelV4StreamPart[],
+  // The heartbeat timeout the plugin schedules by default, and a provider that answers at once.
+  { heartbeatTimeoutMs = 10_000, stallMs = 0 } = {}
+): Promise<{ result: InvokeModelResult; published: unknown[][]; heartbeats: number }> {
+  const activities = createActivities(streamingProvider(parts, stallMs)) as {
     invokeModelStreaming: (args: InvokeModelStreamingArgs) => Promise<InvokeModelResult>;
   };
   const published: unknown[][] = [];
-  const env = new MockActivityEnvironment(undefined, { client: recordingClient(published) });
+  const env = new MockActivityEnvironment({ heartbeatTimeoutMs }, { client: recordingClient(published) });
+  let heartbeats = 0;
+  env.on('heartbeat', () => heartbeats++);
   const result = (await env.run(activities.invokeModelStreaming, {
     modelId: 'StreamingTestModel',
     options: { prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] },
     streamingTopic: 'test-topic',
     streamingBatchInterval: '10ms',
   } satisfies InvokeModelStreamingArgs)) as InvokeModelResult;
-  return { result, published };
+  return { result, published, heartbeats };
 }
 
 const usage: LanguageModelV4Usage = {
@@ -125,7 +133,7 @@ test('invokeModelStreaming publishes every part and assembles the final result',
     { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
   ];
 
-  const { result, published } = await runStreamingActivity(parts);
+  const { result, published, heartbeats } = await runStreamingActivity(parts);
 
   t.deepEqual(result.content, [
     { type: 'text', text: 'Hello, world!', providerMetadata: undefined },
@@ -148,6 +156,22 @@ test('invokeModelStreaming publishes every part and assembles the final result',
   // Every stream part (including `raw`) is published to the topic exactly once.
   const totalPublished = published.reduce((sum, batch) => sum + batch.length, 0);
   t.is(totalPublished, parts.length);
+
+  // The call ends well before half the timeout, so its 12 parts send no heartbeat.
+  t.is(heartbeats, 0);
+});
+
+test('invokeModelStreaming sends no heartbeat when heartbeatTimeout is 0', async (t) => {
+  // The provider stalls long enough for a timer to fire, if the Activity started one.
+  const { heartbeats } = await runStreamingActivity(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
+    ],
+    { heartbeatTimeoutMs: 0, stallMs: 100 }
+  );
+
+  t.is(heartbeats, 0);
 });
 
 test('invokeModelStreaming retains the latest text provider metadata', async (t) => {

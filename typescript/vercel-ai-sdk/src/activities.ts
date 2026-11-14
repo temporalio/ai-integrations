@@ -28,7 +28,8 @@ import { encodeContentFileData, encodeResultFileData } from './file-data';
 const encoder = new TextEncoder();
 
 // A slow provider call must not look like a lost Worker, and a cancellation request
-// reaches the Activity only through heartbeats.
+// reaches the Activity only through heartbeats. This timer sends the only heartbeats, the
+// first one half the timeout in, so a shorter call sends none.
 function heartbeatUntilDisposed(): Disposable {
   const ctx = Context.current();
   const timeoutMs = ctx.info.heartbeatTimeoutMs;
@@ -379,8 +380,6 @@ export function createActivities(
         const { done, value } = await callProvider(() => reader.read());
         if (done) break;
         const part = encodeContentFileData(value);
-
-        Context.current().heartbeat();
 
         // Publish the raw stream part as JSON so consumers can switch on
         // the native AI SDK type. Accumulation below is for the final
