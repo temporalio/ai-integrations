@@ -374,9 +374,10 @@ def test_seam_guard(
     message = str(excinfo.value)
     assert f"{module_name}.{attr}" in message
     assert _workflow_runtime.installed_version() in message
-    # The message names the releases the suite ran against.
+    # The message names the tested range (pinned to the lock by
+    # test_dependency_range.py).
     assert _workflow_runtime.TESTED_VERSIONS in message
-    assert "1.23.0 through 1.26.0" in message
+    assert "1.23.0 through" in message
 
 
 def test_sync_tool_seam_guard(monkeypatch: pytest.MonkeyPatch) -> None:

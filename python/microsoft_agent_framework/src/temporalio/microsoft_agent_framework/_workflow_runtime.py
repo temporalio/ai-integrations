@@ -50,8 +50,10 @@ from temporalio.microsoft_agent_framework.workflow import (
     MicrosoftAgentFrameworkWorkflowError,
 )
 
-TESTED_VERSIONS = "1.23.0 through 1.26.0"
-"""The ``agent-framework-core`` releases this plugin's test suite ran against."""
+TESTED_VERSIONS = "1.23.0 through 1.24.0"
+"""The ``agent-framework-core`` range the suite runs on: from the floor the plugin was first
+tested on through the version ``uv.lock`` pins, which CI runs on every change. A test keeps the
+upper bound equal to the lock, so a lock bump moves this string and the README sentence with it."""
 
 logger = logging.getLogger(__name__)
 

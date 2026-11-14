@@ -10,7 +10,7 @@ This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) runs a [M
 uv add temporalio-microsoft-agent-framework
 ```
 
-The plugin depends on `agent-framework-core` (1.23.0 or newer, below 2; tested with 1.23.0 through 1.26.0). Add the provider package you use, for example `agent-framework-openai`. Replay safety rests on a few private names of the framework, so a worker or replayer fails at start with a message naming the name and the tested range if a release moves one of them.
+The plugin depends on `agent-framework-core` (1.23.0 or newer, below 2). The tested range, 1.23.0 through 1.24.0, runs from the floor the plugin was first tested on through the version `uv.lock` pins, which CI runs on every change; a test keeps the upper bound equal to the lock, so a lock bump moves the range and this sentence in the same PR. Add the provider package you use, for example `agent-framework-openai`. Replay safety rests on a few private names of the framework, so a worker or replayer fails at start with a message naming the name and the tested range if a release moves one of them.
 
 ## Quickstart
 
