@@ -41,7 +41,7 @@ from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from temporalio import activity as activity_mod
 from temporalio.converter import DataConverter
@@ -51,6 +51,9 @@ from temporalio.deepagents.workflow import DeepAgentsWorkflowError
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
+
+if TYPE_CHECKING:
+    from langchain_core.language_models import ModelProfile
 
 # Runtime floor for the Deep Agents control loop. Kept in a constant so
 # static checkers do not narrow `sys.version_info` comparisons into
@@ -68,6 +71,9 @@ class DeepAgentsPlugin(SimplePlugin):
             LLM-SDK retries disabled (Temporal owns retries).
         model_activity_options: ``ActivityConfig`` (or ``Mapping[model_name,
             ActivityConfig]``) for the model activities — timeouts, retry policy.
+        model_profiles: LangChain model profiles keyed by model name. A
+            ``TemporalModel`` built without ``profile=`` takes its model's entry;
+            Deep Agents sizes summarization from it.
         tool_activity_options: ``ActivityConfig`` (or ``Mapping[tool_name,
             ActivityConfig]``) default for tools wrapped with ``tool_as_activity``.
         backends: Map of names to worker-side backend factories used by
@@ -95,6 +101,7 @@ class DeepAgentsPlugin(SimplePlugin):
         *,
         model_provider: Callable[[str], Any] | None = None,
         model_activity_options: Any = None,
+        model_profiles: Mapping[str, ModelProfile] | None = None,
         tool_activity_options: Any = None,
         backends: Mapping[str, Callable[..., Any]] | None = None,
         streaming_topic: str | None = None,
@@ -131,6 +138,7 @@ class DeepAgentsPlugin(SimplePlugin):
         # when the caller does not override ``activity_options``.
         _serde.set_settings(
             model_activity_options=model_activity_options,
+            model_profiles=model_profiles,
             streaming_topic=streaming_topic,
         )
         # wired-via-composition: consumed on the tool dispatch path in _tools.py
@@ -310,8 +318,8 @@ class DeepAgentsPlugin(SimplePlugin):
             "name, so it can serve several models, and backends= takes every "
             "factory. To run another instance, build its Worker from a Client "
             "without DeepAgentsPlugin, on its own task queue; in one process, "
-            "model_activity_options, tool_activity_options and streaming_topic "
-            "still come from the instance built last."
+            "model_activity_options, model_profiles, tool_activity_options and "
+            "streaming_topic still come from the instance built last."
         )
 
     def _differences(self, other: DeepAgentsPlugin) -> list[str]:

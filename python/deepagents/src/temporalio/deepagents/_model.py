@@ -41,7 +41,7 @@ with workflow.unsafe.imports_passed_through():
         CallbackManagerForLLMRun,
     )
     from langchain_core.exceptions import ContextOverflowError
-    from langchain_core.language_models import BaseChatModel
+    from langchain_core.language_models import BaseChatModel, ModelProfile
     from langchain_core.messages import AIMessageChunk, BaseMessage
     from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
@@ -188,6 +188,11 @@ class TemporalModel(BaseChatModel):
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
         return self.bind(tools=schemas, **kwargs)
+
+    def _resolve_model_profile(self) -> ModelProfile | None:
+        """Return the plugin's ``model_profiles`` entry for this model."""
+        profiles = _serde.get_settings().model_profiles
+        return profiles.get(self.model) if profiles else None
 
     def _summary(self) -> str:
         return f"invoke_model[{self.model}]"
