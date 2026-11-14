@@ -1,0 +1,19 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "microsoft-agent-framework"
+language = "dotnet"
+coordinate = "Temporalio.Extensions.MicrosoftAgentFramework"
+registry = "nuget"
+root-api = "Temporalio.Extensions.MicrosoftAgentFramework"
+maturity = "pre-release"
+docs = "https://docs.temporal.io/develop/dotnet/integrations/microsoft-agent-framework"
+
+[ci]
+# .NET runtimes the tests run on (major.minor), oldest first. The last one is the SDK channel
+# global.json pins, the dist cell and the framework the clean consumer targets.
+runtime-versions = ["8.0", "10.0"]
+
+[smoke]
+# Fully qualified type names a clean consumer must load from the package assembly.
+imports = ["Temporalio.Extensions.MicrosoftAgentFramework.MicrosoftAgentFrameworkPlugin"]

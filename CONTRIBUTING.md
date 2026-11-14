@@ -8,6 +8,7 @@ workflow.
 - Python plugins: install [uv](https://docs.astral.sh/uv/) and GNU make (`brew install make` on
   macOS if needed; `choco install make` on Windows, or use WSL).
 - `cd python/<plugin> && make sync && make lint && make test`.
+- .NET plugins: install the .NET 10 SDK and GNU make; `cd dotnet/<plugin> && make sync && make lint && make test`.
 
 ## Pull requests
 
@@ -27,6 +28,13 @@ uv run --project scripts --locked python scripts/new_python_plugin.py <name> --d
 
 The scaffolder copies `python/_template`, prints the remaining manual steps, and no workflow
 edits are needed: CI discovers plugins from `plugin.toml`.
+
+## Adding a .NET plugin
+
+There is no scaffolder yet. Create `dotnet/<name>/` with the layout in [`dotnet/README.md`](dotnet/README.md)
+and the ".NET conventions" in `AGENTS.md`, run `make lock` to write the `packages.lock.json` files, and
+commit them. CI discovers the plugin from `Directory.Build.props`;
+`uv run --project scripts --locked python scripts/ci/check_conventions.py` lists anything still missing.
 
 ## Contributor License Agreement
 

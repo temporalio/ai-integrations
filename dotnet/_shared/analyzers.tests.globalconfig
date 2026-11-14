@@ -1,0 +1,38 @@
+# Additional severities for *.Tests projects, listed after analyzers.globalconfig (which applies to
+# them as well; global_level = 1 makes this file win should the two ever set the same key). Every
+# entry here fails the Release build (warnings are errors) or `make lint` when removed, measured by
+# removing each entry on its own and rebuilding (`scripts/dev/narrow_dotnet_analyzers.py measure`,
+# temporalio/ai-integrations#523); a suppression whose rule never fired was dropped. Counts are
+# unique source sites with the test project counted once. Keep in order by rule id.
+is_global = true
+global_level = 1
+
+# Test code does not null-check its parameters: removal fires CA1062 on 29 parameters, all in the
+# test project (xunit fixtures, message handlers and Workflow entry points). The library validates
+# its public parameters at 42 ArgumentNullException.ThrowIfNull sites under src/, so the shared
+# analyzers.globalconfig no longer suppresses the rule.
+dotnet_diagnostic.CA1062.severity = none
+
+# Test types are public for the test framework; a test executable has no API surface to hide:
+# removal fires CA1515 on 52 types.
+dotnet_diagnostic.CA1515.severity = none
+
+# Test method names use underscores: removal fires CA1707 on 124 tests.
+dotnet_diagnostic.CA1707.severity = none
+
+# Activity methods, Workflow handlers and fixture helpers are instance members on purpose: removal
+# fires CA1822 on 15 members (WeatherActivities x5, DevServerFixture.WorkflowOptions and 9 handlers
+# in *.workflow.cs).
+dotnet_diagnostic.CA1822.severity = none
+
+# The test csproj turns XML documentation output off (GenerateDocumentationFile=false), which
+# StyleCop reports once per build: removal fires SA0001.
+dotnet_diagnostic.SA0001.severity = none
+
+# Helper members and types sit next to the tests that use them: removal fires SA1201 in 3 files
+# (DevServerFixture, McpTests, WorkflowTestBase).
+dotnet_diagnostic.SA1201.severity = none
+
+# Test members are undocumented. The build skips the documentation rules while the documentation
+# file is off, but `dotnet format` runs them: removal fails `make lint` with SA1600 on 291 members.
+dotnet_diagnostic.SA1600.severity = none

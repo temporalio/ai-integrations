@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Rendered by scripts/ci/smoke_dotnet.py into a temporary directory outside the repository.
+       The consumer sees only the restored package: no plugin source, no test dependencies. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>__TFM__</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Advisories stay warnings here as in dotnet.props: the consumer proves restore and load,
+         the plugin build is where the audit is read. -->
+    <WarningsNotAsErrors>NU1900;NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
+    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
+    <ImportDirectoryPackagesProps>false</ImportDirectoryPackagesProps>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="__COORDINATE__" Version="[__VERSION__]" />
+  </ItemGroup>
+</Project>

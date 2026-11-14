@@ -12,8 +12,8 @@ Rules (see AGENTS.md, "CI architecture"):
   * scripts/** (non-ci)          -> no plugins; reported as scripts_only when nothing else changed
   * anything else (root files)   -> nothing
 
-Outputs (GITHUB_OUTPUT and stdout): python, typescript, java, go (sorted JSON
-arrays, literal [] when empty), any, scripts_only, and mode (all|diff|none).
+Outputs (GITHUB_OUTPUT and stdout): python, typescript, java, go, dotnet (sorted
+JSON arrays, literal [] when empty), any, scripts_only, and mode (all|diff|none).
 """
 
 from __future__ import annotations
