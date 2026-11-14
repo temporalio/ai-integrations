@@ -170,6 +170,10 @@ export function createMCPActivities(
 ): Record<string, (args: never) => Promise<unknown>> {
   const activities: Record<string, (args: never) => Promise<unknown>> = {};
   for (const [name, factory] of Object.entries(toolsets)) {
+    // Fail when the Worker is built, not in every MCP Activity.
+    if (typeof factory !== 'function') {
+      throw new TypeError(`MCP toolset factory '${name}' is ${describeValue(factory)}, not a function.`);
+    }
     Object.assign(activities, withSources(mcpActivitiesForName(name, factory), [factory]));
   }
   return activities;
@@ -208,6 +212,13 @@ const MCP_CONNECTION_PARAMS_TYPES: ReadonlySet<unknown> = new Set([
   'StreamableHTTPConnectionParams',
 ]);
 
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `Promise`.
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
+  return (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+}
+
 function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<MCPToolsetFactory> {
   const produced = factory();
   if (
@@ -217,7 +228,7 @@ function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<
     return produced;
   }
   throw ApplicationFailure.nonRetryable(
-    `MCP toolset factory '${name}' must return a BaseToolset or MCPConnectionParams.`,
+    `MCP toolset factory '${name}' returned ${describeValue(produced)}, not a BaseToolset or MCPConnectionParams.`,
     'MCPToolsetFactoryTypeError'
   );
 }

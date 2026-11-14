@@ -9,7 +9,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
 
 import { createMCPActivities } from '../activities';
-import { GoogleAdkPlugin } from '../index';
+import { GoogleAdkPlugin, type MCPToolsetFactory } from '../index';
 import { TemporalMCPToolset } from '../workflow';
 import { mockMCPToolset } from '../testing';
 import {
@@ -82,8 +82,22 @@ const getEnv = setupTestEnv(test);
 
 for (const operation of ['listTools', 'callTool', 'listResources', 'readResource']) {
   test(`${operation} rejects invalid MCP factory results without retries`, async (t) => {
-    const invalidResults: unknown[] = [undefined, null, 42, {}, { type: 'UnknownConnectionParams' }];
-    for (const result of invalidResults) {
+    const invalidResults: [unknown, string][] = [
+      [undefined, 'undefined'],
+      [null, 'null'],
+      [42, 'number'],
+      [{}, 'Object'],
+      [{ type: 'UnknownConnectionParams' }, 'Object'],
+      // What an async factory returns.
+      [Promise.resolve({ type: 'StdioConnectionParams' }), 'Promise'],
+    ];
+    for (const [result, kind] of invalidResults) {
+      // Passed in place of the factory, the value fails when the Worker is built.
+      t.throws(() => createMCPActivities({ testServer: result as MCPToolsetFactory }), {
+        instanceOf: TypeError,
+        message: `MCP toolset factory 'testServer' is ${kind}, not a function.`,
+      });
+
       const activities = createMCPActivities({ testServer: () => result as BaseToolset });
       const activity = activities[`testServer-${operation}`] as (args: unknown) => Promise<unknown>;
       const err = await t.throwsAsync(
@@ -92,7 +106,10 @@ for (const operation of ['listTools', 'callTool', 'listResources', 'readResource
       );
       t.true(err!.nonRetryable);
       t.is(err!.type, 'MCPToolsetFactoryTypeError');
-      t.is(err!.message, "MCP toolset factory 'testServer' must return a BaseToolset or MCPConnectionParams.");
+      t.is(
+        err!.message,
+        `MCP toolset factory 'testServer' returned ${kind}, not a BaseToolset or MCPConnectionParams.`
+      );
     }
   });
 
