@@ -14,6 +14,8 @@ TESTS := tests/$(PACKAGE).Tests/$(PACKAGE).Tests.csproj
 CONFIGURATION ?= Release
 RELEASE_VERSION ?= 0.0.0
 TEST_ARGS ?=
+# One of the test project's target frameworks (net8.0); empty runs every framework.
+TEST_FRAMEWORK ?=
 # Package entry timestamps come from the commit under test, not from checkout mtimes, so a
 # rebuild of the same commit on the same SDK version is byte-identical (a servicing patch
 # ships a new compiler and changes the assembly).
@@ -61,7 +63,7 @@ lint: ## Formatting, style and analyzer fixers would change nothing
 	$(DOTNET) format $(SOLUTION) --verify-no-changes --exclude-diagnostics CA2007
 
 test: ## Build in Release with the release version and run the suite under Microsoft.Testing.Platform
-	$(DOTNET) test --solution $(SOLUTION) -c $(CONFIGURATION) $(BUILD_PROPS) --results-directory TestResults --minimum-expected-tests 1 -- --report-trx $(TEST_ARGS)
+	$(DOTNET) test --solution $(SOLUTION) -c $(CONFIGURATION) $(BUILD_PROPS) $(if $(TEST_FRAMEWORK),--framework $(TEST_FRAMEWORK)) --results-directory TestResults --minimum-expected-tests 1 -- --report-trx $(TEST_ARGS)
 
 build: ## Pack the tested build into dist/ (nupkg and snupkg)
 	rm -rf dist

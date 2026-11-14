@@ -3,8 +3,8 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Temporalio.Activities;
 using Temporalio.Exceptions;
-using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.Extensions.MicrosoftAgentFramework.Internal;
+using Temporalio.Extensions.WorkflowStreams;
 
 namespace Temporalio.Extensions.MicrosoftAgentFramework.Activities;
 

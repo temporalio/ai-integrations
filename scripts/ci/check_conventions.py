@@ -514,14 +514,14 @@ class Checker:
                     self.fail(f"{rel}: plugin.toml must not contain {banned!r}")
         runtimes = ci.get("runtime-versions", [])
         if not runtimes or not all(isinstance(v, str) and re.fullmatch(r"\d+\.\d+", v) for v in runtimes):
-            self.fail(f"{rel}: runtime-versions must list .NET SDK channels as major.minor strings")
+            self.fail(f"{rel}: runtime-versions must list the .NET runtimes the tests run on as major.minor strings, "
+                      "oldest first; the last one is the SDK channel global.json pins")
             runtimes = []
-        elif len(runtimes) != 1:
-            # global.json resolves the floor channel with latestFeature in every cell, so a second channel would
-            # build with the floor SDK and test nothing new; a multi-channel matrix needs the workflow to inject an
-            # SDK above the floor, which waits for a plugin that needs one.
-            self.fail(f"{rel}: runtime-versions must name exactly one SDK channel until the workflow can inject "
-                      "an SDK above the global.json floor")
+        elif [tuple(map(int, v.split("."))) for v in runtimes] != sorted({tuple(map(int, v.split("."))) for v in runtimes}):
+            # Every cell builds with the global.json channel (the newest entry) and runs the test project's
+            # target framework for its own runtime, so the list is runtimes in order, not SDK channels.
+            self.fail(f"{rel}: runtime-versions must be strictly increasing, oldest runtime first and the SDK channel last")
+            runtimes = []
         imports = meta.get("smoke", {}).get("imports", [])
         if not imports or not all(isinstance(i, str) and i.startswith(coordinate + ".") for i in imports):
             self.fail(f"{rel}: smoke imports must name types under {coordinate}")
@@ -576,7 +576,7 @@ class Checker:
         if (d / library).is_file():
             self.check_dotnet_library(plugin, coordinate, d / library, f"net{runtimes[0]}" if runtimes else None)
         if (d / tests).is_file():
-            self.check_dotnet_tests(plugin, d / tests)
+            self.check_dotnet_tests(plugin, d / tests, [f"net{v}" for v in runtimes])
         canonical = {(d / library).resolve(), (d / tests).resolve()}
         for project in projects:
             if project.resolve() not in canonical:
@@ -613,8 +613,8 @@ class Checker:
             return
         sdk = settings.get("sdk", {}) if isinstance(settings, dict) else {}
         version = str(sdk.get("version", ""))
-        if runtimes and ".".join(version.split(".")[:2]) != runtimes[0]:
-            self.fail(f"{rel}: sdk.version {version!r} must be in the floor channel {runtimes[0]} (first [ci] runtime-versions entry)")
+        if runtimes and ".".join(version.split(".")[:2]) != runtimes[-1]:
+            self.fail(f"{rel}: sdk.version {version!r} must be in the SDK channel {runtimes[-1]} (last [ci] runtime-versions entry)")
         if sdk.get("rollForward") != "latestFeature":
             self.fail(f"{rel}: sdk.rollForward must be 'latestFeature' so a newer major SDK is never used silently")
         if sdk.get("allowPrerelease") is not False:
@@ -793,12 +793,17 @@ class Checker:
         policy = {name: value for name, value in DOTNET_POLICY_PROPERTIES.items() if name != "GenerateDocumentationFile"}
         self._dotnet_common_rules(plugin, csproj, parsed, policy)
 
-    def check_dotnet_tests(self, plugin: Plugin, csproj: Path) -> None:
+    def check_dotnet_tests(self, plugin: Plugin, csproj: Path, frameworks: list[str]) -> None:
         parsed = self._dotnet_project(plugin, csproj)
         if parsed is None:
             return
         properties, items = parsed.properties, parsed.items
         rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
+        targets = [part.strip() for part in properties.get("targetframeworks", "").split(";") if part.strip()]
+        targets += [properties["targetframework"]] if properties.get("targetframework") else []
+        if frameworks and targets != frameworks:
+            self.fail(f"{rel}: the test project must target {';'.join(frameworks)} (one net<major>.<minor> per "
+                      f"[ci] runtime-versions entry, in order), got {';'.join(targets) or 'nothing'}")
         if properties.get("usemicrosofttestingplatformrunner", "").lower() != "true":
             self.fail(f"{rel}: UseMicrosoftTestingPlatformRunner must be true (xunit.v3 under Microsoft.Testing.Platform)")
         if properties.get("outputtype", "").lower() != "exe":

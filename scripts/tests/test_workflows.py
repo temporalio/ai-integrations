@@ -165,9 +165,11 @@ def test_dotnet_checks_package_and_clean_consumer_after_testing() -> None:
     names = [step.get("name", "") for step in steps]
     assert not any("version" in name.lower() for name in names), "the plugin tree is never modified for a release"
     setup = next(step for step in steps if step.get("uses", "").startswith("actions/setup-dotnet@"))
+    # The SDK comes from the plugin's global.json; the cell's runtime is installed next to it for the tests.
     assert setup["with"]["dotnet-version"] == "${{ matrix.runtime }}.x"
+    assert setup["with"]["global-json-file"] == "dotnet/${{ inputs.plugin }}/global.json"
     assert setup["with"]["cache"] is True and setup["with"]["cache-dependency-path"].endswith("/**/packages.lock.json")
-    sdk = names.index("SDK under test is the matrix channel")
+    sdk = names.index("SDK is the global.json channel and the runtime under test is installed")
     check = names.index("Check dependency resolution under the cooldown")
     sync = names.index("Sync dependencies")
     lint = names.index("Lint")
@@ -177,7 +179,9 @@ def test_dotnet_checks_package_and_clean_consumer_after_testing() -> None:
     upload = names.index("Upload tested package")
     assert sdk < check < sync < lint < run_tests < build < reports < upload
     assert steps[lint]["run"] == 'cd "$PLUGIN_DIR" && make lint'
-    assert steps[run_tests]["run"] == 'cd "$PLUGIN_DIR" && make test'
+    # Each cell runs the target framework of its runtime; the global.json SDK builds every framework.
+    assert steps[run_tests]["run"] == 'cd "$PLUGIN_DIR" && make test TEST_FRAMEWORK="net$RUNTIME"'
+    assert steps[run_tests]["env"] == {"RUNTIME": "${{ matrix.runtime }}"}
     assert steps[build]["if"] == "matrix.dist"
     assert "make build" in steps[build]["run"]
     assert "check_dotnet_dist.py" in steps[build]["run"] and '--commit "$(git rev-parse HEAD)"' in steps[build]["run"]

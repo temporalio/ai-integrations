@@ -1,8 +1,8 @@
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
-using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.Extensions.MicrosoftAgentFramework.Activities;
 using Temporalio.Extensions.MicrosoftAgentFramework.Internal;
+using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.Workflows;
 
 namespace Temporalio.Extensions.MicrosoftAgentFramework;

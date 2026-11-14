@@ -73,6 +73,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
+          # The SDK channel comes from global.json; the cell's runtime is installed next to it for the tests.
+          global-json-file: dotnet/${{ inputs.plugin }}/global.json
           dotnet-version: ${{ matrix.runtime }}.x
           cache: true
           cache-dependency-path: dotnet/${{ inputs.plugin }}/**/packages.lock.json
@@ -82,17 +84,22 @@ jobs:
       - name: Install GNU make (Windows)
         if: runner.os == 'Windows'
         run: choco install make -y --no-progress
-      - name: SDK under test is the matrix channel
-        # global.json's latestFeature policy must have selected this cell's channel, not a preinstalled SDK.
+      - name: SDK is the global.json channel and the runtime under test is installed
+        # global.json's latestFeature policy must have selected its own channel, not a preinstalled SDK, and
+        # the cell's runtime must be present for the test project's matching target framework.
         env:
-          CHANNEL: ${{ matrix.runtime }}
+          RUNTIME: ${{ matrix.runtime }}
         run: |
           cd "$PLUGIN_DIR"
+          channel="$(jq -r '.sdk.version' global.json | cut -d. -f1,2)"
           actual="$(dotnet --version)"
           case "$actual" in
-            "$CHANNEL".*) echo "SDK $actual" ;;
-            *) echo "::error::global.json selected SDK $actual, not the $CHANNEL channel under test"; exit 1 ;;
+            "$channel".*) echo "SDK $actual" ;;
+            *) echo "::error::global.json selected SDK $actual, not the $channel channel it pins"; exit 1 ;;
           esac
+          if ! dotnet --list-runtimes | grep -q "^Microsoft.NETCore.App $RUNTIME\."; then
+            echo "::error::runtime $RUNTIME under test is not installed"; exit 1
+          fi
       - name: Check dependency resolution under the cooldown
         # Every version in the committed locks must be older than nuget.config's minPublishAgeHours.
         if: matrix.dist && inputs.deps == 'locked'
@@ -110,7 +117,10 @@ jobs:
       - name: Lint
         run: cd "$PLUGIN_DIR" && make lint
       - name: Test
-        run: cd "$PLUGIN_DIR" && make test
+        # Each cell runs the test project's target framework for its runtime; the SDK channel builds all of them.
+        env:
+          RUNTIME: ${{ matrix.runtime }}
+        run: cd "$PLUGIN_DIR" && make test TEST_FRAMEWORK="net$RUNTIME"
       - name: Build and verify NuGet package
         # Only on the designated dist cell: the release pipeline publishes the ubuntu-built package.
         if: matrix.dist
