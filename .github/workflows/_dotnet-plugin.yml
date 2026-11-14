@@ -117,7 +117,8 @@ jobs:
       - name: Lint
         run: cd "$PLUGIN_DIR" && make lint
       - name: Test
-        # Each cell runs the test project's target framework for its runtime; the SDK channel builds all of them.
+        # Each cell builds and runs only the test project's target framework for its runtime (--framework);
+        # make lint analyzes every framework on every cell.
         env:
           RUNTIME: ${{ matrix.runtime }}
         run: cd "$PLUGIN_DIR" && make test TEST_FRAMEWORK="net$RUNTIME"

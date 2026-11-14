@@ -132,11 +132,13 @@ public class StreamingTests : WorkflowTestBase
             var result = await handle.GetResultAsync();
             Assert.Equal(text, result.FinalText);
 
-            // 301 updates (300 text pieces and the usage) against a bound of 256. The bound wakes the publisher's
-            // background flusher, which takes the whole buffer, so the first Signal carries at least 256 updates and
-            // possibly more (items published before the swap join it); a stale wake can add a Signal for the items
-            // that arrived during the first Signal's RPC, so the count is at least two. The 30-second interval timer
-            // starts on the first publish and cannot fire inside the subscriber's own 30-second window.
+            // 301 updates (300 text pieces and the usage) against a bound of 256. The publisher guarantees two
+            // things: the bound wakes its background flusher, which takes the whole buffer, so the first Signal
+            // carries at least 256 updates (items published before the swap join it), and every update is sent once,
+            // so the Signals sum to 301. At least two Signals is a timing property: it holds as long as the flusher
+            // swaps before the Activity's final FlushAsync, which the 45 remaining updates at 1 ms each give it time
+            // to do; a stale wake can add a third Signal. The 30-second interval timer starts on the first publish
+            // and cannot fire inside the subscriber's own 30-second window.
             var history = await handle.FetchHistoryAsync();
             var batches = new List<int>();
             foreach (var signaled in history.Events.Select(e => e.WorkflowExecutionSignaledEventAttributes).Where(a => a?.SignalName == WorkflowStreamConstants.PublishSignalName))
