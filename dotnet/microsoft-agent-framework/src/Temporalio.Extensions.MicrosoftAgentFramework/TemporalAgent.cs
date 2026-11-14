@@ -371,6 +371,7 @@ public sealed class TemporalAgent : AIAgent
         ArgumentNullException.ThrowIfNull(messages);
         var input = messages as IReadOnlyCollection<ChatMessage> ?? messages.ToList();
         var typedSession = session is null ? new TemporalAgentSession() : RequireSession(session);
+
         // Set for parity with AIAgent.RunAsync so a provider that reads AIAgent.CurrentRunContext
         // sees the run; nothing in the plugin reads it, and the async machinery restores the caller's value.
         CurrentRunContext = new AgentRunContext(this, typedSession, input, options);

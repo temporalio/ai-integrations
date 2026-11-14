@@ -32,8 +32,5 @@ dotnet_diagnostic.SA1101.severity = none
 # Using directives sit above the namespace: removal fires SA1200 on 288 sites (112 src, 176 tests).
 dotnet_diagnostic.SA1200.severity = none
 
-# A single-line comment needs no blank line before it: removal fires SA1515 once (src TemporalAgent.cs).
-dotnet_diagnostic.SA1515.severity = none
-
 # No file headers: removal fires SA1633 on every file, 108 sites (36 src, 72 tests).
 dotnet_diagnostic.SA1633.severity = none
