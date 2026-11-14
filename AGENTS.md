@@ -224,18 +224,19 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   (`scripts/dev/narrow_dotnet_analyzers.py`); the measurement is re-run when the SDK or the analyzer
   packages move.
 - `plugin.toml` `[ci] runtime-versions` lists the .NET runtimes the tests run on, oldest first; the
-  last entry is the SDK channel `global.json` pins (`latestFeature`), the dist cell and the framework
-  the clean consumer targets. The library targets one framework: `netstandard2.0`, like the SDK's own
-  `Temporalio.Extensions.*` packages, when its dependencies' netstandard2.0 assemblies behave like their
-  net8.0 ones, otherwise the oldest listed runtime. Microsoft Agent Framework's netstandard2.0
-  assemblies polyfill `IsExternalInit` as their own internal type, so their `init` accessors (for
-  example `AgentResponse<T>.IsWrappedInObject`) have a different signature from the net8.0 assemblies,
-  and code compiled against the netstandard2.0 assembly fails at run time on .NET 8 with
-  `MissingMethodException`; the plugin therefore targets `net8.0`. A second framework would ship an
-  asset the suite never runs. The test project targets `net<major>.<minor>` for every listed runtime.
-  The matrix runs the oldest runtime on Ubuntu and the newest on Ubuntu (the dist cell), macOS and
-  Windows; every cell installs the `global.json` SDK plus its runtime, fails if `dotnet --version`
-  leaves the SDK channel, and runs `make test TEST_FRAMEWORK=net<runtime>`.
+  last entry is the SDK channel `global.json` pins (`latestFeature`), the dist cell and the
+  framework the clean consumer targets. The library targets one framework: `netstandard2.0`, like
+  the SDK's own `Temporalio.Extensions.*` packages, when its dependencies' netstandard2.0 assemblies
+  behave like their net8.0 ones, otherwise the oldest listed runtime. Microsoft Agent Framework's
+  netstandard2.0 assemblies polyfill `IsExternalInit` as their own internal type, so their `init`
+  accessors (for example `AgentResponse<T>.IsWrappedInObject`) have a different signature from the
+  net8.0 assemblies, and code compiled against the netstandard2.0 assembly fails at run time on .NET
+  8 and later (every runtime that loads the net8.0 assembly) with `MissingMethodException`; the
+  plugin therefore targets `net8.0`. A second framework would ship an asset the suite never runs.
+  The test project targets `net<major>.<minor>` for every listed runtime. The matrix runs the oldest
+  runtime on Ubuntu and the newest on Ubuntu (the dist cell), macOS and Windows; every cell installs
+  the `global.json` SDK plus its runtime, fails if `dotnet --version` leaves the SDK channel, and
+  runs `make test TEST_FRAMEWORK=net<runtime>`.
 
 ## CI
 
@@ -429,7 +430,7 @@ gallery.
    deactivates if that profile leaves the organization. No stored tokens.
 2. Merge release changes to main. Dry-run with
    `gh workflow run release-dotnet.yml --ref main -f tag=dotnet/<name>/v<version>`.
-   The full channel/platform matrix tests the injected version at one pinned
+   The full runtime/platform matrix tests the injected version at one pinned
    commit; Ubuntu/max packs, checks and smoke-restores the package and saves
    `dist-dotnet-<name>` as an Actions artifact.
 3. Generate notes with `uv run --project scripts --locked python
@@ -469,11 +470,13 @@ gallery.
    differ from nuget.org, fix forward with the next version; nuget.org never
    deletes a version and tags never move.
 6. After the first published version, set `PackageValidationBaselineVersion` in
-   the library csproj to that version. `dotnet pack` then downloads that exact
-   version from nuget.org on every build (the dist cell needs it listed; the
-   download is pinned by version, not by the lock) and compares the public API
-   with it, failing the build on a breaking change; move the baseline forward
-   with each release, and record an intended break with `<SuppressionFile>` only
+   the library csproj to that version. Restore then fetches that exact version
+   from nuget.org as a `PackageDownload` (cached like any package, pinned by
+   version, not by the lock; an unlisted version still restores) and
+   `dotnet pack` compares the public API with it, failing the build on a breaking
+   change; the comparison is incremental, so it re-runs when the csproj or the
+   assembly changes and on every CI checkout. Move the baseline forward with
+   each release, and record an intended break with `<SuppressionFile>` only
    after review.
 
 ### Python releases

@@ -21,7 +21,8 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * every .NET plugin follows the dotnet/<name>/ contract (AGENTS.md, ".NET conventions"): a
     Directory.Build.props that starts by importing dotnet/_shared/dotnet.props and whose body keeps
     the shared policy, no other MSBuild directory file anywhere in the plugin, one <Coordinate>.slnx,
-    the runtimes the tests run on with the SDK channel last, global.json and nuget.config policy, the canonical .editorconfig, the library and
+    the runtimes the tests run on with the SDK channel last, global.json and nuget.config policy, the
+    canonical .editorconfig, the library and
     MTP test csproj rules, a committed packages.lock.json beside each csproj
   * no Directory.Build.props, Directory.Build.targets, Directory.Packages.props, global.json or
     nuget.config at dotnet/ itself (MSBuild would apply them to every plugin silently)

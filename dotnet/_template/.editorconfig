@@ -1,8 +1,9 @@
 # Canonical .editorconfig for every plugin under dotnet/. scripts/ci/check_conventions.py keeps each
 # plugin's copy byte-identical to this file, so `dotnet format` gives the same answer in every plugin.
-# Project-wide analyzer severities live in dotnet/_shared/analyzers.globalconfig. Only the editor
-# baseline is kept here: each entry is a gate whose comment states the probe that shows it live
-# (an injected violation with and without the entry; `scripts/dev/narrow_dotnet_analyzers.py measure`,
+# Project-wide analyzer severities live in dotnet/_shared/analyzers.globalconfig. Each entry here is
+# either a gate whose comment states the probe that shows it live (charset, end_of_line and
+# insert_final_newline: an injected violation with and without the entry) or the editor baseline for
+# the files `dotnet format` never touches (`scripts/dev/narrow_dotnet_analyzers.py measure`,
 # temporalio/ai-integrations#523). Every formatting and style preference was removed because removing
 # it on its own changed neither `make lint` nor the build, so C# follows the Roslyn defaults. A
 # path-scoped rule, should a plugin ever need one, goes in its own section below.

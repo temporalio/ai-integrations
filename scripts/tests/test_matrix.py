@@ -56,9 +56,9 @@ def test_cli_preserves_go_patch_floor_and_selects_all_platforms(tmp_path: Path) 
     assert [cell["runtime"] for cell in result["include"] if cell["dist"]] == ["1.27"]
 
 
-def test_dotnet_channels_select_all_platforms_with_dist_on_ubuntu(tmp_path: Path) -> None:
-    # The generator stays channel-agnostic; check_conventions.py requires one channel until the
-    # workflow injects an SDK above the global.json floor.
+def test_dotnet_runtimes_select_all_platforms_with_dist_on_ubuntu(tmp_path: Path) -> None:
+    # The generator is runtime-agnostic: for .NET the entries are runtimes, the last one the SDK channel
+    # global.json pins, and each cell installs its runtime next to that SDK.
     plugin = tmp_path / "dotnet" / "fakedotnet"
     plugin.mkdir(parents=True)
     (plugin / "plugin.toml").write_text('[ci]\nruntime-versions = ["10.0"]\n')
