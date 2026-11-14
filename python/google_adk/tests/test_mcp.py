@@ -36,6 +36,7 @@ from mcp.types import Tool
 from temporalio.exceptions import ApplicationError
 from temporalio.google_adk._mcp import (
     TemporalMcpToolSetProvider,
+    TemporalStatefulMcpToolSetProvider,
     TemporalToolContext,
     TemporalToolSession,
     _CallToolArguments,
@@ -123,13 +124,24 @@ async def test_invalid_factory_result_is_non_retryable(operation: str) -> None:
         raise RuntimeError("close failed")
 
     invalid_results = [
-        None,
-        object(),
-        SimpleNamespace(get_tools=1),
-        SimpleNamespace(get_tools=_FakeToolset().get_tools),
-        SimpleNamespace(close=close),
+        (None, "builtins.NoneType"),
+        (object(), "builtins.object"),
+        (SimpleNamespace(get_tools=1), "types.SimpleNamespace"),
+        (SimpleNamespace(get_tools=_FakeToolset().get_tools), "types.SimpleNamespace"),
+        (SimpleNamespace(close=close), "types.SimpleNamespace"),
     ]
-    for result in invalid_results:
+    for result, kind in invalid_results:
+        # Passed in place of the factory, the value fails when the Worker is built.
+        for provider_type in (
+            TemporalMcpToolSetProvider,
+            TemporalStatefulMcpToolSetProvider,
+        ):
+            with pytest.raises(TypeError) as type_err:
+                provider_type("invalid", cast(Any, result))
+            assert str(type_err.value) == (
+                f"MCP toolset factory 'invalid' is {kind}, not callable"
+            )
+
         provider = TemporalMcpToolSetProvider(
             "invalid", lambda _: cast(McpToolset, result)
         )
@@ -142,7 +154,7 @@ async def test_invalid_factory_result_is_non_retryable(operation: str) -> None:
         assert err.value.type == "MCPToolsetFactoryTypeError"
         assert err.value.non_retryable
         assert err.value.message == (
-            "MCP toolset factory 'invalid' must return a toolset with "
+            f"MCP toolset factory 'invalid' returned {kind}, not a toolset with "
             "callable get_tools() and close() methods"
         )
     assert closed == [True]

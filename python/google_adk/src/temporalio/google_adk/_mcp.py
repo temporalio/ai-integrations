@@ -180,6 +180,20 @@ def _protocol_error(err: McpError) -> ApplicationError:
     )
 
 
+def _type_name(value: object) -> str:
+    kind = type(value)
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _check_toolset_factory(name: str, toolset_factory: object) -> None:
+    # Fail when the Worker is built, not in every MCP Activity.
+    if not callable(toolset_factory):
+        raise TypeError(
+            f"MCP toolset factory {name!r} is {_type_name(toolset_factory)}, "
+            "not callable"
+        )
+
+
 async def _validate_toolset(name: str, toolset: McpToolset) -> McpToolset:
     if callable(getattr(toolset, "get_tools", None)) and callable(
         getattr(toolset, "close", None)
@@ -192,8 +206,8 @@ async def _validate_toolset(name: str, toolset: McpToolset) -> McpToolset:
             # Cleanup must not hide the invalid factory result.
             pass
     raise ApplicationError(
-        f"MCP toolset factory {name!r} must return a toolset with "
-        "callable get_tools() and close() methods",
+        f"MCP toolset factory {name!r} returned {_type_name(toolset)}, not a "
+        "toolset with callable get_tools() and close() methods",
         type="MCPToolsetFactoryTypeError",
         non_retryable=True,
     )
@@ -232,6 +246,7 @@ class TemporalMcpToolSetProvider:
                 shared between workflow runs.
         """
         super().__init__()
+        _check_toolset_factory(name, toolset_factory)
         self._name = name
         self._toolset_factory = toolset_factory
 
@@ -970,6 +985,7 @@ class TemporalStatefulMcpToolSetProvider:
                 shared between workflow runs.
         """
         super().__init__()
+        _check_toolset_factory(name, toolset_factory)
         self._name = name + "-stateful"
         self._toolset_factory = toolset_factory
         self._toolsets: dict[str, _RunningToolset] = {}

@@ -1070,7 +1070,9 @@ async def test_stateful_block_exit_error(client: Client, case: str):
         cause = cause.__cause__
     expected = {
         "factory_fails": "factory failed",
-        "invalid_factory_result": "MCP toolset factory 'stateful_server-stateful'",
+        "invalid_factory_result": (
+            "MCP toolset factory 'stateful_server-stateful' returned builtins.NoneType"
+        ),
     }.get(case, "List the toolset's tools again inside an open block.")
     if case == "invalid_factory_result":
         failure = next(
