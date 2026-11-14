@@ -66,6 +66,8 @@ def _tool_context() -> ToolContext:
                 tool_confirmation=None,
                 function_call_id=None,
                 _event_actions=EventActions(),
+                session=SimpleNamespace(app_name="test-app"),
+                user_id="test-user",
             ),
         ),
     )

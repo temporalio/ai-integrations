@@ -10,13 +10,16 @@ from typing import Any, Callable
 
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import EventActions
+from google.adk.models.llm_request import LlmRequest
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset
-from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool import McpTool, McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
 from google.adk.tools.tool_confirmation import ToolConfirmation
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from google.genai.types import FunctionDeclaration
+from mcp import Tool as McpBaseTool
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1.workflow_pb2 import (
@@ -50,6 +53,14 @@ class _ToolResult:
     is_long_running: bool
     custom_metadata: dict[str, Any] | None
     function_declaration: FunctionDeclaration | None
+    tool_definition: McpBaseTool | None = None
+
+
+@dataclass
+class TemporalToolSession:
+    """ADK application identity available inside a tool activity."""
+
+    app_name: str
 
 
 @dataclass
@@ -62,6 +73,13 @@ class TemporalToolContext:
     tool_confirmation: ToolConfirmation | None
     function_call_id: str | None
     event_actions: EventActions
+    session: TemporalToolSession | None = None
+    user_id: str | None = None
+
+    @property
+    def actions(self) -> EventActions:
+        """Event actions for the current tool call, matching ADK's context."""
+        return self.event_actions
 
     def request_confirmation(
         self,
@@ -153,6 +171,7 @@ class TemporalMcpToolSetProvider:
                         tool.is_long_running,
                         tool.custom_metadata,
                         tool._get_declaration(),
+                        tool.raw_mcp_tool if isinstance(tool, McpTool) else None,
                     )
                     for tool in tools
                 ]
@@ -190,6 +209,39 @@ class TemporalMcpToolSetProvider:
         return get_tools, call_tool
 
 
+class _TemporalMCPManager(MCPSessionManager):
+    def __init__(self) -> None:  # pyright: ignore[reportMissingSuperCall]
+        # process_llm_request never uses the manager, so no initialization is needed.
+        pass
+
+
+async def _process_tool_llm_request(
+    tool: BaseTool,
+    tool_definition: McpBaseTool | None,
+    *,
+    tool_context: ToolContext,
+    llm_request: LlmRequest,
+) -> None:
+    if tool_definition is None:
+        await BaseTool.process_llm_request(
+            tool, tool_context=tool_context, llm_request=llm_request
+        )
+        return
+
+    mcp_tool = McpTool(
+        mcp_tool=tool_definition,
+        mcp_session_manager=_TemporalMCPManager(),
+    )
+    mcp_tool.name = tool.name
+    mcp_tool.description = tool.description
+    mcp_tool.is_long_running = tool.is_long_running
+    mcp_tool.custom_metadata = tool.custom_metadata
+    await mcp_tool.process_llm_request(
+        tool_context=tool_context, llm_request=llm_request
+    )
+    llm_request.tools_dict[tool.name] = tool
+
+
 class _TemporalTool(BaseTool):
     def __init__(
         self,
@@ -202,6 +254,7 @@ class _TemporalTool(BaseTool):
         description: str,
         is_long_running: bool = False,
         custom_metadata: dict[str, Any] | None = None,
+        tool_definition: McpBaseTool | None = None,
     ):
         super().__init__(
             name=name,
@@ -215,9 +268,20 @@ class _TemporalTool(BaseTool):
             start_to_close_timeout=timedelta(minutes=1)
         )
         self._declaration = declaration
+        self._tool_definition = tool_definition
 
     def _get_declaration(self) -> types.FunctionDeclaration | None:
         return self._declaration
+
+    async def process_llm_request(
+        self, *, tool_context: ToolContext, llm_request: LlmRequest
+    ) -> None:
+        await _process_tool_llm_request(
+            self,
+            self._tool_definition,
+            tool_context=tool_context,
+            llm_request=llm_request,
+        )
 
     async def run_async(
         self, *, args: dict[str, Any], tool_context: ToolContext
@@ -232,6 +296,8 @@ class _TemporalTool(BaseTool):
                     tool_confirmation=tool_context.tool_confirmation,
                     function_call_id=tool_context.function_call_id,
                     event_actions=tool_context._event_actions,
+                    session=TemporalToolSession(tool_context.session.app_name),
+                    user_id=tool_context.user_id,
                 ),
             ),
             result_type=_CallToolResult,
@@ -327,6 +393,7 @@ class TemporalMcpToolSet(BaseToolset):
                 description=tool_result.description,
                 is_long_running=tool_result.is_long_running,
                 custom_metadata=tool_result.custom_metadata,
+                tool_definition=tool_result.tool_definition,
             )
             for tool_result in tool_results
         ]
@@ -834,6 +901,7 @@ class TemporalStatefulMcpToolSetProvider:
                     tool.is_long_running,
                     tool.custom_metadata,
                     tool._get_declaration(),
+                    tool.raw_mcp_tool if isinstance(tool, McpTool) else None,
                 )
                 for tool in tools
             ]
@@ -945,6 +1013,7 @@ class _TemporalStatefulTool(BaseTool):
         description: str,
         is_long_running: bool = False,
         custom_metadata: dict[str, Any] | None = None,
+        tool_definition: McpBaseTool | None = None,
     ):
         super().__init__(
             name=name,
@@ -956,9 +1025,20 @@ class _TemporalStatefulTool(BaseTool):
         self._session = session
         self._config = config
         self._declaration = declaration
+        self._tool_definition = tool_definition
 
     def _get_declaration(self) -> types.FunctionDeclaration | None:
         return self._declaration
+
+    async def process_llm_request(
+        self, *, tool_context: ToolContext, llm_request: LlmRequest
+    ) -> None:
+        await _process_tool_llm_request(
+            self,
+            self._tool_definition,
+            tool_context=tool_context,
+            llm_request=llm_request,
+        )
 
     @_handle_worker_failure
     async def run_async(
@@ -974,6 +1054,8 @@ class _TemporalStatefulTool(BaseTool):
                     tool_confirmation=tool_context.tool_confirmation,
                     function_call_id=tool_context.function_call_id,
                     event_actions=tool_context._event_actions,
+                    session=TemporalToolSession(tool_context.session.app_name),
+                    user_id=tool_context.user_id,
                 ),
             ),
             result_type=_CallToolResult,
@@ -1184,6 +1266,7 @@ class TemporalStatefulMcpToolSet(BaseToolset):
                 description=tool_result.description,
                 is_long_running=tool_result.is_long_running,
                 custom_metadata=tool_result.custom_metadata,
+                tool_definition=tool_result.tool_definition,
             )
             for tool_result in tool_results
         ]

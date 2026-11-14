@@ -1536,8 +1536,8 @@ async def test_litellm_model(client: Client):
     assert result.content.parts[0].text == "hello from litellm"
 
 
-def test_unset_none_fields_stripped() -> None:
-    """ADK plugin converter strips unset None fields from Pydantic payloads."""
+def test_unset_none_fields_preserved() -> None:
+    """Default None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1555,11 +1555,11 @@ def test_unset_none_fields_stripped() -> None:
         "cacheable_contents_token_count",
         "previous_interaction_id",
     ):
-        assert field not in serialized, f"Unset field {field!r} should be stripped"
+        assert serialized[field] is None
 
 
 def test_explicitly_set_none_preserved() -> None:
-    """Explicitly-set None is preserved (exclude_unset, not exclude_none)."""
+    """Explicit None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1570,7 +1570,6 @@ def test_explicitly_set_none_preserved() -> None:
     payloads = converter.payload_converter.to_payloads([request])
     serialized = json.loads(payloads[0].data)
 
-    assert "cache_config" in serialized, "Explicitly-set None should be preserved"
     assert serialized["cache_config"] is None
 
 
@@ -1937,6 +1936,7 @@ async def test_agent_with_output_schema(client: Client):
 
 @pytest.mark.parametrize("schema", [CityWeather, list[CityWeather], StringChoice])
 def test_output_schema_type_sent_as_json_schema(schema: Any) -> None:
+    expected_schema = TypeAdapter(schema).json_schema()
     request = LlmRequest(
         model="gemini-2.0-flash",
         contents=[Content(role="user", parts=[Part(text="hello")])],
@@ -1951,7 +1951,7 @@ def test_output_schema_type_sent_as_json_schema(schema: Any) -> None:
     converter = GoogleAdkPlugin()._configure_data_converter(None)
     payloads = converter.payload_converter.to_payloads([converted])
     serialized = json.loads(payloads[0].data)
-    assert serialized["config"]["responseSchema"] == TypeAdapter(schema).json_schema()
+    assert serialized["config"]["responseSchema"] == expected_schema
 
 
 def test_output_schema_preserves_custom_model_json_schema() -> None:
