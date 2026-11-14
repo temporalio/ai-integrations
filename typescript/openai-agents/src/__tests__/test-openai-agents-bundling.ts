@@ -82,35 +82,17 @@ test('Agents picked or changed during the run are checked before they call their
       1,
     ],
     'agent-start-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 0],
-    // A nested run's failure is the tool's output, as upstream; the run ends on it.
-    'nested-agent-start-model-object': [
-      /^An error occurred while running the tool.*Agent 'Nested' has a Model object/,
-      1,
-    ],
-    // The nested Runner's run checks the config it uses as it starts, inside the tool, so upstream
-    // returns the failure as the tool's output.
-    'tool-start-model-provider': [
-      /^An error occurred while running the tool.*agent 'Nested' has a model provider that would call models/,
-      1,
-    ],
-    'tool-start-run-model-object': [
-      /^An error occurred while running the tool.*agent 'Nested' has a Model object as runConfig.model/,
-      1,
-    ],
-    'input-builder-model-provider': [
-      /^An error occurred while running the tool.*agent 'Nested' has a model provider that would call models/,
-      1,
-    ],
-    'tool-start-clear-model-provider': [
-      /^An error occurred while running the tool.*agent 'Nested' has a model provider that would call models/,
-      1,
-    ],
-    'tool-start-memory-session': [/^An error occurred while running the tool.*agent 'Nested' has a MemorySession/, 1],
-    'tool-start-tracing-key': [/^An error occurred while running the tool.*cannot pass a trace's own tracing key/, 1],
-    'tool-start-run-config-tracing-key': [
-      /^An error occurred while running the tool.*cannot pass a trace's own tracing key/,
-      1,
-    ],
+    // A nested run's failure reaches the lead only as upstream's generic tool output, and the run ends on it.
+    // A missing check shows as the inline model's answer in the output or as one more model Activity.
+    'nested-agent-start-model-object': [/^An error occurred while running the tool/, 1],
+    // These change the tool's config after the lead's model call, so the nested run's own check catches them.
+    'tool-start-model-provider': [/^An error occurred while running the tool/, 1],
+    'tool-start-run-model-object': [/^An error occurred while running the tool/, 1],
+    'input-builder-model-provider': [/^An error occurred while running the tool/, 1],
+    'tool-start-clear-model-provider': [/^An error occurred while running the tool/, 1],
+    'tool-start-memory-session': [/^An error occurred while running the tool/, 1],
+    'tool-start-tracing-key': [/^An error occurred while running the tool/, 1],
+    'tool-start-run-config-tracing-key': [/^An error occurred while running the tool/, 1],
     'tool-option-model-provider-undefined': [
       /^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.modelProvider/,
       0,

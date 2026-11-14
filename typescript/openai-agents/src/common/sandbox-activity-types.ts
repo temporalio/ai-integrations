@@ -102,6 +102,10 @@ export interface TemporalSandboxSessionState extends SandboxSessionState {
 export interface SandboxSessionResult {
   state: SerializedSandboxSessionState;
   supportsPty: boolean;
+  /** The session has an in-container mount, so upstream resumes it only while it is live. */
+  inContainerMounts?: true;
+  /** The session has a mount upstream can't verify after persistence, so upstream never resumes it. */
+  nonResumableMountAuthority?: true;
 }
 
 export interface SandboxCreateSessionInput {

@@ -1,5 +1,9 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import test from 'ava';
 import { Agent, handoff } from '@openai/agents-core';
+import { UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';
 import {
   Manifest,
   SandboxAgent,
@@ -996,3 +1000,63 @@ test('session envelope survives a JSON round-trip and revives a live Manifest', 
   t.deepEqual(decoded.exposedPorts, { 'port:8080': { host: 'localhost', port: 8080 } });
   t.deepEqual(decoded.providerState, { workspacePath: '/tmp/w' });
 });
+
+// The Unix local sandbox can't run on Windows, where CI also runs.
+(process.platform === 'win32' ? test.skip : test)(
+  "A session with a local mount is used on a Worker that didn't create it",
+  async (t) => {
+    const mountSource = fs.mkdtempSync(path.join(os.tmpdir(), 'oa-mount-src-'));
+    const workspaceBaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oa-mount-ws-'));
+    t.teardown(() => {
+      fs.rmSync(mountSource, { recursive: true, force: true });
+      fs.rmSync(workspaceBaseDir, { recursive: true, force: true });
+    });
+    fs.writeFileSync(path.join(mountSource, 'a.txt'), 'mounted content');
+
+    const activities = () =>
+      activityMap(new SandboxClientProvider('local', new UnixLocalSandboxClient({ workspaceBaseDir })));
+    const manifest = new Manifest({
+      entries: { data: { type: 'mount', source: mountSource, mountPath: 'data', readOnly: false } },
+    });
+    const { state } = await activities()[`local${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+      manifest: encodeManifest(manifest),
+    });
+
+    // A fresh provider has no cached session, so it resumes the session from the envelope.
+    const output = await activities()[`local${SANDBOX_SESSION_EXEC_COMMAND_SUFFIX}`]!({
+      state,
+      args: { cmd: 'cat data/a.txt' },
+    });
+    t.regex(output, /mounted content/);
+  }
+);
+
+// The Unix local sandbox can't run on Windows, where CI also runs.
+(process.platform === 'win32' ? test.skip : test)(
+  'A manifest applied to a UnixLocal session resolves its Worker environment references',
+  async (t) => {
+    const variable = 'OPENAI_AGENTS_TEST_APPLIED_SECRET';
+    process.env[variable] = 'sk-applied-sentinel';
+    const workspaceBaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oa-apply-ws-'));
+    t.teardown(() => {
+      delete process.env[variable];
+      fs.rmSync(workspaceBaseDir, { recursive: true, force: true });
+    });
+    const provider = new SandboxClientProvider('local', new UnixLocalSandboxClient({ workspaceBaseDir }));
+    provider._setResolvableWorkerEnvVars([variable]);
+    const activities = activityMap(provider);
+    const { state } = await activities[`local${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+      manifest: encodeManifest(new Manifest()),
+    });
+
+    const manifest = await activities[`local${SANDBOX_SESSION_APPLY_MANIFEST_SUFFIX}`]!({
+      state,
+      manifest: encodeManifest(new Manifest({ environment: { API_KEY: workerEnvValue(variable) } })),
+    });
+    const output = await activities[`local${SANDBOX_SESSION_EXEC_COMMAND_SUFFIX}`]!({
+      state: { ...state, manifest },
+      args: { cmd: 'echo "applied=$API_KEY"' },
+    });
+    t.regex(output, /applied=sk-applied-sentinel/);
+  }
+);

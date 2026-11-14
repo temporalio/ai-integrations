@@ -10,6 +10,7 @@ minimumReleaseAge: 20160
 minimumReleaseAgeExclude:
   - '@temporalio/*'
 
-  # Exact security fixes; all other third-party releases keep the two-week cooldown.
-  - hono@4.13.16
-  - '@hono/node-server@2.1.6'
+  # agents-core 0.22.0 lets sandbox clients prepare manifest environments
+  # (openai/openai-agents-js#2085). agents-openai pins the same core version.
+  - '@openai/agents-core@0.22.0'
+  - '@openai/agents-openai@0.22.0'
