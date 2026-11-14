@@ -17,6 +17,19 @@ from google.adk.tools.tool_confirmation import ToolConfirmation
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from google.genai.types import FunctionDeclaration
+from mcp.types import (
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+)
+
+try:
+    from mcp import (  # type: ignore[attr-defined]  # mcp>=2
+        MCPError as McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
+except ImportError:  # mcp<2
+    from mcp.shared.exceptions import McpError  # type: ignore[assignment,no-redef]
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1.workflow_pb2 import (
@@ -99,6 +112,57 @@ class _CallToolArguments:
     tool_context: TemporalToolContext
 
 
+# JSON-RPC errors that a retry of the same request cannot fix.  INTERNAL_ERROR,
+# timeouts, unknown codes and a lost session (see ``_protocol_error``) stay
+# retryable.
+_NON_RETRYABLE_PROTOCOL_ERRORS = frozenset(
+    {PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS}
+)
+
+# A server answers HTTP 404 for a session it no longer knows (for example after
+# a restart); MCP reports it only as INVALID_REQUEST with no data and one of
+# these messages.  Reconnecting fixes it, so it must stay retryable.
+_SESSION_LOST_MESSAGES = frozenset({"Session terminated", "Session not found"})
+
+
+def _find_mcp_error(err: BaseException) -> McpError | None:
+    """Return the MCP protocol error behind ``err``, if any.
+
+    ADK does not raise the ``McpError`` itself: ``McpToolset.get_tools`` wraps
+    it in a ``ConnectionError``, so it is looked up along the ``__cause__``
+    chain of ``err``.
+    """
+    seen: set[int] = set()
+    cause: BaseException | None = err
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, McpError):
+            return cause
+        seen.add(id(cause))
+        cause = cause.__cause__
+    return None
+
+
+def _protocol_error(err: McpError) -> ApplicationError:
+    """Convert an MCP protocol error to an ``ApplicationError``.
+
+    Errors a retry cannot fix (invalid request/params, unknown method, parse
+    error) are non-retryable so the activity does not keep retrying them.
+    """
+    error = err.error
+    session_lost = (
+        error.code == INVALID_REQUEST
+        and error.data is None
+        and error.message in _SESSION_LOST_MESSAGES
+    )
+    details = (error.code,) if error.data is None else (error.code, error.data)
+    return ApplicationError(
+        error.message,
+        *details,
+        type="MCPProtocolError",
+        non_retryable=error.code in _NON_RETRYABLE_PROTOCOL_ERRORS and not session_lost,
+    )
+
+
 class TemporalMcpToolSetProvider:
     """Provider for creating Temporal-aware MCP toolsets.
 
@@ -156,6 +220,11 @@ class TemporalMcpToolSetProvider:
                     )
                     for tool in tools
                 ]
+            except Exception as err:
+                mcp_error = _find_mcp_error(err)
+                if mcp_error is not None:
+                    raise _protocol_error(mcp_error) from err
+                raise
             finally:
                 await toolset.close()
 
@@ -184,6 +253,11 @@ class TemporalMcpToolSetProvider:
                     tool_context=args.tool_context,  #  type:ignore
                 )
                 return _CallToolResult(result=result, tool_context=args.tool_context)
+            except Exception as err:
+                mcp_error = _find_mcp_error(err)
+                if mcp_error is not None:
+                    raise _protocol_error(mcp_error) from err
+                raise
             finally:
                 await toolset.close()
 
