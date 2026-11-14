@@ -1536,8 +1536,8 @@ async def test_litellm_model(client: Client):
     assert result.content.parts[0].text == "hello from litellm"
 
 
-def test_unset_none_fields_stripped() -> None:
-    """None fields are omitted from ADK payloads."""
+def test_unset_none_fields_preserved() -> None:
+    """Default None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1555,11 +1555,11 @@ def test_unset_none_fields_stripped() -> None:
         "cacheable_contents_token_count",
         "previous_interaction_id",
     ):
-        assert field not in serialized, f"Unset field {field!r} should be stripped"
+        assert serialized[field] is None
 
 
-def test_explicitly_set_none_stripped() -> None:
-    """Explicitly-set None is omitted along with default None fields."""
+def test_explicitly_set_none_preserved() -> None:
+    """Explicit None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1570,7 +1570,7 @@ def test_explicitly_set_none_stripped() -> None:
     payloads = converter.payload_converter.to_payloads([request])
     serialized = json.loads(payloads[0].data)
 
-    assert "cache_config" not in serialized
+    assert serialized["cache_config"] is None
 
 
 def test_activity_as_tool_preserves_metadata() -> None:
