@@ -198,9 +198,10 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   its newest version with `dotnet package update` and re-locks in the CI checkout only; until NuGet
   reads the cooldown that lane tests versions younger than the window. Known-vulnerability advisories
   (`NuGetAuditMode=all`) are warnings, not errors; fix them with `dotnet package update --vulnerable`.
-- The package ships `LICENSE` (`PackageLicenseFile`, a committed copy byte-identical to the root
-  file), `README.md` (`PackageReadmeFile`; absolute links only, nuget.org renders it), `icon.png`
-  from `dotnet/_shared/`, XML docs, Source Link metadata and a `.snupkg`.
+- The package declares the MIT license as `PackageLicenseExpression` (no packed LICENSE; the plugin
+  directory keeps a committed copy of the root file for the repository) and ships `README.md`
+  (`PackageReadmeFile`; absolute links only, nuget.org renders it), `icon.png` from `dotnet/_shared/`,
+  XML docs, Source Link metadata and a `.snupkg`.
   `ContinuousIntegrationBuild=true` is set on CI only; `DeterministicTimestamp` is the commit time, so
   one commit packs to identical bytes on one SDK version (a servicing patch ships a new compiler and
   changes assembly and PDB bytes; `recover-run` covers that case).
