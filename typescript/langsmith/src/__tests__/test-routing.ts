@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import test from 'ava';
-import { address } from 'langsmith';
+import { AgentAddress } from 'langsmith';
 import { RunTree, type WriteReplica } from 'langsmith/run_trees';
 import { traceable } from 'langsmith/traceable';
 import { Worker } from '@temporalio/worker';
@@ -9,14 +9,14 @@ import { runHeaders, runTreeFromContext } from '../run-tree';
 import { bindReplicaCredentials } from '../routing';
 import { HEADER_KEY } from '../propagation';
 import * as activities from './activities/routing';
-import { InMemoryRunCollector, useSharedEnv, withTracingWorker } from './helpers';
+import { idPath, InMemoryRunCollector, useSharedEnv, withTracingWorker } from './helpers';
 import { comprehensiveNexusServiceHandler } from './stubs/nexus';
 import { ROUTING_ADDRESS, ROUTING_ENDPOINT, RoutingWorkflow } from './workflows/routing';
 
 process.env.LANGSMITH_TRACING = 'true';
 process.env.LANGCHAIN_CALLBACKS_BACKGROUND = 'false';
 const WORKFLOWS_PATH = require.resolve('./workflows/routing');
-const SECONDARY_ADDRESS = address.agent('support', 'production');
+const SECONDARY_ADDRESS = { ...new AgentAddress('support', 'production') };
 const REPLICAS: WriteReplica[] = [
   { projectName: 'primary', primary: true },
   { projectName: 'secondary', updates: { tags: ['secondary-only'] } },
@@ -29,7 +29,9 @@ test('plugin validates mutually exclusive destinations', (t) => {
   t.throws(() => new LangSmithPlugin({ projectName: 'project', address: ROUTING_ADDRESS }), {
     message: 'projectName and address are mutually exclusive',
   });
-  t.throws(() => new LangSmithPlugin({ address: 'invalid' as typeof ROUTING_ADDRESS }));
+  t.throws(() => new LangSmithPlugin({ address: 'invalid' as unknown as typeof ROUTING_ADDRESS }));
+  t.notThrows(() => new LangSmithPlugin({ address: new AgentAddress('support', 'STAGING') }));
+  t.throws(() => new LangSmithPlugin({ address: { ...ROUTING_ADDRESS, id: 'INVALID' } }));
 });
 
 test('headers preserve addresses and replica routing without credentials', (t) => {
@@ -41,7 +43,7 @@ test('headers preserve addresses and replica routing without credentials', (t) =
     start_time: time,
     address: ROUTING_ADDRESS,
     client: collector.asClient(),
-    extra: { metadata: { team: 'sdk', api_key: 'metadata-secret' } },
+    extra: { metadata: { team: 'sdk', api_key: 'run-metadata' } },
     replicas: [{
       address: SECONDARY_ADDRESS,
       primary: true,
@@ -57,14 +59,17 @@ test('headers preserve addresses and replica routing without credentials', (t) =
   });
   const headers = runHeaders(parent)!;
   const encoded = decodeURIComponent(headers.baggage);
-  for (const secret of ['metadata-secret', 'replica-secret', 'private-ingestion', 'private-workspace', 'nested-secret']) {
+  t.true(encoded.includes('"address":"lrn:agents/support/environments/production"'));
+  for (const secret of ['replica-secret', 'private-ingestion', 'private-workspace', 'nested-secret']) {
     t.false(encoded.includes(secret));
   }
+  // Run metadata travels unchanged, as LangSmith's own headers carry it.
+  t.true(encoded.includes('"api_key":"run-metadata"'));
   t.false(encoded.includes('untrusted-id'));
   t.false(encoded.includes('untrusted-destination'));
   const before = Date.now();
   const restored = runTreeFromContext(headers)!;
-  t.is(restored.address, ROUTING_ADDRESS);
+  t.deepEqual(restored.address, ROUTING_ADDRESS);
   t.is(restored.project_name, undefined);
   t.true(restored.start_time >= before && restored.start_time <= Date.now());
   t.deepEqual(restored.replicas, [{
@@ -87,6 +92,18 @@ test('replica headers support Python and JavaScript project names and explicit e
   t.deepEqual(runTreeFromContext(runHeaders(parent))?.replicas, []);
 });
 
+test('existing LRN headers restore agent addresses and replicas', (t) => {
+  const parent = new RunTree({ name: 'parent' });
+  const replicas = [{ address: 'lrn:agents/support/environments/production', primary: true }];
+  const restored = runTreeFromContext({
+    'langsmith-trace': parent.dotted_order,
+    baggage: 'langsmith-address=lrn%3Aagents%2Fsupport%2Fenvironments%2Fstaging,' +
+      `langsmith-replicas=${encodeURIComponent(JSON.stringify(replicas))}`,
+  });
+  t.deepEqual(restored?.address, ROUTING_ADDRESS);
+  t.deepEqual(restored?.replicas, [{ address: SECONDARY_ADDRESS, primary: true }]);
+});
+
 test('replicas use the receiving worker credentials for the matching destination', (t) => {
   t.deepEqual(bindReplicaCredentials([{ projectName: 'secondary', primary: false }], [{
     projectName: 'secondary', apiKey: 'worker-key', apiUrl: 'https://worker.invalid', workspaceId: 'workspace',
@@ -94,6 +111,16 @@ test('replicas use the receiving worker credentials for the matching destination
     projectName: 'secondary', primary: false, apiKey: 'worker-key', apiUrl: 'https://worker.invalid',
     workspaceId: 'workspace', client: undefined,
   }]);
+  const local = {
+    address: new AgentAddress('support', 'production'),
+    apiKey: 'agent-worker-key', apiUrl: 'https://agent-worker.invalid', workspaceId: 'agent-workspace',
+  };
+  const [bound] = bindReplicaCredentials([{ address: { ...SECONDARY_ADDRESS } }], [
+    { address: new AgentAddress('other', 'production'), apiKey: 'wrong-agent-key' },
+    { address: new AgentAddress('support', 'staging'), apiKey: 'wrong-environment-key' },
+    local,
+  ])!;
+  t.deepEqual(bound, { ...local, address: SECONDARY_ADDRESS, client: undefined });
 });
 
 function historyText(value: unknown): string {
@@ -196,7 +223,7 @@ for (const addTemporalRuns of [false, true]) {
             t.true(runs.length > 0, `missing ${name}`);
             for (const run of runs) {
               const inheritsPluginProject = addTemporalRuns && ['decorator', 'runtime'].includes(source);
-              t.is(run.address, inheritsPluginProject ? undefined : ROUTING_ADDRESS, name);
+              t.deepEqual(run.address, inheritsPluginProject ? undefined : ROUTING_ADDRESS, name);
               t.is(run.project_name, inheritsPluginProject ? 'fallback' : undefined, name);
               t.truthy(run.end_time, name);
             }
@@ -204,7 +231,7 @@ for (const addTemporalRuns of [false, true]) {
           for (const run of collector.records.filter((item) => item.parent_run_id)) {
             const parent = collector.byId.get(run.parent_run_id!);
             t.truthy(parent, `${run.name} has a real parent`);
-            t.true(run.dotted_order!.startsWith(`${parent!.dotted_order}.`));
+            t.deepEqual(idPath(run.dotted_order!), [...idPath(parent!.dotted_order!), run.id]);
           }
         },
       });

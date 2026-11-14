@@ -596,9 +596,9 @@ def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
 
 
 def _cancel_requests() -> int:
-    """Pending cancellation requests of the current task (Python 3.11 and later)."""
-    cancelling = getattr(asyncio.current_task(), "cancelling", None)
-    return cancelling() if cancelling else 0
+    """Pending cancellation requests of the current task."""
+    task = asyncio.current_task()
+    return task.cancelling() if task is not None else 0
 
 
 def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
@@ -1009,8 +1009,7 @@ class StatefulMCPServerProvider:
                 # heartbeat, which says a session may be open.
                 await heartbeats.wait_until_stored()
                 # A cancellation, such as a worker shutdown, doesn't interrupt
-                # the read-back, and Python 3.10 and 3.11's asyncio.wait_for can
-                # drop one.
+                # the read-back, and Python 3.11's asyncio.wait_for can drop one.
                 if activity.is_cancelled():
                     raise asyncio.CancelledError()
                 if server_id in self._servers:

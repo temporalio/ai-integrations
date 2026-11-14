@@ -28,7 +28,13 @@ _ErrorT = TypeVar("_ErrorT", bound=OSError)
 
 
 class TemporalSandbox(Sandbox):
-    """Workflow-side sandbox that dispatches operations as Temporal activities."""
+    """Workflow-side sandbox that dispatches operations as Temporal activities.
+
+    ``heartbeat_timeout`` defaults to 10 seconds. The sandbox activities
+    heartbeat on a timer at half of it, so a cancel reaches a running command
+    and a lost worker is noticed. Pass ``heartbeat_timeout=None`` to turn
+    heartbeats off.
+    """
 
     def __init__(
         self,
@@ -38,7 +44,7 @@ class TemporalSandbox(Sandbox):
         schedule_to_close_timeout: timedelta | None = None,
         schedule_to_start_timeout: timedelta | None = None,
         start_to_close_timeout: timedelta | None = None,
-        heartbeat_timeout: timedelta | None = None,
+        heartbeat_timeout: timedelta | None = timedelta(seconds=10),
         retry_policy: RetryPolicy | None = None,
         cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL,
         versioning_intent: VersioningIntent | None = None,

@@ -23,14 +23,19 @@ honors that call's ``factory_argument``, and always closes the toolset.
 """
 
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from google.adk.events import EventActions
 from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
+from google.adk.tools.mcp_tool.mcp_tool import McpTool
+from mcp.types import Tool
 
 from temporalio.google_adk._mcp import (
     TemporalMcpToolSetProvider,
     TemporalToolContext,
+    TemporalToolSession,
     _CallToolArguments,
     _GetToolsArguments,
 )
@@ -93,6 +98,8 @@ def _tool_context() -> TemporalToolContext:
         tool_confirmation=None,
         function_call_id=None,
         event_actions=EventActions(),
+        session=TemporalToolSession(app_name="test-app"),
+        user_id="test-user",
     )
 
 
@@ -124,6 +131,38 @@ async def test_call_tool_creates_and_closes_fresh_toolset_each_call():
     # One fresh toolset per call, and every one was closed.
     assert len(created) == 5
     assert all(t.closed for t in created)
+
+
+async def test_mcp_confirmation_returns_event_actions_without_calling_server():
+    session_manager = MagicMock(spec=MCPSessionManager)
+    tool = McpTool(
+        mcp_tool=Tool.model_validate(
+            {"name": "echo", "inputSchema": {"type": "object"}}
+        ),
+        mcp_session_manager=session_manager,
+        require_confirmation=True,
+    )
+    toolset = MagicMock(spec=McpToolset)
+    toolset.get_tools = AsyncMock(return_value=[tool])
+    toolset.close = AsyncMock()
+    provider = TemporalMcpToolSetProvider("confirmation", lambda _: toolset)
+    _, call_tool = provider._get_activities()
+    args = _call_tool_args()
+    args.tool_context.function_call_id = "call-1"
+
+    result = await call_tool(args)
+
+    assert result.result == {
+        "error": "This tool call requires confirmation, please approve or reject."
+    }
+    assert result.tool_context.event_actions.skip_summarization is True
+    assert result.tool_context.actions is result.tool_context.event_actions
+    confirmation = result.tool_context.event_actions.requested_tool_confirmations[
+        "call-1"
+    ]
+    assert confirmation.confirmed is False
+    session_manager.create_session.assert_not_called()
+    toolset.close.assert_awaited_once()
 
 
 async def test_get_tools_creates_and_closes_fresh_toolset():

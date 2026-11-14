@@ -1,4 +1,4 @@
-import { address } from 'langsmith';
+import { AgentAddress } from 'langsmith';
 import { RunTree } from 'langsmith/run_trees';
 import { getCurrentRunTree, traceable, withRunTree } from 'langsmith/traceable';
 import { proxySinks, sleep } from '@temporalio/workflow';
@@ -50,7 +50,7 @@ export async function NativeRunTreeWorkflow(): Promise<Record<string, unknown>[]
   await explicit.patchRun({ excludeInputs: false });
   const snapshots = [root, child, tracedChild!, tracedRoot!, explicit].map(snapshot);
   try {
-    new RunTree({ name: 'conflicting-destinations', project_name: 'project', address: address.agent('agent', 'env') });
+    new RunTree({ name: 'conflicting-destinations', project_name: 'project', address: new AgentAddress('agent', 'staging') });
     snapshots[0]!.conflictRejected = false;
   } catch {
     snapshots[0]!.conflictRejected = true;

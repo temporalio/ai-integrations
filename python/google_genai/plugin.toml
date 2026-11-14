@@ -10,7 +10,7 @@ maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/python/integrations/google-genai"
 
 [ci]
-runtime-versions = ["3.10", "3.14"]
+runtime-versions = ["3.11", "3.15"]
 
 [smoke]
 imports = ["temporalio.google_genai.workflow"]

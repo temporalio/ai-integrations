@@ -3,11 +3,13 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
+import email.utils
 import functools
 import importlib.metadata
 import json
 import os
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -808,7 +810,6 @@ class Unprintable:
 @activity.defn
 @dataclass
 class ActivityWeatherUnprintableDefault:
-    # Documented, or Python 3.10's dataclasses fails to write its docstring.
     """
     Weather tools.
     """
@@ -1151,8 +1152,7 @@ class WeatherDefaultsService:
     ],
 )
 def test_method_tool_with_none_defaults(target: Any, parameters: list[str]):
-    # Python 3.10's typing.get_type_hints would wrap these in Optional, hiding the context type
-    # and the alias.
+    # A None default preserves the declared context type and alias metadata.
     tool = openai_agents.workflow.activity_as_tool(
         target, start_to_close_timeout=timedelta(seconds=10)
     )
@@ -3122,6 +3122,34 @@ def test_should_retry_false_stays_non_retryable():
     assert err.value.next_retry_delay == timedelta(milliseconds=5000)
 
 
+def test_retry_after_http_date_propagated():
+    retry_at = email.utils.formatdate(time.time() + 30, usegmt=True)
+    with pytest.raises(ApplicationError) as err:
+        _raise_for_openai_status(_openai_status_error(429, {"retry-after": retry_at}))
+    assert not err.value.non_retryable
+    assert err.value.next_retry_delay is not None
+    assert timedelta(seconds=28) < err.value.next_retry_delay <= timedelta(seconds=30)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"retry-after": email.utils.formatdate(time.time() + 30, usegmt=True)},
+        {"retry-after": "soon"},
+        {"retry-after": "Wed, 21 Oct 10000 07:28:00 GMT"},
+        {"retry-after": "Wed, 2000000000 Oct 2026 07:28:00 GMT"},
+        {"retry-after": "1e20"},
+        {"retry-after-ms": "soon"},
+        {"retry-after-ms": "1e20"},
+    ],
+)
+def test_retry_after_does_not_change_non_retryable_status(headers: dict[str, str]):
+    with pytest.raises(ApplicationError) as err:
+        _raise_for_openai_status(_openai_status_error(400, headers))
+    assert err.value.non_retryable
+    assert err.value.type == "APIStatusError"
+
+
 def test_retry_after_ms_takes_precedence_over_retry_after():
     with pytest.raises(ApplicationError) as err:
         _raise_for_openai_status(
@@ -3345,15 +3373,32 @@ async def test_alternative_model(client: Client):
             await workflow_handle.result()
 
 
-async def test_heartbeat(client: Client, env: WorkflowEnvironment):
+# WaitModel takes a second, so a 0.5-second heartbeat timeout passes only if the
+# model activity heartbeats. With nothing set, the default is 10 seconds.
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        (
+            ModelActivityParameters(heartbeat_timeout=timedelta(seconds=0.5)),
+            timedelta(seconds=0.5),
+        ),
+        (ModelActivityParameters(), timedelta(seconds=10)),
+        (ModelActivityParameters(heartbeat_timeout=None), None),
+    ],
+    ids=["set", "default", "off"],
+)
+async def test_heartbeat(
+    client: Client,
+    env: WorkflowEnvironment,
+    params: ModelActivityParameters,
+    expected: timedelta | None,
+):
     if env.supports_time_skipping:
         pytest.skip("Relies on real timing, skip.")
 
     async with AgentEnvironment(
         model=WaitModel(),
-        model_params=ModelActivityParameters(
-            heartbeat_timeout=timedelta(seconds=0.5),
-        ),
+        model_params=params,
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -3368,6 +3413,13 @@ async def test_heartbeat(client: Client, env: WorkflowEnvironment):
                 task_queue=worker.task_queue,
             )
             await workflow_handle.result()
+            heartbeat_timeouts = [
+                e.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+                or None
+                async for e in workflow_handle.fetch_history_events()
+                if e.HasField("activity_task_scheduled_event_attributes")
+            ]
+    assert heartbeat_timeouts == [expected]
 
 
 @workflow.defn
@@ -3493,6 +3545,10 @@ class LiteLlmAgent:
         return result.final_output
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 15),
+    reason="LiteLLM's fastuuid dependency does not support Python 3.15",
+)
 async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
     # LiteLLM fetches its model cost map at import time unless explicitly told to
     # use the copy bundled in the package.
@@ -3515,8 +3571,8 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
         Message as LiteLlmMessage,
     )
 
-    # LiteLLM 1.97 leaves this Pydantic model's nested forward reference
-    # unresolved on Python 3.10, before a custom provider can handle the call.
+    # Resolve this Pydantic model's nested forward reference before the custom
+    # provider handles the call.
     if not LiteLlmMessage.__pydantic_complete__:
         LiteLlmMessage.model_rebuild(
             _types_namespace={
@@ -3526,7 +3582,7 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
 
     requested_models: list[str] = []
 
-    class FakeLiteLlmProvider(CustomLLM):
+    class FakeLiteLlmProvider(CustomLLM):  # pyright: ignore[reportUntypedBaseClass]
         def completion(self, *args: Any, **kwargs: Any) -> LiteLlmResponse:
             model = args[0] if args else kwargs.get("model", "unknown")
             requested_models.append(model)
@@ -5698,10 +5754,6 @@ async def test_stateful_mcp_server_session_end_with_other_events(
             async with workflow_worker():
                 if case == "timer_first":
                     # The block raises the documented error, so the recovery runs.
-                    assert await handle.result() == "recovered"
-                elif not hasattr(asyncio.Task, "cancelling"):
-                    # Python 3.10 can't tell the workflow's cancellation from the
-                    # session's end, as the README says.
                     assert await handle.result() == "recovered"
                 else:
                     # The workflow's cancellation wins over the session's end.

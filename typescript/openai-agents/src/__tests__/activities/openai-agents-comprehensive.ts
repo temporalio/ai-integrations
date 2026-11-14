@@ -6,6 +6,7 @@
  * classification.
  */
 import { withCustomSpan } from '@openai/agents-core';
+import { ApplicationFailure } from '@temporalio/common';
 
 export interface WeatherInput {
   location: string;
@@ -50,8 +51,8 @@ export async function calculateSum(input: SumInput): Promise<number> {
   return input.a + input.b;
 }
 
-export async function failingTool(_input: { reason?: string }): Promise<never> {
-  throw new Error('failingTool always fails');
+export async function failingTool(input: { reason?: string }): Promise<never> {
+  throw ApplicationFailure.nonRetryable('failingTool always fails', 'ToolFailed', input.reason);
 }
 
 let phase1Resolver: (() => void) | undefined;

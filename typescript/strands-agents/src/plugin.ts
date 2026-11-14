@@ -238,12 +238,14 @@ export class StrandsPlugin extends SimplePlugin {
    *     `@google/genai`, `ai`). The workers constructs models worker-side;
    *     workflow code only goes through {@link TemporalModel}.
    *   - `@aws-sdk/client-s3`, dynamically imported by the SDK's S3-backed
-   *     `context-offloader` vended plugin — worker-only, never reached from
-   *     workflow code.
+   *     `context-offloader` vended plugin. The offloader can run in workflows
+   *     with in-memory storage; S3 I/O must run in Activities.
    *   - `@temporalio/activity` and `@temporalio/client`, which the
    *     worker-only halves of {@link TemporalMCPClient}, {@link autoHeartbeat},
    *     and `@temporalio/workflow-streams/client` import.
    *   - `path` / `crypto`, pulled in transitively by the same worker-only code.
+   *   - `node:crypto`, dynamically imported by `LocalFileStorage` through the
+   *     unified storage entrypoint. In-memory storage does not use it.
    *
    * - Replace the dynamic-imported MCP transport helpers
    *   (`@modelcontextprotocol/sdk/client/{stdio,sse,streamableHttp}.js` and
@@ -326,7 +328,7 @@ interface WebpackCompiler {
 function emptyModuleRewritesPlugin(): WebpackPlugin {
   const empty = require.resolve('./empty-module');
   const ignorePattern =
-    /^(?:node:(?:fs\/promises|os|path|process|stream)|@modelcontextprotocol\/sdk\/client\/(?:stdio|sse|streamableHttp)\.js|eventsource|eventsource-parser\/stream)$/;
+    /^(?:node:(?:crypto|fs\/promises|os|path|process|stream)|@modelcontextprotocol\/sdk\/client\/(?:stdio|sse|streamableHttp)\.js|eventsource|eventsource-parser\/stream)$/;
   return {
     apply(compiler) {
       const { NormalModuleReplacementPlugin } = compiler.webpack;
