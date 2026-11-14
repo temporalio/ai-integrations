@@ -246,6 +246,10 @@ async def test_store_true_uses_service_conversation(client: Client) -> None:
         )
     assert result == {"texts": ["one", "two"], "service_session_id": "conv-1"}
     first_call, second_call = factory().calls
+    # The provider receives the explicit store=True, so this cannot pass on a
+    # client that always sends False.
+    assert first_call["options"]["store"] is True
+    assert second_call["options"]["store"] is True
     assert first_call["options"].get("conversation_id") is None
     assert second_call["options"]["conversation_id"] == "conv-1"
     # The service keeps the history, so the second call carries only the new turn.
