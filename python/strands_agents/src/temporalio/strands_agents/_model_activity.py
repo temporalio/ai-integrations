@@ -1,3 +1,4 @@
+import time
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -112,7 +113,9 @@ class ModelActivity:
                 raise ValueError(
                     f"Unknown model name {name!r}. Known: {sorted(self._factories)}"
                 )
+            start = time.monotonic()
             self._models[name] = self._factories[name]()
+            _warn_if_slower_than_heartbeat(name, time.monotonic() - start)
         return self._models[name]
 
     @activity.defn(name="strands_get_model_config")
@@ -187,6 +190,26 @@ class ModelActivity:
         state = dict(input.model_state or {})
         events = await _publish(_stream(model, input, state), input)
         return _InvokeModelResult(events=events, model_state=state)
+
+
+def _warn_if_slower_than_heartbeat(name: str, seconds: float) -> None:
+    """Say why a heartbeat timeout may follow a slow model factory.
+
+    The factory runs on the worker's event loop, so the heartbeat timer can't
+    run while it builds the model.
+    """
+    timeout = activity.info().heartbeat_timeout if activity.in_activity() else None
+    if timeout and seconds >= timeout.total_seconds():
+        activity.logger.warning(
+            "Building model %r took %.1f s, longer than this Activity's %g s "
+            "heartbeat timeout. The factory blocks the event loop, so no heartbeat "
+            "went out and this attempt may fail with a heartbeat timeout. The next "
+            "attempt reuses the built model. Make the factory faster, or set a "
+            "longer heartbeat_timeout (or None).",
+            name,
+            seconds,
+            timeout.total_seconds(),
+        )
 
 
 async def _publish(

@@ -29,7 +29,7 @@ from temporalio.strands_agents import (
     temporal_worker_env_ref,
 )
 from temporalio.worker import Replayer, Worker
-from tests.common import get_activities
+from tests.common import get_activities, get_heartbeat_timeouts
 
 
 class RecordingSandbox(Sandbox):
@@ -232,6 +232,7 @@ async def test_sandbox_operations_are_durable_and_factory_runs_for_each_activity
         "strands-sandbox-remove-file",
         "strands-sandbox-list-files",
     ]
+    assert get_heartbeat_timeouts(history) == [timedelta(seconds=10)] * 7
     await Replayer(workflows=[SandboxWorkflow], plugins=[plugin]).replay_workflow(
         history
     )
