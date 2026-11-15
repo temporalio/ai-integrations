@@ -4,6 +4,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import { TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from '..';
 import { TOOL_FILTER_UNSUPPORTED_TYPE } from '../common/mcp-types';
 import { StatelessMCPServerProvider, filterListedTools } from '../worker/mcp-provider';
+import { StatefulMCPServerProvider } from '../worker/stateful-mcp-provider';
 import { statelessMcpServer } from '../workflow/mcp-client';
 
 function fakeServer(toolFilter: MCPServer['toolFilter'], onConnect = () => {}): MCPServer {
@@ -48,6 +49,18 @@ test('StatelessMCPServerProvider rejects invalid factory results before connecti
   }
   t.is(connects, 0);
   t.is(closes, 0);
+});
+
+test('MCP server providers refuse a factory that is not a function when they are built', (t) => {
+  for (const value of [undefined, null, 42, fakeServer(undefined)]) {
+    const factory = value as unknown as () => MCPServer;
+    for (const build of [
+      () => new StatelessMCPServerProvider('files', factory),
+      () => new StatefulMCPServerProvider('files', factory, undefined as never),
+    ]) {
+      t.throws(build, { instanceOf: TypeError, message: "MCP server factory 'files' is not a function." });
+    }
+  }
 });
 
 test('filterListedTools applies a static filter with the agent SDK rules', (t) => {

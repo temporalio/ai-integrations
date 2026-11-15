@@ -8,6 +8,13 @@ import {
   TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
 } from '../common/mcp-types';
 
+/** Refuse a factory that isn't a function when the provider is built, not in every MCP Activity. */
+export function assertMCPServerFactory(name: string, factory: unknown): void {
+  if (typeof factory !== 'function') {
+    throw new TypeError(`MCP server factory '${name}' is not a function.`);
+  }
+}
+
 /** Check that a factory result has the methods the Worker calls. */
 export function assertMCPServer(name: string, server: unknown): asserts server is MCPServer {
   const methods = ['connect', 'close', 'listTools', 'callTool'] as const;
@@ -86,6 +93,7 @@ export class StatelessMCPServerProvider {
     public readonly name: string,
     private serverFactory: (factoryArgument?: unknown) => MCPServer
   ) {
+    assertMCPServerFactory(name, serverFactory);
     this._name = `${name}${MCP_STATELESS_SUFFIX}`;
   }
 
