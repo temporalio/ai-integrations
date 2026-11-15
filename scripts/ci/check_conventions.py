@@ -57,6 +57,9 @@ STANDARD_TEST_SUPPORT = {
 }
 STANDARD_TYPESCRIPT_TEST_SUPPORT = {
     "src/__tests__/helpers/environment.ts": "src/__tests__/helpers/environment.ts.tmpl",
+    "src/__tests__/helpers/payload-round-trip.ts":
+        "src/__tests__/helpers/payload-round-trip.ts.tmpl",
+    "src/__tests__/payload-round-trip.test.ts": "src/__tests__/payload-round-trip.test.ts.tmpl",
     "src/__tests__/test-environment-startup.test.ts": "src/__tests__/test-environment-startup.test.ts.tmpl",
 }
 PYTHON_DEVELOPMENT_VERSION = "0.0.0"

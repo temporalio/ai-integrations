@@ -1,37 +1,40 @@
 /** Scoped LangSmith defaults for worker handlers with no propagated parent. */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { RunTree, type RunTreeConfig } from 'langsmith/run_trees';
+import type { RunTree, RunTreeConfig } from 'langsmith/run_trees';
 import { AsyncLocalStorageProviderSingleton } from 'langsmith/singletons/traceable';
+import { patchRunTree, type RunTreeOverrides } from './run-tree';
 import type { EmitterConfig } from './sinks';
 
 const context = new AsyncLocalStorage<EmitterConfig>();
 let installed = false;
 
-interface AddressingHook {
-  _resolveAddressing(config: RunTreeConfig): void;
-}
+export const WORKER_RUN_TREE_OVERRIDES: RunTreeOverrides = {
+  statics: {
+    getSharedClient: (original) =>
+      function (this: typeof RunTree, ...args: unknown[]) {
+        return context.getStore()?.client ?? original.apply(this, args);
+      },
+  },
+  methods: {
+    _resolveAddressing: (original) =>
+      function (this: RunTree, config: RunTreeConfig, ...args: unknown[]) {
+        const defaults = context.getStore();
+        if (!defaults) return original.call(this, config, ...args);
+        this.replicas ??= defaults.replicas;
+        // Explicit destinations and native child inheritance outrank the plugin.
+        const selected = config.project_name || config.address != null
+          ? config
+          : { ...config, project_name: defaults.projectName, address: defaults.address };
+        return original.call(this, selected, ...args);
+      },
+  },
+};
 
 function installDefaults(): void {
   if (installed) return;
+  patchRunTree(WORKER_RUN_TREE_OVERRIDES);
   installed = true;
-  const prototype = RunTree.prototype as unknown as AddressingHook;
-  const originalAddressing = prototype._resolveAddressing;
-  const originalClient = RunTree.getSharedClient;
-
-  RunTree.getSharedClient = function () {
-    return context.getStore()?.client ?? originalClient.call(this);
-  };
-  prototype._resolveAddressing = function (this: RunTree, config) {
-    const defaults = context.getStore();
-    if (!defaults) return originalAddressing.call(this, config);
-    this.replicas ??= defaults.replicas;
-    // Explicit destinations and native child inheritance outrank the plugin.
-    const selected = config.project_name || config.address != null
-      ? config
-      : { ...config, project_name: defaults.projectName, address: defaults.address };
-    return originalAddressing.call(this, selected);
-  };
 }
 
 /** Supply native roots with defaults without installing an ambient RunTree. */

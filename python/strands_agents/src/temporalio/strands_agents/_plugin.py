@@ -26,6 +26,7 @@ from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._sync_calls import refuse_sync_calls_in_workflows
 from ._worker_env_ref import AllowAllWorkerEnvVars
+from ._workflow_time import install_workflow_time
 
 if TYPE_CHECKING:
     from mcp import Client
@@ -193,6 +194,7 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
     refuse_sync_calls_in_workflows()
     if not runner:
         raise ValueError("No WorkflowRunner provided to the Strands plugin.")
+    install_workflow_time()
     if isinstance(runner, SandboxedWorkflowRunner):
         return replace(
             runner,

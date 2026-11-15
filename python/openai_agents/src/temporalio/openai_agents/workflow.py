@@ -738,7 +738,9 @@ def temporal_mcp_server(
     Args:
         name: Name matching a server factory registered on the plugin.
         activity_config: Activity options for MCP operations. Defaults to a
-            one-minute start-to-close timeout.
+            one-minute start-to-close timeout and a 10-second heartbeat
+            timeout. Set ``heartbeat_timeout`` to ``None`` to turn heartbeats
+            off.
         cache_tools_list: Whether to cache the tool list for this object.
         factory_argument: Non-secret value passed to the worker-side factory.
             A non-None value creates a fresh server for every Activity instead

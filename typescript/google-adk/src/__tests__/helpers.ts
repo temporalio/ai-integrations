@@ -463,7 +463,10 @@ export async function waitForScheduledActivities(
 
 /** An `ActivityTaskScheduled` history event, narrowed to what the helpers below read. */
 type ScheduledActivityEvent = {
-  activityTaskScheduledEventAttributes?: { activityType?: { name?: string | null } | null } | null;
+  activityTaskScheduledEventAttributes?: {
+    activityType?: { name?: string | null } | null;
+    heartbeatTimeout?: { seconds?: unknown } | null;
+  } | null;
   userMetadata?: { summary?: unknown } | null;
 };
 
@@ -494,6 +497,20 @@ export function getScheduledActivitySummary(
   activityTypeName: string
 ): string | undefined {
   return getScheduledActivitySummaries(events, activityTypeName)[0];
+}
+
+/**
+ * Reads the heartbeat timeout, in whole seconds, of every `ActivityTaskScheduled`
+ * event with the given activity type name, in history order; an entry is
+ * `undefined` where the event has none.
+ */
+export function getScheduledHeartbeatTimeouts(
+  events: ScheduledActivityEvent[],
+  activityTypeName: string
+): Array<number | undefined> {
+  return events
+    .filter((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === activityTypeName)
+    .map((e) => Number(e.activityTaskScheduledEventAttributes?.heartbeatTimeout?.seconds ?? 0) || undefined);
 }
 
 /**

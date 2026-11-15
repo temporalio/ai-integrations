@@ -144,6 +144,11 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   return result.finalOutput ?? '';
 }
 
+export async function mcpFactoryValidationWorkflow(activityName: string): Promise<void> {
+  const activities = proxyActivities<Record<string, () => Promise<void>>>({ startToCloseTimeout: '10 seconds' });
+  await activities[activityName]!();
+}
+
 export async function mcpToolFilterWorkflow(stateful: boolean): Promise<string[]> {
   const name = stateful ? 'filterStateful' : 'filterStateless';
   // The factory's server blocks `danger_tool` with a static filter; this filter blocks `extra_tool`
@@ -505,6 +510,23 @@ export async function nestedToolCancelWorkflow(input: {
   const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
   if (!input.stream) return (await runner.run(lead, 'go', { maxTurns: input.maxTurns })).finalOutput ?? '';
   const result = await runner.run(lead, 'go', { stream: true, maxTurns: input.maxTurns });
+  for await (const _event of result);
+  await result.completed;
+  return result.finalOutput ?? '';
+}
+
+/** The agent calls `holdTool`, an Activity that runs until the test cancels the Workflow. */
+export async function activityToolCancelWorkflow(stream: boolean): Promise<string> {
+  new WorkflowStream();
+  const holdTool = activityAsTool<() => Promise<string>>({
+    name: 'holdTool',
+    description: 'Hold',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+  });
+  const agent = new Agent({ name: 'Holder', model: 'gpt-4o-mini', tools: [holdTool] });
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  if (!stream) return (await runner.run(agent, 'go')).finalOutput ?? '';
+  const result = await runner.run(agent, 'go', { stream: true });
   for await (const _event of result);
   await result.completed;
   return result.finalOutput ?? '';

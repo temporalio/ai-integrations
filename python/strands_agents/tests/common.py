@@ -1,5 +1,6 @@
 import zlib
 from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
 
 from temporalio.api.common.v1 import Payload
@@ -11,6 +12,15 @@ from temporalio.converter import PayloadCodec
 def get_activities(history: WorkflowHistory) -> list[str]:
     return [
         event.activity_task_scheduled_event_attributes.activity_type.name
+        for event in history.events
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ]
+
+
+def get_heartbeat_timeouts(history: WorkflowHistory) -> list[timedelta | None]:
+    return [
+        event.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+        or None
         for event in history.events
         if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
     ]

@@ -3,7 +3,10 @@
 Implements mapping of OpenAI datastructures to Pydantic friendly types.
 """
 
+import asyncio
+import email.utils
 import enum
+import time
 from collections.abc import Collection
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -44,14 +47,21 @@ from openai import (
     APIStatusError,
     AsyncOpenAI,
 )
-from openai.types.responses import CustomToolParam
+from openai.types.responses import (
+    CustomToolParam,
+    ResponseCreatedEvent,
+    ResponseErrorEvent,
+)
 from openai.types.responses.tool_param import Mcp
 from typing_extensions import Required, TypedDict
 
 from temporalio import activity
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
-from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
+from temporalio.openai_agents._heartbeat_decorator import (
+    auto_heartbeater,
+    heartbeating,
+)
 from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _WorkerEnvRefResolver,
@@ -361,17 +371,39 @@ def _align_implicit_model_settings(
     return replace(aligned, extra_args=model_settings.extra_args)
 
 
-def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
-    """Translate an OpenAI APIStatusError into the right retry posture."""
-    retry_after: timedelta | None = None
+def _retry_after(e: APIStatusError) -> timedelta | None:
+    """Read the delay the provider asks for, as the OpenAI client does.
+
+    ``retry-after-ms`` wins over ``retry-after``, which is a number of seconds or an HTTP date.
+    Values that cannot be parsed, or that do not fit in a ``timedelta``, are ignored.
+    """
     retry_after_ms_header = e.response.headers.get("retry-after-ms")
     if retry_after_ms_header is not None:
-        retry_after = timedelta(milliseconds=float(retry_after_ms_header))
+        try:
+            return timedelta(milliseconds=float(retry_after_ms_header))
+        except (OverflowError, ValueError):
+            pass
 
-    if retry_after is None:
-        retry_after_header = e.response.headers.get("retry-after")
-        if retry_after_header is not None:
-            retry_after = timedelta(seconds=float(retry_after_header))
+    retry_after_header = e.response.headers.get("retry-after")
+    if retry_after_header is None:
+        return None
+    try:
+        return timedelta(seconds=float(retry_after_header))
+    except (OverflowError, ValueError):
+        pass
+    retry_date = email.utils.parsedate_tz(retry_after_header)
+    if retry_date is None:
+        return None
+    try:
+        delay = timedelta(seconds=email.utils.mktime_tz(retry_date) - time.time())
+    except (OverflowError, ValueError):  # a date outside the supported range
+        return None
+    return delay if delay > timedelta(0) else None
+
+
+def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
+    """Translate an OpenAI APIStatusError into the right retry posture."""
+    retry_after = _retry_after(e)
 
     should_retry_header = e.response.headers.get("x-should-retry")
     if should_retry_header == "false":
@@ -401,6 +433,12 @@ def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
         non_retryable=not retryable,
         next_retry_delay=retry_after,
     ) from e
+
+
+def _cancel_requested() -> bool:
+    """Whether the workflow asked to cancel the running activity."""
+    details = activity.cancellation_details()
+    return details is not None and details.cancel_requested
 
 
 def _default_openai_client() -> AsyncOpenAI:
@@ -456,7 +494,6 @@ class ModelActivity:
             _raise_for_openai_status(e)
 
     @activity.defn
-    @auto_heartbeater
     async def invoke_model_activity_streaming(
         self, input: StreamingActivityModelInput
     ) -> list[TResponseStreamEvent]:
@@ -476,7 +513,15 @@ class ModelActivity:
         ``streaming_topic`` so external consumers (UIs, tracing,
         etc.) can observe events as they arrive.
 
-        Heartbeats run on a background task via ``auto_heartbeater`` so
+        When the workflow cancels it, for example for a tripped input
+        guardrail, ``RunResultStreaming.cancel()`` or a
+        ``ModelSettings.timeout``, it publishes a ``ResponseErrorEvent``
+        with the code ``cancelled`` after its events and stops. Its
+        ``param`` is the ID from the call's ``response.created`` event, if
+        the model sent one. That event ends this model call, not the run: a
+        ``ModelSettings.retry`` or the next model call can publish after it.
+
+        Heartbeats run on a background task via ``heartbeating`` so
         long initial-token latency or long pauses between chunks do not
         trip ``heartbeat_timeout``.
         """
@@ -489,6 +534,8 @@ class ModelActivity:
             "streaming_batch_interval", timedelta(milliseconds=100)
         )
         events: list[TResponseStreamEvent] = []
+        # From the call's response.created event, to name the response a cancel ends.
+        response_id: str | None = None
 
         stream = WorkflowStreamClient.from_within_activity(
             batch_interval=batch_interval
@@ -499,26 +546,61 @@ class ModelActivity:
         # typed decode can pass result_type=TResponseStreamEvent on
         # their own subscribe call.
         events_topic = stream.topic(topic)
-        async with stream:
-            try:
-                async for event in model.stream_response(
-                    system_instructions=input.get("system_instructions"),
-                    input=input["input"],
-                    model_settings=model_settings,
-                    tools=tools,
-                    output_schema=input.get("output_schema"),
-                    handoffs=handoffs,
-                    tracing=ModelTracing(input["tracing"]),
-                    previous_response_id=input.get("previous_response_id"),
-                    conversation_id=input.get("conversation_id"),
-                    prompt=input.get("prompt"),
-                ):
-                    # OpenAI models set defer_build=True, so an event's pydantic
-                    # schema may still be an unbuilt placeholder.
-                    type(event).model_rebuild()
-                    events.append(event)
-                    events_topic.publish(event)
-            except APIStatusError as e:
-                _raise_for_openai_status(e)
+        try:
+            async with heartbeating():
+                async with stream:
+                    try:
+                        async for event in model.stream_response(
+                            system_instructions=input.get("system_instructions"),
+                            input=input["input"],
+                            model_settings=model_settings,
+                            tools=tools,
+                            output_schema=input.get("output_schema"),
+                            handoffs=handoffs,
+                            tracing=ModelTracing(input["tracing"]),
+                            previous_response_id=input.get("previous_response_id"),
+                            conversation_id=input.get("conversation_id"),
+                            prompt=input.get("prompt"),
+                        ):
+                            # OpenAI models set defer_build=True, so an event's pydantic
+                            # schema may still be an unbuilt placeholder.
+                            type(event).model_rebuild()
+                            if isinstance(event, ResponseCreatedEvent):
+                                response_id = event.response.id
+                            events.append(event)
+                            events_topic.publish(event)
+                    except APIStatusError as e:
+                        _raise_for_openai_status(e)
+            # Leaving the context managers swallows a cancel that arrives while they
+            # stop the stream's background flusher or the heartbeats, so raise that
+            # cancel here.
+            if _cancel_requested():
+                raise asyncio.CancelledError()
+        except asyncio.CancelledError:
+            # When the workflow cancelled the call, for example because a parallel
+            # input guardrail tripped, tell subscribers the response ends here. The
+            # cancel can arrive while the model streams or while leaving the context
+            # managers flushes the events, so publish after both, behind the events
+            # still buffered. Other cancels, such as a Worker shutdown or a heartbeat
+            # timeout, can be retried, so publish nothing and let the retry answer.
+            if _cancel_requested():
+                # Best effort: if the publish fails, still report the cancel.
+                try:
+                    async with heartbeating():
+                        events_topic.publish(
+                            ResponseErrorEvent(
+                                type="error",
+                                code="cancelled",
+                                message="The model call was cancelled.",
+                                param=response_id,
+                                sequence_number=len(events),
+                            )
+                        )
+                        await stream.flush()
+                except Exception:
+                    activity.logger.debug(
+                        "Could not publish the cancelled event", exc_info=True
+                    )
+            raise
 
         return events

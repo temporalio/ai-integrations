@@ -43,8 +43,6 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
 from google.adk.sessions import InMemorySessionService
-from google.adk.telemetry._schema_version import resolve_schema_version
-from google.adk.telemetry.context import TelemetryConfig
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
@@ -610,45 +608,23 @@ async def test_single_agent_telemetry(
 
     spans = dump_spans(exporter.get_finished_spans(), with_attributes=False)
     print("\n".join(spans))
-    expected_spans = [
+    # OpenInference suppresses duplicate ADK invocation/agent spans and emits
+    # its own call_llm spans independently of ADK's telemetry schema.
+    assert spans == [
         "StartWorkflow:WeatherAgent",
         "  RunWorkflow:WeatherAgent",
         "    invocation [test_app]",
-        "      invocation",
-        "        agent_run [test_agent]",
-        "          invoke_agent test_agent",
-        "            execute_tool get_weather",
-        "              StartActivity:get_weather",
-        "                RunActivity:get_weather",
-        "            call_llm",
-        "              StartActivity:invoke_model",
-        "                RunActivity:invoke_model",
-        "            call_llm",
-        "              StartActivity:invoke_model",
-        "                RunActivity:invoke_model",
+        "      agent_run [test_agent]",
+        "        execute_tool get_weather",
+        "          StartActivity:get_weather",
+        "            RunActivity:get_weather",
+        "        call_llm",
+        "          StartActivity:invoke_model",
+        "            RunActivity:invoke_model",
+        "        call_llm",
+        "          StartActivity:invoke_model",
+        "            RunActivity:invoke_model",
     ]
-    # ADK 2.12 introduces workflow spans before the inference format migrates.
-    # ADK 2.13 enables both changes by default.
-    schema_v2 = resolve_schema_version() >= 2
-    if schema_v2:
-        expected_spans[3] = "      invoke_workflow test_agent"
-    if schema_v2 and TelemetryConfig().should_use_experimental_genai_semconv:
-        expected_spans = [
-            "StartWorkflow:WeatherAgent",
-            "  RunWorkflow:WeatherAgent",
-            "    invocation [test_app]",
-            "      invoke_workflow test_agent",
-            "        agent_run [test_agent]",
-            "          invoke_agent test_agent",
-            "            StartActivity:invoke_model",
-            "              RunActivity:invoke_model",
-            "            execute_tool get_weather",
-            "              StartActivity:get_weather",
-            "                RunActivity:get_weather",
-            "            StartActivity:invoke_model",
-            "              RunActivity:invoke_model",
-        ]
-    assert spans == expected_spans
 
 
 async def test_unsetting_timeout():
@@ -1560,8 +1536,8 @@ async def test_litellm_model(client: Client):
     assert result.content.parts[0].text == "hello from litellm"
 
 
-def test_unset_none_fields_stripped() -> None:
-    """ADK plugin converter strips unset None fields from Pydantic payloads."""
+def test_unset_none_fields_preserved() -> None:
+    """Default None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1579,11 +1555,11 @@ def test_unset_none_fields_stripped() -> None:
         "cacheable_contents_token_count",
         "previous_interaction_id",
     ):
-        assert field not in serialized, f"Unset field {field!r} should be stripped"
+        assert serialized[field] is None
 
 
 def test_explicitly_set_none_preserved() -> None:
-    """Explicitly-set None is preserved (exclude_unset, not exclude_none)."""
+    """Explicit None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1594,7 +1570,6 @@ def test_explicitly_set_none_preserved() -> None:
     payloads = converter.payload_converter.to_payloads([request])
     serialized = json.loads(payloads[0].data)
 
-    assert "cache_config" in serialized, "Explicitly-set None should be preserved"
     assert serialized["cache_config"] is None
 
 
@@ -1961,6 +1936,7 @@ async def test_agent_with_output_schema(client: Client):
 
 @pytest.mark.parametrize("schema", [CityWeather, list[CityWeather], StringChoice])
 def test_output_schema_type_sent_as_json_schema(schema: Any) -> None:
+    expected_schema = TypeAdapter(schema).json_schema()
     request = LlmRequest(
         model="gemini-2.0-flash",
         contents=[Content(role="user", parts=[Part(text="hello")])],
@@ -1975,7 +1951,7 @@ def test_output_schema_type_sent_as_json_schema(schema: Any) -> None:
     converter = GoogleAdkPlugin()._configure_data_converter(None)
     payloads = converter.payload_converter.to_payloads([converted])
     serialized = json.loads(payloads[0].data)
-    assert serialized["config"]["responseSchema"] == TypeAdapter(schema).json_schema()
+    assert serialized["config"]["responseSchema"] == expected_schema
 
 
 def test_output_schema_preserves_custom_model_json_schema() -> None:

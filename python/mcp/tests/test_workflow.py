@@ -104,6 +104,8 @@ class ConfiguredMCPWorkflow:
                 "schedule_to_close_timeout": None,
                 "retry_policy": RetryPolicy(maximum_attempts=1),
             }
+        elif mode == "heartbeat-off":
+            config = {"heartbeat_timeout": None}
         else:
             config = {"schedule_to_close_timeout": timedelta(hours=1)}
         client = TemporalMCPClient("rich", activity_config=config)
@@ -193,6 +195,7 @@ async def test_activity_config_keeps_default_timeout_only_when_needed(
         for mode in (
             "retry-policy-only",
             "explicit-none",
+            "heartbeat-off",
             "schedule-to-close-only",
         ):
             handle = await client.start_workflow(
@@ -202,8 +205,15 @@ async def test_activity_config_keeps_default_timeout_only_when_needed(
                 task_queue=worker.task_queue,
             )
             assert await handle.result() == mode
-            [(start_to_close, schedule_to_close)] = await activity_timeouts(handle)
-            if mode in {"retry-policy-only", "explicit-none"}:
+            [(start_to_close, schedule_to_close, heartbeat)] = await activity_timeouts(
+                handle
+            )
+            # The 10-second heartbeat default is added unless the config sets one,
+            # even to None.
+            assert heartbeat == (
+                None if mode == "heartbeat-off" else timedelta(seconds=10)
+            )
+            if mode in {"retry-policy-only", "explicit-none", "heartbeat-off"}:
                 # The default start-to-close timeout was merged in.
                 assert (start_to_close, schedule_to_close) == (
                     timedelta(minutes=1),
@@ -274,17 +284,19 @@ async def test_only_errors_a_retry_can_fix_are_retried(
 
 async def activity_timeouts(
     handle: Any,
-) -> list[tuple[timedelta | None, timedelta | None]]:
-    timeouts: list[tuple[timedelta | None, timedelta | None]] = []
+) -> list[tuple[timedelta | None, timedelta | None, timedelta | None]]:
+    timeouts: list[tuple[timedelta | None, timedelta | None, timedelta | None]] = []
     async for event in handle.fetch_history_events():
         if event.HasField("activity_task_scheduled_event_attributes"):
             attrs = event.activity_task_scheduled_event_attributes
             start_to_close = attrs.start_to_close_timeout.ToTimedelta()
             schedule_to_close = attrs.schedule_to_close_timeout.ToTimedelta()
+            heartbeat = attrs.heartbeat_timeout.ToTimedelta()
             timeouts.append(
                 (
                     start_to_close or None,
                     schedule_to_close or None,
+                    heartbeat or None,
                 )
             )
     return timeouts

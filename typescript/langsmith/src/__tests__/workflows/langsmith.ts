@@ -5,7 +5,7 @@
  */
 
 import { RunTree } from 'langsmith/run_trees';
-import { traceable } from 'langsmith/traceable';
+import { getCurrentRunTree, traceable } from 'langsmith/traceable';
 import {
   ApplicationFailure,
   condition,
@@ -13,6 +13,7 @@ import {
   defineQuery,
   defineSignal,
   defineUpdate,
+  getExternalWorkflowHandle,
   proxyActivities,
   proxyLocalActivities,
   setHandler,
@@ -149,6 +150,20 @@ export async function SignalChildWorkflow(input: string): Promise<string> {
   return child.result();
 }
 
+/** Starts a child and signals it through an external handle. */
+export async function SignalExternalWorkflow(input: string): Promise<string> {
+  const child = await startChild(SignalReceiverWorkflow, {
+    workflowId: `${workflowInfo().workflowId}-signal-external`,
+  });
+  await getExternalWorkflowHandle(child.workflowId).signal(mySignal, input);
+  return child.result();
+}
+
+/** Waits until cancelled. */
+export async function WaitForeverWorkflow(): Promise<void> {
+  await condition(() => false);
+}
+
 /** Start-with-signal ordering reproducer for async signal inbound interceptors. */
 export async function SignalStartOrderingWorkflow(): Promise<string> {
   const order: string[] = [];
@@ -187,12 +202,16 @@ export async function ContinueAsNewTraceableWorkflow(iteration: number): Promise
 }
 
 export const readonlyUpdate = defineUpdate<string, [string]>('readonly_update');
+export const readonlyQuery = defineQuery<string>('readonly_query');
 export const releaseSignal = defineSignal('release');
 
 /** Child target of {@link ReadonlyDeterminismWorkflow}. */
 export async function ReadonlyDeterminismChildWorkflow(): Promise<void> {}
 
-/** Draws `uuid4()` post-validator and embeds it in a child `workflowId`, so any PRNG perturbation surfaces on replay. */
+/**
+ * Draws `uuid4()` and a run id post-validator and embeds both in a child `workflowId`, so any perturbation of the
+ * main PRNG or the run-id stream surfaces on replay.
+ */
 export async function ReadonlyDeterminismWorkflow(): Promise<string> {
   let released = false;
   setHandler(readonlyUpdate, (value: string) => `updated:${value}`, {
@@ -208,6 +227,7 @@ export async function ReadonlyDeterminismWorkflow(): Promise<string> {
       throw new Error('always rejected');
     },
   });
+  setHandler(readonlyQuery, () => 'queried');
   setHandler(releaseSignal, () => {
     released = true;
   });
@@ -215,11 +235,27 @@ export async function ReadonlyDeterminismWorkflow(): Promise<string> {
   await condition(() => released);
 
   const id = uuid4();
+  const runId = new RunTree({ name: 'post-readonly' }).id;
   const child = await startChild(ReadonlyDeterminismChildWorkflow, {
-    workflowId: `rod-child-${id}`,
+    workflowId: `rod-child-${id}-${runId}`,
   });
   await child.result();
   return id;
+}
+
+/** Builds children of the current `traceable` run both ways LangSmith allows, and writes them. */
+export async function ManualChildrenWorkflow(): Promise<void> {
+  await traceable(async () => {
+    const parent = getCurrentRunTree();
+    for (const child of [
+      parent.createChild({ name: 'created-child' }),
+      new RunTree({ name: 'constructed-child', parent_run: parent }),
+    ]) {
+      await child.postRun();
+      await child.end({});
+      await child.patchRun();
+    }
+  }, { name: 'manual-children-root' })();
 }
 
 /** Fails directly with a BENIGN failure. */

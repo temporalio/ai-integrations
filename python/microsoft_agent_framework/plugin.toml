@@ -1,0 +1,20 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "microsoft_agent_framework"
+language = "python"
+coordinate = "temporalio-microsoft-agent-framework"
+registry = "pypi"
+root-api = "temporalio.microsoft_agent_framework"
+maturity = "pre-release"
+docs = "https://docs.temporal.io/develop/python/integrations/microsoft-agent-framework"
+
+[ci]
+runtime-versions = ["3.11", "3.15"]
+
+[smoke]
+imports = [
+  "temporalio.microsoft_agent_framework",
+  "temporalio.microsoft_agent_framework.workflow",
+  "temporalio.microsoft_agent_framework.testing",
+]

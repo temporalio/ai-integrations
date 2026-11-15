@@ -105,14 +105,9 @@ test('context propagation codec never throws on malformed input', (t) => {
   t.is(decodeContextString('{"unrelated":true}'), undefined);
 });
 
-test('describeError renders a non-benign ApplicationFailure as "type: message"', (t) => {
+test('describeError renders a non-benign ApplicationFailure as "ClassName: message"', (t) => {
   const err = ApplicationFailure.create({ message: 'boom', type: 'MyError' });
-  t.is(describeError(err), 'MyError: boom');
-});
-
-test('describeError defaults the type to ApplicationError', (t) => {
-  const err = ApplicationFailure.create({ message: 'boom' });
-  t.is(describeError(err), 'ApplicationError: boom');
+  t.is(describeError(err), 'ApplicationFailure: boom');
 });
 
 test('describeError suppresses BENIGN-category failures', (t) => {

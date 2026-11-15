@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-REQUIRED_VERSION = ">=0.12.5,<0.13"
+REQUIRED_VERSION = ">=0.13.0,<0.14"
 LICENSE_TEXT = "MIT License\n\nCopyright (c) 2026 Temporal Technologies Inc.\n\nPermission is hereby granted...\n"
 
 
