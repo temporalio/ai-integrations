@@ -13,7 +13,7 @@ from mcp.types import (
 try:
     from mcp import MCPError as McpError  # type: ignore[attr-defined]  # mcp>=2
 except ImportError:  # mcp<2
-    from mcp.shared.exceptions import McpError  # type: ignore[no-redef]
+    from mcp.shared.exceptions import McpError  # type: ignore[attr-defined,no-redef]
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -39,16 +39,16 @@ class _FailingServer:
     async def cleanup(self) -> None:
         self.cleaned_up = True
 
-    async def list_tools(self, *args: Any, **kwargs: Any):
+    async def list_tools(self, *_args: Any, **_kwargs: Any):
         raise self._error
 
-    async def call_tool(self, *args: Any, **kwargs: Any):
+    async def call_tool(self, *_args: Any, **_kwargs: Any):
         raise self._error
 
-    async def list_prompts(self, *args: Any, **kwargs: Any):
+    async def list_prompts(self, *_args: Any, **_kwargs: Any):
         raise self._error
 
-    async def get_prompt(self, *args: Any, **kwargs: Any):
+    async def get_prompt(self, *_args: Any, **_kwargs: Any):
         raise self._error
 
 
