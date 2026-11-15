@@ -501,7 +501,9 @@ class RealAgentCanWorkflow:
     ) -> list[list[Any]]:
         # deepagents 0.7 leaves todos out of the default stack; add them so the
         # driver sees pending work.
-        agent = create_deep_agent(model="fake:model", middleware=[TodoListMiddleware()])
+        agent = create_deep_agent(
+            name="test-agent", model="fake:model", middleware=[TodoListMiddleware()]
+        )
         result = await run_deep_agent(
             agent,
             input,
@@ -635,7 +637,9 @@ FILES_RESPONSES: list[Any] = [
 class FilesCanWorkflow:
     @workflow.run
     async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
-        agent = create_deep_agent(model="fake:model", middleware=[TodoListMiddleware()])
+        agent = create_deep_agent(
+            name="test-agent", model="fake:model", middleware=[TodoListMiddleware()]
+        )
         result = await run_deep_agent(
             agent,
             input,

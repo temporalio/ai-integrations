@@ -579,7 +579,7 @@ class RepeatedToolCallWorkflow:
         tool = tool_as_activity(
             pairing_weather, start_to_close_timeout=timedelta(seconds=10)
         )
-        agent = create_deep_agent(model="fake:model", tools=[tool])
+        agent = create_deep_agent(name="test-agent", model="fake:model", tools=[tool])
         result = await run_deep_agent(
             agent,
             input,

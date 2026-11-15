@@ -31,8 +31,11 @@ class _DurableSaver:
     """Stand-in for a checkpointer that does its own database I/O."""
 
 
-class InMemorySaver:
-    """Same class name LangGraph's in-workflow saver uses."""
+from langgraph.checkpoint.memory import InMemorySaver
+
+
+class CustomMemorySaver(InMemorySaver):
+    """Caller-owned saver subclasses are supported."""
 
 
 @workflow.defn
@@ -52,6 +55,8 @@ def test_durable_checkpointer_warns() -> None:
         warnings.simplefilter("always")
         warn_durable_checkpointer(None)
         warn_durable_checkpointer(InMemorySaver())
+        warn_durable_checkpointer(CustomMemorySaver())
+        warn_durable_checkpointer(False)
     assert not records, [str(r.message) for r in records]
 
     # ...a durable saver warns (respect the choice, do not hard-fail).

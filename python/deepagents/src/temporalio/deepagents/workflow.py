@@ -28,10 +28,7 @@ from temporalio.exceptions import ApplicationError
 _CACHE_KEY = "__temporal_cache__"
 _INPUT_CARRIED_KEY = "__temporal_input_in_transcript__"
 
-# Checkpointer classes that keep their state in the workflow's own memory and are
-# therefore rehydrated for free by deterministic replay. Anything else does its
-# own I/O and is not replay-safe from inside the workflow.
-_IN_WORKFLOW_SAVERS = frozenset({"InMemorySaver", "MemorySaver"})
+_CONTINUE_INPUT_UNSET = object()
 
 
 def warn_durable_checkpointer(checkpointer: Any) -> None:
@@ -42,11 +39,14 @@ def warn_durable_checkpointer(checkpointer: Any) -> None:
     replay-safe. Direct ``agent.ainvoke`` emits this warning;
     :func:`run_deep_agent` rejects durable checkpointers. Prefer an in-workflow
     ``InMemorySaver`` rehydrated by replay, plus
-    :func:`run_deep_agent` with ``continue_as_new_after`` for long conversations.
+    :func:`run_deep_agent` for rollover within a long invocation. Conversation
+    loops own their between-turn rollover policy.
     """
-    if checkpointer is None:
+    if checkpointer is None or checkpointer is False:
         return
-    if type(checkpointer).__name__ in _IN_WORKFLOW_SAVERS:
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    if isinstance(checkpointer, InMemorySaver):
         return
     warnings.warn(
         f"create_deep_agent received a durable checkpointer "
@@ -54,7 +54,8 @@ def warn_durable_checkpointer(checkpointer: Any) -> None:
         f"workflow, so this checkpointer's I/O would run from workflow code, "
         f"which is not replay-safe. Prefer the default in-workflow InMemorySaver "
         f"(rehydrated by replay) plus run_deep_agent(continue_as_new_after=...) "
-        f"for long-conversation durability. run_deep_agent rejects durable "
+        f"for long invocations. Conversation loops own between-turn rollover. "
+        f"run_deep_agent rejects durable "
         f"checkpointers.",
         stacklevel=3,
     )
@@ -262,6 +263,7 @@ async def run_deep_agent(
     *,
     continue_as_new_after: int | None = None,
     state_snapshot: Mapping[str, Any] | None = None,
+    continue_as_new_input: Any = _CONTINUE_INPUT_UNSET,
 ) -> Any:
     """Run a Deep Agent with checkpoint-based continue-as-new.
 
@@ -282,7 +284,12 @@ async def run_deep_agent(
 
     The graph must use an in-memory checkpointer or none; no external checkpoint
     I/O runs inside the workflow. The enclosing ``@workflow.run`` method must
-    accept ``(input, state_snapshot=None)``. A checkpoint snapshot resumes the
+    accept ``(input, state_snapshot=None)``. Give the agent a stable, unique
+    ``name``. Pass ``continue_as_new_input`` when the agent input differs from
+    the workflow input, including every ``Command`` resume. Signal and Update
+    handlers run to completion without automatic rollover.
+
+    A checkpoint snapshot resumes the
     interrupted invocation, retaining its remaining recursion budget, and must
     be restored with the same graph and middleware definitions.
 
@@ -301,12 +308,18 @@ async def run_deep_agent(
     from temporalio.deepagents._checkpoint import run
 
     _serde.set_result_cache({})
+    carry_options = (
+        {}
+        if continue_as_new_input is _CONTINUE_INPUT_UNSET
+        else {"continue_as_new_input": continue_as_new_input}
+    )
     try:
         return await run(
             agent,
             input,
             continue_as_new_after=continue_as_new_after,
             state_snapshot=state_snapshot,
+            **carry_options,
         )
     except ApplicationError:
         raise
