@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import TracebackType
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import EventActions
@@ -29,7 +29,9 @@ try:
         MCPError as McpError,  # pyright: ignore[reportAttributeAccessIssue]
     )
 except ImportError:  # mcp<2
-    from mcp.shared.exceptions import McpError  # type: ignore[assignment,no-redef]
+    from mcp.shared.exceptions import (  # type: ignore[attr-defined,assignment,no-redef]
+        McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1.workflow_pb2 import (
@@ -136,7 +138,7 @@ def _find_mcp_error(err: BaseException) -> McpError | None:
     cause: BaseException | None = err
     while cause is not None and id(cause) not in seen:
         if isinstance(cause, McpError):
-            return cause
+            return cast(McpError, cause)
         seen.add(id(cause))
         cause = cause.__cause__
     return None

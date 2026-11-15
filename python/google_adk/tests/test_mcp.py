@@ -241,7 +241,9 @@ def _mcp_error(code: int, message: str, data: Any) -> Exception:
 
         return MCPError(code, message, data)
     except ImportError:  # mcp<2
-        from mcp.shared.exceptions import McpError
+        from mcp.shared.exceptions import (  # type: ignore[attr-defined]
+            McpError,  # pyright: ignore[reportAttributeAccessIssue]
+        )
         from mcp.types import ErrorData
 
         return McpError(ErrorData(code=code, message=message, data=data))
