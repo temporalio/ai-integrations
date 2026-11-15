@@ -752,6 +752,16 @@ back while such runs are open. Drain the earlier version's workers before starti
 workers of both versions run, a run whose session gets a refusal can fail
 replay when it moves from one to the other.
 
+A block left before its first `await`, whether it is empty or its first
+statement raises, never starts its session activity. It completes, and an
+exception from its body leaves the block unchanged. Earlier versions raised a
+bare `CancelledError` there instead. A run behaves this way once it records the
+patch marker `openai-agents-stateful-mcp-unstarted-session`, which it does when
+it leaves such a block. Histories recorded on an earlier version have no marker,
+so they still raise the `CancelledError` and replay on this version. A run with
+the marker fails replay on an earlier version, so do not roll back while such
+runs are open.
+
 ### Hosted MCP Tool
 
 For network-accessible MCP servers, you can also use `HostedMCPTool` from the OpenAI Agents SDK, which uses an MCP client hosted by OpenAI.

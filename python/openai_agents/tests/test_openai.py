@@ -5765,15 +5765,18 @@ async def test_stateful_mcp_server_session_end_with_other_events(
 @workflow.defn
 class McpServerStatefulEmptyBlockWorkflow:
     @workflow.run
-    async def run(self) -> None:
+    async def run(self, raise_at_once: bool) -> str:
         async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
-            pass
+            if raise_at_once:
+                raise ApplicationError("body failed")
+        return "left"
 
 
-async def test_stateful_mcp_server_empty_block(client: Client):
-    # The session activity never started, so leaving the block raises the bare
-    # CancelledError that earlier versions raise (#391), not a
-    # DedicatedWorkerFailure for a session that ended.
+@pytest.mark.parametrize("raise_at_once", [False, True])
+async def test_stateful_mcp_server_empty_block(client: Client, raise_at_once: bool):
+    # The block is left before its session activity starts (#391): an empty
+    # block completes, and an exception from the body leaves the block as it
+    # is, not replaced by a CancelledError.
     provider = StatefulMCPServerProvider(
         "HelloServer", lambda _: get_tracking_server("HelloServer")
     )
@@ -5784,13 +5787,23 @@ async def test_stateful_mcp_server_empty_block(client: Client):
         async with new_worker(client, McpServerStatefulEmptyBlockWorkflow) as worker:
             handle = await client.start_workflow(
                 McpServerStatefulEmptyBlockWorkflow.run,
+                raise_at_once,
                 id=f"mcp-server-empty-block-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=30),
             )
-            with pytest.raises(WorkflowFailureError) as err:
-                await handle.result()
-            assert isinstance(err.value.cause, CancelledError)
+            if raise_at_once:
+                with pytest.raises(WorkflowFailureError) as err:
+                    await handle.result()
+                assert isinstance(err.value.cause, ApplicationError)
+                assert err.value.cause.message == "body failed"
+            else:
+                assert await handle.result() == "left"
+            events = [e async for e in handle.fetch_history_events()]
+            assert not any(
+                e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+                for e in events
+            )
 
 
 async def test_model_conversion_loops():

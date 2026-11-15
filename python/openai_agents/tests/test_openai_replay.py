@@ -9,8 +9,10 @@ from temporalio.worker import Replayer
 from tests.helpers.stateful_replay import (
     StatefulMcpCancelWaitWorkflow,
     StatefulMcpCancelWorkflow,
+    StatefulMcpEmptyBlockWorkflow,
     StatefulMcpGatherWaitWorkflow,
     StatefulMcpGatherWorkflow,
+    StatefulMcpRaisingBlockWorkflow,
 )
 from tests.test_openai import (
     AgentsAsToolsWorkflow,
@@ -49,6 +51,15 @@ from tests.test_openai import (
         # Recorded on this version, with the patch marker.
         "stateful-mcp-cancel-wait-marker-workflow-history.json",
         "stateful-mcp-gather-wait-marker-workflow-history.json",
+        # Recorded on main at e3fef4e: blocks left before their session activity
+        # starts fail with a bare CancelledError. Without the
+        # openai-agents-stateful-mcp-unstarted-session patch, the empty block
+        # fails replay.
+        "stateful-mcp-empty-block-workflow-history.json",
+        "stateful-mcp-raising-block-workflow-history.json",
+        # Recorded on this version, with the patch marker.
+        "stateful-mcp-empty-block-marker-workflow-history.json",
+        "stateful-mcp-raising-block-marker-workflow-history.json",
         "tools-workflow-callable-class-history.json",
         "tools-workflow-history.json",
     ],
@@ -76,6 +87,8 @@ async def test_replay(file_name: str) -> None:
                 StatefulMcpGatherWaitWorkflow,
                 StatefulMcpCancelWorkflow,
                 StatefulMcpCancelWaitWorkflow,
+                StatefulMcpEmptyBlockWorkflow,
+                StatefulMcpRaisingBlockWorkflow,
             ],
             plugins=[OpenAIAgentsPlugin()],
         ).replay_workflow(WorkflowHistory.from_json("fake", history_json))

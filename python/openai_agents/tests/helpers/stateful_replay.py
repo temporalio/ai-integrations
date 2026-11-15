@@ -11,6 +11,7 @@ from datetime import timedelta
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityCancellationType, ActivityConfig
 
 with workflow.unsafe.imports_passed_through():
@@ -121,3 +122,24 @@ class StatefulMcpCancelWaitWorkflow:
     @workflow.run
     async def run(self, host_task_queue: str) -> str:
         return await _cancel(host_task_queue, wait_cancellation=True)
+
+
+@workflow.defn
+class StatefulMcpEmptyBlockWorkflow:
+    """A block left before its session activity starts."""
+
+    @workflow.run
+    async def run(self, host_task_queue: str) -> str:
+        async with _server(host_task_queue):
+            pass
+        return "left"
+
+
+@workflow.defn
+class StatefulMcpRaisingBlockWorkflow:
+    """A block whose first statement raises, before its session activity starts."""
+
+    @workflow.run
+    async def run(self, host_task_queue: str) -> str:
+        async with _server(host_task_queue):
+            raise ApplicationError("body failed")

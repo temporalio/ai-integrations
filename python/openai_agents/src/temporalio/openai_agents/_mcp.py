@@ -375,6 +375,10 @@ _HEARTBEAT_INTERVAL = 30.0
 # schedule-to-close timeout follow the session activity.
 _SESSION_WATCH_PATCH = "openai-agents-stateful-mcp-session-watch"
 
+# Patch marker of runs that leave a block normally when it ends before its
+# session activity starts.
+_UNSTARTED_SESSION_PATCH = "openai-agents-stateful-mcp-unstarted-session"
+
 # Seconds the ``-server-session`` activity waits for the server to show its
 # first heartbeat.
 _STORE_TIMEOUT = 30.0
@@ -662,7 +666,9 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         with no cause, whatever the session's error, since the SDK then drops
         the session's result. A cancellation wins over this failure only when
         it leaves the ``async with`` block: ``cleanup()`` called directly after
-        a workflow cancellation raises it.
+        a workflow cancellation raises it. If the session activity hasn't
+        started, as when the block is left before its first ``await``,
+        returns without waiting.
         """
         if self._connect_handle:
             session = self._connect_handle
@@ -676,11 +682,15 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             try:
                 await session
             except asyncio.CancelledError:
-                if (
-                    not started
-                    or not session.cancelled()
-                    or _cancel_requests() > cancels
-                ):
+                if _cancel_requests() > cancels:
+                    raise
+                if not started and workflow.patched(_UNSTARTED_SESSION_PATCH):
+                    # The session activity never started, so cancelling it
+                    # scheduled nothing and there is nothing to wait for.
+                    # Runs recorded without the marker raised here, so they
+                    # still do and replay.
+                    return
+                if not started or not session.cancelled():
                     raise
                 # The block's last timer fired in the workflow task that
                 # brought the session's end, ahead of it, and cancelling the
