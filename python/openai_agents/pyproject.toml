@@ -68,9 +68,7 @@ dev = [
   "openinference-instrumentation-openai-agents>=2,<3",
   "opentelemetry-sdk>=1.26,<2",
   "openai-agents[litellm]>=0.22,<0.25; python_version < '3.15'",  # fastuuid does not support Python 3.15 yet.
-  # litellm 1.83.1+ requires openai<3, while openai-agents 0.22 requires openai>=3.
-  # Raise this pin once LiteLLM supports OpenAI 3.
-  "litellm==1.83.0; python_version < '3.15'",
+  "litellm>=1.108.0,<2; python_version < '3.15'",
 ]
 
 [tool.uv]
