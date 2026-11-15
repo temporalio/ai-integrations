@@ -311,10 +311,14 @@ recording its result, causing a retry to perform the operation again. Use a
 bounded `retry_policy`, and make commands and mutations idempotent when repeated
 execution would be unsafe.
 
-By default, `TemporalSandbox.get_tools()` vends `sandbox_shell` and
-`sandbox_file_editor`. A tool passed explicitly through `TemporalAgent(tools=...)`
-with either name takes precedence, following Strands' normal sandbox-tool
-override behavior.
+By default, `TemporalSandbox.get_tools()` vends `sandbox_shell`, `sandbox_read`,
+`sandbox_write`, and `sandbox_edit`. The file tools use Strands' focused read,
+write, and edit implementations: read returns numbered text with optional paging
+or image/document content, write creates or overwrites a text file, and edit
+replaces an exact, unique string. They require absolute paths. These tools replace
+the deprecated `sandbox_file_editor`. A tool passed explicitly through
+`TemporalAgent(tools=...)` with the same name takes precedence, following Strands'
+normal sandbox-tool override behavior.
 
 Execution output is always buffered into the activity result so workflow replay
 observes the same ordered `StreamChunk` and `ExecutionResult` values. For live,
@@ -360,6 +364,9 @@ need to host a `WorkflowStream`.
 All sandbox Activity arguments and results are serialized into workflow history.
 Keep command output and files within the server's configured payload size limits;
 use external storage for large artifacts.
+`sandbox_read` and `sandbox_edit` record the entire file in a read-file Activity
+result, even when the read tool requests only a page of text. `sandbox_write`
+and `sandbox_edit` record the written content in a write-file Activity input.
 
 Do not put secret values directly in `env`, because those values are serialized
 into workflow history. Use `temporal_worker_env_ref()` to serialize only the
