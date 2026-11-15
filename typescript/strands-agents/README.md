@@ -411,6 +411,8 @@ See the [OpenTelemetry interceptor README](../interceptors-opentelemetry) for ex
 
 If you build workflow code with `bundleWorkflowCode` instead of giving the worker `workflowsPath`, pass the plugin to the bundler as well as to the worker. Its bundler hook stubs modules that workflow code cannot load.
 
+The plugin excludes `@aws-sdk/client-s3` and `@aws-sdk/client-s3vectors` from workflow bundles. Strands' in-memory storage can run inside workflows; S3 storage and vector search must run in Activities.
+
 ```ts
 import { bundleWorkflowCode } from '@temporalio/worker';
 import { StrandsPlugin } from '@temporalio/strands-agents';

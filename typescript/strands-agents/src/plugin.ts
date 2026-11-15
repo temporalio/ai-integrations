@@ -237,9 +237,10 @@ export class StrandsPlugin extends SimplePlugin {
    *     (`@aws-sdk/client-bedrock-runtime`, `@anthropic-ai/sdk`, `openai`,
    *     `@google/genai`, `ai`). The workers constructs models worker-side;
    *     workflow code only goes through {@link TemporalModel}.
-   *   - `@aws-sdk/client-s3`, dynamically imported by the SDK's S3-backed
-   *     `context-offloader` vended plugin. The offloader can run in workflows
-   *     with in-memory storage; S3 I/O must run in Activities.
+   *   - `@aws-sdk/client-s3` and `@aws-sdk/client-s3vectors`, dynamically
+   *     imported by the SDK's S3 storage and vector search. The storage
+   *     entrypoint also exports in-memory storage, which workflows can use;
+   *     S3 I/O must run in Activities.
    *   - `@temporalio/activity` and `@temporalio/client`, which the
    *     worker-only halves of {@link TemporalMCPClient}, {@link autoHeartbeat},
    *     and `@temporalio/workflow-streams/client` import.
@@ -270,6 +271,7 @@ export class StrandsPlugin extends SimplePlugin {
       '@temporalio/client',
       '@aws-sdk/client-bedrock-runtime',
       '@aws-sdk/client-s3',
+      '@aws-sdk/client-s3vectors',
       '@aws-sdk/middleware-websocket',
       '@anthropic-ai/sdk',
       'openai',
