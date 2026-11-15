@@ -39,7 +39,7 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import is_dataclass
 from datetime import timedelta
-from types import GenericAlias, SimpleNamespace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
 
 if sys.version_info >= (3, 14):
@@ -288,8 +288,9 @@ def _tool_signature(
 ) -> tuple[inspect.Signature, dict[str, Any], str | None, bool]:
     """Return the parameters the model fills, their types, and the tool's docstring.
 
-    The fourth item is True when the last parameter is the activity's ``*args``,
-    offered as a list.
+    The signature keeps the activity's ``*args``, so LangChain builds the same
+    schema for it as for the function itself. The fourth item is True when there
+    is one.
     """
     if inspect.isclass(activity):
         # Workflow code references a callable-class activity by its class, but the
@@ -341,9 +342,6 @@ def _tool_signature(
     star = False
     for p in signature.parameters.values():
         if p.kind is inspect.Parameter.VAR_POSITIONAL:
-            hints = {**hints, p.name: GenericAlias(list, (hints.get(p.name, Any),))}
-            # Defaults to None, as in LangChain's own schema for *args.
-            p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
             star = True
         elif p.kind is inspect.Parameter.KEYWORD_ONLY:
             message = f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
@@ -422,12 +420,22 @@ def activity_as_tool(
     signature, hints, doc, star = _tool_signature(activity)
     tool_desc = description or (doc or f"Temporal activity {tool_name}.")
     act_summary = summary or f"tool:{tool_name}"
+    # The model sends *args as a list under its own name, so the call binds it as
+    # an ordinary parameter, None when the model leaves it out.
+    call_signature = signature.replace(
+        parameters=[
+            p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+            if p.kind is inspect.Parameter.VAR_POSITIONAL
+            else p
+            for p in signature.parameters.values()
+        ]
+    )
 
     async def _run(*args: Any, **kwargs: Any) -> Any:
         # The model's arguments go to the activity by position, in parameter order.
         # Defaults are passed too: the worker decodes arguments with the
         # activity's type hints only when every parameter has a value.
-        bound = signature.bind(*args, **kwargs)
+        bound = call_signature.bind(*args, **kwargs)
         bound.apply_defaults()
         activity_args = list(bound.args)
         if star:

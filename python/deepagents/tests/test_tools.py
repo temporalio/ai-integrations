@@ -52,7 +52,7 @@ create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
 from langchain_core.tools import StructuredTool, tool  # noqa: E402
 from langgraph.prebuilt import InjectedState  # noqa: E402
-from pydantic import BaseModel, ConfigDict  # noqa: E402
+from pydantic import BaseModel, ConfigDict, ValidationError  # noqa: E402
 
 
 def pairing_weather(city: str) -> str:
@@ -399,12 +399,32 @@ class VarargsClass:
         return text + "".join(more)
 
 
-@pytest.mark.parametrize("activity_ref", [varargs_activity, VarargsClass])
+@activity.defn
+async def args_activity(text: str, *args: str) -> str:
+    return text + "".join(args)
+
+
+@activity.defn
+async def unannotated_varargs_activity(text: str, *more) -> str:  # pyright: ignore[reportMissingParameterType]
+    return text + "".join(more)
+
+
+@pytest.mark.parametrize(
+    ("activity_ref", "function", "name"),
+    [
+        (varargs_activity, varargs_activity, "more"),
+        (VarargsClass, varargs_activity, "more"),
+        # A plain parameter named args would clash with Pydantic's own field.
+        (args_activity, args_activity, "args"),
+        # Without an annotation LangChain still offers an array.
+        (unannotated_varargs_activity, unannotated_varargs_activity, "more"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_activity_as_tool_spreads_var_positional(
-    activity_ref: Any, monkeypatch: pytest.MonkeyPatch
+    activity_ref: Any, function: Callable, name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # *more is offered as a list, as LangChain's own schema for the function
+    # *args is offered as a list, as LangChain's own schema for the function
     # offers it, and spread into the activity's arguments.
     calls: list[Any] = []
 
@@ -415,12 +435,17 @@ async def test_activity_as_tool_spreads_var_positional(
     monkeypatch.setattr(workflow, "execute_activity", execute_activity)
     tool = activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
     native = StructuredTool.from_function(
-        coroutine=varargs_activity, description="LangChain's schema"
+        coroutine=function, description="LangChain's schema"
     )
     assert tool.args == native.args
-    await tool.ainvoke({"text": "a", "more": ["b", "c"]})
+    listed: dict[str, Any] = {"text": "a", name: ["b", "c"]}
+    await tool.ainvoke(listed)
     await tool.ainvoke({"text": "a"})
     assert calls == [["a", "b", "c"], ["a"]]
+    not_a_list: dict[str, Any] = {"text": "a", name: "bc"}
+    with pytest.raises(ValidationError):
+        await tool.ainvoke(not_a_list)
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
