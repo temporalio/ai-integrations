@@ -6,7 +6,10 @@ from typing import Any, TypeVar
 from strands.sandbox import ExecutionResult, FileInfo, OutputFile, Sandbox, StreamChunk
 from strands.sandbox.errors import SandboxPathNotFoundError, SandboxTimeoutError
 from strands.types.tools import AgentTool
-from strands.vended_tools import make_file_editor, make_shell
+from strands.vended_tools import (
+    make_file_editor,  # pyright: ignore[reportDeprecated]
+    make_shell,
+)
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
@@ -149,8 +152,10 @@ class TemporalSandbox(Sandbox):
 
     def get_tools(self) -> list[AgentTool]:
         """Vend Strands' standard shell and file-editor sandbox tools."""
+        # Strands deprecated make_file_editor, but its own Docker and SSH
+        # sandboxes still vend it, so we do too.
         return [
-            make_file_editor(sandbox=self, name="sandbox_file_editor"),
+            make_file_editor(sandbox=self, name="sandbox_file_editor"),  # pyright: ignore[reportDeprecated]
             make_shell(sandbox=self, name="sandbox_shell"),
         ]
 
