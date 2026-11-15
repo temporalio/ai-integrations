@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, ClassVar, NoReturn, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, Protocol, cast
 from urllib.parse import quote
 
 import langsmith
@@ -35,12 +35,15 @@ from temporalio.langsmith._tracing import (
     install_addressing_override,
 )
 
+if TYPE_CHECKING:
+    from langsmith.address import AgentAddress
+
 
 def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
     """Return the destination LangSmith's env defaults name, or None.
 
-    The env defaults are ``LANGSMITH_PROJECT``, and on LangSmith versions with
-    agent addresses, ``LANGSMITH_AGENT_ID`` and ``LANGSMITH_AGENT_ENVIRONMENT``.
+    The env defaults are ``LANGSMITH_PROJECT``, ``LANGSMITH_AGENT_ID`` and
+    ``LANGSMITH_AGENT_ENVIRONMENT``.
     The probe is a LangSmith ``RunTree`` that names no destination, so the
     installed version's own rules pick one; it is never posted. LangSmith
     raises ``EnvAddressError``, a ``LangSmithUserError``, for an env it can't
@@ -52,8 +55,7 @@ def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
         return None
     if probe.session_name:
         return {"project_name": probe.session_name}
-    address = getattr(probe, "address", None)
-    return {"address": address} if address is not None else None
+    return {"address": probe.address} if probe.address is not None else None
 
 
 # Used by _end_run_on_exception outside workflows. Workflow code logs through
@@ -99,7 +101,18 @@ def _trace_headers(run_tree: RunTree) -> dict[str, str]:
         # and ingestion URLs must never enter persisted Temporal headers.
         filter_replica = getattr(run_trees, "_filter_replica_for_headers", None)
         if filter_replica is not None:
-            safe = [filter_replica(replica) for replica in replicas]
+            safe: list[dict[str, Any]] = [
+                dict(filter_replica(replica)) for replica in replicas
+            ]
+            for replica in safe:
+                address = replica.get("address")
+                if isinstance(address, dict):
+                    # RunTree.from_headers reads a replica address only in the
+                    # lrn: form LangSmith writes for its langsmith-address entry.
+                    replica["address"] = (
+                        f"lrn:agents/{address['id']}"
+                        f"/environments/{address['environment'].lower()}"
+                    )
             encoded = quote(json.dumps(safe, separators=(",", ":"), default=str))
             headers["baggage"] = ",".join(
                 part for part in (baggage, f"langsmith-replicas={encoded}") if part
@@ -236,7 +249,7 @@ def _install_aio_to_thread_override() -> None:
 
 def _destination(
     project_name: str | None,
-    address: str | None,
+    address: AgentAddress | None,
 ) -> dict[str, Any]:
     """Name the plugin's default destination, without consulting the environment."""
     if address is not None:
@@ -343,7 +356,7 @@ def _maybe_run(
     if parent is not None:
         # RunTree(parent_run=...) inherits IDs but not the destination.
         run_tree_args["project_name"] = parent.session_name
-        run_tree_args["address"] = getattr(parent, "address", None)
+        run_tree_args["address"] = parent.address
         run_tree_args["parent_run"] = parent
         run_tree_args["replicas"] = parent.replicas
     elif destination is not None:
@@ -407,7 +420,7 @@ class LangSmithInterceptor(
         *,
         client: langsmith.Client | None = None,
         project_name: str | None = None,
-        address: str | None = None,
+        address: AgentAddress | None = None,
         add_temporal_runs: bool = False,
         default_metadata: dict[str, Any] | None = None,
         default_tags: list[str] | None = None,
@@ -418,10 +431,10 @@ class LangSmithInterceptor(
             raise ValueError("project_name and address are mutually exclusive")
         if address is not None:
             address_api = getattr(langsmith, "address", None)
-            parse_address = getattr(address_api, "parse", None)
-            if not callable(parse_address):
-                raise ValueError("Agent addressing requires langsmith>=0.14.4")
-            address = str(parse_address(address))
+            ensure_agent = getattr(address_api, "ensure_agent", None)
+            if not callable(ensure_agent):
+                raise ValueError("Agent addressing requires langsmith>=0.14.10")
+            address = cast("AgentAddress", ensure_agent(address))
         if client is None:
             client = langsmith.Client()
         self._client = client

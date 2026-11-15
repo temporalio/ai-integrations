@@ -10,7 +10,14 @@ import { ApplicationFailure } from '@temporalio/common';
 
 import { GoogleAdkPlugin } from '../index';
 import { activityAsTool } from '../workflow';
-import { countScheduledActivities, setupTestEnv, ToolCallingLlm, uid, withWorker } from './helpers';
+import {
+  countScheduledActivities,
+  getScheduledHeartbeatTimeouts,
+  setupTestEnv,
+  ToolCallingLlm,
+  uid,
+  withWorker,
+} from './helpers';
 import { agentToolLoopWorkflow } from './workflows';
 
 const getEnv = setupTestEnv(test);
@@ -54,6 +61,10 @@ test.serial('dispatchesModelToolCallToActivity', async (t) => {
   // at the tool call nor ran the tool twice.
   t.is(countScheduledActivities(events ?? [], 'adk-invokeModel'), 2);
   t.is(countScheduledActivities(events ?? [], 'lookupOrder'), 1);
+  // The model calls get the plugin's default heartbeat timeout. The tool is the
+  // user's own Activity, which may never heartbeat, so it gets none.
+  t.deepEqual(getScheduledHeartbeatTimeouts(events ?? [], 'adk-invokeModel'), [10, 10]);
+  t.deepEqual(getScheduledHeartbeatTimeouts(events ?? [], 'lookupOrder'), [undefined]);
 });
 
 // activityAsTool outside a Workflow

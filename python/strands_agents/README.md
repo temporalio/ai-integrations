@@ -145,7 +145,7 @@ Passing `retry_strategy=...` to `TemporalAgent(...)` raises `ValueError`; remove
 
 ## Structured Output
 
-Like Strands `Agent`, `TemporalAgent` supports structured output with `structured_output_model`. The plugin defaults to [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/pydantic), so Pydantic types easily serialize across the activity and workflow boundary.
+Like Strands `Agent`, `TemporalAgent` supports structured output with `structured_output_model`. The plugin defaults to [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/pydantic.py), so Pydantic types easily serialize across the activity and workflow boundary.
 
 ```python
 from pydantic import BaseModel
@@ -426,6 +426,17 @@ the activity's error message, and `AfterToolCallEvent.exception` contains the
 underlying exception. This also applies when an MCP tool's call-tool activity
 fails.
 
+When a workflow or tool task is cancelled, cancellation of its activity or MCP
+call propagates as `asyncio.CancelledError` instead of a failed tool result, so
+cancelling the workflow ends it as `CANCELED`. The tool's `cancellation_type`
+controls whether it waits for activity cleanup. An activity that reports
+cancellation independently still produces a failed tool result for the agent.
+
+**Breaking change:** histories that previously processed a cancelled tool as an
+error result can fail replay on this version. Keep those runs on their original
+workers with Worker Versioning. To recover a run stuck during tool cancellation,
+reset it to before the affected tool call and run it on upgraded workers.
+
 ## Hooks
 
 Strands' [hook system](https://strandsagents.com/) (`strands.hooks`) lets you subscribe callbacks to events in the agent lifecycle — invocation start/end, model call before/after, tool call before/after, message added. Pass `hooks=[MyHookProvider()]` to `TemporalAgent`: every single-agent hook event fires in workflow context, so deterministic callbacks just work.
@@ -704,7 +715,23 @@ Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools`
 
 ## Observability
 
-`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:
+Strands' agent cycle, tool, and trace durations use Temporal's Workflow
+clock inside Workflows, so replay reconstructs the original elapsed time. These
+durations include Activity scheduling, retries, and waits; provider-reported
+latency and token usage still come from the recorded model response. Activities
+and ordinary Strands calls outside Workflows keep their native clocks.
+
+Graph and Swarm orchestration-level `execution_time` and `execution_timeout`
+still use native wall clocks and are not replay-safe. Their agents' cycle and
+tool metrics use the Workflow clock as described above.
+
+This changes the values returned by earlier versions, which measured replay
+execution time after a cache eviction or Worker restart. It can break replay if
+Workflow code uses those durations to choose what to do next. Let existing runs
+finish on their original Workers, or use Worker Versioning to keep them there
+before deploying this change.
+
+`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:
 
 ```python
 import opentelemetry.trace
@@ -722,4 +749,4 @@ Worker(
 )
 ```
 
-Set the tracer provider before connecting the client. See the [OpenTelemetry plugin README](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/opentelemetry) for exporter setup.
+Set the tracer provider before connecting the client. See the [OpenTelemetry plugin README](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/opentelemetry) for exporter setup.

@@ -56,7 +56,10 @@ def _generated_class_doc(cls: type) -> str | None:
                 # generated unevaluated, and the field keeps the reference from
                 # that time.
                 annotate = getattr(cls.__init__, "__annotate__", None)
-                if getattr(annotate, "__generated_by_dataclasses__", False):
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
                     field_types = {
                         n: f.type for n, f in cls.__dataclass_fields__.items()
                     }

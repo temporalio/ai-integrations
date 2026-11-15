@@ -217,6 +217,10 @@ def lookup_backend(ref: str) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
+# Options activity_as_tool builds itself from the model's tool call.
+_RESERVED_ACTIVITY_OPTIONS = frozenset({"arg", "args"})
+
+
 def _call_function(method: Any) -> Callable | None:
     """Return the function under a function, staticmethod, classmethod or partialmethod."""
     while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
@@ -247,7 +251,10 @@ def _generated_class_doc(cls: type) -> str | None:
                 # generated unevaluated, and the field keeps the reference from
                 # that time.
                 annotate = getattr(cls.__init__, "__annotate__", None)
-                if getattr(annotate, "__generated_by_dataclasses__", False):
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
                     field_types = {
                         n: f.type for n, f in cls.__dataclass_fields__.items()
                     }
@@ -362,11 +369,9 @@ def _tool_signature(
 def activity_as_tool(
     activity: Callable,
     *,
-    start_to_close_timeout: timedelta,
     name: str | None = None,
     description: str | None = None,
-    retry_policy: Any = None,
-    summary: str | None = None,
+    activity_options: ActivityConfig | None = None,
 ) -> BaseTool:
     """Expose an existing Temporal activity as a Deep Agents tool.
 
@@ -381,19 +386,24 @@ def activity_as_tool(
     Args:
         activity: A function decorated with ``@activity.defn``, a method passed
             as ``Class.method``, or a callable-class activity passed as its class.
-        start_to_close_timeout: Required per-call timeout for the activity.
         name: Override the tool name advertised to the model (defaults to
             the activity definition name).
         description: Override the tool description advertised to the model
             (defaults to the activity docstring).
-        retry_policy: Optional Temporal retry policy for the activity.
-        summary: Optional ``summary=`` recorded on each activity invocation.
+        activity_options: The ``workflow.execute_activity`` options for each
+            call: timeouts, ``retry_policy``, ``task_queue``,
+            ``heartbeat_timeout``, ``activity_id``, ``summary``, and so on. Must
+            set ``start_to_close_timeout`` or ``schedule_to_close_timeout``.
+            ``summary`` defaults to ``"tool:<name>"``. ``arg`` and ``args`` are
+            reserved: the tool builds them from the model's call.
 
     Raises:
         ValueError: If ``activity`` is not a named activity, is an instance of a
             callable-class activity, is a class without a ``__call__`` the tool
             can use, or takes arguments the tool can't pass: keyword-only
-            arguments or ``**kwargs``.
+            arguments or ``**kwargs``; if ``activity_options`` sets ``arg`` or
+            ``args``; or if it sets neither a start-to-close nor a
+            schedule-to-close timeout.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -419,7 +429,24 @@ def activity_as_tool(
         )
     signature, hints, doc, star = _tool_signature(activity)
     tool_desc = description or (doc or f"Temporal activity {tool_name}.")
-    act_summary = summary or f"tool:{tool_name}"
+
+    opts: dict[str, Any] = dict(activity_options or {})
+    reserved = _RESERVED_ACTIVITY_OPTIONS & opts.keys()
+    if reserved:
+        raise ValueError(
+            f"activity_options must not set {', '.join(sorted(reserved))}: "
+            "the tool builds the activity arguments from the model's call."
+        )
+    if (
+        opts.get("start_to_close_timeout") is None
+        and opts.get("schedule_to_close_timeout") is None
+    ):
+        raise ValueError(
+            "activity_as_tool requires start_to_close_timeout or "
+            "schedule_to_close_timeout in activity_options."
+        )
+    # The default summary this helper has always recorded.
+    opts.setdefault("summary", f"tool:{tool_name}")
     # The model sends *args as a list under its own name, so the call binds it as
     # an ordinary parameter, None when the model leaves it out.
     call_signature = signature.replace(
@@ -440,13 +467,7 @@ def activity_as_tool(
         activity_args = list(bound.args)
         if star:
             activity_args.extend(activity_args.pop() or ())
-        return await workflow.execute_activity(
-            activity,
-            args=activity_args,
-            start_to_close_timeout=start_to_close_timeout,
-            retry_policy=retry_policy,
-            summary=act_summary,
-        )
+        return await workflow.execute_activity(activity, args=activity_args, **opts)
 
     # StructuredTool builds the model-facing schema from _run's signature and types.
     setattr(_run, "__signature__", signature)
@@ -583,8 +604,7 @@ def install_backend_async_patch() -> None:
     method natively are unaffected; only the protocol defaults are replaced.
     Idempotent.
     """
-    # importlib: `deepagents` is absent on Python 3.10 environments (its floor
-    # is 3.11), so a static import here fails type-checking there.
+    # Resolve the framework's top-level package explicitly.
     BackendProtocol = importlib.import_module(
         "deepagents.backends.protocol"
     ).BackendProtocol

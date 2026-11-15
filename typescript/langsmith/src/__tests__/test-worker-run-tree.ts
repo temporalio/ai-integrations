@@ -1,5 +1,5 @@
 import test from 'ava';
-import { address } from 'langsmith';
+import { AgentAddress } from 'langsmith';
 import { RunTree } from 'langsmith/run_trees';
 import { getCurrentRunTree, traceable, withRunTree } from 'langsmith/traceable';
 import * as nexus from 'nexus-rpc';
@@ -12,7 +12,7 @@ process.env.LANGCHAIN_CALLBACKS_BACKGROUND = 'false';
 
 type Inbound = 'activity' | 'nexus-start' | 'nexus-cancel';
 const INBOUNDS: Inbound[] = ['activity', 'nexus-start', 'nexus-cancel'];
-const ADDRESS = address.agent('support', 'production');
+const ADDRESS = { ...new AgentAddress('support', 'production') };
 
 async function invoke(inbound: Inbound, config: EmitterConfig, body: () => Promise<void>): Promise<void> {
   if (inbound === 'activity') {
@@ -62,7 +62,7 @@ for (const inbound of INBOUNDS) {
       t.is(collector.records.length, 3);
       for (const run of collector.records) {
         t.is(run.project_name, mode === 'project' ? 'plugin-project' : undefined);
-        t.is(run.address, mode === 'address' ? ADDRESS : undefined);
+        t.deepEqual(run.address, mode === 'address' ? ADDRESS : undefined);
         t.truthy(run.end_time);
       }
       for (const name of ['native-root', 'traceable-root']) {
@@ -84,7 +84,7 @@ test('worker defaults preserve explicit destinations, clients, replicas and nati
     replicas: [{ projectName: 'plugin-replica' }],
   }, async () => {
     const defaults = new RunTree({ name: 'defaults' });
-    t.is(defaults.address, ADDRESS);
+    t.deepEqual(defaults.address, ADDRESS);
     t.deepEqual(defaults.replicas, [{ projectName: 'plugin-replica' }]);
     const native = new RunTree({ name: 'explicit', project_name: 'explicit-project', client: explicit.asClient(), replicas: [] });
     t.is(native.project_name, 'explicit-project');
@@ -103,7 +103,7 @@ test('worker defaults preserve explicit destinations, clients, replicas and nati
       name: 'explicit-traceable', project_name: 'traceable-project', client: explicit.asClient(), replicas: [],
     })();
     t.throws(() => new RunTree({ name: 'conflict', project_name: 'project', address: ADDRESS }));
-    t.throws(() => new RunTree({ name: 'invalid', address: '' as typeof ADDRESS }));
+    t.throws(() => new RunTree({ name: 'invalid', address: '' as unknown as typeof ADDRESS }));
     await traceable(async () => {}, { name: 'disabled', tracingEnabled: false })();
   });
   t.deepEqual(collector.records, []);
@@ -140,6 +140,6 @@ test('concurrent worker defaults stay local and restore the caller context after
   const after = new RunTree({ name: 'after' });
   t.is(after.client, outside.client);
   t.is(after.project_name, outside.project_name);
-  t.is(after.address, outside.address);
+  t.deepEqual(after.address, outside.address);
   t.is(getCurrentRunTree(true), undefined);
 });

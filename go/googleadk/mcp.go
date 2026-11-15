@@ -35,7 +35,8 @@ type MCPToolsetOptions struct {
 	ToolFilter tool.Predicate
 	// ActivityOptions overrides the per-call Activity options for the ListMcpTools
 	// and CallMcpTool Activities. A zero StartToCloseTimeout falls back to the
-	// default one-minute tool timeout.
+	// default one-minute tool timeout, and a zero HeartbeatTimeout to 10
+	// seconds. A negative HeartbeatTimeout turns heartbeats off.
 	ActivityOptions workflow.ActivityOptions
 }
 
@@ -139,7 +140,8 @@ func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	if !ok {
 		return nil, errMissingContext
 	}
-	actx := workflow.WithActivityOptions(wfCtx, resolveToolActivityOptions(m.activityOptions, ""))
+	ao := resolveHeartbeatTimeout(resolveToolActivityOptions(m.activityOptions, ""))
+	actx := workflow.WithActivityOptions(wfCtx, ao)
 	var decls []*genai.FunctionDeclaration
 	if err := workflow.ExecuteActivity(actx, ListMcpToolsActivityName, mcpListInput{Toolset: m.name}).Get(wfCtx, &decls); err != nil {
 		return nil, err
@@ -490,7 +492,7 @@ func (t *mcpProxyTool) Run(ctx agent.Context, args any) (map[string]any, error) 
 	if !ok {
 		return nil, errMissingContext
 	}
-	ao := resolveToolActivityOptions(t.activityOptions, "")
+	ao := resolveHeartbeatTimeout(resolveToolActivityOptions(t.activityOptions, ""))
 	ao.Summary = toolSummary(ctx, t.Name())
 	actx := workflow.WithActivityOptions(wfCtx, ao)
 	argsMap, _ := args.(map[string]any)
@@ -555,9 +557,8 @@ type mcpCallOutput struct {
 // {name, description} — lets the model produce well-formed arguments.
 func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*genai.FunctionDeclaration, error) {
 	log := activity.GetLogger(ctx)
-	// No-op unless the user set a HeartbeatTimeout on the toolset's Activity
-	// options; then a slow MCP server (or first-connect) must not be falsely
-	// heartbeat-timed-out and retried. Same rationale as InvokeModel.
+	// Heartbeat on a timer, so a slow MCP server (or first-connect) is not
+	// falsely heartbeat-timed-out and retried. Same rationale as InvokeModel.
 	stopHeartbeats := startPeriodicHeartbeats(ctx)
 	defer stopHeartbeats()
 	ts, err := a.mcpToolset(ctx, in.Toolset)
@@ -598,9 +599,8 @@ func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*gena
 // retryable wrapError.
 func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCallOutput, error) {
 	log := activity.GetLogger(ctx)
-	// No-op unless the user set a HeartbeatTimeout on the toolset's Activity
-	// options; then a slow MCP tool call must not be falsely heartbeat-timed-out
-	// and retried. Same rationale as InvokeModel.
+	// Heartbeat on a timer, so a slow MCP tool call is not falsely
+	// heartbeat-timed-out and retried. Same rationale as InvokeModel.
 	stopHeartbeats := startPeriodicHeartbeats(ctx)
 	defer stopHeartbeats()
 	ts, err := a.mcpToolset(ctx, in.Toolset)

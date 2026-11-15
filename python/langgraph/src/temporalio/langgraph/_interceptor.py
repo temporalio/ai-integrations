@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+import sys
+from types import FrameType
+from typing import Any, Callable
 
 from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
@@ -54,6 +57,7 @@ class LangGraphInterceptor(Interceptor):
                 super().init(outbound)
 
             async def execute_workflow(self, input: ExecuteWorkflowInput) -> Any:
+                _run_langchain_sync_calls_inline(asyncio.get_running_loop())
                 if (
                     streaming_topic is not None
                     and workflow.get_signal_handler(_PUBLISH_SIGNAL) is None
@@ -75,3 +79,56 @@ class LangGraphInterceptor(Interceptor):
                     clear_store_warning(run_id)
 
         return Inbound
+
+
+def _run_langchain_sync_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the workflow event loop run LangChain's thread calls inline.
+
+    LangGraph runs a sync routing function (``add_conditional_edges``) with
+    LangChain's ``run_in_executor`` helper, which calls
+    ``loop.run_in_executor``. The workflow event loop has no threads and raised
+    ``NotImplementedError``, so the run never finished. Only calls from that
+    helper run inline; any other ``run_in_executor`` call fails as before.
+    """
+    _run_inline_when_called_by(loop, _called_by_langchain)
+
+
+# The callers whose run_in_executor calls the workflow loop runs inline. A
+# plugin that adds its own caller uses this same list on the same loop, so with
+# several plugins one wrapper checks the original caller against all of them.
+_INLINE_CALLERS = "_temporal_inline_executor_callers"
+
+
+def _run_inline_when_called_by(
+    loop: asyncio.AbstractEventLoop, is_caller: Callable[[FrameType], bool]
+) -> None:
+    """Make the workflow loop run ``run_in_executor`` inline for this caller."""
+    callers: list[Callable[[FrameType], bool]] | None = getattr(
+        loop, _INLINE_CALLERS, None
+    )
+    if callers is None:
+        callers = []
+        run_in_executor = loop.run_in_executor
+
+        def inline_run_in_executor(
+            executor: Any, func: Callable[..., Any], *args: Any
+        ) -> asyncio.Future[Any]:
+            caller = sys._getframe(1)
+            if not any(called_by(caller) for called_by in callers):
+                return run_in_executor(executor, func, *args)
+            future = loop.create_future()
+            future.set_result(func(*args))
+            return future
+
+        setattr(loop, "run_in_executor", inline_run_in_executor)
+        setattr(loop, _INLINE_CALLERS, callers)
+    if is_caller not in callers:
+        callers.append(is_caller)
+
+
+def _called_by_langchain(frame: FrameType) -> bool:
+    """Whether the caller is ``langchain_core.runnables.config.run_in_executor``."""
+    return (
+        frame.f_code.co_name == "run_in_executor"
+        and frame.f_globals.get("__name__") == "langchain_core.runnables.config"
+    )

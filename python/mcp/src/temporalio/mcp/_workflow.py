@@ -35,7 +35,9 @@ class TemporalMCPClient:
 
     Each operation executes as an Activity with ``activity_config``; a one-minute
     ``start_to_close_timeout`` is added when the config sets neither
-    ``start_to_close_timeout`` nor ``schedule_to_close_timeout``. Tool discovery
+    ``start_to_close_timeout`` nor ``schedule_to_close_timeout``, and a
+    10-second ``heartbeat_timeout`` when the config leaves it out. Set
+    ``heartbeat_timeout`` to ``None`` to turn heartbeats off. Tool discovery
     is cached for the lifetime of this object by default. A non-None ``factory_argument`` selects
     a fresh worker-side client for every Activity. The argument is recorded in
     workflow history and must not contain secrets.
@@ -64,6 +66,8 @@ class TemporalMCPClient:
             and config.get("schedule_to_close_timeout") is None
         ):
             config["start_to_close_timeout"] = timedelta(minutes=1)
+        if "heartbeat_timeout" not in config:
+            config["heartbeat_timeout"] = timedelta(seconds=10)
         self._activity_config: ActivityConfig = config
         self._cache_tools_list = cache_tools_list
         self._tools: ListToolsResult | None = None

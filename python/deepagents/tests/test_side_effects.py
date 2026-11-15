@@ -9,19 +9,14 @@ schedules one activity per op and nothing more.
 
 from __future__ import annotations
 
-import sys
 import uuid
 from datetime import timedelta
 
 import pytest
 
-from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 from temporalio import workflow
 from temporalio.deepagents import DeepAgentsPlugin, TemporalBackend
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from tests.helpers.deepagents import count_scheduled_activities
 

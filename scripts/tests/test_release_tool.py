@@ -39,9 +39,9 @@ def test_parse_tag_invalid(tag: str) -> None:
 
 def test_cli_parse_tag_emits_plugin_python_requirement(plugin_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
     manifest = plugin_repo / "python/fakeplug/pyproject.toml"
-    manifest.write_text(manifest.read_text().replace('requires-python = ">=3.10"', 'requires-python = ">=3.11"'))
+    manifest.write_text(manifest.read_text().replace('requires-python = ">=3.11"', 'requires-python = ">=3.12"'))
     assert release_tool.main(["--repo-root", str(plugin_repo), "parse-tag", "python/fakeplug/v0.0.1"]) == 0
-    assert "requires_python=>=3.11" in capsys.readouterr().out
+    assert "requires_python=>=3.12" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("version,prerelease", [("0.1.0-RC1", "true"), ("0.1.0", "false")])
@@ -97,7 +97,7 @@ def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
            "head_sha": sha, "path": ".github/workflows/release-python.yml", "status": "completed"}
     names = ["Validate tag and version policy", "Test / matrix"]
     names.extend(f"Test / fakeplug ({runner}, py{version})" for runner, version in (
-        ("ubuntu-latest", "3.10"), ("ubuntu-latest", "3.14"), ("macos-latest", "3.14"), ("windows-latest", "3.14"),
+        ("ubuntu-latest", "3.11"), ("ubuntu-latest", "3.15"), ("macos-latest", "3.15"), ("windows-latest", "3.15"),
     ))
     jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"} for name in names]}
     artifacts = {"artifacts": [{"name": "dist-fakeplug-locked", "expired": False}]}
@@ -304,9 +304,10 @@ def test_published_release_check_rejects_unreviewed_or_misclassified_release(
 
 
 NIGHTLY_ISSUES = [
-    {"number": 444, "title": "nightly: openai_agents failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/444"},
+    {"number": 444, "title": "nightly: python/openai_agents failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/444"},
     {"number": 500, "title": "nightly: typescript/langsmith failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/500"},
     {"number": 501, "title": "nightly: go/googleadk failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/501"},
+    {"number": 502, "title": "nightly: java/google-adk failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/502"},
 ]
 
 
@@ -314,6 +315,8 @@ NIGHTLY_ISSUES = [
     ("python/openai_agents/v2.0.0", 444),
     ("typescript/langsmith/v1.24.0", 500),
     ("go/googleadk/v0.1.0", 501),
+    ("java/google-adk/v0.1.0", 502),
+    ("typescript/google-adk/v0.1.0", None),  # the Java plugin's issue doesn't block the TypeScript one
     ("python/langsmith/v0.2.0", None),  # the TypeScript plugin's issue doesn't block the Python one
     ("typescript/openai-agents/v1.24.0", None),
     ("java/spring-ai/v0.1.0", None),
@@ -333,7 +336,7 @@ def test_nightly_check_blocks_only_a_plugin_with_an_open_nightly_issue(
         assert code == 1 and f"#{blocked_by} is open" in out
 
 
-@pytest.mark.parametrize("name", ["Validate tag and version policy", "Test / fakeplug (macos-latest, py3.14)"])
+@pytest.mark.parametrize("name", ["Validate tag and version policy", "Test / fakeplug (macos-latest, py3.15)"])
 @pytest.mark.parametrize("state", ["missing", "failure", "in_progress"])
 def test_recovery_requires_the_complete_successful_matrix(recovery_source: tuple, name: str, state: str) -> None:
     repo, _, jobs, _ = recovery_source

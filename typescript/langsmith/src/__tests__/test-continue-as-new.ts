@@ -37,6 +37,9 @@ test('continue-as-new: keeps the successor on the same trace with a distinct run
   const second = runs[1]!;
   t.not(first.id, second.id);
   t.is(first.trace_id, second.trace_id);
+  // Continue-as-new ends the run with a status, not an error.
+  t.deepEqual(runs.map((r) => r.outputs), [{ status: 'continued_as_new' }, { status: 'ok' }]);
+  t.true(runs.every((r) => r.error == null));
 
   // No ContinueAsNew run is emitted — only the trace context is propagated.
   t.falsy(collector.byName('ContinueAsNew:ContinueAsNewWorkflow'));
