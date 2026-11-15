@@ -240,6 +240,8 @@ export class StrandsPlugin extends SimplePlugin {
    *   - `@aws-sdk/client-s3`, dynamically imported by the SDK's S3-backed
    *     `context-offloader` vended plugin. The offloader can run in workflows
    *     with in-memory storage; S3 I/O must run in Activities.
+   *   - `@aws-sdk/client-s3vectors`, dynamically imported by the SDK's
+   *     `S3VectorSearchStrategy`, which `S3Storage` imports.
    *   - `@temporalio/activity` and `@temporalio/client`, which the
    *     worker-only halves of {@link TemporalMCPClient}, {@link autoHeartbeat},
    *     and `@temporalio/workflow-streams/client` import.
@@ -270,6 +272,7 @@ export class StrandsPlugin extends SimplePlugin {
       '@temporalio/client',
       '@aws-sdk/client-bedrock-runtime',
       '@aws-sdk/client-s3',
+      '@aws-sdk/client-s3vectors',
       '@aws-sdk/middleware-websocket',
       '@anthropic-ai/sdk',
       'openai',
