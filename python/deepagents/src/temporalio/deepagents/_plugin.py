@@ -85,9 +85,9 @@ class DeepAgentsPlugin(SimplePlugin):
             plugin's LangChain/deepagents defaults.
         data_converter: Explicit converter override. ``None`` adapts the client
             or replayer's existing converter, preserving its codec and other
-            settings. The SDK default payload converter is upgraded; converters
-            using ``DeepAgentsPayloadConverter`` or a subclass are accepted;
-            other payload converters raise.
+            settings. The SDK default payload converter is replaced with the
+            plugin's Pydantic payload converter; a converter that already
+            uses it is kept; other payload converters raise ``ValueError``.
     """
 
     def __init__(

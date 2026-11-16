@@ -16,8 +16,8 @@ references, so neither survives a naive round-trip. This module owns:
 * tool → JSON-schema advertisement (full name + description + argument schema,
   never ``{name, description}`` alone — without the argument schema the model
   picks the right tool but hallucinates its arguments);
-* the Pydantic data converter (``exclude_unset=True``) the plugin installs on
-  the client and replayer, so message payloads stay small and round-trip
+* the Pydantic data converter the plugin installs on the client and
+  replayer, which also writes default-filled fields, so values round-trip
   cleanly;
 * a workflow-scoped result cache so model / tool results computed before a
   ``continue_as_new`` are reused rather than recomputed after it;
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from langchain_core.messages import BaseMessage
     from langchain_core.runnables import RunnableConfig
 
-from temporalio.contrib.pydantic import PydanticPayloadConverter, ToJsonOptions
+from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 
 # ---------------------------------------------------------------------------
@@ -91,22 +91,19 @@ def get_settings() -> Settings:
 
 
 class DeepAgentsPayloadConverter(PydanticPayloadConverter):
-    """Pydantic payload converter pinned to ``exclude_unset=True``.
+    """The Pydantic payload converter the plugin installs.
 
-    LangChain request/response types (and ``DeepAgentState``) are deeply nested
-    with many ``Optional[...] = None`` fields. Shipping every unset default
-    inflates payloads several-fold and some peers reject the explicit nulls on
-    round-trip, so we exclude unset fields by convention.
+    It is the SDK's converter with no options, so it writes the fields
+    Pydantic filled from a default along with the ones the caller set. A
+    LangChain message's ``type`` and a ``default_factory`` value are filled
+    that way, and the receiver needs them to rebuild the value the sender had.
+    The subclass lets :func:`build_data_converter` recognize a data converter
+    that already uses it.
     """
-
-    def __init__(self) -> None:
-        """Construct the converter with ``exclude_unset`` serialization."""
-        super().__init__(ToJsonOptions(exclude_unset=True))
 
 
 data_converter = DataConverter(payload_converter_class=DeepAgentsPayloadConverter)
-"""The plugin's default data converter (LangChain messages are shipped as their
-``dumpd`` JSON form, so the Pydantic converter only ever sees plain containers)."""
+"""The plugin's default data converter."""
 
 
 def build_data_converter(
@@ -129,10 +126,11 @@ def build_data_converter(
     if issubclass(user_converter.payload_converter_class, DeepAgentsPayloadConverter):
         return user_converter
     raise ValueError(
-        "DeepAgentsPlugin cannot compose with a custom data_converter "
-        "automatically. Set payload_converter_class=DeepAgentsPayloadConverter "
-        "on your own DataConverter (so LangChain messages serialize with "
-        "exclude_unset=True)."
+        "DeepAgentsPlugin cannot compose with a custom payload_converter_class. "
+        "Leave payload_converter_class at the SDK default on your own "
+        "DataConverter: the plugin replaces the default with a Pydantic payload "
+        "converter and keeps the rest of your DataConverter, such as its "
+        "payload codec."
     )
 
 
@@ -362,10 +360,10 @@ def load_messages(dumped: list[Any]) -> list[Any]:
 def dump_carried_messages(messages: Any) -> list[Any]:
     """Serialize the transcript ``run_deep_agent`` carries across continue-as-new.
 
-    The plugin's payload converter writes a LangChain message as a dict of the
-    fields that were set, which leaves out its ``type``, so the continued run
-    cannot rebuild it. Each message of a class from ``langchain_core.messages``
-    goes in its ``dumpd`` form instead. Any other value, such as a string, a
+    The continued run decodes the snapshot as a ``dict``, so a LangChain
+    message in it would arrive as a dict of its fields, not as a message.
+    Each message of a class from ``langchain_core.messages`` goes in its
+    ``dumpd`` form instead. Any other value, such as a string, a
     ``{"role": ..., "content": ...}`` dict or a message subclass defined
     elsewhere (which ``load`` could not rebuild), is kept as is.
     """

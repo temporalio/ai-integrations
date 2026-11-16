@@ -332,8 +332,8 @@ async def run_deep_agent(
                 carried = _extract_messages(input)
             else:
                 carried = _as_message_list(input)
-        # The snapshot goes through the payload converter, which would drop
-        # each message's type; carry messages in their dumpd form instead.
+        # The continued run decodes the snapshot as a dict, where a message
+        # would be a dict of its fields; carry messages in their dumpd form.
         snapshot: dict[str, Any] = {"messages": _serde.dump_carried_messages(carried)}
         files: Any = result.get("files")
         if isinstance(files, Mapping):

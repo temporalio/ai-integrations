@@ -485,3 +485,55 @@ async def connect():
 
 For agents built directly as LangGraph graphs (rather than a compiled Deep
 Agent), see `temporalio.langgraph`.
+
+## Data converter
+
+On a Client, the plugin replaces the SDK's default payload converter with a
+Pydantic one and keeps your payload codec and failure converter. A `Replayer`
+with the plugin gets the same converter. A Worker takes its converter from its
+Client, so a plugin passed to the Worker alone does not change it. Passing a
+`DataConverter` that sets a payload converter class of its own raises
+`ValueError`: leave the class at its default and the plugin replaces it.
+
+The converter is used for every payload of that Client, in Deep Agents
+Workflows and in any other. It writes Pydantic values as the SDK's
+`pydantic_data_converter` does, with the fields that came from a default
+included, so a LangChain message keeps its `type` in Workflow inputs and
+results, Signals, Updates and Queries. To get message objects on the receiving
+side, use a Pydantic model with a `list[AnyMessage]` field as the parameter or
+result type. A bare `list[AnyMessage]` annotation is not enough: the SDK reads
+it without the discriminator that tells the message classes apart, so most
+messages fail to decode. Under `dict` or `Any`, a message arrives as a dict of
+its fields.
+
+**Breaking change:** earlier versions left out the fields the sender had not
+set. A message lost its `type`, and the receiver generated a `default_factory`
+value again. The payload now carries those fields, and the receiver reads them
+instead of filling in its own defaults. For your own models that means:
+
+- A default that cannot be written as JSON, such as a function or a class, no
+  longer encodes: sending the model raises `PydanticSerializationError`. In a
+  Workflow this fails the Workflow Task, also when it replays a History
+  recorded before the upgrade. A `SecretStr` default is written masked, so the
+  receiver gets `**********`. Mark such a field `Field(exclude=True)`, and the
+  receiver uses its own default as before.
+- A default that does not pass the field's own validation, such as
+  `name: str = None`, no longer decodes. Declare the field `str | None`. A
+  float default of `inf` or `nan` fails the same way, because Pydantic writes
+  it as `null`: set `ser_json_inf_nan="constants"` in the model's config.
+- `model_fields_set` of a received model includes the fields that came from a
+  default, so `model_dump(exclude_unset=True)` on it returns them too.
+- A model with `extra="forbid"` rejects a payload whose sender has a field the
+  model lacks, even when the sender left that field unset. Add the field to
+  the receiving model first.
+
+Payloads grow by the fields that were left out. A LangChain message that your
+own code sends, or that is in a wrapped tool's arguments, takes up to about
+200 bytes more, depending on its class and on how many of its fields were set.
+Model Activity payloads do not change. Histories recorded before the upgrade
+replay as before, unless the Workflow sends a model with a default that cannot
+be written as JSON. Earlier versions of the plugin read the new payloads, so
+Clients and Workers can be upgraded and rolled back in any order. A payload
+keeps the shape its writer gave it, also in History. A Client on an earlier
+version still starts Workflows and sends Signals and Updates without those
+fields, so upgrade the Clients as well as the Workers.
