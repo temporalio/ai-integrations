@@ -252,8 +252,9 @@ release notes. Start each title with the plugin it changes:
 
 - The tag is the plugin's folder path, as written in its release tags: `python/openai_agents`,
   `typescript/vercel-ai-sdk`, `go/googleadk`.
-- A PR that changes two plugins lists both: `[python/strands_agents, python/deepagents]`. One that
-  changes many plugins uses `[all]`, and one that changes no plugin uses `[repo]`.
+- A PR that changes up to three plugins lists them all:
+  `[python/strands_agents, python/deepagents]`. One that changes more than three has no tag, and
+  one that changes no plugin uses `[repo]`.
 - Write the text after the tag in lowercase, and don't repeat the plugin's name. Start with
   `breaking:` when the change is breaking. Other PRs get no type word.
 
