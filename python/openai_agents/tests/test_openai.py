@@ -126,6 +126,7 @@ from temporalio.openai_agents import (
     ModelSummaryProvider,
     OpenAIPayloadConverter,
     TemporalAgent,
+    TemporalModel,
 )
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
@@ -136,9 +137,6 @@ from temporalio.openai_agents._invoke_model_activity import (
 )
 from temporalio.openai_agents._openai_runner import (
     _coerce_run_config,
-)
-from temporalio.openai_agents._temporal_model import (
-    TemporalModel,
 )
 from temporalio.openai_agents._temporal_worker_env_ref import (
     _WorkerEnvRefResolver,
@@ -4569,6 +4567,39 @@ async def test_implicit_model_settings_kept_for_an_unnamed_provider_model(
     model = RecordingUnnamedModel()
     await _run_with_model(client, model, ImplicitSettingsAgent)
     assert model.settings == [get_default_model_settings()]
+
+
+@workflow.defn
+class RunUnnamedModelAgent:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
+        for settings in (None, ModelSettings(temperature=0.2)):
+            await Runner.run(
+                agent,
+                input=prompt,
+                run_config=RunConfig(model=TemporalModel(), model_settings=settings),
+            )
+        return "done"
+
+
+@pytest.mark.parametrize("default_model", ["gpt-5", "gpt-4o"])
+async def test_unnamed_model_override_preserves_upstream_settings(
+    client: Client, monkeypatch: pytest.MonkeyPatch, default_model: str
+):
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", default_model)
+    native_model = RecordingNamedModel("gpt-5")
+    for settings in (None, ModelSettings(temperature=0.2)):
+        await Runner.run(
+            Agent(name="Native"),
+            input="Hello",
+            run_config=RunConfig(model=native_model, model_settings=settings),
+        )
+    assert native_model.settings == [ModelSettings(), ModelSettings(temperature=0.2)]
+
+    model = RecordingNamedModel("gpt-5")
+    await _run_with_model(client, model, RunUnnamedModelAgent)
+    assert model.settings == native_model.settings
 
 
 async def test_explicit_model_settings_reach_the_provider_model_unchanged(

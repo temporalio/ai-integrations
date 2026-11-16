@@ -83,6 +83,7 @@ from temporalio.openai_agents import (
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
     TemporalAgent,
+    TemporalModel,
     _heartbeat_decorator,
 )
 from temporalio.openai_agents.testing import AgentEnvironment
@@ -631,6 +632,61 @@ class RecordingStreamingModel(StreamingTestModel):
             **kwargs,
         ):
             yield event
+
+
+@workflow.defn
+class StreamingUnnamedModelOverrideWorkflow:
+    @workflow.init
+    def __init__(self, prompt: str) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self, prompt: str) -> None:
+        agent = TemporalAgent[None](name="Assistant")
+        for settings in (None, ModelSettings(temperature=0.2)):
+            result = Runner.run_streamed(
+                agent,
+                input=prompt,
+                run_config=RunConfig(model=TemporalModel(), model_settings=settings),
+            )
+            async for _ in result.stream_events():
+                pass
+
+
+@pytest.mark.parametrize("default_model", ["gpt-5", "gpt-4o"])
+async def test_streamed_unnamed_model_override_preserves_upstream_settings(
+    client: Client, monkeypatch: pytest.MonkeyPatch, default_model: str
+):
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", default_model)
+    native_model = RecordingStreamingModel("gpt-5")
+    for settings in (None, ModelSettings(temperature=0.2)):
+        result = Runner.run_streamed(
+            Agent(name="Native"),
+            input="Hello",
+            run_config=RunConfig(model=native_model, model_settings=settings),
+        )
+        async for _ in result.stream_events():
+            pass
+    assert native_model.settings == [ModelSettings(), ModelSettings(temperature=0.2)]
+
+    model = RecordingStreamingModel("gpt-5")
+    async with AgentEnvironment(model=model, streaming_topic="events") as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, StreamingUnnamedModelOverrideWorkflow) as worker:
+            handle = await client.start_workflow(
+                StreamingUnnamedModelOverrideWorkflow.run,
+                "Hello",
+                id=f"streamed-unnamed-model-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            await handle.result()
+            history = await handle.fetch_history()
+        await Replayer(
+            workflows=[StreamingUnnamedModelOverrideWorkflow],
+            plugins=[env.openai_agents_plugin],
+        ).replay_workflow(history)
+    assert model.settings == native_model.settings
 
 
 @workflow.defn

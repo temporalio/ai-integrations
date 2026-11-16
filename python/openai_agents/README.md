@@ -1094,6 +1094,11 @@ implicit defaults, so an activity worker with a different `OPENAI_DEFAULT_MODEL`
 same result, and `RunConfig.model_settings` is re-applied after the replacement. Settings
 the agent sets explicitly are sent unchanged.
 
+For an agent using implicit settings, `RunConfig(model=TemporalModel())` preserves
+the SDK's empty Model-object settings, plus any `RunConfig.model_settings`. The
+provider still chooses its default model without adding reasoning or verbosity
+defaults.
+
 Model calls run in an Activity on the Worker, so they use the provider set on the Worker with
 `OpenAIAgentsPlugin(model_provider=...)`. To use several providers, set a `MultiProvider` with a
 prefix map there and choose a provider by model name. A Workflow cannot set its own provider:

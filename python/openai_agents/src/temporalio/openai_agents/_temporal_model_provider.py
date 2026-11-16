@@ -131,7 +131,9 @@ class _TemporalModelProvider(ModelProvider):
 
     def get_model(self, model_name: str | None) -> Model:
         """Return the durable model for a name or the Worker's default model."""
-        return TemporalModel(model_name)
+        model = TemporalModel(model_name)
+        model._is_provider_default = model_name is None
+        return model
 
     def install(self, run_config: RunConfig) -> RunConfig:
         """Return ``run_config`` using this provider and an agent-capturing input filter."""

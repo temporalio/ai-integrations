@@ -138,6 +138,9 @@ class TemporalModel(Model):
                 combined with a non-None static summary in effective configuration.
         """
         self.model_name = model_name
+        # Only provider-created default models need their implicit settings aligned
+        # on the Worker. Explicit Model objects retain the settings resolved upstream.
+        self._is_provider_default = False
         self._options = _ModelOptions(
             activity_config=activity_config or ActivityConfig(),
             use_local_activity=use_local_activity,
@@ -274,12 +277,10 @@ class TemporalModel(Model):
 
         agent = _current_agent.get()
 
-        if self.model_name is None and agent is not None:
-            # Neither the agent nor the run named a model, so the activity's provider
-            # will choose one. Record here, against this worker's environment, whether
-            # the agent's settings are the SDK's implicit defaults for an unnamed model,
-            # plus the run-level overrides, so the activity can align the defaults with
-            # the model it resolves and then re-apply the overrides.
+        if self._is_provider_default and agent is not None:
+            # The provider is choosing an implicit model, rather than executing an
+            # explicit Model object. Record the Workflow's verdict on implicit defaults
+            # and the run overrides so the Activity can align them with its own model.
             activity_input["implicit_model_settings"] = (
                 agent.model_settings == get_default_model_settings()
             )
