@@ -317,6 +317,8 @@ async def test_get_model_profile_reads_the_workers_model(
 def test_activity_options_keep_the_models_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import sys
+
     monkeypatch.setitem(
         sys.modules,
         "deepagents",
