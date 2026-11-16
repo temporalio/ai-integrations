@@ -288,17 +288,17 @@ hour. A slow refresh can also fail other running Gemini calls. If that can be
 slow, set a longer `heartbeat_timeout`, or `None`.
 
 **Breaking change when you upgrade or roll back:**
-[PR #551](https://github.com/temporalio/ai-integrations/pull/551) adds timer
-heartbeats and the 10-second default. A call scheduled with this default and
-run by a worker without timer heartbeats fails after 10 seconds without a
-heartbeat, and so does each retry.
+`temporalio-google-genai` 1.0.0 adds timer heartbeats and the 10-second default.
+A call scheduled with this default and run by a worker without timer
+heartbeats fails after 10 seconds without a heartbeat, and so does each retry.
 
-- To upgrade, deploy this version to the workers that run the Gemini activities
+- To upgrade to 1.0.0, deploy it to the workers that run the Gemini activities
   first. If the same workers run workflows too, deploy it with
   `heartbeat_timeout=None` in `activity_config` and remove that in a later
   deploy.
-- To roll back, first deploy with `heartbeat_timeout=None`, then wait for the
-  calls scheduled before that deploy to finish: they keep the 10-second timeout.
+- To roll back from 1.0.0, first deploy it with `heartbeat_timeout=None`, then
+  wait for calls scheduled before that deploy to finish: they keep the
+  10-second timeout.
 - Runs pinned with Worker Versioning avoid both, when their Gemini activities
   use the workflow's task queue.
 

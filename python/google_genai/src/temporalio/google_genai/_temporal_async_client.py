@@ -243,9 +243,10 @@ class TemporalAsyncClient(AsyncClient):
                 ``interactions`` and ``agents``. A refresh can cause heartbeat
                 timeouts in other calls sharing the loop even when it takes
                 less than the heartbeat timeout. If refreshes can be slow,
-                set a longer ``heartbeat_timeout``, or ``None``. Workers on
-                an earlier version of this plugin don't heartbeat this way, so
-                a call they run fails after 10 seconds without a heartbeat.
+                set a longer ``heartbeat_timeout``, or ``None``. Version 1.0.0
+                adds timer heartbeats. Workers on earlier versions don't
+                heartbeat this way, so a call they run fails after 10 seconds
+                without a heartbeat.
                 The README says how to upgrade and roll back.
             streaming_topic: When set, ``generate_content_stream`` publishes each
                 streamed ``GenerateContentResponse`` to this
