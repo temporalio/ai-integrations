@@ -26,7 +26,7 @@ import (
 
 // StreamServer installs the workflow-side stream server that streamed model
 // output lands in. Call it once, near the top of the workflow that drives
-// runner.Run, whenever you set Options.StreamingTopic. The InvokeModel Activity
+// runner.Run, whenever a model uses WithStreaming. The InvokeModel Activity
 // publishes each model chunk back to this workflow (via a Temporal signal), and
 // external consumers (UIs) read the chunks with workflowstreams.Client.Subscribe.
 // Without it the published chunks have nowhere to land. It is a no-op to omit

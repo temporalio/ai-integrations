@@ -50,8 +50,6 @@ gate composes `workflow.IsReadOnly`.
 
 Runnable end-to-end samples live in
 [temporalio/samples-go](https://github.com/temporalio/samples-go/tree/main/googleadk).
-Those upstream samples use the former module path; update their Google ADK
-import to `go.temporal.io/googleadk` when using this module.
 
 ## Hello world
 
@@ -90,7 +88,7 @@ func AgentWorkflow(ctx workflow.Context, question string) (string, error) {
 	root, err := llmagent.New(llmagent.Config{
 		Name:        "assistant",
 		Description: "a helpful assistant",
-		Model:       googleadk.NewModel("gemini-2.0-flash"),
+		Model:       googleadk.NewModel("gemini-3.8-flash"),
 		Instruction: "Answer concisely.",
 	})
 	if err != nil {
@@ -141,7 +139,7 @@ func main() {
 	// cached MCP toolsets at worker stop.
 	adkPlugin, err := googleadk.NewPlugin(googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
-			"gemini-2.0-flash": func(ctx context.Context, name string) (model.LLM, error) {
+			"gemini-3.8-flash": func(ctx context.Context, name string) (model.LLM, error) {
 				// nil config reads GEMINI_API_KEY / GOOGLE_API_KEY from the env, worker-side.
 				return gemini.NewModel(ctx, name, nil)
 			},
@@ -174,6 +172,12 @@ Worker model: the resolved model receives the new name, as ADK's models do
 outside Temporal. To use another model, build the agent with
 `NewModel(<name>)`.
 
+Register each factory under a name its provider accepts. ADK copies the
+`NewModel` name into `LLMRequest.Model`, and ADK's Gemini and OpenAI models
+send that name to the provider, not the name they were built with. So a
+factory registered as `"fast"` that builds a `gemini-3.8-flash` model asks the
+Gemini API for a model named `fast`.
+
 ## What you get
 
 - **Every LLM turn is a durable Activity.** `NewModel(name)` returns a `model.LLM`
@@ -195,7 +199,11 @@ outside Temporal. To use another model, build the agent with
   ...)` exposes an existing `func(context.Context, TArgs) (TResults, error)`
   Temporal activity to the agent as a tool (parameter schema inferred from
   `TArgs`); its `Run` dispatches the activity. Register the same activity on the
-  worker as usual.
+  worker as usual. If you set `ActivityToolOptions.Name`, that name is also the
+  Activity type the tool schedules, so register the Activity under it
+  (`activity.RegisterOptions{Name: ...}`). When no Worker has that Activity
+  type, each attempt fails with `unable to find activityType`, and Temporal
+  retries it.
 - **MCP, statelessly.** `NewMCPToolset(...)` is a workflow-side proxy: it lists
   remote tools (full declarations, including parameters) via `ListMcpTools` and
   executes calls via `CallMcpTool`. The live, stateful `mcptoolset.New(...)` runs
@@ -238,12 +246,24 @@ outside Temporal. To use another model, build the agent with
 
   To upgrade to this version:
   - A run that used `NewMCPToolset` directly in an agent's `Toolsets` before
-    you deploy this version fails replay on it with `[TMPRL1100]`, with or
-    without a tool call, and so does such a run on this version after a
-    rollback. Let those runs finish first, or keep them on the earlier version
-    with Worker Versioning. Runs whose MCP toolsets are all wrapped replay and
-    continue across the upgrade and a rollback, with the ADK release they ran
-    on.
+    you deploy this version cannot continue on it, with or without a tool
+    call, and neither can such a run of this version on an earlier one after
+    a rollback. On its next Workflow Task, `runner.Run` returns an error. A
+    Workflow that returns that error, as the examples here do, closes as
+    `Failed` with no failed Workflow Task, and a rollback does not reopen it.
+    A Workflow that keeps running instead fails its Workflow Tasks with
+    `[TMPRL1100]`, and continues after a rollback. Let those runs finish
+    first, or keep them on the earlier version with Worker Versioning. Don't
+    let Workers of both versions poll one Task Queue while such runs can
+    exist, including runs that start during the rollout. To find them before
+    you deploy, replay your open runs' Histories with this version in a
+    `worker.WorkflowReplayer`: it reports `[TMPRL1100]` for each. To recover a
+    run that closed as `Failed`, put Workers of the version it ran on back and
+    reset the run to its last Workflow Task. Runs whose MCP toolsets are all
+    wrapped continue across the upgrade and a rollback when the earlier
+    version runs ADK v2.6.0 or later too. When it runs an earlier ADK release,
+    they continue only if no agent run in them took a second model step.
+    Otherwise they end the same way.
   - If an agent or a runner plugin has a tool-error callback, or an after-tool
     callback that treats errors differently from results, don't run Workers of
     an earlier version and this one on the same Task Queue. An earlier Workflow
@@ -260,7 +280,9 @@ outside Temporal. To use another model, build the agent with
   `SendA2AMessage` Activities (a cancellation in `CancelA2ATask`), so a replay
   reads them from History instead of sending them again. Like ADK's own
   provider, the card provider fetches the card on every run of the agent; set a
-  static `AgentCard` to skip the fetch.
+  static `AgentCard` to skip the fetch. Add `googleadk.NewRunnerPlugin(root)`
+  to the runner's plugins too: it fails a run whose tree holds a remote agent
+  built without these providers (see **Rejected** below for what it sees).
   - The Activities build a2a-go's JSON-RPC and REST clients with no HTTP timeout
     of their own, so the Activity's timeouts bound each call. To add options,
     such as call interceptors that add credentials, set
@@ -275,8 +297,10 @@ outside Temporal. To use another model, build the agent with
     that times out or fails on the network is retried, which sends the message
     again and starts another remote task, so set a `StartToCloseTimeout` longer
     than the remote agent takes to answer. The same happens when the Worker
-    stops, or the Activity is paused or reset, during a send. A card file
-    missing on the worker is retried too.
+    stops, or the Activity is paused or reset, during a send, and when one of
+    its heartbeats reaches the server more than about 2 seconds late under the
+    10-second default (see [Heartbeats](#heartbeats)). A card file missing on
+    the worker is retried too.
   - ADK streams the send unless the run's `StreamingMode` is
     `agent.StreamingModeNone`, so the zero `RunConfig` streams too. A streamed
     reply reaches the workflow when the stream ends, with the chunks of each
@@ -299,10 +323,18 @@ outside Temporal. To use another model, build the agent with
   workflow random stream, and `platform.RunTasks` to a `workflow.Go` fan-out, so
   the agent loop replays deterministically. Concurrent tool fan-out is on by
   default; use `NewContext(ctx, googleadk.WithSequentialToolFanout())` for a
-  serial fallback.
-- **Typed failures.** Model / tool / MCP / A2A failures surface as Temporal
-  `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`
-  / `.A2AError`. An MCP tool's own error is not one of these: ADK, its
+  serial fallback. A bridged context belongs to the coroutine of the
+  `workflow.Context` it was made from. To run a turn on another coroutine,
+  such as an Update handler, call `NewContext` there with that coroutine's
+  `workflow.Context`. With a context made on another coroutine the turn fails
+  with `trying to block on coroutine which is already blocked`.
+- **Typed failures.** Model, MCP and A2A failures surface as Temporal
+  `ApplicationError`s tagged `googleadk.ModelError`, `.McpError` and
+  `.A2AError`. `googleadk.ToolError` tags only what an MCP tool cannot do with
+  the read-only context it gets on the Worker: write session state, search
+  memory, or request a confirmation without a function call ID. An
+  `ActivityAsTool` Activity fails with the error your Activity returned, not
+  a `googleadk` one. An MCP tool's own error is not one of these: ADK, its
   tool-error callbacks and the model get an error with the tool's message, as
   without Temporal, not a `googleadk.McpError`. Its Go type and identity don't
   cross the Activity boundary, so `errors.Is` and `errors.As` don't match it;
@@ -356,6 +388,13 @@ Worker is noticed within about 10 seconds instead of at the
   of the Worker if that's shorter. So with the default Worker options, a
   30-second call sends four. Each retry is a new attempt, and heartbeats
   again.
+- That leaves less slack than the timeout: with the defaults, heartbeats
+  reach the server 8 seconds apart against a 10-second timeout. One that
+  arrives more than about 2 seconds late, for example while the Worker can't
+  reach the server, fails the attempt with a heartbeat timeout, and the retry
+  runs the call again: a second model request, MCP tool call or remote A2A
+  task. For a call that isn't safe to repeat, set a longer `HeartbeatTimeout`
+  (30 seconds leaves about 6) or a negative one.
 - `CancelA2ATask` gets the same default, but the server caps its heartbeat
   timeout at the cancellation's 5-second `StartToCloseTimeout`. Nothing cancels
   a cancellation, so its heartbeats only notice a lost Worker, and only a
@@ -374,6 +413,10 @@ is tunneled back across the Activity boundary and re-recorded workflow-side, so
 the agent pauses the same way. Drive it from your workflow like this:
 
 ```go
+// Confirmations no human has decided yet, by FunctionCallID. ADK emits each
+// request once, so keep them across passes.
+waiting := map[string]googleadk.PendingConfirmation{}
+decisions := workflow.GetSignalChannel(ctx, googleadk.ConfirmationSignalName)
 for {
 	var events []*session.Event
 	for ev, err := range r.Run(adkCtx, userID, sessionID, msg, agent.RunConfig{}) {
@@ -383,26 +426,38 @@ for {
 		events = append(events, ev)
 	}
 
-	pending := googleadk.PendingConfirmations(events)
-	if len(pending) == 0 {
+	for _, p := range googleadk.PendingConfirmations(events) {
+		waiting[p.FunctionCallID] = p // show p.OriginalCall and p.Hint to the human
+	}
+	if len(waiting) == 0 {
 		break // done
 	}
 
-	// Ask the human. Deliver decisions via a Temporal signal or update.
-	var decisions []googleadk.ConfirmationDecision
-	for _, p := range pending {
+	// Wait for a decision on a pending confirmation, here from a Signal. One
+	// that names no pending confirmation, or one already decided, is dropped.
+	for {
 		var d googleadk.ConfirmationDecision // {FunctionCallID, Confirmed}
-		// e.g. workflow.GetSignalChannel(ctx, googleadk.ConfirmationSignalName).Receive(ctx, &d)
-		decisions = append(decisions, d)
+		decisions.Receive(ctx, &d)
+		if _, ok := waiting[d.FunctionCallID]; ok {
+			delete(waiting, d.FunctionCallID)
+			// Resume: re-run with the confirmation response. The other
+			// pending confirmations stay in waiting.
+			msg = googleadk.ConfirmationResponse(d)
+			break
+		}
 	}
-
-	// Resume: re-run with the confirmation responses.
-	msg = googleadk.ConfirmationResponse(decisions...)
 }
 ```
 
 `PendingConfirmations` exposes each pending call's `OriginalCall` and `Hint` for
-your UI; `ConfirmationResponse` builds the resume message ADK expects.
+your UI; `ConfirmationResponse` builds the resume message ADK expects, from one
+decision or several. Match each decision to a pending `FunctionCallID`, as the
+loop does. ADK emits a confirmation request once: a resume that answers only
+some of the pending requests does not emit the others again, and a decision
+with another ID answers none of them. The loop resumes after each decision, so
+the model takes a step while the other requests are still pending. To resume
+once instead, wait for a decision on every pending request and pass them all to
+`ConfirmationResponse`.
 
 ## Continue-as-new (long conversations)
 
@@ -433,7 +488,36 @@ if snap != nil {
 `SessionSnapshot` is JSON-serializable (session-scoped state + full event
 history); every value in session state and every tool result must be
 JSON-encodable. App/user-scoped state (managed across sessions by the session
-service) is not carried — use a durable session service for that.
+service) is not carried. To keep a value, pass it in your own continue-as-new
+input and add it to `snap.State` under its `app:` or `user:` key before
+`ImportSession`.
+
+Continue-as-new bounds the length of the History, not the size of the
+conversation. Temporal limits the size of each payload, 2 MiB by default, and
+these grow with the conversation or with your data:
+
+- the `InvokeModel` input, which is the whole model request: every turn so
+  far, inline files and tool declarations;
+- the `InvokeModel` result (the model's reply), the `ListMcpTools` result (a
+  toolset's declarations) and the `CallMcpTool` result;
+- the `CallMcpTool` input, which carries the tool's arguments and a copy of
+  the session state;
+- the `SendA2AMessage` input and result, and the input and result of an
+  `ActivityAsTool` Activity;
+- the `SessionSnapshot`, which holds every event of the session.
+
+A Worker that got the limit from the server checks its payloads, and reports
+one over the limit as `[TMPRL1103]`. A result over the limit fails the
+Activity attempt after the call ran, and each retry runs the model or the tool
+again. An input or a snapshot over the limit fails the Workflow Task on every
+attempt: the run stays open, and Workflow code gets no error. When the Worker
+does not check, because the server reported no limit or
+`worker.Options.DisablePayloadErrorLimit` is set, the server applies the limit:
+an Activity with a result over it fails without a retry, and a run with an
+Activity input or a snapshot over it is terminated. Configure external storage
+on the Worker's Client (`client.Options.ExternalStorage`) so larger payloads
+are stored outside History, or keep the conversation and the session state
+smaller.
 
 ## Streaming
 
@@ -443,6 +527,9 @@ and **publishes each chunk** to a per-run
 [`workflowstreams`](https://pkg.go.dev/go.temporal.io/sdk/contrib/workflowstreams)
 topic for external (UI) consumers, then returns the aggregated final response into
 the workflow so replay stays deterministic.
+
+Streaming is experimental: it builds on `workflowstreams`, a v0 module, and
+`WithStreaming` and `StreamServer` may change in a 1.x release.
 
 Call `googleadk.StreamServer(ctx)` once near the top of the workflow that drives
 `r.Run`, and set `agent.RunConfig{StreamingMode: agent.StreamingModeSSE}`:
@@ -454,7 +541,7 @@ func StreamingAgentWorkflow(ctx workflow.Context, q string) (string, error) {
 	}
 	topic := "run-" + workflow.GetInfo(ctx).WorkflowExecution.ID
 	root, _ := llmagent.New(llmagent.Config{
-		Model: googleadk.NewModel("gemini-2.0-flash", googleadk.WithStreaming(topic, 0)),
+		Model: googleadk.NewModel("gemini-3.8-flash", googleadk.WithStreaming(topic, 0)),
 		// ...
 	})
 	// ... build runner, set agent.RunConfig{StreamingMode: agent.StreamingModeSSE}, drive r.Run as above
@@ -463,6 +550,12 @@ func StreamingAgentWorkflow(ctx workflow.Context, q string) (string, error) {
 
 External consumers read chunks with `workflowstreams.NewClient(c, workflowID, ...).Subscribe(...)`.
 The bidirectional `RunLive` path (hard-coded goroutines/channels) is **not** supported.
+
+Subscribers get each chunk as the Activity publishes it, before ADK's
+`AfterModelCallbacks` and plugin `OnEventCallback`s run in the Workflow.
+Content those callbacks remove or replace still reaches subscribers, and stays
+in Event History. To filter what subscribers see, filter in the `model.LLM`
+your `ModelFactory` returns.
 
 If a batch of chunks cannot be published, the model call fails with
 `googleadk.StreamError` instead of returning as if every chunk was delivered. It
@@ -484,6 +577,16 @@ is non-retryable when a retry would call the model again and fail the same way:
 Other failures, such as a shorter server outage, are retried; the retry calls
 the model again and publishes its stream again.
 
+`StreamServer` starts an empty stream in every run. A Workflow that continues
+as new while subscribers follow it has to host the stream itself: call
+`workflowstreams.NewWorkflowStream(ctx, priorState)` in place of
+`StreamServer`, and continue with the stream's `NewContinueAsNewError`, which
+hands the stream's state to the next run. That state holds every item the
+stream has not dropped with `Truncate`. After a plain
+`workflow.NewContinueAsNewError`, the next run's stream starts at offset 0
+again, and a subscriber that kept its offset misses that many items of the
+next run, with no error.
+
 ## Composing with other plugins
 
 This integration's plugin only registers its Activities at worker start and
@@ -493,6 +596,14 @@ or converter-based plugins like `sdk-go/contrib/opentelemetry`) without conflict
 On the ADK side, add other ADK plugins to `runner.PluginConfig.Plugins` as usual.
 ADK also emits its own OpenTelemetry telemetry from inside the workflow — see the
 next section before wiring exporters.
+
+Create one plugin per Worker, and add it to `worker.Options.Plugins`, not to
+`client.Options.Plugins`: a Client hands its plugins to every Worker created
+from it. When two Workers share a plugin value, MCP calls on one fail once the
+other has stopped. A Worker that gets the plugin twice panics at start with
+`activity type "googleadk.InvokeModel" is already registered`: that happens
+with two plugin values, and with one value on both its Client and its own
+options.
 
 ## Telemetry and replay
 
@@ -617,9 +728,9 @@ recording is kept rather than lost. Side-effect functions are read-only
 contexts too, harmlessly so: they never execute during replay at all — their
 recorded markers supply the value.
 
-**OTel Logs API status:** `NewReplaySafeLoggerProvider` is built on the
-pre-1.0 `go.opentelemetry.io/otel/log` (`v0.19.x` at this pin), which may
-change shape between minor releases; upgrading it can require a matching
+**OTel Logs API status:** `NewReplaySafeLoggerProvider` is built on
+`go.opentelemetry.io/otel/log` (`v1.47.0` at this pin), whose interfaces may
+gain methods without a major version bump; upgrading it can require a matching
 upgrade of this package. A surface test in this package fails on any method
 an upgrade would newly pass through ungated.
 
@@ -633,6 +744,39 @@ an upgrade would newly pass through ungated.
 - **Not yet:** `RunLive` (bidirectional streaming), sub-agent-as-child-workflow,
   live memory/artifact tools that require in-workflow network I/O, and DB/Vertex
   session services. These raise or are documented rather than silently degrading.
+  Also not supported yet:
+  - Parallel agents (`parallelagent`), `ParallelWorker` nodes and graph
+    (`workflowagent`) fan-outs with two or more branches that use Temporal: a
+    model call on `NewModel`, an `ActivityAsTool` tool, an MCP toolset, or a
+    remote A2A agent built with this package's providers. ADK runs the
+    branches on plain goroutines, which Workflow code cannot do. The Worker
+    process exits with a Go panic or fatal error, each Worker that retries the
+    Workflow Task exits too, and the run stays open until you terminate it. A
+    graph fan-out can fail the run with a node panic instead. Fan out with
+    `agenttool` tools called in one model response, or use a sequential agent
+    (`sequentialagent`). A later 1.x release may refuse these shapes with an
+    error when the run starts.
+  - Single-turn sub-agents (`llmagent.ModeSingleTurn`) called in the same model
+    response as another tool or sub-agent: every Workflow Task fails with
+    `trying to block on coroutine which is already blocked`. Pass
+    `googleadk.WithSequentialToolFanout()` to `NewContext`, or wrap the agents
+    with `agenttool.New`.
+  - Graph node `RetryConfig` delays and `NodeConfig.Timeout`: they use the wall
+    clock, not Workflow timers. A retry delay over a second fails the Workflow
+    Task with `[TMPRL1101]`, and a History in which a node timeout fired does
+    not replay. Leave both unset.
+  - Graph input requests without an `InterruptID`, on ADK v2.6.0 to v2.7.1:
+    ADK gives them a random ID, and every replay gives them another. After a
+    replay, an answer sent with the ID a client read before it does not resume
+    the graph. Set a replay-stable `InterruptID`.
+  - `toolsearch.New` (ADK v2.7.0 and later) around `NewMCPToolset`: every MCP
+    tool is still declared to the model and callable.
+  - Per-user MCP credentials (`mcptoolset.Config.Auth` with a provider that
+    reads the acting user): `agent.IdentityFromContext` finds no user in the
+    MCP Activities.
+  - `GenerateContentConfig.HTTPOptions.ExtrasRequestProvider`: it is a
+    function, so it does not reach the Worker model, and nothing reports it.
+    `Headers` and `ExtraBody` do reach it.
 - **Rejected:** ADK's remote A2A agents built without
   `NewA2AClientProvider`, or that fetch their card without
   `NewA2AAgentCardProvider` (a static `AgentCard` is fine). This includes every
@@ -648,16 +792,25 @@ an upgrade would newly pass through ungated.
   check, and an `OnModelErrorCallbacks` entry can turn the refusal into a
   transfer to the remote agent. Only `googleadk.NewRunnerPlugin(root)` catches
   these: add it to the runner's plugins, and it fails every run, before any
-  agent runs, while the tree under `root` holds such an agent. It sees an
-  agent wrapped with `agenttool` in an agent's `Tools`, but not in its
-  `Toolsets`. Neither check sees a remote agent further inside an agent that
-  `agenttool` wraps, such as one under a sequential, loop or parallel agent
-  there: ADK gives no way to reach the wrapped agent's own sub-agents. An agent
-  on `NewModel` inside it still checks the agents below it at its own model
+  agent runs, while `root`, one of its sub-agents at any depth, or an agent
+  that one of them wraps with `agenttool` in its `Tools`, is such an agent. It
+  does not see an agent wrapped with `agenttool` in an agent's `Toolsets`.
+  Neither check sees a remote agent that is a node of a `workflowagent` graph,
+  or one further inside an agent that `agenttool` wraps, such as one under a
+  sequential, loop or parallel agent there: they walk sub-agents, not graph
+  nodes, and they don't look below a wrapped agent. An agent on `NewModel`
+  inside a wrapped agent still checks the agents below it at its own model
   calls. For the requests that still go out, `NewContext` logs one warning,
   outside replay, the first time an HTTP request carries its context. It only
   warns: the request still goes out.
+  Later 1.x releases may refuse more agent shapes that send from Workflow
+  code, so a tree that passes both checks today may be refused after an
+  upgrade.
 
-  An open run that made such a model call on an earlier version fails to replay
-  on this one with a non-determinism error. Let those runs finish before you
-  upgrade, or keep them on the earlier version with Worker Versioning.
+  An open run that made such a model call on an earlier version cannot
+  continue on this one: on its next Workflow Task, `runner.Run` returns the
+  refusal as an error. A Workflow that returns it closes as `Failed`, and one
+  that keeps running fails its Workflow Tasks with `[TMPRL1100]`. Let those
+  runs finish before you upgrade, or keep them on the earlier version with
+  Worker Versioning. The upgrade steps under **MCP, statelessly** apply to
+  these runs too.

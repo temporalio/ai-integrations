@@ -26,7 +26,9 @@ const (
 const (
 	// ErrorTypeModel tags failures originating from a model.LLM call.
 	ErrorTypeModel = "googleadk.ModelError"
-	// ErrorTypeTool tags failures originating from a tool execution.
+	// ErrorTypeTool tags what a tool cannot do with the read-only context it
+	// gets inside an MCP Activity: write session state, search memory, or
+	// request a confirmation without a function call ID.
 	ErrorTypeTool = "googleadk.ToolError"
 	// ErrorTypeMCP tags failures originating from an MCP list/call.
 	ErrorTypeMCP = "googleadk.McpError"
