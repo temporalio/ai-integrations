@@ -36,7 +36,15 @@ test('StatelessMCPServerProvider rejects invalid factory results before connecti
     },
     callTool: undefined,
   };
-  for (const value of [undefined, null, 42, {}, Promise.resolve(fakeServer(undefined)), incompleteServer]) {
+  const invalidResults: [unknown, string][] = [
+    [undefined, 'undefined'],
+    [null, 'null'],
+    [42, 'number'],
+    [{}, 'Object'],
+    [Promise.resolve(fakeServer(undefined)), 'Promise'],
+    [incompleteServer, 'Object'],
+  ];
+  for (const [value, kind] of invalidResults) {
     const activities = new StatelessMCPServerProvider('files', () => value as MCPServer)._getActivities();
     for (const name of ['files-stateless-list-tools', 'files-stateless-call-tool']) {
       const err = await t.throwsAsync(activities[name]!({ toolName: 'read', args: {} }), {
@@ -44,7 +52,11 @@ test('StatelessMCPServerProvider rejects invalid factory results before connecti
       });
       t.is(err?.type, 'MCPServerFactoryTypeError');
       t.true(err?.nonRetryable);
-      t.regex(err!.message, /MCP server factory 'files'/);
+      t.is(
+        err?.message,
+        `MCP server factory 'files' returned ${kind}, ` +
+          'not a server with connect(), close(), listTools() and callTool() methods.'
+      );
     }
   }
   t.is(connects, 0);

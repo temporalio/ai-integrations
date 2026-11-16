@@ -28,8 +28,8 @@ export function assertMCPServer(name: string, server: unknown): asserts server i
   if (server != null && methods.every((method) => typeof (server as MCPServer)[method] === 'function')) return;
   throw ApplicationFailure.create({
     message:
-      `MCP server factory '${name}' returned an invalid server; ` +
-      'expected connect(), close(), listTools() and callTool() methods.',
+      `MCP server factory '${name}' returned ${describeValue(server)}, ` +
+      'not a server with connect(), close(), listTools() and callTool() methods.',
     type: 'MCPServerFactoryTypeError',
     nonRetryable: true,
   });
