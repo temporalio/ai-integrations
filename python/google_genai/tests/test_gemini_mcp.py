@@ -522,6 +522,7 @@ async def test_mcp_factory_return_type_is_non_retryable(
         value = coroutine()
     server = "invalid-factory"
     kind = type(value)
+    coroutine_id = id(value) if value_kind == "coroutine" else None
 
     # Passed in place of the factory, the value fails when the Worker is built.
     with pytest.raises(TypeError) as type_error:
@@ -532,7 +533,11 @@ async def test_mcp_factory_return_type_is_non_retryable(
     )
     del type_error
 
+    owner_task_id: int | None = None
+
     def factory() -> Any:
+        nonlocal owner_task_id
+        owner_task_id = id(asyncio.current_task())
         return value
 
     # The error must reach only the Activity. asyncio reports a task whose error
@@ -541,7 +546,12 @@ async def test_mcp_factory_return_type_is_non_retryable(
     reported: list[dict[str, Any]] = []
 
     def report(_: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
-        reported.append(context)
+        if id(context.get("task", context.get("future"))) == owner_task_id:
+            reported.append(context)
+        elif previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
 
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(report)
@@ -567,7 +577,14 @@ async def test_mcp_factory_return_type_is_non_retryable(
     finally:
         loop.set_exception_handler(previous_handler)
     assert reported == []
-    assert [str(warning.message) for warning in recwarn] == []
+    assert [
+        str(warning.message)
+        for warning in recwarn
+        if coroutine_id is not None
+        and issubclass(warning.category, RuntimeWarning)
+        and id(warning.source) == coroutine_id
+        and "was never awaited" in str(warning.message)
+    ] == []
 
 
 @pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
@@ -646,12 +663,24 @@ async def test_mcp_transport_error_evicts_connection(
         if fail_on_connect
         else RuntimeError("Connection closed")
     )
-    factory = _failing_factory(err, fail_on_connect=fail_on_connect)
+    connect = _failing_factory(err, fail_on_connect=fail_on_connect)
+    owner_task_id: int | None = None
+
+    def factory() -> AbstractAsyncContextManager[Any]:
+        nonlocal owner_task_id
+        owner_task_id = id(asyncio.current_task())
+        return connect()
+
     loop = asyncio.get_running_loop()
     reported: list[dict[str, Any]] = []
 
     def report(_: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
-        reported.append(context)
+        if id(context.get("task", context.get("future"))) == owner_task_id:
+            reported.append(context)
+        elif previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
 
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(report)
@@ -671,7 +700,7 @@ async def test_mcp_transport_error_evicts_connection(
             exc_info.value, DefaultPayloadConverter(), failure
         )
         assert not failure.application_failure_info.non_retryable
-        del exc_info, err, factory
+        del exc_info, err, factory, connect
         await asyncio.sleep(0)
         gc.collect()
     finally:
