@@ -34,6 +34,8 @@ from openai._models import construct_type
 from typing_extensions import NotRequired, Required, is_typeddict
 
 import temporalio.api.common.v1
+import temporalio.common
+import temporalio.worker
 from temporalio.contrib.opentelemetry._tracer_provider import ReplaySafeTracerProvider
 from temporalio.contrib.pydantic import (
     PydanticJSONPlainPayloadConverter,
@@ -44,6 +46,9 @@ from temporalio.converter import (
     DataConverter,
     DefaultPayloadConverter,
     JSONPlainPayloadConverter,
+)
+from temporalio.openai_agents._activity_session_interceptor import (
+    _ActivitySessionInterceptor,
 )
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import ModelActivity
@@ -62,7 +67,7 @@ from temporalio.openai_agents._trace_interceptor import (
     OpenAIAgentsContextPropagationInterceptor,
 )
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkflowRunner
+from temporalio.worker import ReplayerConfig, WorkerConfig, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 if typing.TYPE_CHECKING:
@@ -435,6 +440,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         *,
         mcp_servers: Mapping[str, Callable[..., MCPServer]] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
+        session_options: temporalio.common.ActivitySessionOptions | None = None,
     ) -> None:
         """Initialize the OpenAI agents plugin.
 
@@ -462,6 +468,19 @@ class OpenAIAgentsPlugin(SimplePlugin):
             mcp_connection_idle_timeout: How long an idle modern MCP connection
                 remains cached. Defaults to five minutes. None disables idle
                 eviction, and zero disables reuse.
+            session_options: Activity session options applied to every
+                non-local activity that workflows on this worker start on the
+                workflow's own task queue and that has no session options yet.
+                This includes non-agent workflows and user activities. A
+                ``workflow.activity_session(...)`` scope in workflow code wins,
+                and activities on another task queue are left unchanged. When
+                set, every ``Worker`` and ``Replayer`` using this plugin must
+                have ``session_config`` (a
+                ``temporalio.worker.WorkerSessionConfig``), passed to its
+                constructor or set by a plugin listed before this one;
+                otherwise configuration raises ``ValueError``.
+                Warning: session_options is experimental and behavior may change in future versions.
+                Use with caution in production environments.
             sandbox_clients: Sequence of named sandbox client providers to register
                 on the worker.  Each provider pairs a unique name with a real
                 ``BaseSandboxClient`` (e.g. ``DaytonaSandboxClient``,
@@ -628,15 +647,43 @@ class OpenAIAgentsPlugin(SimplePlugin):
                     ):
                         yield
 
+        self._session_options = session_options
+        interceptors: list[temporalio.worker.Interceptor] = [interceptor]
+        if session_options is not None:
+            interceptors.append(_ActivitySessionInterceptor(session_options))
+
         super().__init__(
             name="OpenAIAgentsPlugin",
             data_converter=_data_converter,
-            interceptors=[interceptor],
+            interceptors=interceptors,
             activities=add_activities,
             workflow_runner=workflow_runner,
             workflow_failure_exception_types=[AgentsWorkflowError],
             run_context=lambda: run_context(),
         )
+
+    def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
+        """See base class."""
+        config = super().configure_worker(config)
+        self._check_session_config(config.get("session_config"))
+        return config
+
+    def configure_replayer(self, config: ReplayerConfig) -> ReplayerConfig:
+        """See base class."""
+        config = super().configure_replayer(config)
+        self._check_session_config(config.get("session_config"))
+        return config
+
+    def _check_session_config(
+        self, session_config: "temporalio.worker.WorkerSessionConfig | None"
+    ) -> None:
+        if self._session_options is not None and session_config is None:
+            raise ValueError(
+                "OpenAIAgentsPlugin(session_options=...) requires session_config; "
+                "pass session_config=temporalio.worker.WorkerSessionConfig(...) to "
+                "Worker(...)/Replayer(...) or set it in a plugin listed before "
+                "OpenAIAgentsPlugin"
+            )
 
     def version(self) -> str:
         """Return this package's version, which worker heartbeats report."""

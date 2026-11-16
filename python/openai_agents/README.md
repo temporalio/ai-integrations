@@ -876,6 +876,46 @@ retries the same way as any other workflow_streams publisher — see
 the conventional `RETRY` event pattern for surfacing the transition to
 consumers.
 
+## Activity sessions (experimental)
+
+> ⚠️ **Experimental.** This uses the Temporal SDK's experimental activity session
+> API and may change without notice.
+
+Pass `session_options` to place the activities your workflows start in the
+workflow's activity session. This covers model and streaming model calls, MCP
+calls, sandbox calls, `activity_as_tool` tools and your own activities:
+
+```python
+from temporalio.common import ActivitySessionOptions, UseWorkflowSession
+from temporalio.openai_agents import OpenAIAgentsPlugin
+from temporalio.worker import Worker, WorkerSessionConfig
+
+plugin = OpenAIAgentsPlugin(
+    session_options=ActivitySessionOptions(placement=UseWorkflowSession()),
+)
+client = await Client.connect("localhost:7233", plugins=[plugin])
+
+worker = Worker(
+    client,
+    task_queue="my-task-queue",
+    workflows=[MyAgentWorkflow],
+    session_config=WorkerSessionConfig(),
+)
+```
+
+- Every non-local activity started on the workflow's own task queue by any
+  workflow on the worker is placed in the session, including activities from
+  non-agent workflows.
+- A `workflow.activity_session(...)` scope in your workflow code wins over the
+  plugin's `session_options`.
+- Activities started on a different task queue and local activities are not
+  affected.
+- Every `Worker` and `Replayer` using the plugin with `session_options` set must
+  have `session_config`, including activity-only workers. Pass it to the
+  `Worker(...)`/`Replayer(...)` constructor or set it from a plugin listed before
+  `OpenAIAgentsPlugin`; otherwise the plugin raises `ValueError`.
+- The Temporal server must have sticky activity execution enabled.
+
 ## Feature Support
 
 This integration is presently subject to certain limitations.
