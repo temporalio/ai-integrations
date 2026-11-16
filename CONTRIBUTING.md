@@ -15,6 +15,8 @@ workflow.
 
 - PRs are squash-merged. Issue and PR templates are the organization defaults from
   `temporalio/.github`.
+- Start the PR title with the plugin it changes, like `[openai-agents-python] breaking: …`. See
+  "Pull requests" in `AGENTS.md`.
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status`,
   `Check for CODEOWNERS` and `opengrep/scan` are the required checks, plus one code-owner
   approval. No secrets are needed: provider behavior uses deterministic local test doubles.

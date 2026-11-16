@@ -240,6 +240,24 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   runs `make test TEST_FRAMEWORK=net<runtime>`. A plain `make test` runs every listed runtime, so a
   machine needs their runtimes installed next to the SDK.
 
+## Pull requests
+
+PRs are squash-merged, so the PR title becomes the commit subject and a line in the plugin's
+release notes. Start each title with the plugin it changes:
+
+```
+[openai-agents-python] breaking: remove the gates that kept 1.x runs replaying
+[mcp-python] say that `timedelta(0)` also turns heartbeats off
+```
+
+- The tag is the plugin's folder name with `_` replaced by `-`, then its language:
+  `python/openai_agents` is `openai-agents-python`, and `typescript/vercel-ai-sdk` is
+  `vercel-ai-sdk-typescript`. `go/googleadk` is `google-adk-go`.
+- A PR that changes two plugins lists both: `[strands-agents-python, deepagents-python]`. One that
+  changes many plugins uses `[all]`, and one that changes no plugin uses `[repo]`.
+- Write the text after the tag in lowercase, and don't repeat the plugin's name. Start with
+  `breaking:` when the change is breaking. Other PRs get no type word.
+
 ## CI
 
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.
