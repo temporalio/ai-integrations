@@ -16,7 +16,6 @@ from typing import Any, cast
 
 import pytest
 from agents import (
-    Agent,
     AgentOutputSchemaBase,
     FunctionTool,
     Handoff,
@@ -46,17 +45,19 @@ from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
-from temporalio.openai_agents import AgentsWorkflowError, ModelActivityParameters
+from temporalio.openai_agents import AgentsWorkflowError, TemporalAgent
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
     FunctionToolInput,
     _build_tool,
     _build_tools_and_handoffs,
 )
+from temporalio.openai_agents._model_parameters import _ModelOptions
 from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 from temporalio.openai_agents._temporal_openai_agents import OpenAIPayloadConverter
 from temporalio.openai_agents._temporal_worker_env_ref import _WorkerEnvRefResolver
 from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
+from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
 
 
@@ -136,7 +137,7 @@ def _responses_tools(tools: list[Tool]) -> list[dict[str, Any]]:
 def _stub() -> _TemporalModelStub:
     return _TemporalModelStub(
         model_name="gpt-5",
-        model_params=ModelActivityParameters(),
+        model_params=_ModelOptions(),
         agent=None,
     )
 
@@ -299,7 +300,7 @@ class _ResponsesConvertingModel(Model):
 class ToolSearchWorkflow:
     @workflow.run
     async def run(self, case: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="tool-search-agent", instructions="x", tools=TOOL_CASES[case]()
         )
         result = await Runner.run(starting_agent=agent, input="hi")
@@ -312,7 +313,7 @@ async def test_deferred_function_tool_with_tool_search_workflow(
 ):
     async with AgentEnvironment(
         model=_ResponsesConvertingModel(),
-        model_params=ModelActivityParameters(
+        activity_config=ActivityConfig(
             start_to_close_timeout=timedelta(seconds=10),
             retry_policy=RetryPolicy(maximum_attempts=1),
         ),
@@ -371,7 +372,7 @@ def test_unsupported_tool_is_rejected_when_building_activity_input(name: str):
 class UnsupportedToolWorkflow:
     @workflow.run
     async def run(self, name: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="unsupported-tool-agent",
             instructions="x",
             tools=[UNSUPPORTED_TOOLS[name]()],

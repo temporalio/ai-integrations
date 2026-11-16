@@ -35,10 +35,11 @@ from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.openai_agents import (
     AgentsWorkflowError,
-    ModelActivityParameters,
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
     SandboxClientProvider,
+    TemporalAgent,
+    TemporalModel,
     TemporalWorkerEnvValue,
 )
 from temporalio.openai_agents._openai_runner import _has_sandbox_agent
@@ -89,44 +90,47 @@ from tests.helpers import new_worker
 
 
 def test_has_sandbox_agent_regular_agent():
-    assert _has_sandbox_agent(Agent[None](name="regular")) is False
+    assert _has_sandbox_agent(TemporalAgent[None](name="regular")) is False
 
 
 def test_has_sandbox_agent_sandbox_starting():
-    assert _has_sandbox_agent(SandboxAgent[None](name="sandbox")) is True
+    assert (
+        _has_sandbox_agent(SandboxAgent[None](model=TemporalModel(), name="sandbox"))
+        is True
+    )
 
 
 def test_has_sandbox_agent_sandbox_direct_handoff():
-    sandbox = SandboxAgent[None](name="sandbox")
-    regular = Agent[None](name="regular", handoffs=[sandbox])
+    sandbox = SandboxAgent[None](model=TemporalModel(), name="sandbox")
+    regular = TemporalAgent[None](name="regular", handoffs=[sandbox])
     assert _has_sandbox_agent(regular) is True
 
 
 def test_has_sandbox_agent_sandbox_deep_handoff():
-    sandbox = SandboxAgent[None](name="sandbox")
-    middle = Agent[None](name="middle", handoffs=[sandbox])
-    top = Agent[None](name="top", handoffs=[middle])
+    sandbox = SandboxAgent[None](model=TemporalModel(), name="sandbox")
+    middle = TemporalAgent[None](name="middle", handoffs=[sandbox])
+    top = TemporalAgent[None](name="top", handoffs=[middle])
     assert _has_sandbox_agent(top) is True
 
 
 def test_has_sandbox_agent_no_sandbox_in_chain():
-    c = Agent[None](name="c")
-    b = Agent[None](name="b", handoffs=[c])
-    a = Agent[None](name="a", handoffs=[b])
+    c = TemporalAgent[None](name="c")
+    b = TemporalAgent[None](name="b", handoffs=[c])
+    a = TemporalAgent[None](name="a", handoffs=[b])
     assert _has_sandbox_agent(a) is False
 
 
 def test_has_sandbox_agent_circular_no_sandbox():
-    a: Agent[Any] = Agent[None](name="a")
-    b: Agent[Any] = Agent[None](name="b", handoffs=[a])
+    a: Agent[Any] = TemporalAgent[None](name="a")
+    b: Agent[Any] = TemporalAgent[None](name="b", handoffs=[a])
     a.handoffs = [b]
     assert _has_sandbox_agent(a) is False
 
 
 def test_has_sandbox_agent_circular_with_sandbox():
-    sandbox = SandboxAgent[None](name="sandbox")
-    a: Agent[Any] = Agent[None](name="a", handoffs=[sandbox])
-    b: Agent[Any] = Agent[None](name="b", handoffs=[a])
+    sandbox = SandboxAgent[None](model=TemporalModel(), name="sandbox")
+    a: Agent[Any] = TemporalAgent[None](name="a", handoffs=[sandbox])
+    b: Agent[Any] = TemporalAgent[None](name="b", handoffs=[a])
     a.handoffs = [b, sandbox]
     assert _has_sandbox_agent(b) is True
 
@@ -163,7 +167,7 @@ class SandboxValidationWorkflow:
     async def run(self) -> str:
         # Case 1: SandboxAgent without run_config.sandbox
         try:
-            agent = SandboxAgent[None](name="sandbox")
+            agent = SandboxAgent[None](model=TemporalModel(), name="sandbox")
             await Runner.run(starting_agent=agent, input="hello")
             return "FAIL: no-config should have raised"
         except ValueError as e:
@@ -171,8 +175,8 @@ class SandboxValidationWorkflow:
 
         # Case 2: SandboxAgent reachable via handoff without run_config.sandbox
         try:
-            sandbox = SandboxAgent[None](name="sandbox_target")
-            router = Agent[None](name="router", handoffs=[sandbox])
+            sandbox = SandboxAgent[None](model=TemporalModel(), name="sandbox_target")
+            router = TemporalAgent[None](name="router", handoffs=[sandbox])
             await Runner.run(starting_agent=router, input="hello")
             return "FAIL: handoff-no-config should have raised"
         except ValueError as e:
@@ -180,7 +184,7 @@ class SandboxValidationWorkflow:
 
         # Case 3: SandboxRunConfig with client=None
         try:
-            agent = SandboxAgent[None](name="sandbox")
+            agent = SandboxAgent[None](model=TemporalModel(), name="sandbox")
             await Runner.run(
                 starting_agent=agent,
                 input="hello",
@@ -194,7 +198,7 @@ class SandboxValidationWorkflow:
 
         # Case 4: Non-TemporalSandboxClient in run_config.sandbox.client
         try:
-            agent = SandboxAgent[None](name="sandbox")
+            agent = SandboxAgent[None](model=TemporalModel(), name="sandbox")
             await Runner.run(
                 starting_agent=agent,
                 input="hello",
@@ -594,9 +598,7 @@ def _plugin_with_one_shot_names(
     *sandbox_clients: SandboxClientProvider,
 ) -> OpenAIAgentsPlugin:
     return OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(
             TestModel.returning_responses([ResponseBuilders.output_message("done")])
         ),
@@ -1112,7 +1114,9 @@ class SandboxE2EWorkflow:
     @workflow.run
     async def run(self) -> str:
         agent = SandboxAgent[None](
-            name="sandbox-e2e", capabilities=[_TestSandboxCapability()]
+            model=TemporalModel(),
+            name="sandbox-e2e",
+            capabilities=[_TestSandboxCapability()],
         )
         result = await Runner.run(
             starting_agent=agent,
@@ -1167,7 +1171,7 @@ class _GrantInjectingCapability(Capability):
 class HostPathGrantWorkflow:
     @workflow.run
     async def run(self, route: str) -> str:
-        agent = SandboxAgent[None](name="sandbox-grant")
+        agent = SandboxAgent[None](model=TemporalModel(), name="sandbox-grant")
         client = temporal_sandbox_client("mock")
         options = _TestSandboxClientOptions()
         expected = "/workspace/shared"
@@ -1178,7 +1182,9 @@ class HostPathGrantWorkflow:
             )
         elif route == "default_manifest":
             agent = SandboxAgent[None](
-                name="sandbox-grant", default_manifest=_HOST_PATH_GRANT_MANIFEST
+                model=TemporalModel(),
+                name="sandbox-grant",
+                default_manifest=_HOST_PATH_GRANT_MANIFEST,
             )
             sandbox = SandboxRunConfig(client=client, options=options)
         elif route == "session_state":
@@ -1194,7 +1200,9 @@ class HostPathGrantWorkflow:
             # The manifest must be present but empty: upstream skips capabilities
             # when there is no manifest at all.
             agent = SandboxAgent[None](
-                name="sandbox-grant", capabilities=[_GrantInjectingCapability()]
+                model=TemporalModel(),
+                name="sandbox-grant",
+                capabilities=[_GrantInjectingCapability()],
             )
             sandbox = SandboxRunConfig(
                 client=client, options=options, manifest=Manifest()
@@ -1242,9 +1250,7 @@ async def test_host_path_grants_are_rejected_per_manifest_source(
 ):
     mock_sandbox_client = _MockSandboxClient(_MockSandboxSession())
     plugin = OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(
             TestModel.returning_responses([ResponseBuilders.output_message("done")])
         ),
@@ -1277,7 +1283,9 @@ class UncaughtHostPathGrantWorkflow:
     @workflow.run
     async def run(self) -> str:
         await Runner.run(
-            starting_agent=SandboxAgent[None](name="sandbox-grant"),
+            starting_agent=SandboxAgent[None](
+                model=TemporalModel(), name="sandbox-grant"
+            ),
             input="hello",
             run_config=RunConfig(
                 sandbox=SandboxRunConfig(
@@ -1296,9 +1304,7 @@ async def test_host_path_grant_fails_the_workflow_on_a_production_like_worker(
     """Given no test-only ``workflow_failure_exception_types``, so only the plugin's own applies."""
     mock_sandbox_client = _MockSandboxClient(_MockSandboxSession())
     plugin = OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(
             TestModel.returning_responses([ResponseBuilders.output_message("done")])
         ),
@@ -1333,7 +1339,9 @@ class SandboxWorkerEnvValueWorkflow:
     @workflow.run
     async def run(self) -> str:
         await Runner.run(
-            starting_agent=SandboxAgent[None](name="sandbox-env"),
+            starting_agent=SandboxAgent[None](
+                model=TemporalModel(), name="sandbox-env"
+            ),
             input="hello",
             run_config=RunConfig(
                 sandbox=SandboxRunConfig(
@@ -1366,9 +1374,7 @@ async def test_a_sandbox_activity_resolves_only_the_variables_its_plugin_names(
     monkeypatch.setenv(_PLUGIN_ENV_NAME, secret)
     mock_sandbox_client = _MockSandboxClient(_MockSandboxSession())
     plugin = OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(
             TestModel.returning_responses([ResponseBuilders.output_message("done")])
         ),
@@ -1417,9 +1423,7 @@ class ResolveOnWorkflowThreadWorkflow:
 async def test_worker_env_value_resolve_raises_inside_a_real_workflow(client: Client):
     """``in_workflow()`` is genuinely True here, unlike the monkeypatched unit test."""
     plugin = OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(
             TestModel.returning_responses([ResponseBuilders.output_message("done")])
         ),
@@ -1449,7 +1453,9 @@ class LiveSandboxSessionWorkflow:
     async def run(self) -> str:
         try:
             await Runner.run(
-                starting_agent=SandboxAgent[None](name="sandbox-live"),
+                starting_agent=SandboxAgent[None](
+                    model=TemporalModel(), name="sandbox-live"
+                ),
                 input="hello",
                 run_config=RunConfig(
                     sandbox=SandboxRunConfig(
@@ -1467,9 +1473,7 @@ class LiveSandboxSessionWorkflow:
 async def test_live_sandbox_session_is_rejected(client: Client):
     mock_sandbox_client = _MockSandboxClient(_MockSandboxSession())
     plugin = OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(
             TestModel.returning_responses([ResponseBuilders.output_message("done")])
         ),
@@ -1526,9 +1530,7 @@ async def test_sandbox_e2e_runner(client: Client):
     )
 
     plugin = OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(mock_model),
         sandbox_clients=[SandboxClientProvider("mock", mock_sandbox_client)],
     )

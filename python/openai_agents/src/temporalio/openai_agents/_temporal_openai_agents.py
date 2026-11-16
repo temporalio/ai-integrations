@@ -45,7 +45,10 @@ from temporalio.converter import (
 )
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import ModelActivity
-from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._model_parameters import (
+    ModelSummaryProvider,
+    _ModelOptions,
+)
 from temporalio.openai_agents._openai_runner import (
     TemporalOpenAIRunner,
 )
@@ -62,6 +65,7 @@ from temporalio.openai_agents._trace_interceptor import (
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
+from temporalio.workflow import ActivityConfig
 
 if typing.TYPE_CHECKING:
     from temporalio.openai_agents import (
@@ -144,7 +148,7 @@ def _uninstall_otel_instrumentation() -> None:
 
 @contextmanager
 def _set_open_ai_agent_temporal_overrides(
-    model_params: ModelActivityParameters,
+    model_params: _ModelOptions,
     start_spans_in_replay: bool = False,
 ):
     previous_runner = get_default_agent_runner()
@@ -347,17 +351,18 @@ class OpenAIAgentsPlugin(SimplePlugin):
         >>> from temporalio.client import Client
         >>> from temporalio.worker import Worker
         >>> from agents.mcp import MCPServerStreamableHttp
-        >>> from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+        >>> from temporalio.openai_agents import OpenAIAgentsPlugin
+        >>> from temporalio.workflow import ActivityConfig
         >>> from datetime import timedelta
         >>>
         >>> # Configure model parameters
-        >>> model_params = ModelActivityParameters(
+        >>> activity_config = ActivityConfig(
         ...     start_to_close_timeout=timedelta(seconds=30),
         ...     retry_policy=RetryPolicy(maximum_attempts=3)
         ... )
         >>>
         >>> plugin = OpenAIAgentsPlugin(
-        ...     model_params=model_params,
+        ...     activity_config=activity_config,
         ...     mcp_servers={"filesystem": lambda: MCPServerStreamableHttp(
         ...         name="filesystem", params={"url": "https://example.com/mcp"}
         ...     )}
@@ -377,7 +382,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
 
     def __init__(
         self,
-        model_params: ModelActivityParameters | None = None,
+        activity_config: ActivityConfig | None = None,
         model_provider: ModelProvider | None = None,
         mcp_server_providers: Sequence[
             "StatelessMCPServerProvider | StatefulMCPServerProvider"
@@ -388,14 +393,25 @@ class OpenAIAgentsPlugin(SimplePlugin):
         use_otel_instrumentation: bool = False,
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
         *,
+        use_local_activity: bool | None = None,
+        streaming_topic: str | None = None,
+        streaming_batch_interval: timedelta | None = None,
+        summary_provider: ModelSummaryProvider | None = None,
         mcp_servers: Mapping[str, Callable[..., MCPServer]] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
     ) -> None:
         """Initialize the OpenAI agents plugin.
 
         Args:
-            model_params: Configuration parameters for Temporal activity execution
-                of model calls. If None, default parameters will be used.
+            activity_config: Per-field defaults for model Activities. Supplied
+                dictionaries are copied; explicit None values override defaults.
+            use_local_activity: Use local model Activities by default. Explicit
+                Activity options unsupported by local Activities are refused.
+            streaming_topic: Default Workflow Stream topic (experimental).
+            streaming_batch_interval: Default stream publishing interval; 100 ms
+                if omitted (experimental).
+            summary_provider: Deterministic dynamic summary provider. Cannot be
+                combined with a static activity_config summary.
             model_provider: Optional model provider for custom model implementations.
                 Useful for testing or custom model integrations.
             mcp_server_providers: Legacy MCP server providers to register with the
@@ -442,21 +458,13 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 Use with caution in production environments.
 
         """
-        if model_params is None:
-            model_params = ModelActivityParameters()
-
-        # For the default provider, we provide a default start_to_close_timeout of 60 seconds.
-        # Other providers will need to define their own.
-        if (
-            model_params.start_to_close_timeout is None
-            and model_params.schedule_to_close_timeout is None
-        ):
-            if model_provider is None:
-                model_params.start_to_close_timeout = timedelta(seconds=60)
-            else:
-                raise ValueError(
-                    "When configuring a custom provider, the model activity must have start_to_close_timeout or schedule_to_close_timeout"
-                )
+        model_params = _ModelOptions(
+            activity_config=activity_config or ActivityConfig(),
+            use_local_activity=use_local_activity,
+            streaming_topic=streaming_topic,
+            streaming_batch_interval=streaming_batch_interval,
+            summary_provider=summary_provider,
+        )
 
         self._use_otel_instrumentation = use_otel_instrumentation
         if mcp_server_providers:

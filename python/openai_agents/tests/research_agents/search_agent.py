@@ -1,5 +1,7 @@
-from agents import Agent, WebSearchTool
+from agents import WebSearchTool
 from agents.model_settings import ModelSettings
+
+from temporalio.openai_agents import TemporalAgent
 
 INSTRUCTIONS = (
     "You are a research assistant. Given a search term, you search the web for that term and "
@@ -12,7 +14,7 @@ INSTRUCTIONS = (
 
 
 def new_search_agent():
-    return Agent(
+    return TemporalAgent(
         name="Search agent",
         instructions=INSTRUCTIONS,
         tools=[WebSearchTool()],

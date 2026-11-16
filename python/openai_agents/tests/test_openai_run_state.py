@@ -53,7 +53,8 @@ from openai.types.responses.response_usage import (
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.workflow_streams import WorkflowStream
-from temporalio.openai_agents import ModelActivityParameters, ModelSummaryProvider
+from temporalio.openai_agents import ModelSummaryProvider, TemporalAgent
+from temporalio.openai_agents._model_parameters import _ModelOptions
 from temporalio.openai_agents._openai_runner import (
     TemporalOpenAIRunner,
     _convert_agent,
@@ -68,6 +69,7 @@ from temporalio.openai_agents._temporal_model_stub import (
     _TemporalModelStub,  # pyright: ignore[reportPrivateUsage]
 )
 from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
+from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
 
 
@@ -204,7 +206,7 @@ def _run_again_reply(
 
 
 def _make_banker() -> Agent[None]:
-    return Agent[None](
+    return TemporalAgent[None](
         name="Banker",
         instructions="Move money when asked.",
         tools=[transfer_funds],
@@ -213,7 +215,7 @@ def _make_banker() -> Agent[None]:
 
 def _make_triage(use_handoff_object: bool) -> Agent[None]:
     banker = _make_banker()
-    return Agent[None](
+    return TemporalAgent[None](
         name="Triage",
         instructions="Hand off to the Banker.",
         handoffs=[handoff(banker) if use_handoff_object else banker],
@@ -282,7 +284,7 @@ async def test_converted_handoff_restores_tool_use_after_resume(
 ) -> None:
     banker = _make_banker()
     banker.model_settings.tool_choice = "required"
-    triage = Agent[None](
+    triage = TemporalAgent[None](
         name="Triage",
         handoffs=[handoff(banker) if use_handoff_object else banker],
     )
@@ -293,7 +295,7 @@ async def test_converted_handoff_restores_tool_use_after_resume(
         max_turns=10,
     )
     state.set_tool_use_tracker_snapshot({"Banker": ["transfer_funds"]})
-    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    converted = _convert_agent(_ModelOptions(), triage, None)
     restored = await RunState.from_string(converted, state.to_string())
     model = ScriptedModel(
         lambda _instructions, _input: ResponseBuilders.output_message(
@@ -313,8 +315,10 @@ async def test_shared_handoff_target_restores_after_approval(
     streamed: bool, shared_target: Literal["agent", "tool", "both"]
 ) -> None:
     banker = _make_banker()
-    other = Agent[None](name="Other", instructions="Other", handoffs=[handoff(banker)])
-    triage = Agent[None](name="Triage", instructions="Triage", handoffs=[other])
+    other = TemporalAgent[None](
+        name="Other", instructions="Other", handoffs=[handoff(banker)]
+    )
+    triage = TemporalAgent[None](name="Triage", instructions="Triage", handoffs=[other])
     if shared_target in ("agent", "both"):
         triage.handoffs.append(banker)
     if shared_target in ("tool", "both"):
@@ -336,7 +340,7 @@ async def test_shared_handoff_target_restores_after_approval(
         return _banker_reply(instructions, input)
 
     config = RunConfig(model=ScriptedModel(reply))
-    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    converted = _convert_agent(_ModelOptions(), triage, None)
     result = await _run(
         converted, "Move 5 dollars.", streamed=streamed, run_config=config
     )
@@ -352,7 +356,7 @@ async def test_shared_handoff_target_tool_restores_nested_approval(
     streamed: bool,
 ) -> None:
     banker = _make_banker()
-    triage = Agent[None](
+    triage = TemporalAgent[None](
         name="Triage",
         instructions="Triage",
         handoffs=[handoff(banker)],
@@ -371,7 +375,7 @@ async def test_shared_handoff_target_tool_restores_nested_approval(
         )
 
     config = RunConfig(model=ScriptedModel(reply))
-    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    converted = _convert_agent(_ModelOptions(), triage, None)
     result = await _run(
         converted, "Move 5 dollars.", streamed=streamed, run_config=config
     )
@@ -391,11 +395,11 @@ async def test_handoff_callback_updates_cached_graph(
     change: Literal["instructions", "tools"],
     graph: Literal["target", "downstream", "shared_cycle"],
 ) -> None:
-    banker = Agent[None](name="Banker", instructions="Before callback.")
+    banker = TemporalAgent[None](name="Banker", instructions="Before callback.")
     target = (
         banker
         if graph == "target"
-        else Agent[None](name="Other", instructions="Other", handoffs=[banker])
+        else TemporalAgent[None](name="Other", instructions="Other", handoffs=[banker])
     )
     handoff_count = 0
 
@@ -407,7 +411,7 @@ async def test_handoff_callback_updates_cached_graph(
         else:
             banker.tools = [transfer_funds]
 
-    triage = Agent[None](
+    triage = TemporalAgent[None](
         name="Triage",
         instructions="Triage",
         handoffs=[handoff(target, on_handoff=configure_target)],
@@ -435,7 +439,7 @@ async def test_handoff_callback_updates_cached_graph(
         return ResponseBuilders.output_message(instructions or "")
 
     config = RunConfig(model=ScriptedModel(reply))
-    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    converted = _convert_agent(_ModelOptions(), triage, None)
     for invocation in range(1, 3):
         result = await _run(
             converted, "Move 5 dollars.", streamed=streamed, run_config=config
@@ -546,7 +550,7 @@ class ConcurrentNestedResumeWorkflow:
     @workflow.run
     async def run(self) -> str:
         agents = [
-            Agent[None](
+            TemporalAgent[None](
                 name=name,
                 instructions=f"You are {name}.",
                 tools=[transfer_funds],
@@ -574,7 +578,7 @@ class ConcurrentNestedResumeWorkflow:
 
             return resume
 
-        orchestrator = Agent[None](
+        orchestrator = TemporalAgent[None](
             name="Orchestrator",
             instructions="You are Orchestrator.",
             tools=[resume_tool(a, s) for a, s in zip(agents, states)],
@@ -590,10 +594,10 @@ class ConcurrentAgentToolsWorkflow:
     @workflow.run
     async def run(self) -> str:
         helpers = [
-            Agent[None](name=name, instructions=f"You are {name}.")
+            TemporalAgent[None](name=name, instructions=f"You are {name}.")
             for name in ("Alpha", "Beta")
         ]
-        orchestrator = Agent[None](
+        orchestrator = TemporalAgent[None](
             name="Orchestrator",
             instructions="You are Orchestrator.",
             tools=[
@@ -717,7 +721,7 @@ class RepeatedRunsWorkflow:
         config = RunConfig(call_model_input_filter=record)
         failures = 0
         for _ in range(runs):
-            agent = Agent[None](
+            agent = TemporalAgent[None](
                 name="Looker",
                 instructions=_MODE_INSTRUCTIONS.get(mode, "Look it up."),
                 tools=[lookup, explode, cancel_run],
@@ -760,11 +764,9 @@ async def _execute(
     """Run a workflow and return its result and the activity summaries from its history."""
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-            summary_override=summary_override,
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
+        summary_provider=summary_override,
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(client, *ALL_WORKFLOWS) as worker:
@@ -925,7 +927,7 @@ async def test_capture_filter_returns_user_result_unchanged():
     async def async_filter(_data: CallModelData[Any]) -> ModelInputData:
         return returned
 
-    provider = _TemporalModelProvider(ModelActivityParameters())
+    provider = _TemporalModelProvider(_ModelOptions())
     data = _call_data(agent)
 
     sync_config = provider.install(RunConfig(call_model_input_filter=sync_filter))
@@ -949,19 +951,22 @@ async def test_capture_filter_returns_user_result_unchanged():
         no_filter.call_model_input_filter(_call_data(agent))
 
 
-def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs():
+def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(workflow, "patched", lambda _: True)
     target = Agent(name="target", model=ScriptedModel(_banker_reply))
-    middle = Agent(name="middle", handoffs=[target])
-    starting = Agent(name="starting", handoffs=[middle])
+    middle = TemporalAgent(name="middle", handoffs=[target])
+    starting = TemporalAgent(name="starting", handoffs=[middle])
     middle.handoffs.append(starting)  # a loop must not recurse forever
-    runner = TemporalOpenAIRunner(ModelActivityParameters())
+    runner = TemporalOpenAIRunner(_ModelOptions())
     with pytest.raises(ValueError, match="model name to be a string"):
         runner._prepare_workflow_run(starting, {})
 
 
 async def test_capture_filter_resolves_agent_lazily_and_is_installed_once():
     agent = _make_banker()
-    params = ModelActivityParameters()
+    params = _ModelOptions()
     config = install_model_provider(params, RunConfig())
     provider = config.model_provider
     assert isinstance(provider, _TemporalModelProvider)
@@ -1009,7 +1014,7 @@ async def test_finished_runs_leave_no_agent_in_workflow_context(
 
 def test_capture_scope_restores_the_callers_context():
     outer_agent, inner_agent = _make_banker(), _make_triage(False)
-    config = install_model_provider(ModelActivityParameters(), RunConfig())
+    config = install_model_provider(_ModelOptions(), RunConfig())
     provider = config.model_provider
     assert isinstance(provider, _TemporalModelProvider)
     stub = provider.get_model("gpt-4o")

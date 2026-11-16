@@ -138,11 +138,11 @@ from temporalio.exceptions import (
     TemporalError,
 )
 from temporalio.openai_agents import (
-    ModelActivityParameters,
     ModelSummaryProvider,
     OpenAIPayloadConverter,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
+    TemporalAgent,
     _mcp,
 )
 from temporalio.openai_agents._invoke_model_activity import (
@@ -152,6 +152,7 @@ from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
     _raise_for_openai_status,
 )
+from temporalio.openai_agents._model_parameters import _ModelOptions
 from temporalio.openai_agents._openai_runner import (
     _coerce_run_config,
     _convert_agent,
@@ -199,7 +200,7 @@ def test_tool_call_response_builder_keeps_default_ids():
 class HelloWorldAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
         )
@@ -211,7 +212,7 @@ class HelloWorldAgent:
 class CallerAgentWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
         )
@@ -225,9 +226,7 @@ class CallerAgentWorkflow:
 async def test_hello_world_agent(client: Client):
     async with AgentEnvironment(
         model=hello_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -394,7 +393,7 @@ def nexus_weather_mock_model():
 class ToolsWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="Tools Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -434,7 +433,7 @@ class ToolsWorkflow:
 class NexusToolsWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="Nexus Tools Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -541,7 +540,7 @@ class NexusToolCancelWorkflow:
         elif case == "tool_bug":
             tools.append(function_tool(self.bug, failure_error_function=None))
         if case in ("nested", "nested_tool_fails"):
-            inner = Agent[str](
+            inner = TemporalAgent[str](
                 name="Inner", instructions="You are a helpful agent.", tools=tools
             )
             tools = [
@@ -552,7 +551,7 @@ class NexusToolCancelWorkflow:
                 )
             ]
         elif case == "spawned":
-            inner = Agent[str](
+            inner = TemporalAgent[str](
                 name="Inner", instructions="You are a helpful agent.", tools=tools
             )
 
@@ -566,7 +565,7 @@ class NexusToolCancelWorkflow:
                 return task.result().final_output
 
             tools = [function_tool(spawn)]
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="Nexus Tool Cancel Workflow",
             instructions="You are a helpful agent.",
             tools=tools,
@@ -599,9 +598,7 @@ class FixedNexusToolCancelWorkflow(NexusToolCancelWorkflow):
 async def test_tool_workflow(client: Client):
     async with AgentEnvironment(
         model=weather_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1319,9 +1316,7 @@ def weather_failure_mock_model():
 async def test_tool_failure_workflow(client: Client):
     async with AgentEnvironment(
         model=weather_failure_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1353,9 +1348,7 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
 
     async with AgentEnvironment(
         model=nexus_weather_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -1481,9 +1474,7 @@ async def test_nexus_tool_cancel_workflow(
         responses.insert(0, ResponseBuilders.tool_call("{}", "spawn"))
     async with AgentEnvironment(
         model=TestModel.returning_responses(responses),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -1710,7 +1701,7 @@ class ResearchWorkflow:
 async def test_research_workflow(client: Client):
     async with AgentEnvironment(
         model=research_mock_model(),
-        model_params=ModelActivityParameters(
+        activity_config=ActivityConfig(
             start_to_close_timeout=timedelta(seconds=120),
             schedule_to_close_timeout=timedelta(seconds=120),
         ),
@@ -1761,25 +1752,25 @@ async def test_research_workflow(client: Client):
 
 
 def orchestrator_agent() -> Agent:
-    spanish_agent = Agent[None](
+    spanish_agent = TemporalAgent[None](
         name="spanish_agent",
         instructions="You translate the user's message to Spanish",
         handoff_description="An english to spanish translator",
     )
 
-    french_agent = Agent[None](
+    french_agent = TemporalAgent[None](
         name="french_agent",
         instructions="You translate the user's message to French",
         handoff_description="An english to french translator",
     )
 
-    italian_agent = Agent[None](
+    italian_agent = TemporalAgent[None](
         name="italian_agent",
         instructions="You translate the user's message to Italian",
         handoff_description="An english to italian translator",
     )
 
-    orchestrator_agent = Agent[None](
+    orchestrator_agent = TemporalAgent[None](
         name="orchestrator_agent",
         instructions=(
             "You are a translation agent. You use the tools given to you to translate."
@@ -1805,7 +1796,7 @@ def orchestrator_agent() -> Agent:
 
 
 def synthesizer_agent() -> Agent:
-    return Agent(
+    return TemporalAgent(
         name="synthesizer_agent",
         instructions="You inspect translations, correct them if needed, and produce a final concatenated response.",
     )
@@ -1855,9 +1846,7 @@ def agent_as_tools_mock_model():
 async def test_agents_as_tools_workflow(client: Client):
     async with AgentEnvironment(
         model=agent_as_tools_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1972,7 +1961,7 @@ def init_agents() -> Agent[AirlineAgentContext]:
     Initialize the agents for the airline customer service workflow.
     :return: triage agent
     """
-    faq_agent = Agent[AirlineAgentContext](
+    faq_agent = TemporalAgent[AirlineAgentContext](
         name="FAQ Agent",
         handoff_description="A helpful agent that can answer questions about the airline.",
         instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
@@ -1985,7 +1974,7 @@ def init_agents() -> Agent[AirlineAgentContext]:
         tools=[faq_lookup_tool],
     )
 
-    seat_booking_agent = Agent[AirlineAgentContext](
+    seat_booking_agent = TemporalAgent[AirlineAgentContext](
         name="Seat Booking Agent",
         handoff_description="A helpful agent that can update a seat on a flight.",
         instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
@@ -1999,7 +1988,7 @@ def init_agents() -> Agent[AirlineAgentContext]:
         tools=[update_seat],
     )
 
-    triage_agent = Agent[AirlineAgentContext](
+    triage_agent = TemporalAgent[AirlineAgentContext](
         name="Triage Agent",
         handoff_description="A triage agent that can delegate a customer's request to the appropriate agent.",
         instructions=(
@@ -2125,9 +2114,7 @@ class CustomerServiceWorkflow:
 async def test_customer_service_workflow(client: Client):
     async with AgentEnvironment(
         model=customer_service_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2277,7 +2264,7 @@ class CarriedItemsWorkflow:
                 for part in item["content"]
             ]
             result = await Runner.run(
-                Agent(name="Assistant", instructions="Answer."),
+                TemporalAgent(name="Assistant", instructions="Answer."),
                 input_items + [{"content": "Next", "role": "user"}],
             )
         except Exception as e:
@@ -2559,7 +2546,7 @@ class CarriedCustomToolChatWorkflow:
         async def echo(ctx: ToolContext[Any], input: str) -> str:  # type: ignore[reportUnusedParameter]
             return input
 
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="custom-tool-agent",
             instructions="Use the echo tool.",
             tools=[
@@ -2683,7 +2670,7 @@ class MathHomeworkOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-guardrail_agent: Agent = Agent(
+guardrail_agent: Agent = TemporalAgent(
     name="Guardrail check",
     instructions="Check if the user is asking you to do their math homework.",
     output_type=MathHomeworkOutput,
@@ -2712,7 +2699,7 @@ async def math_guardrail(
 class InputGuardrailWorkflow:
     @workflow.run
     async def run(self, messages: list[str]) -> list[str]:
-        agent = Agent(
+        agent = TemporalAgent(
             name="Customer support agent",
             instructions="You are a customer support agent. You help customers with their questions.",
             input_guardrails=[math_guardrail],
@@ -2750,9 +2737,7 @@ class InputGuardrailWorkflow:
 async def test_input_guardrail(client: Client):
     async with AgentEnvironment(
         model=InputGuardrailModel(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2815,7 +2800,7 @@ async def sensitive_data_check(
     )
 
 
-output_guardrail_agent = Agent(
+output_guardrail_agent = TemporalAgent(
     name="Assistant",
     instructions="You are a helpful assistant.",
     output_type=MessageOutput,
@@ -2840,9 +2825,7 @@ class OutputGuardrailWorkflow:
 async def test_output_guardrail(client: Client):
     async with AgentEnvironment(
         model=output_guardrail_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2903,7 +2886,7 @@ class WorkflowToolWorkflow:
 
     @workflow.run
     async def run(self) -> dict[str, list[str]]:
-        agent: Agent = Agent(
+        agent: Agent = TemporalAgent(
             name="Assistant",
             instructions="You are a helpful assistant.",
             model="gpt-4o",
@@ -2946,9 +2929,7 @@ class WorkflowToolWorkflow:
 async def test_workflow_method_tools(client: Client):
     async with AgentEnvironment(
         model=workflow_tool_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -3017,8 +2998,8 @@ async def assert_status_retry_behavior(
 
     async with AgentEnvironment(
         model=TestModel(lambda: status_error(status)),
-        model_params=ModelActivityParameters(
-            retry_policy=retry_policy or RetryPolicy(maximum_attempts=2),
+        activity_config=ActivityConfig(
+            retry_policy=retry_policy or RetryPolicy(maximum_attempts=2)
         ),
     ) as env:
         client = env.applied_on_client(client)
@@ -3277,7 +3258,7 @@ async def test_chat_completions_model(
 
         async with AgentEnvironment(
             model_provider=model_provider,
-            model_params=ModelActivityParameters(
+            activity_config=ActivityConfig(
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=1),
             ),
@@ -3336,7 +3317,7 @@ class WaitModel(Model):
 class AlternateModelAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
             model="test_model",
@@ -3354,9 +3335,7 @@ class CheckModelNameProvider(ModelProvider):
 async def test_alternative_model(client: Client):
     async with AgentEnvironment(
         model_provider=CheckModelNameProvider(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -3379,18 +3358,18 @@ async def test_alternative_model(client: Client):
     ("params", "expected"),
     [
         (
-            ModelActivityParameters(heartbeat_timeout=timedelta(seconds=0.5)),
+            ActivityConfig(heartbeat_timeout=timedelta(seconds=0.5)),
             timedelta(seconds=0.5),
         ),
-        (ModelActivityParameters(), timedelta(seconds=10)),
-        (ModelActivityParameters(heartbeat_timeout=None), None),
+        (ActivityConfig(), timedelta(seconds=10)),
+        (ActivityConfig(heartbeat_timeout=None), None),
     ],
     ids=["set", "default", "off"],
 )
 async def test_heartbeat(
     client: Client,
     env: WorkflowEnvironment,
-    params: ModelActivityParameters,
+    params: ActivityConfig,
     expected: timedelta | None,
 ):
     if env.supports_time_skipping:
@@ -3398,7 +3377,7 @@ async def test_heartbeat(
 
     async with AgentEnvironment(
         model=WaitModel(),
-        model_params=params,
+        activity_config=params,
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -3426,7 +3405,7 @@ async def test_heartbeat(
 class SessionWorkflow:
     @workflow.run
     async def run(self) -> None:
-        agent: Agent = Agent(
+        agent: Agent = TemporalAgent(
             name="Assistant",
             instructions="You are a helpful assistant.",
         )
@@ -3482,7 +3461,7 @@ class RunModelProviderWorkflow:
             if provider == "custom"
             else MultiProvider(openai_use_responses=False)
         )
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant", instructions="You are a helpful assistant."
         )
         result = await Runner.run(
@@ -3536,7 +3515,7 @@ async def test_run_model_provider_refused(client: Client, provider: str):
 class LiteLlmAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
             model="fake/test-model",
@@ -3611,9 +3590,7 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
 
     async with AgentEnvironment(
         model_provider=LitellmProvider(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -3660,7 +3637,7 @@ def file_search_tool_mock_model():
 class FileSearchToolWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="File Search Workflow",
             instructions="You are a librarian. You should use your tools to source all your information.",
             tools=[
@@ -3684,9 +3661,7 @@ class FileSearchToolWorkflow:
 
 async def test_file_search_tool(client: Client):
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model=file_search_tool_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -3729,7 +3704,7 @@ def image_generation_mock_model():
 class ImageGenerationWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="Image Generation Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -3751,9 +3726,7 @@ class ImageGenerationWorkflow:
 
 async def test_image_generation_tool(client: Client):
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model=image_generation_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -3797,7 +3770,7 @@ def code_interpreter_mock_model():
 class CodeInterpreterWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="Code Interpreter Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -3822,9 +3795,7 @@ class CodeInterpreterWorkflow:
 async def test_code_interpreter_tool(client: Client):
     async with AgentEnvironment(
         model=code_interpreter_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=60),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=60)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -3889,7 +3860,7 @@ class HostedMCPWorkflow:
             requested_approval = True
             return MCPToolApprovalFunctionResult(approve=True)
 
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="Hosted MCP Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -3915,9 +3886,7 @@ class HostedMCPWorkflow:
 
 async def test_hosted_mcp_tool(client: Client):
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model=hosted_mcp_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -3967,7 +3936,7 @@ class CustomToolWorkflow:
             captured.append(input)
             return input
 
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="custom-tool-agent",
             instructions="Use the echo tool.",
             tools=[
@@ -4032,12 +4001,12 @@ def multiple_models_mock_model():
 class MultipleModelWorkflow:
     @workflow.run
     async def run(self, use_run_config: bool):
-        underling = Agent[None](
+        underling = TemporalAgent[None](
             name="Underling",
             instructions="You do all the work you are told.",
         )
 
-        starting_agent = Agent[None](
+        starting_agent = TemporalAgent[None](
             name="Lazy Assistant",
             model="gpt-4o-mini",
             instructions="You delegate all your work to another agent.",
@@ -4054,9 +4023,7 @@ class MultipleModelWorkflow:
 async def test_multiple_models(client: Client):
     provider = AssertDifferentModelProvider(multiple_models_mock_model())
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model_provider=provider,
     ) as env:
         client = env.applied_on_client(client)
@@ -4078,9 +4045,7 @@ async def test_multiple_models(client: Client):
 async def test_run_config_models(client: Client):
     provider = AssertDifferentModelProvider(multiple_models_mock_model())
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model_provider=provider,
     ) as env:
         client = env.applied_on_client(client)
@@ -4108,12 +4073,12 @@ class DictRunConfigWorkflow:
 
     @workflow.run
     async def run(self) -> str:
-        underling = Agent[None](
+        underling = TemporalAgent[None](
             name="Underling",
             instructions="You do all the work you are told.",
         )
 
-        starting_agent = Agent[None](
+        starting_agent = TemporalAgent[None](
             name="Lazy Assistant",
             model="gpt-4o-mini",
             instructions="You delegate all your work to another agent.",
@@ -4135,9 +4100,7 @@ async def test_dict_run_config_models(client: Client):
     # RunConfig(model="gpt-4o") in test_run_config_models above.
     provider = AssertDifferentModelProvider(multiple_models_mock_model())
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model_provider=provider,
     ) as env:
         client = env.applied_on_client(client)
@@ -4189,10 +4152,8 @@ async def test_summary_provider(client: Client):
             return "My summary"
 
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120),
-            summary_override=SummaryProvider(),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
+        summary_provider=SummaryProvider(),
         model=hello_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -4222,7 +4183,7 @@ class OutputType(pydantic.BaseModel):
 class OutputTypeWorkflow:
     @workflow.run
     async def run(self) -> OutputType:
-        agent: Agent = Agent(
+        agent: Agent = TemporalAgent(
             name="Assistant",
             instructions="You are a helpful assistant, adhere to the json schema output",
             output_type=OutputType,
@@ -4247,9 +4208,7 @@ def output_type_mock_model():
 async def test_output_type(client: Client):
     async with AgentEnvironment(
         model=output_type_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -4284,7 +4243,7 @@ class McpServerWorkflow:
             factory_argument=factory_argument,
             require_approval=require_approval,
         )
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="MCP ServerWorkflow",
             instructions="Use the tools to assist the customer.",
             mcp_servers=[server],
@@ -4315,7 +4274,7 @@ class McpServerStatefulWorkflow:
             factory_argument=factory_argument,
             require_approval=require_approval,
         ) as server:
-            agent = Agent[str](
+            agent = TemporalAgent[str](
                 name="MCP ServerWorkflow",
                 instructions="Use the tools to assist the customer.",
                 mcp_servers=[server],
@@ -4478,9 +4437,7 @@ async def test_mcp_server(client: Client, mode: str):
     )
 
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model=tracking_mcp_mock_model(),
         mcp_server_providers=[server],
     ) as env:
@@ -4604,9 +4561,7 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
     )
 
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model=tracking_mcp_mock_model(),
         mcp_server_providers=[server],
     ) as env:
@@ -4677,9 +4632,7 @@ async def test_mcp_server_factory_settings_are_rejected(
     )
 
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model=tracking_mcp_mock_model(),
         mcp_server_providers=[server],
     ) as env:
@@ -4745,9 +4698,7 @@ async def test_stateful_mcp_server_no_worker(client: Client):
     )
 
     async with AgentEnvironment(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=120)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
         model=tracking_mcp_mock_model(),
         mcp_server_providers=[server],
     ) as env:
@@ -5795,7 +5746,7 @@ async def test_stateful_mcp_server_empty_block(client: Client):
 
 async def test_model_conversion_loops():
     agent = init_agents()
-    converted = _convert_agent(ModelActivityParameters(), agent, None)
+    converted = _convert_agent(_ModelOptions(), agent, None)
     seat_booking_handoff = converted.handoffs[1]
     assert isinstance(seat_booking_handoff, Handoff)
     context: RunContextWrapper[AirlineAgentContext] = RunContextWrapper(
@@ -5823,7 +5774,7 @@ def test_sandbox_apply_patch_tool_round_trips_through_activity_input():
 
     stub = _TemporalModelStub(
         model_name="gpt-5",
-        model_params=ModelActivityParameters(),
+        model_params=_ModelOptions(),
         agent=None,
     )
 
@@ -5863,7 +5814,7 @@ def test_custom_tool_with_defer_loading_round_trips_through_activity_input():
 
     stub_model = _TemporalModelStub(
         model_name="gpt-5",
-        model_params=ModelActivityParameters(),
+        model_params=_ModelOptions(),
         agent=None,
     )
 
@@ -5891,10 +5842,8 @@ def test_custom_tool_with_defer_loading_round_trips_through_activity_input():
 async def test_local_hello_world_agent(client: Client):
     async with AgentEnvironment(
         model=hello_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            use_local_activity=True,
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        use_local_activity=True,
     ) as env:
         client = env.applied_on_client(client)
 
@@ -5918,9 +5867,7 @@ async def test_split_workers(client: Client):
     new_config = client.config()
 
     workflow_plugin = openai_agents.OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         model_provider=TestModelProvider(hello_mock_model()),
         register_activities=False,
     )
@@ -5932,7 +5879,7 @@ async def test_split_workers(client: Client):
         workflow_client, HelloWorldAgent, no_remote_activities=True
     ) as worker:
         activity_plugin = openai_agents.OpenAIAgentsPlugin(
-            model_params=ModelActivityParameters(
+            activity_config=ActivityConfig(
                 start_to_close_timeout=timedelta(seconds=30)
             ),
             model_provider=TestModelProvider(hello_mock_model()),
@@ -5966,13 +5913,13 @@ def multiple_handoffs_mock_model():
 class MultipleHandoffsWorkflow:
     @workflow.run
     async def run(self, task: str) -> str:
-        planner = Agent[None](
+        planner = TemporalAgent[None](
             name="Planner",
             instructions="You analyze requirements and create detailed plans.",
             handoff_description="An agent that creates detailed plans and strategies",
         )
 
-        writer = Agent[None](
+        writer = TemporalAgent[None](
             name="Writer",
             instructions="You write documents and reports based on provided information.",
             handoff_description="An agent that writes professional documents and reports",
@@ -5983,7 +5930,7 @@ class MultipleHandoffsWorkflow:
             handoff(agent=a) for a in specialists
         ]
 
-        triage = Agent[None](
+        triage = TemporalAgent[None](
             name="Triage",
             instructions="Hand off to Planner when requested.",
             handoffs=handoffs_list,
@@ -5997,9 +5944,7 @@ async def test_multiple_handoffs_workflow(client: Client):
     model = multiple_handoffs_mock_model()
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -6099,7 +6044,7 @@ class ImplicitSettingsAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
         # Names no model, so the agent carries the SDK's implicit default settings.
-        agent = Agent(name="Assistant", instructions="Reply briefly.")
+        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
         return (await Runner.run(agent, input=prompt)).final_output
 
 
@@ -6107,7 +6052,7 @@ class ImplicitSettingsAgent:
 class ExplicitSettingsAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent(
+        agent = TemporalAgent(
             name="Assistant",
             instructions="Reply briefly.",
             model_settings=ModelSettings(temperature=0.2, verbosity="high"),
@@ -6118,9 +6063,7 @@ class ExplicitSettingsAgent:
 async def _run_with_model(client: Client, model: Model, workflow_type: type) -> None:
     async with AgentEnvironment(
         model_provider=FixedModelProvider(model),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(client, workflow_type) as worker:
@@ -6182,7 +6125,7 @@ class RunModelAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
         # Names no model, but the run does.
-        agent = Agent(name="Assistant", instructions="Reply briefly.")
+        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
         result = await Runner.run(
             agent, input=prompt, run_config=RunConfig(model="gpt-5.4-pro")
         )
@@ -6202,7 +6145,7 @@ class RunOverrideSettingsAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
         # Names no model, but the run sets a reasoning effort explicitly.
-        agent = Agent(name="Assistant", instructions="Reply briefly.")
+        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
         result = await Runner.run(
             agent,
             input=prompt,
@@ -6258,9 +6201,7 @@ async def test_alignment_uses_the_workflow_workers_defaults(
     model = RecordingNamedModel("gpt-oss-120b")
     async with AgentEnvironment(
         model_provider=DifferentDefaultModelProvider(model),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as env:
         env_client = env.applied_on_client(client)
         async with new_worker(env_client, ImplicitSettingsAgent) as worker:

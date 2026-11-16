@@ -29,12 +29,16 @@ from temporalio.openai_agents._mcp import (
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
 )
-from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._model_parameters import (
+    ModelSummaryProvider,
+    _ModelOptions,
+)
 from temporalio.openai_agents._temporal_openai_agents import OpenAIAgentsPlugin
 from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _snapshot_resolvable_env_vars,
 )
+from temporalio.workflow import ActivityConfig
 
 __all__ = [
     "AgentEnvironment",
@@ -184,7 +188,7 @@ class AgentEnvironment:
 
     def __init__(
         self,
-        model_params: ModelActivityParameters | None = None,
+        activity_config: ActivityConfig | None = None,
         model_provider: ModelProvider | None = None,
         model: Model | None = None,
         mcp_server_providers: Sequence[
@@ -195,14 +199,25 @@ class AgentEnvironment:
         use_otel_instrumentation: bool = False,
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
         *,
+        use_local_activity: bool | None = None,
+        streaming_topic: str | None = None,
+        streaming_batch_interval: timedelta | None = None,
+        summary_provider: ModelSummaryProvider | None = None,
         mcp_servers: Mapping[str, Callable[..., MCPServer]] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
     ) -> None:
         """Initialize the AgentEnvironment.
 
         Args:
-            model_params: Configuration parameters for Temporal activity execution
-                of model calls. If None, default parameters will be used.
+            activity_config: Per-field defaults for model Activities. Supplied
+                dictionaries are copied; explicit None values override defaults.
+            use_local_activity: Use local model Activities by default. Explicit
+                Activity options unsupported by local Activities are refused.
+            streaming_topic: Default Workflow Stream topic (experimental).
+            streaming_batch_interval: Default stream publishing interval; 100 ms
+                if omitted (experimental).
+            summary_provider: Deterministic dynamic summary provider. Cannot be
+                combined with a static activity_config summary.
             model_provider: Optional model provider for custom model implementations.
                 Only one of model_provider or model should be provided.
                 If both are provided, model_provider will be used.
@@ -229,7 +244,13 @@ class AgentEnvironment:
                 Warning: resolvable_worker_env_vars is experimental and behavior may change in future versions.
                 Use with caution in production environments.
         """
-        self._model_params = model_params
+        self._model_options = _ModelOptions(
+            activity_config=activity_config or ActivityConfig(),
+            use_local_activity=use_local_activity,
+            streaming_topic=streaming_topic,
+            streaming_batch_interval=streaming_batch_interval,
+            summary_provider=summary_provider,
+        )
         self._model_provider = None
         if model_provider is not None:
             self._model_provider = model_provider
@@ -250,7 +271,11 @@ class AgentEnvironment:
         """Enter the async context manager."""
         # Create the plugin with the provided configuration
         self._plugin = OpenAIAgentsPlugin(
-            model_params=self._model_params,
+            activity_config=self._model_options.activity_config,
+            use_local_activity=self._model_options.use_local_activity,
+            streaming_topic=self._model_options.streaming_topic,
+            streaming_batch_interval=self._model_options.streaming_batch_interval,
+            summary_provider=self._model_options.summary_provider,
             model_provider=self._model_provider,
             mcp_server_providers=self._mcp_server_providers,
             mcp_servers=self._mcp_servers,

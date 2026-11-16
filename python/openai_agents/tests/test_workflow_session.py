@@ -5,7 +5,6 @@ from typing import Any
 
 import pytest
 from agents import (
-    Agent,
     AgentOutputSchemaBase,
     Handoff,
     ModelResponse,
@@ -20,7 +19,7 @@ from agents import (
 
 from temporalio import workflow
 from temporalio.client import Client
-from temporalio.openai_agents import WorkflowSession
+from temporalio.openai_agents import TemporalAgent, WorkflowSession
 from temporalio.openai_agents.testing import (
     AgentEnvironment,
     ResponseBuilders,
@@ -95,7 +94,7 @@ class SessionOperationsWorkflow:
 class MultiTurnSessionWorkflow:
     @workflow.run
     async def run(self) -> tuple[str, str]:
-        agent = Agent(name="Assistant")
+        agent = TemporalAgent(name="Assistant")
         session = WorkflowSession("conversation")
         first = await Runner.run(agent, "My name is Ada.", session=session)
         first_turn = await session.get_items()

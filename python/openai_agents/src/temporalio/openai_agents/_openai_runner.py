@@ -33,12 +33,15 @@ from temporalio.openai_agents._errors import (
     AgentsWorkflowError,
     NonRetryableAgentsWorkflowError,
 )
-from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._model_parameters import _ModelOptions
+from temporalio.openai_agents._temporal_model import TemporalModel
 from temporalio.openai_agents._temporal_model_provider import (
     _current_run_model_settings,
     _TemporalModelProvider,
     capture_scope,
+    effective_model_options,
     install_model_provider,
+    validate_agent,
 )
 from temporalio.openai_agents._temporal_model_stub import (
     _current_streamed_run,
@@ -143,7 +146,7 @@ async def _wait_for_tool_operations(run: _AgentRun) -> bool:
 
 # Recursively replace models in all agents
 def _convert_agent(
-    model_params: ModelActivityParameters,
+    model_params: _ModelOptions,
     agent: Agent[Any],
     seen: dict[int, Agent] | None,
     *,
@@ -362,7 +365,7 @@ class TemporalOpenAIRunner(AgentRunner):
 
     def __init__(
         self,
-        model_params: ModelActivityParameters,
+        model_params: _ModelOptions,
     ) -> None:
         """Initialize the Temporal OpenAI Runner."""
         self._runner = DEFAULT_AGENT_RUNNER or AgentRunner()
@@ -372,26 +375,19 @@ class TemporalOpenAIRunner(AgentRunner):
         self,
         starting_agent: Agent[TContext],
         kwargs: RunOptions[TContext],
+        *,
+        streaming: bool = False,
     ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
+        explicit = workflow.patched("openai-agents-explicit-temporal-models")
+        model_params = self.model_params
         # Refuse a Model object up front for every agent reachable through public fields.
         # Agents behind handoff(), as_tool() or a custom on_invoke_handoff are only
         # reachable through private SDK fields, so the call_model_input_filter refuses
         # them just before their model call instead.
-        pending: list[Agent[Any]] = [starting_agent]
-        checked: set[int] = set()
-        while pending:
-            agent = pending.pop()
-            if id(agent) in checked:
-                continue
-            checked.add(id(agent))
-            if agent.model is not None and not isinstance(
-                agent.model, (str, _TemporalModelStub)
-            ):
-                raise ValueError(
-                    "Temporal workflows require a model name to be a string in the agent."
-                )
-            pending.extend(h for h in agent.handoffs if isinstance(h, Agent))
+        agents = self._reachable_agents(starting_agent)
+        for agent in agents:
+            validate_agent(agent, explicit=explicit)
 
         for t in starting_agent.tools:
             if callable(t):
@@ -436,9 +432,11 @@ class TemporalOpenAIRunner(AgentRunner):
 
         # The plugin's model provider turns the name into the model Activity. Keeping the
         # name lets the SDK apply that model's default settings, as it does natively.
-        if run_config.model and not isinstance(run_config.model, str):
+        if run_config.model is not None and not isinstance(
+            run_config.model, (str, TemporalModel)
+        ):
             raise ValueError(
-                "Temporal workflows require a model name to be a string in the run config."
+                "Temporal workflows require a model name to be a string or TemporalModel in the run config."
             )
 
         # Model calls run in an Activity on the Worker's provider, so a provider set on the
@@ -460,7 +458,21 @@ class TemporalOpenAIRunner(AgentRunner):
         if run_config.tracing is not None:
             _refuse_tracing_key(run_config.tracing.get("api_key"))
 
-        run_config = install_model_provider(self.model_params, run_config)
+        if explicit:
+            # Validate in this run's scope, including nested runs that create a
+            # fresh RunConfig instead of inheriting their caller's override.
+            with capture_scope(
+                run_config.model_settings,
+                defaults=model_params,
+                run_model=run_config.model,
+            ):
+                for agent in agents:
+                    effective_model_options(agent).config(streaming=streaming)
+        elif streaming:
+            model_params.config(streaming=True)
+        run_config = install_model_provider(
+            model_params, run_config, explicit=explicit, streaming=streaming
+        )
 
         # run_config.sandbox is global for the entire run — configure it if any agent needs it.
         if _has_sandbox_agent(starting_agent) or run_config.sandbox:
@@ -493,8 +505,21 @@ class TemporalOpenAIRunner(AgentRunner):
 
         kwargs["run_config"] = run_config
         if not workflow.patched(_RUN_CALLER_AGENTS_PATCH):
-            return _convert_agent(self.model_params, starting_agent, None), run_config
+            return _convert_agent(model_params, starting_agent, None), run_config
         return starting_agent, run_config
+
+    @staticmethod
+    def _reachable_agents(starting_agent: Agent[Any]) -> list[Agent[Any]]:
+        pending = [starting_agent]
+        result: list[Agent[Any]] = []
+        checked: set[int] = set()
+        while pending:
+            agent = pending.pop()
+            if id(agent) not in checked:
+                checked.add(id(agent))
+                result.append(agent)
+                pending.extend(h for h in agent.handoffs if isinstance(h, Agent))
+        return result
 
     async def run(
         self,
@@ -517,7 +542,14 @@ class TemporalOpenAIRunner(AgentRunner):
         if parent is not None:
             parent.nested.add(run)
         token = _current_agent_run.set(run)
-        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
+        with (
+            capture_scope(
+                run_config.model_settings,
+                defaults=self.model_params,
+                run_model=run_config.model,
+            ),
+            _inline_sync_function_tools(),
+        ):
             try:
                 return await self._runner.run(
                     starting_agent=starting_agent,
@@ -587,24 +619,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        # Fail-fast before the agents framework starts a background task:
-        # validation raised inside ``Model.stream_response`` is otherwise
-        # captured into ``RunResultStreaming._stored_exception`` and may
-        # be silently dropped if the queue completion sentinel is read
-        # before the run_loop_task is observed as done.
-        if self.model_params.streaming_topic is None:
-            raise AgentsWorkflowError(
-                "Runner.run_streamed requires "
-                "ModelActivityParameters.streaming_topic to be set."
-            )
-        if self.model_params.use_local_activity:
-            raise AgentsWorkflowError(
-                "Runner.run_streamed is incompatible with "
-                "use_local_activity (local activities do not support "
-                "heartbeats or the workflow stream signal channel)."
-            )
-
-        starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        starting_agent, run_config = self._prepare_workflow_run(
+            starting_agent, kwargs, streaming=True
+        )
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
@@ -612,7 +629,11 @@ class TemporalOpenAIRunner(AgentRunner):
         token = _current_streamed_run.set(streamed_run)
         try:
             with (
-                capture_scope(run_config.model_settings),
+                capture_scope(
+                    run_config.model_settings,
+                    defaults=self.model_params,
+                    run_model=run_config.model,
+                ),
                 _inline_sync_function_tools(),
             ):
                 streamed_result = self._runner.run_streamed(

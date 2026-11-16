@@ -1,6 +1,7 @@
 # Agent used to synthesize a final report from the individual summaries.
-from agents import Agent
 from pydantic import BaseModel
+
+from temporalio.openai_agents import TemporalAgent
 
 PROMPT = (
     "You are a senior researcher tasked with writing a cohesive report for a research query. "
@@ -25,7 +26,7 @@ class ReportData(BaseModel):
 
 
 def new_writer_agent():
-    return Agent(
+    return TemporalAgent(
         name="WriterAgent",
         instructions=PROMPT,
         model="o3-mini",

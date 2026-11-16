@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
+from datetime import timedelta
 from typing import Any, get_type_hints
 
 from agents import (
@@ -56,7 +57,7 @@ from temporalio.openai_agents._invoke_model_activity import (
     StreamingActivityModelInput,
     ToolInput,
 )
-from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._model_parameters import _ModelOptions
 
 # The SDK reads an Activity's return type with typing.get_type_hints, which drops
 # the type discriminator that TResponseStreamEvent carries in Annotated. When an
@@ -108,7 +109,7 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         self,
         model_name: str | None,
         *,
-        model_params: ModelActivityParameters,
+        model_params: _ModelOptions,
         agent: Agent[Any] | None,
         current_agent: Callable[[], Agent[Any] | None] | None = None,
         current_run_model_settings: Callable[[], ModelSettings | None] | None = None,
@@ -118,6 +119,9 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         self.agent = agent
         self._current_agent = current_agent
         self._current_run_model_settings = current_run_model_settings
+
+    def _effective_model_options(self) -> _ModelOptions:
+        return self.model_params
 
     def _build_activity_input(
         self,
@@ -229,6 +233,10 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         )
 
         agent = self.agent
+        if agent is None and self._current_agent is None:
+            from temporalio.openai_agents._temporal_model_provider import _current_agent
+
+            agent = _current_agent.get()
         if agent is None and self._current_agent is not None:
             agent = self._current_agent()
 
@@ -244,23 +252,19 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             activity_input["run_model_settings"] = (
                 self._current_run_model_settings()
                 if self._current_run_model_settings is not None
-                else None
+                else _run_model_settings()
             )
 
-        if self.model_params.summary_override:
-            summary = (
-                self.model_params.summary_override
-                if isinstance(self.model_params.summary_override, str)
-                else (
-                    self.model_params.summary_override.provide(
-                        agent, system_instructions, input
-                    )
-                )
+        options = self._effective_model_options()
+        summary: str | None
+        if options.summary_provider is not None:
+            summary = options.summary_provider.provide(
+                agent, system_instructions, input
             )
-        elif agent:
-            summary = agent.name
+        elif "summary" in options.activity_config:
+            summary = options.activity_config["summary"]
         else:
-            summary = None
+            summary = agent.name if agent else None
 
         return activity_input, summary
 
@@ -291,30 +295,19 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             prompt=prompt,
         )
 
-        if self.model_params.use_local_activity:
+        options = self._effective_model_options()
+        config = options.config()
+        config["summary"] = summary
+        if options.use_local_activity:
             return await workflow.execute_local_activity_method(
                 ModelActivity.invoke_model_activity,
                 activity_input,
-                summary=summary,
-                schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
-                schedule_to_start_timeout=self.model_params.schedule_to_start_timeout,
-                start_to_close_timeout=self.model_params.start_to_close_timeout,
-                retry_policy=self.model_params.retry_policy,
-                cancellation_type=self.model_params.cancellation_type,
+                **options.local_config(config),
             )
         return await workflow.execute_activity_method(
             ModelActivity.invoke_model_activity,
             activity_input,
-            summary=summary,
-            task_queue=self.model_params.task_queue,
-            schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
-            schedule_to_start_timeout=self.model_params.schedule_to_start_timeout,
-            start_to_close_timeout=self.model_params.start_to_close_timeout,
-            heartbeat_timeout=self.model_params.heartbeat_timeout,
-            retry_policy=self.model_params.retry_policy,
-            cancellation_type=self.model_params.cancellation_type,
-            versioning_intent=self.model_params.versioning_intent,
-            priority=self.model_params.priority,
+            **config,
         )
 
     def get_retry_advice(
@@ -344,25 +337,10 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        # Streaming relies on activity heartbeats to hear a cancel and notice a
-        # lost worker, and on WorkflowStreamClient.from_within_activity() to
-        # signal partial results back to the workflow. Local activities support
-        # neither: their result commits with the workflow task, so there
-        # is no independent task to heartbeat against or to send signals
-        # from.
-        if self.model_params.use_local_activity:
-            raise ValueError(
-                "Streaming is incompatible with use_local_activity "
-                "(local activities do not support heartbeats or the "
-                "workflow stream signal channel)."
-            )
-
-        topic = self.model_params.streaming_topic
-        if topic is None:
-            raise ValueError(
-                "Runner.run_streamed requires "
-                "ModelActivityParameters.streaming_topic to be set."
-            )
+        options = self._effective_model_options()
+        config = options.config(streaming=True)
+        topic = options.streaming_topic
+        assert topic is not None
 
         base_input, summary = self._build_activity_input(
             system_instructions=system_instructions,
@@ -379,7 +357,9 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         streaming_input: StreamingActivityModelInput = {
             **base_input,
             "streaming_topic": topic,
-            "streaming_batch_interval": self.model_params.streaming_batch_interval,
+            "streaming_batch_interval": options.streaming_batch_interval
+            if options.streaming_batch_interval is not None
+            else timedelta(milliseconds=100),
         }
 
         # The activity publishes each event to the topic as the model sends it, but the
@@ -396,20 +376,12 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
 
         # Scheduled by name, so that result_type applies (a callable's declared
         # return type would replace it).
+        config["summary"] = summary
         handle = workflow.start_activity(
             ModelActivity.invoke_model_activity_streaming.__name__,
             streaming_input,
             result_type=_STREAM_EVENTS_TYPE,
-            summary=summary,
-            task_queue=self.model_params.task_queue,
-            schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
-            schedule_to_start_timeout=self.model_params.schedule_to_start_timeout,
-            start_to_close_timeout=self.model_params.start_to_close_timeout,
-            heartbeat_timeout=self.model_params.heartbeat_timeout,
-            retry_policy=self.model_params.retry_policy,
-            cancellation_type=self.model_params.cancellation_type,
-            versioning_intent=self.model_params.versioning_intent,
-            priority=self.model_params.priority,
+            **config,
         )
 
         cancelled_for: list[InputGuardrailResult] = []
@@ -440,3 +412,11 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
                 watcher.cancel()
         for event in events:
             yield event
+
+
+def _run_model_settings() -> ModelSettings | None:
+    from temporalio.openai_agents._temporal_model_provider import (
+        _current_run_model_settings,
+    )
+
+    return _current_run_model_settings.get()

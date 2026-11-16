@@ -1,8 +1,11 @@
 import warnings
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from agents import Agent, Runner
 
+from temporalio import workflow
 from temporalio.client import WorkflowHistory
 from temporalio.openai_agents import OpenAIAgentsPlugin
 from temporalio.worker import Replayer
@@ -14,7 +17,6 @@ from tests.helpers.stateful_replay import (
 )
 from tests.test_openai import (
     AgentsAsToolsWorkflow,
-    CallerAgentWorkflow,
     CustomerServiceWorkflow,
     HelloWorldAgent,
     InputGuardrailWorkflow,
@@ -23,6 +25,22 @@ from tests.test_openai import (
     RunModelProviderWorkflow,
     ToolsWorkflow,
 )
+
+
+@workflow.defn(name="CallerAgentWorkflow")
+class LegacyCallerAgentWorkflow:
+    """Keep an unmodified upstream Agent to exercise the pre-API replay path."""
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent[None](
+            name="Assistant", instructions="You only respond in haikus."
+        )
+        result = await Runner.run(starting_agent=agent, input=prompt)
+        if result.last_agent is agent:
+            await workflow.sleep(timedelta(milliseconds=100))
+        return result.final_output
+
 
 # Replay is promised only within a major (see AGENTS.md), so only the histories
 # in the current major's folder replay.
@@ -55,7 +73,7 @@ async def test_replay(file_name: str) -> None:
                 ToolsWorkflow,
                 CustomerServiceWorkflow,
                 AgentsAsToolsWorkflow,
-                CallerAgentWorkflow,
+                LegacyCallerAgentWorkflow,
                 HelloWorldAgent,
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,

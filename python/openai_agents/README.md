@@ -47,13 +47,14 @@ The code below shows how to wrap an agent for durable execution.
 
 ```python
 from temporalio import workflow
-from agents import Agent, Runner
+from agents import Runner
+from temporalio.openai_agents import TemporalAgent
 
 @workflow.defn
 class HelloWorldAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent(
+        agent = TemporalAgent(
             name="Assistant",
             instructions="You only respond in haikus.",
         )
@@ -203,7 +204,8 @@ import asyncio
 from datetime import timedelta
 
 from temporalio.client import Client
-from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin
+from temporalio.workflow import ActivityConfig
 from temporalio.worker import Worker
 
 from hello_world_workflow import HelloWorldAgent
@@ -215,7 +217,7 @@ async def worker_main():
         "localhost:7233",
         plugins=[
             OpenAIAgentsPlugin(
-                model_params=ModelActivityParameters(
+                activity_config=ActivityConfig(
                     start_to_close_timeout=timedelta(seconds=30)
                 )
             ),
@@ -282,6 +284,97 @@ We also configure the client with the `OpenAIAgentsPlugin` to ensure serializati
 
 To run this example, see the detailed instructions in the [Temporal Python Samples Repository](https://github.com/temporalio/samples-python/tree/main/openai_agents).
 
+## Model Activity Configuration
+
+Use `TemporalAgent` for agents with a string or implicit model. It subclasses the
+upstream `agents.Agent`, preserving its arguments, identity, hooks, handoffs,
+tools, generic context type, and `clone()` behavior. Model names remain strings so
+the SDK can apply its model-specific defaults.
+
+```python
+from datetime import timedelta
+
+from agents import Runner
+from temporalio.openai_agents import TemporalAgent
+from temporalio.workflow import ActivityConfig
+
+agent = TemporalAgent(
+    name="Researcher",
+    model="gpt-5",
+    activity_config=ActivityConfig(
+        start_to_close_timeout=timedelta(minutes=20),
+    ),
+)
+result = await Runner.run(agent, "Research this topic")
+```
+
+`TemporalModel` implements the upstream `agents.Model` interface. Use it with an
+upstream `Agent`, including `SandboxAgent`, or for model-specific configuration:
+
+```python
+from agents import Agent, RunConfig
+from temporalio.openai_agents import TemporalModel
+
+model = TemporalModel(
+    "gpt-5",
+    activity_config=ActivityConfig(heartbeat_timeout=None),
+)
+agent = Agent(name="Researcher", model=model)
+result = await Runner.run(
+    agent,
+    "Research this topic",
+    run_config=RunConfig(model=TemporalModel(
+        "gpt-5",
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(minutes=20)),
+    )),
+)
+```
+
+Model Activity configuration merges **per field**, in this order (later values win):
+built-in defaults → `OpenAIAgentsPlugin(activity_config=...)` → the agent's
+`TemporalModel` → `TemporalAgent` → `RunConfig.model=TemporalModel(...)`.
+An explicit `None` clears an inherited field. Supplied dictionaries are copied.
+The built-in execution timeout is 60 seconds and the heartbeat timeout is 10
+seconds. At least one of `start_to_close_timeout` or `schedule_to_close_timeout`
+must remain set. `AgentEnvironment` accepts the same defaults for testing.
+
+A string `RunConfig.model` changes the model name and retains the agent's Activity
+configuration. Every agent in a handoff or tool run uses its own configuration;
+concurrent runs do not share overrides. Providers and credentials remain on the Worker.
+
+`TemporalAgent`, `TemporalModel`, `OpenAIAgentsPlugin`, and `AgentEnvironment` also
+accept `use_local_activity`, `streaming_topic`, `streaming_batch_interval`, and
+`summary_provider` as separate keyword arguments. Omitted options inherit from the
+preceding layer. `use_local_activity=False` selects regular Activities explicitly.
+Local Activities reject explicitly supplied `task_queue`, `heartbeat_timeout`,
+`versioning_intent`, and `priority` options, including explicit `None` values.
+Streaming requires a topic and cannot use local Activities.
+
+Use `activity_config["summary"]` for a static summary, or `summary_provider` with a
+`ModelSummaryProvider` for a deterministic dynamic summary. Combining both in the
+effective configuration raises an error. Without either, the agent's name is used;
+`summary=None` disables that default.
+
+### Breaking source API migration and in-flight Workflows
+
+Replace `agents.Agent` with `TemporalAgent` for string or implicit models, or set
+`Agent(model=TemporalModel(...))`. Replace
+`model_params=ModelActivityParameters(...)` on `OpenAIAgentsPlugin` and
+`AgentEnvironment` with `activity_config=ActivityConfig(...)`, moving local,
+streaming, and dynamic-summary options to their separate constructor keywords.
+Replace `summary_override="text"` with `activity_config["summary"]`, and
+`summary_override=provider` with `summary_provider=provider`. The public
+`ModelActivityParameters` class and the uncommitted
+`workflow.model_activity_parameters` context manager are removed without aliases.
+
+Activity names and model payloads are unchanged. Current-major histories recorded
+before this API still replay through a patch-gated legacy path that accepts
+upstream agents with string or implicit models. New runs require the explicit
+API. Preserve the effective Activity options when migrating existing Workflow
+code. If changing recorded commands, especially switching between local and
+regular Activities, use Temporal patching or keep in-flight Workflows on their
+original Worker Deployment version. Keep the same Worker defaults for replay.
+
 ## Tool Calling
 
 Model invocations are automatically routed through Temporal activities.
@@ -308,7 +401,8 @@ We then pass this through the `activity_as_tool` helper function to create an Op
 from dataclasses import dataclass
 from datetime import timedelta
 from temporalio import activity, openai_agents, workflow
-from agents import Agent, Runner
+from agents import Runner
+from temporalio.openai_agents import TemporalAgent
 
 @dataclass
 class Weather:
@@ -325,7 +419,7 @@ async def get_weather(city: str) -> Weather:
 class WeatherAgent:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = Agent(
+        agent = TemporalAgent(
             name="Weather Assistant",
             instructions="You are a helpful weather agent.",
             tools=[
@@ -391,7 +485,8 @@ For simple computations that don't involve external calls, you can call the tool
 
 ```python
 from temporalio import workflow
-from agents import Agent, Runner
+from agents import Runner
+from temporalio.openai_agents import TemporalAgent
 from agents import function_tool
 
 @function_tool
@@ -404,7 +499,7 @@ def calculate_circle_area(radius: float) -> float:
 class MathAssistantAgent:
     @workflow.run
     async def run(self, message: str) -> str:
-        agent = Agent(
+        agent = TemporalAgent(
             name="Math Assistant",
             instructions="You are a helpful math assistant. Use the available tools to help with calculations.",
             tools=[calculate_circle_area],
@@ -507,11 +602,11 @@ plugin = OpenAIAgentsPlugin(
 ```
 
 ```python
-from agents import Agent
+from temporalio.openai_agents import TemporalAgent
 from temporalio.openai_agents.workflow import temporal_mcp_server
 
 server = temporal_mcp_server("weather")
-agent = Agent(name="weather", mcp_servers=[server])
+agent = TemporalAgent(name="weather", mcp_servers=[server])
 ```
 
 Configure transport, connection, retry, and message-handling behavior on the
@@ -867,7 +962,8 @@ import asyncio
 from datetime import timedelta
 from temporalio.client import Client
 from temporalio.worker import Worker
-from temporalio.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider
+from temporalio.workflow import ActivityConfig
 from agents.extensions.sandbox.daytona import DaytonaSandboxClient
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 
@@ -876,7 +972,7 @@ async def main():
         "localhost:7233",
         plugins=[
             OpenAIAgentsPlugin(
-                model_params=ModelActivityParameters(
+                activity_config=ActivityConfig(
                     start_to_close_timeout=timedelta(seconds=30)
                 ),
                 sandbox_clients=[
@@ -903,6 +999,7 @@ In the workflow, use `temporal_sandbox_client()` to create a reference to a regi
 
 ```python
 from temporalio import workflow
+from temporalio.openai_agents import TemporalModel
 from temporalio.openai_agents.workflow import temporal_sandbox_client
 from agents import Runner
 from agents.sandbox import SandboxAgent, SandboxRunConfig
@@ -915,6 +1012,7 @@ class MyWorkflow:
     async def run(self, prompt: str) -> str:
         agent = SandboxAgent(
             name="Coding Assistant",
+            model=TemporalModel(),
             instructions="You are a helpful coding assistant with access to a sandbox.",
         )
 
@@ -974,7 +1072,7 @@ External consumers (UIs, tracing pipelines, etc.) observe events as
 they arrive by hosting a [`WorkflowStream`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/workflow_streams/README.md)
 in the workflow and subscribing with `WorkflowStreamClient`. The
 streaming activity publishes each event to the topic configured on
-`ModelActivityParameters.streaming_topic`. The topic is required
+`TemporalAgent.streaming_topic` or `TemporalModel.streaming_topic`. The topic is required
 when using `Runner.run_streamed`; calling it without a configured topic
 raises before any activity is scheduled.
 
@@ -982,16 +1080,22 @@ Example workflow consuming events via `stream_events()` while the
 streaming activity publishes to the `"events"` topic:
 
 ```python
-from agents import Agent, Runner
+from agents import Runner
+from temporalio.openai_agents import TemporalAgent
 from agents.stream_events import RawResponsesStreamEvent
 
 from temporalio import workflow
+from temporalio.contrib.workflow_streams import WorkflowStream
 
 @workflow.defn
 class MyAgent:
+    @workflow.init
+    def __init__(self, prompt: str) -> None:
+        self.stream = WorkflowStream()
+
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent(name="Assistant", instructions="...")
+        agent = TemporalAgent(name="Assistant", instructions="...", streaming_topic="events")
         result = Runner.run_streamed(agent, prompt)
         async for event in result.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
@@ -1002,7 +1106,7 @@ class MyAgent:
 
 To publish raw model events to external subscribers, host a
 `WorkflowStream` in the workflow and configure
-`OpenAIAgentsPlugin(model_params=ModelActivityParameters(streaming_topic="events"))`. See [`temporalio.contrib.workflow_streams`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/workflow_streams/README.md) for the
+`OpenAIAgentsPlugin(streaming_topic="events")`. See [`temporalio.contrib.workflow_streams`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/workflow_streams/README.md) for the
 publisher and subscriber API.
 
 `RunResultStreaming.stream_events()` yields the agents-SDK
@@ -1193,7 +1297,8 @@ Use `WorkflowSession` for conversation history across multiple agent runs in a
 single workflow execution:
 
 ```python
-from agents import Agent, Runner
+from agents import Runner
+from temporalio.openai_agents import TemporalAgent
 from temporalio import workflow
 from temporalio.openai_agents import WorkflowSession
 
@@ -1201,7 +1306,7 @@ from temporalio.openai_agents import WorkflowSession
 class Conversation:
     @workflow.run
     async def run(self) -> str:
-        agent = Agent(name="Assistant")
+        agent = TemporalAgent(name="Assistant")
         session = WorkflowSession("conversation")
         await Runner.run(agent, "My name is Ada.", session=session)
         result = await Runner.run(agent, "What is my name?", session=session)
@@ -1252,7 +1357,8 @@ To enable OTEL telemetry export, you need to set up a global `ReplaySafeTracerPr
 ```python
 from datetime import timedelta
 from temporalio.client import Client
-from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin
+from temporalio.workflow import ActivityConfig
 from temporalio.contrib.opentelemetry import create_tracer_provider
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry import trace
@@ -1270,7 +1376,7 @@ client = await Client.connect(
     plugins=[
         OpenAIAgentsPlugin(
             use_otel_instrumentation=True,  # Enable OTEL integration
-            model_params=ModelActivityParameters(
+            activity_config=ActivityConfig(
                 start_to_close_timeout=timedelta(seconds=30)
             )
         ),

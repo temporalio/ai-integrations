@@ -5,7 +5,6 @@ from uuid import uuid4
 
 import pytest
 from agents import (
-    Agent,
     AgentBase,
     RunContextWrapper,
     Runner,
@@ -37,7 +36,7 @@ from temporalio import workflow
 from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 from temporalio.mcp import TemporalMCPClient
-from temporalio.openai_agents import ModelActivityParameters
+from temporalio.openai_agents import TemporalAgent
 from temporalio.openai_agents._mcp_backend import (
     _mcp_server_backend_factory,
     _OpenAIMCPServerBackend,
@@ -50,6 +49,7 @@ from temporalio.openai_agents.testing import (
     ResponseBuilders,
     TestModel,
 )
+from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
 
 
@@ -60,7 +60,7 @@ class MCPWorkflow:
         server = openai_agents.workflow.temporal_mcp_server(
             "hello", cache_tools_list=cache_tools_list
         )
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="MCP workflow",
             instructions="Use the tools.",
             mcp_servers=[server],
@@ -76,7 +76,7 @@ class MCPFactoryArgumentWorkflow:
         server = openai_agents.workflow.temporal_mcp_server(
             "hello", factory_argument={"tenant": "acme"}
         )
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="MCP workflow",
             instructions="Use the tools.",
             mcp_servers=[server],
@@ -97,7 +97,7 @@ class MCPToolMetaWorkflow:
                 "server": context.server_name,
             },
         )
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="MCP workflow",
             instructions="Use the tools.",
             mcp_servers=[server],
@@ -187,9 +187,7 @@ async def test_openai_agents_uses_mcp_v2_and_caches_connection(
 
     async with AgentEnvironment(
         model=model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         mcp_servers={"hello": factory},
     ) as environment:
         plugged_client = environment.applied_on_client(client)
@@ -228,9 +226,7 @@ async def test_factory_argument_uses_fresh_client_per_activity(
 
     async with AgentEnvironment(
         model=model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         mcp_servers={"hello": factory},
     ) as environment:
         plugged_client = environment.applied_on_client(client)
@@ -261,9 +257,7 @@ async def test_temporal_mcp_server_sends_tool_meta(client: Client) -> None:
 
     async with AgentEnvironment(
         model=model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30)
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
         mcp_servers={"hello": lambda: RecordingServer(mcp_server)},
     ) as environment:
         plugged_client = environment.applied_on_client(client)

@@ -1,20 +1,18 @@
-"""Parameters for configuring Temporal activity execution for model calls."""
+"""Configuration shared by durable agents, models, and the Worker plugin."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 from agents import Agent, TResponseInputItem
 
-from temporalio.common import Priority, RetryPolicy
-from temporalio.workflow import ActivityCancellationType, VersioningIntent
+from temporalio.openai_agents._errors import AgentsWorkflowError
+from temporalio.workflow import ActivityConfig, LocalActivityConfig
 
 
 class ModelSummaryProvider(ABC):
-    """Abstract base class for providing model summaries. Essentially just a callable,
-    but the arguments are sufficiently complex to benefit from names.
-    """
+    """Provide deterministic summaries for model Activities."""
 
     @abstractmethod
     def provide(
@@ -23,82 +21,84 @@ class ModelSummaryProvider(ABC):
         instructions: str | None,
         input: str | list[TResponseInputItem],
     ) -> str:
-        """Given the provided information, produce a summary for the model invocation activity."""
+        """Produce a summary for the model invocation Activity."""
         pass
 
 
 @dataclass
-class ModelActivityParameters:
-    """Parameters for configuring Temporal activity execution for model calls.
+class _ModelOptions:
+    """Partial options; omitted fields inherit from the preceding layer."""
 
-    This class encapsulates all the parameters that can be used to configure
-    how Temporal activities are executed when making model calls through the
-    OpenAI Agents integration.
-    """
-
-    task_queue: str | None = None
-    """Specific task queue to use for model activities."""
-
-    schedule_to_close_timeout: timedelta | None = None
-    """Maximum time from scheduling to completion."""
-
-    schedule_to_start_timeout: timedelta | None = None
-    """Maximum time from scheduling to starting."""
-
-    start_to_close_timeout: timedelta | None = timedelta(seconds=60)
-    """Maximum time for the activity to complete."""
-
-    heartbeat_timeout: timedelta | None = timedelta(seconds=10)
-    """Maximum time between heartbeats. The model activities heartbeat on a
-    timer at half this timeout, so a cancel reaches a running model call, and a
-    lost worker is noticed, within about this long. It doesn't catch a slow
-    model call. Set it to ``None`` to turn heartbeats off; a cancel then doesn't
-    reach a running model call. For streaming, that includes the cancel when a
-    parallel input guardrail trips, so the activity keeps publishing to
-    ``streaming_topic``."""
-
-    retry_policy: RetryPolicy | None = None
-    """Policy for retrying failed activities."""
-
-    cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL
-    """How the activity handles cancellation. For streaming, ``TRY_CANCEL``
-    lets the run go on while the activity stops, so the ``error`` event it
-    publishes can come after the workflow closes or among later events on
-    ``streaming_topic``. ``WAIT_CANCELLATION_COMPLETED`` waits until the
-    activity has published it. ``ABANDON`` sends no cancel, so the activity
-    keeps publishing."""
-
-    versioning_intent: VersioningIntent | None = None
-    """Versioning intent for the activity."""
-
-    summary_override: None | (str | ModelSummaryProvider) = None
-    """Summary for the activity execution."""
-
-    priority: Priority = Priority.default
-    """Priority for the activity execution."""
-
-    use_local_activity: bool = False
-    """Whether to use a local activity. If changed during a workflow execution, that would break determinism."""
-
+    activity_config: ActivityConfig = field(default_factory=ActivityConfig)
+    use_local_activity: bool | None = None
     streaming_topic: str | None = None
-    """Stream topic to publish raw model stream events to when the workflow
-    calls ``Runner.run_streamed``. Required for ``Runner.run_streamed``;
-    if left as ``None``, ``run_streamed`` raises before scheduling any
-    activity. The workflow must host a
-    :class:`temporalio.contrib.workflow_streams.WorkflowStream` to receive
-    the publishes; otherwise the signals are unhandled and dropped.
+    streaming_batch_interval: timedelta | None = None
+    summary_provider: ModelSummaryProvider | None = None
 
-    Streaming is incompatible with ``use_local_activity`` (local activities
-    do not support heartbeats or the workflow stream signal channel).
+    def __post_init__(self) -> None:
+        self.activity_config = self.activity_config.copy()
+        self._validate_summary()
 
-    .. warning::
-        Streaming support is experimental and may change in future
-        versions."""
+    def _validate_summary(self) -> None:
+        if (
+            self.activity_config.get("summary") is not None
+            and self.summary_provider is not None
+        ):
+            raise ValueError(
+                "Cannot combine activity_config['summary'] with summary_provider"
+            )
 
-    streaming_batch_interval: timedelta = timedelta(milliseconds=100)
-    """Interval between automatic flushes for the stream publisher used
-    by the streaming activity.
+    @classmethod
+    def merge(cls, *layers: "_ModelOptions") -> "_ModelOptions":
+        """Merge partial options without modifying any caller's configuration."""
+        result = cls()
+        for layer in layers:
+            result.activity_config.update(layer.activity_config)
+            for name in (
+                "use_local_activity",
+                "streaming_topic",
+                "streaming_batch_interval",
+                "summary_provider",
+            ):
+                value = getattr(layer, name)
+                if value is not None:
+                    setattr(result, name, value)
+        result._validate_summary()
+        return result
 
-    .. warning::
-        Streaming support is experimental and may change in future
-        versions."""
+    def config(self, *, streaming: bool = False) -> ActivityConfig:
+        """Resolve defaults and validate before scheduling an Activity."""
+        if streaming and self.streaming_topic is None:
+            raise AgentsWorkflowError(
+                "Runner.run_streamed requires streaming_topic to be set."
+            )
+        if streaming and self.use_local_activity:
+            raise AgentsWorkflowError(
+                "Runner.run_streamed is incompatible with use_local_activity "
+                "(local activities do not support heartbeats or the workflow stream signal channel)."
+            )
+        config = ActivityConfig(start_to_close_timeout=timedelta(seconds=60))
+        if self.use_local_activity:
+            unsupported = sorted(
+                set(self.activity_config) - set(LocalActivityConfig.__annotations__)
+            )
+            if unsupported:
+                raise AgentsWorkflowError(
+                    "Local model Activities do not support activity_config options: "
+                    + ", ".join(unsupported)
+                )
+        else:
+            config["heartbeat_timeout"] = timedelta(seconds=10)
+        config.update(self.activity_config)
+        if not (
+            config.get("start_to_close_timeout")
+            or config.get("schedule_to_close_timeout")
+        ):
+            raise AgentsWorkflowError(
+                "Model activity_config requires start_to_close_timeout or schedule_to_close_timeout"
+            )
+        return config
+
+    def local_config(self, config: ActivityConfig) -> LocalActivityConfig:
+        """Narrow a validated local Activity configuration for the SDK."""
+        return cast(LocalActivityConfig, cast(object, config))

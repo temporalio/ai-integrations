@@ -56,7 +56,11 @@ from temporalio.exceptions import (
     CancelledError,
     ChildWorkflowError,
 )
-from temporalio.openai_agents import ModelActivityParameters, _temporal_openai_agents
+from temporalio.openai_agents import (
+    TemporalAgent,
+    _temporal_openai_agents,
+)
+from temporalio.openai_agents._model_parameters import _ModelOptions
 from temporalio.openai_agents._otel_trace_interceptor import (
     OTelOpenAIAgentsContextPropagationInterceptor,
 )
@@ -76,6 +80,7 @@ from temporalio.worker.workflow_sandbox import (
     SandboxedWorkflowRunner,
     SandboxRestrictions,
 )
+from temporalio.workflow import ActivityConfig
 from tests.helpers import assert_event_subsequence, assert_eventually, new_worker
 from tests.test_openai import (
     ResearchWorkflow,
@@ -474,7 +479,7 @@ def test_otel_instrumentation_inside_temporal_provider() -> None:
     """Direct processor registration reaches the wrapped SDK provider."""
     exporter = set_test_tracer_provider()
     with _temporal_openai_agents._set_open_ai_agent_temporal_overrides(
-        ModelActivityParameters()
+        _ModelOptions()
     ) as provider:
         assert (
             provider._multi_processor._lock
@@ -665,7 +670,7 @@ async def lookup_account(account_id: str) -> str:
 class ToolTracingWorkflow:
     @workflow.run
     async def run(self) -> str:
-        agent = Agent[str](
+        agent = TemporalAgent[str](
             name="Account agent",
             instructions="Look up the account.",
             tools=[
@@ -1243,7 +1248,7 @@ async def test_custom_span_without_trace_context(
 class RunTracingKeyWorkflow:
     @workflow.run
     async def run(self) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant", instructions="You are a helpful assistant."
         )
         result = await Runner.run(
@@ -1267,7 +1272,7 @@ class AgentStartHooks(RunHooks[None]):
 class TracingKeyEntryPointWorkflow:
     @workflow.run
     async def run(self, entry_point: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant", instructions="You are a helpful assistant."
         )
         run_config = RunConfig(tracing={"api_key": "sk-tracing-run"})
@@ -1291,10 +1296,8 @@ class TracingKeyEntryPointWorkflow:
 async def test_trace_tracing_key_refused(client: Client):
     async with AgentEnvironment(
         model=TestModel.returning_responses([ResponseBuilders.output_message("test")]),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1656,7 +1659,7 @@ class AgentToolTraceWorkflow:
     @workflow.run
     async def run(self) -> str:
         result = await Runner.run(
-            starting_agent=Agent(name="Trace agent", tools=[trace_test_tool]),
+            starting_agent=TemporalAgent(name="Trace agent", tools=[trace_test_tool]),
             input="Call the tool.",
         )
         return str(result.final_output)

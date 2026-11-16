@@ -80,14 +80,14 @@ from temporalio.converter import (
     WithSerializationContext,
 )
 from temporalio.openai_agents import (
-    ModelActivityParameters,
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
+    TemporalAgent,
     _heartbeat_decorator,
 )
 from temporalio.openai_agents.testing import AgentEnvironment
 from temporalio.worker import Replayer
-from temporalio.workflow import ActivityCancellationType
+from temporalio.workflow import ActivityCancellationType, ActivityConfig
 from tests.helpers import assert_eventually, new_worker
 
 logger = logging.getLogger(__name__)
@@ -347,7 +347,7 @@ class StreamingOpenAIWorkflow:
 
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You are a test agent.",
         )
@@ -375,7 +375,7 @@ class StreamingRequiresTopicWorkflow:
 
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You are a test agent.",
         )
@@ -392,10 +392,8 @@ async def test_streaming_publishes_raw_events(client: Client):
     normalization."""
     async with AgentEnvironment(
         model=StreamingTestModel(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         workflow_id = f"openai-streaming-test-{uuid.uuid4()}"
@@ -472,10 +470,8 @@ async def test_streaming_drifted_event_in_fresh_process(
     )
     async with AgentEnvironment(
         model=DriftedStreamingTestModel(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(
@@ -499,7 +495,7 @@ async def test_streaming_drifted_event_in_fresh_process(
         workflows=[StreamingOpenAIWorkflow],
         plugins=[
             OpenAIAgentsPlugin(
-                model_params=ModelActivityParameters(streaming_topic="events")
+                activity_config=ActivityConfig(), streaming_topic="events"
             )
         ],
     ).replay_workflow(history)
@@ -520,10 +516,8 @@ async def test_streaming_uses_configured_payload_converter(client: Client):
     client = Client(**config)
     async with AgentEnvironment(
         model=StreamingTestModel(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(
@@ -561,10 +555,8 @@ async def test_streaming_requires_topic(client: Client):
     streaming activity is scheduled."""
     async with AgentEnvironment(
         model=StreamingTestModel(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic=None,
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic=None,
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(
@@ -589,11 +581,9 @@ async def test_streaming_rejects_local_activity(client: Client):
     heartbeats nor the workflow-stream signal channel."""
     async with AgentEnvironment(
         model=StreamingTestModel(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-            use_local_activity=True,
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
+        use_local_activity=True,
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(
@@ -648,7 +638,9 @@ class StreamingRunOverrideWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> str:
         # Names no model; the run sets a reasoning effort explicitly.
-        agent = Agent[None](name="Assistant", instructions="You are a test agent.")
+        agent = TemporalAgent[None](
+            name="Assistant", instructions="You are a test agent."
+        )
         result = Runner.run_streamed(
             starting_agent=agent,
             input=prompt,
@@ -671,10 +663,8 @@ async def test_streamed_run_level_model_settings_survive_the_alignment(
     model = RecordingStreamingModel("gpt-5.4")
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(
@@ -747,7 +737,7 @@ def add(a: int, b: int) -> int:
 class StreamingSyncToolWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> list[Any]:
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You are a test agent.",
             tools=[function_tool(add)],
@@ -765,10 +755,8 @@ class StreamingSyncToolWorkflow:
 async def test_streamed_run_runs_sync_function_tools(client: Client):
     async with AgentEnvironment(
         model=SyncToolStreamingModel(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(
@@ -916,7 +904,7 @@ class StreamingInputGuardrailWorkflow:
             retries_asked += 1
             return True
 
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Assistant",
             instructions="You are a test agent.",
             input_guardrails=guardrails,
@@ -991,11 +979,11 @@ async def test_streaming_input_guardrail_trip_stops_the_topic(
     model = HoldingStreamingModel(response_id="resp_held")
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
+        activity_config=ActivityConfig(
             start_to_close_timeout=timedelta(seconds=30),
             heartbeat_timeout=timedelta(seconds=3),
-            streaming_topic="events",
         ),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         workflow_id = f"openai-streaming-guardrail-{uuid.uuid4()}"
@@ -1038,11 +1026,11 @@ async def test_streaming_input_guardrail_known_trip_skips_the_model(
     model = HoldingStreamingModel()
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
+        activity_config=ActivityConfig(
             start_to_close_timeout=timedelta(seconds=30),
             heartbeat_timeout=timedelta(seconds=3),
-            streaming_topic="events",
         ),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(
@@ -1168,12 +1156,12 @@ async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
         stop_heartbeats_slowly(monkeypatch, 8)
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
+        activity_config=ActivityConfig(
             start_to_close_timeout=timedelta(seconds=30),
             heartbeat_timeout=timedelta(seconds=3),
-            streaming_topic="events",
             cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
         ),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         workflow_id = f"openai-streaming-guardrail-wait-{uuid.uuid4()}"
@@ -1223,11 +1211,11 @@ async def test_streaming_worker_shutdown_publishes_no_error_event(client: Client
     model = HoldingStreamingModel()
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
+        activity_config=ActivityConfig(
             start_to_close_timeout=timedelta(seconds=30),
             heartbeat_timeout=timedelta(seconds=3),
-            streaming_topic="events",
         ),
+        streaming_topic="events",
     ) as env:
         client = env.applied_on_client(client)
         workflow_id = f"openai-streaming-shutdown-{uuid.uuid4()}"

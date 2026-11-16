@@ -8,7 +8,6 @@ from typing import Any, cast
 
 import pytest
 from agents import (
-    Agent,
     AgentOutputSchemaBase,
     CodeInterpreterTool,
     Handoff,
@@ -29,9 +28,9 @@ from agents.tool import ApplyPatchTool, ShellTool, ShellToolEnvironment
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.openai_agents import (
-    ModelActivityParameters,
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
+    TemporalAgent,
     temporal_worker_env_ref,
 )
 from temporalio.openai_agents._invoke_model_activity import (
@@ -46,6 +45,7 @@ from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
     _build_tools_and_handoffs,
 )
+from temporalio.openai_agents._model_parameters import _ModelOptions
 from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
@@ -119,7 +119,7 @@ def test_build_tool_reports_unreconstructed_dict():
 def _round_trip_activity_input(tool: Tool) -> tuple[bytes, ActivityModelInput]:
     stub = _TemporalModelStub(
         model_name="gpt-5",
-        model_params=ModelActivityParameters(),
+        model_params=_ModelOptions(),
         agent=None,
     )
     activity_input, _summary = stub._build_activity_input(
@@ -880,7 +880,7 @@ class WorkerEnvRefAgentWorkflow:
             "authorization": temporal_worker_env_ref(ENV_NAME),
             "headers": {"X-Token": temporal_worker_env_ref(OTHER_ENV_NAME)},
         }
-        agent = Agent[None](
+        agent = TemporalAgent[None](
             name="Worker env ref agent",
             tools=[HostedMCPTool(tool_config=tool_config)],
         )
