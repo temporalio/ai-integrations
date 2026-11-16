@@ -129,8 +129,9 @@ class LangGraphPlugin(SimplePlugin):
         entrypoints: Functional API entrypoints to make available to
             workflows, keyed by name. Workflows retrieve them with
             :func:`entrypoint`.
-        tasks: Functional API ``@task`` functions to wrap as Temporal
-            Activities.
+        tasks: Functional API ``@task`` functions to run as Temporal
+            Activities or in the workflow, as their ``execute_in`` option
+            says. A task that is not listed here runs in the workflow.
         activity_options: Per-task activity options for the Functional
             API, keyed by task function name. Each entry must include
             ``execute_in`` and may include any
@@ -143,9 +144,10 @@ class LangGraphPlugin(SimplePlugin):
             inherited default of either form.
         streaming_topic: When set, ``langgraph.config.get_stream_writer()``
             inside a node publishes to this topic on the workflow's
-            :class:`WorkflowStream`. The workflow must construct
-            ``WorkflowStream()`` in its ``@workflow.init`` (the plugin's
-            interceptor verifies this on workflow start). Nodes with
+            :class:`WorkflowStream`. Every workflow type on the worker
+            must construct ``WorkflowStream()`` in its ``@workflow.init``,
+            including one that uses no graph (the plugin's interceptor
+            verifies this on workflow start). Nodes with
             ``execute_in='activity'`` publish through
             :class:`WorkflowStreamClient` (signal); nodes with
             ``execute_in='workflow'`` publish synchronously to the
