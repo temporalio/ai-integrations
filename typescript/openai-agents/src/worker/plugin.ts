@@ -139,7 +139,7 @@ function packageVersion(): string {
 
 /**
  * Temporal plugin integrating the OpenAI Agents SDK. Registers model
- * invocation Activities so Workflow-side ActivityBackedModel can delegate LLM
+ * invocation Activities so Workflow-side TemporalModel can delegate LLM
  * calls, and wires trace propagation between client/Workflow/Activity.
  *
  * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.

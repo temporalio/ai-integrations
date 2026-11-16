@@ -1,7 +1,7 @@
 import test from 'ava';
 import { RequestUsage, Usage, type ModelResponse } from '@openai/agents-core';
 import { toSerializedModelResponse } from '../worker/activities';
-import { toSerializedModelRequest } from '../workflow/activity-backed-model';
+import { toSerializedModelRequest } from '../workflow/temporal-model';
 
 test('toSerializedModelRequest: signal field is structurally absent on wire (selective whitelist projection)', (t) => {
   const request: any = {

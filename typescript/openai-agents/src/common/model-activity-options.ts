@@ -56,7 +56,7 @@ export const STREAMING_TOPIC_NOT_CONFIGURED = {
   type: 'StreamingTopicNotConfigured',
   message:
     "Streaming requires a streamingTopic. Set it via the plugin's modelParams on the client, " +
-    "or via the runner's defaultModelParams (new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic } })). " +
+    "via the runner's defaultModelParams, on TemporalModel options, or in run's modelActivityOptions. " +
     'Host a WorkflowStream in your Workflow to use run(agent, input, { stream: true }).',
 } as const;
 

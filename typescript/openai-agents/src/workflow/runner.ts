@@ -23,14 +23,12 @@ import { ApplicationFailure } from '@temporalio/common';
 import { CancellationScope } from '@temporalio/workflow';
 import {
   DEFAULT_MODEL_ACTIVITY_OPTIONS,
-  STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
-  STREAMING_TOPIC_NOT_CONFIGURED,
   type ModelActivityOptions,
   type SerializableModelActivityOptions,
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
 import { refuseTracingApiKey } from '../common/headers';
-import { ActivityBackedModelProvider } from './activity-backed-model';
+import { ActivityBackedModelProvider, type TemporalModel } from './temporal-model';
 import { getAgentToolRecord } from './agent-tools';
 import { checkAgent } from './check-agent';
 import { validateTemporalSandboxClient } from './sandbox-client';
@@ -63,15 +61,17 @@ export interface TemporalRunOptions<TContext = undefined> {
    * @experimental Streaming support is experimental and may change without notice.
    */
   stream?: boolean;
+  /** Model Activity overrides for this run and inherited agent-as-tool runs. */
+  modelActivityOptions?: ModelActivityOptions;
   // signal intentionally omitted — use Temporal CancellationScope for Workflow cancellation
 
   /** Runner-level config overrides */
   runConfig?: {
     /**
-     * Model name for agents that set no model of their own, as upstream's code does (string only —
-     * Model objects can't cross the Workflow/Activity boundary)
+     * Model for agents that set no model of their own, matching the upstream JS SDK.
+     * TemporalModel carries per-model Activity options; other Model objects are refused.
      */
-    model?: string;
+    model?: string | TemporalModel;
     /** Global model settings (temperature, topP, etc.). An agent's own `modelSettings` override them, as upstream. */
     modelSettings?: ModelSettings;
     /** Global handoff input filter. Agent-level inputFilter takes precedence. */
@@ -221,29 +221,14 @@ export class TemporalOpenAIRunner {
       });
     }
 
-    // Fail fast before the upstream streaming runner starts, so a missing topic
-    // surfaces as a clean error rather than being captured into the streamed result.
-    if (options?.stream === true && this.modelParams.streamingTopic === undefined) {
-      throw ApplicationFailure.create({
-        message: STREAMING_TOPIC_NOT_CONFIGURED.message,
-        type: STREAMING_TOPIC_NOT_CONFIGURED.type,
-        nonRetryable: true,
-      });
-    }
-
-    if (options?.stream === true && this.modelParams.useLocalActivity === true) {
-      throw ApplicationFailure.create({
-        message: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.message,
-        type: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.type,
-        nonRetryable: true,
-      });
-    }
+    const provider = new ActivityBackedModelProvider(this.modelParams, { ...options?.modelActivityOptions });
 
     // Normalized, so a malformed agent graph, such as an `undefined` tool, fails the run.
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     try {
       validateSandboxRunConfig(agent, options?.runConfig?.sandbox);
       checkAgent(agent);
+      provider.validateAgent(agent, options?.runConfig?.model, options?.stream === true);
       preparedInput = input instanceof RunState ? await prepareRunState(agent, input) : input;
     } catch (error) {
       throw normalizeAgentsRunError(error);
@@ -256,7 +241,7 @@ export class TemporalOpenAIRunner {
     const innerRunner = new Runner({
       ...runnerConfigOverrides,
       model: modelOverride,
-      modelProvider: new ActivityBackedModelProvider(this.modelParams),
+      modelProvider: provider,
     });
 
     const sharedRunOptions = {

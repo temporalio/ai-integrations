@@ -65,7 +65,7 @@ export class ErrorModelProvider implements ModelProvider {
 
 /**
  * A model that captures the last ModelRequest it received.
- * Used for testing that request fields survive serialization through ActivityBackedModel.
+ * Used for testing that request fields survive serialization through TemporalModel.
  */
 export class RequestCapturingModel implements Model {
   public lastRequest: ModelRequest | undefined;

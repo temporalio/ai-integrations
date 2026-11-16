@@ -21,7 +21,7 @@ import {
   type HostedToolIdentity,
 } from '../worker/hosted-tool-credentials';
 import { OpenAIAgentsPlugin } from '../worker/plugin';
-import { toSerializedModelRequest } from '../workflow/activity-backed-model';
+import { toSerializedModelRequest } from '../workflow/temporal-model';
 import { streamingTextEvents } from './stubs/openai-agents-fakes';
 
 const MCP_AUTH = 'sk-mcp-authorization-sentinel';

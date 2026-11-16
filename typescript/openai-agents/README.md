@@ -97,7 +97,7 @@ main();
 
 Differences from the upstream runner:
 
-- `runConfig.model` must be a model name string. The Worker's `modelProvider` resolves it inside the model Activity. As upstream, it applies to agents that set no model of their own. Upstream's docs say it overrides every agent's model, but its code and tests let an agent's own model win, and the plugin follows the code. The Python plugin follows the Python SDK, where the run's model wins.
+- `runConfig.model` accepts a model name string or a `TemporalModel`. The Worker's `modelProvider` resolves it inside the model Activity. As upstream, it applies to agents that set no model of their own. Upstream's docs say it overrides every agent's model, but its code and tests let an agent's own model win, and the plugin follows the code. The Python plugin follows the Python SDK, where the run's model wins.
 - `signal` is not supported. Use Temporal cancellation APIs, such as `CancellationScope`, to cancel Workflow work.
 - If the cancellation scope `run()` started in is cancelled, `run()` throws the `CancelledFailure`, and a streamed run fails with it, even if the run ended on a tool's output or failed another way. As upstream, an `agent.asTool()` tool returns a nested run's failure, including a cancelled model Activity, as its output, and with `toolUseBehavior: 'stop_on_first_tool'` the run ends on that output.
 
@@ -311,6 +311,60 @@ const plugin = new OpenAIAgentsPlugin({
 ```
 
 See `ModelActivityOptions` for the public field list. `summary` can be a string in plugin config; `ModelSummaryProvider` functions are intentionally not serialized into Workflow headers.
+
+### Per-agent and per-run model Activity options
+
+Use `TemporalModel` on an upstream `Agent` to configure one agent's model calls:
+
+```ts
+import { Agent } from '@openai/agents-core';
+import { TemporalModel, TemporalOpenAIRunner } from '@temporalio/openai-agents/workflow';
+
+const researcher = new Agent({
+  name: 'Researcher',
+  model: new TemporalModel('gpt-5', {
+    startToCloseTimeout: '20m',
+    retry: { maximumAttempts: 3 },
+  }),
+});
+const runner = new TemporalOpenAIRunner();
+const result = await runner.run(researcher, 'Research this topic');
+
+// Override the Activity configuration for this run, including inherited agent-as-tool runs.
+const followUp = await runner.run(researcher, 'Summarize the findings', {
+  modelActivityOptions: { startToCloseTimeout: '5m' },
+});
+```
+
+Options merge per field, with later layers winning: package defaults → runner
+`defaultModelParams` → Client `modelParams` → the selected `TemporalModel`'s options
+→ `run(..., { modelActivityOptions })`. Undefined values inherit; defined values
+such as `false` and `0` override a lower layer. Supplied option objects are copied.
+An omitted model name (`new TemporalModel()`) uses the Worker's default model.
+Provider clients and credentials stay on the Worker; the Model object and summary
+callbacks stay in the Workflow.
+
+`runConfig.model` can also be a `TemporalModel`, as a fallback for agents that name
+no model. The agent's own model still wins, including its Model-specific Activity
+options. Use `modelActivityOptions` to override Activity settings for the whole
+run independently of model selection. Concurrent runs keep separate overrides,
+even when agents share one Model. Nested `agent.asTool()` runs inherit the run's
+overrides; a separate `TemporalOpenAIRunner.run()` uses the options given to that call.
+
+Both new option locations accept `ModelActivityOptions`, including `summary`
+(static text or a deterministic `ModelSummaryProvider`), `useLocalActivity`,
+`streamingTopic`, and `streamingBatchInterval`. Streaming requires a topic and
+regular Activities. Explicit options unsupported by local Activities, such as
+`taskQueue`, `heartbeatTimeout`, or `priority`, are refused before the model call.
+A local call forwards supported scheduling options, including
+`scheduleToStartTimeout`. Model instances follow the upstream Model-object
+settings defaults; string models keep the SDK's model-name defaults.
+
+These APIs are part of the next major release (2.x). Changing the effective
+Activity options of an open Workflow, especially switching between local and
+regular Activities, can change its recorded commands. Finish earlier-version
+runs on their existing Worker Deployment version or keep that deployment
+available while routing new runs to the new version.
 
 ## Tools
 
@@ -812,7 +866,7 @@ Most applications use two import paths: `@temporalio/openai-agents` in Worker an
 
 `@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
 
-`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool` (deprecated), `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`.
+`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `TemporalModel`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool` (deprecated), `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`.
 
 `@temporalio/openai-agents/otel` exports `createTracerProvider`, `TemporalIdGenerator`, `markReplaySafeTracerProvider`, `isReplaySafeTracerProvider`, and `TemporalOpenAIAgentsTracerProviderOptions`. Install optional peer dependency `@opentelemetry/sdk-trace-base` only when you use this OTel integration.
 
