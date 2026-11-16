@@ -18,8 +18,7 @@ export class EventTargetPolyfill {
 
   // agents-core emits its events through this in the Workflow, and through Node's EventEmitter
   // outside it. As there, a listener that throws stops the dispatch, and its error reaches the code
-  // that emitted the event, such as the run loop, which fails the run. A streamed run rejects
-  // `completed` with the error as it is, as with its other errors.
+  // that emitted the event, such as the run loop, which fails the run.
   dispatchEvent(event: { type: string }): boolean {
     (event as any).target = this;
     (event as any).currentTarget = this;

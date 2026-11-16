@@ -112,6 +112,8 @@ Worker(..., plugins=[StrandsPlugin(models={
 
 Each `TemporalAgent` carries its own activity options (timeouts, retry policy, task queue, streaming topic) and dispatches to the shared model activity, which resolves the model name against the registered factories at runtime. A name not present in `models` raises `ValueError` inside the activity.
 
+`heartbeat_timeout` defaults to 10 seconds. The model activities heartbeat on a timer, so a cancel reaches a running model call and a lost worker is noticed before the start-to-close timeout. Pass `heartbeat_timeout=None` to turn heartbeats off. The timer runs on the worker's event loop, so a model factory or model call that blocks that loop for longer than the timeout fails with a heartbeat timeout on a healthy worker. In Strands 1.56.0, `SageMakerAIModel` and `LlamaAPIModel` call their synchronous clients on the loop: pass `heartbeat_timeout=None` (or a longer timeout) for them. A factory slower than the timeout logs a warning on the worker.
+
 Before its first invocation in a workflow, each `TemporalAgent` reads the worker model's `model_id` and `context_window_limit` with the `strands_get_model_config` activity, using the agent's activity options. `agent.model.get_config()` returns them, so proactive compression, `context_manager="auto"` and Strands' tracing use the real model's window and id, as they do natively. No other part of the model's config is sent to the workflow. The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it: let those runs finish first, or use Worker Versioning.
 
 If you scaled `compression_threshold` by the model's window divided by 200,000 to work around the missing limit, remove that scaling: the threshold now applies to the model's own window.
@@ -309,10 +311,14 @@ recording its result, causing a retry to perform the operation again. Use a
 bounded `retry_policy`, and make commands and mutations idempotent when repeated
 execution would be unsafe.
 
-By default, `TemporalSandbox.get_tools()` vends `sandbox_shell` and
-`sandbox_file_editor`. A tool passed explicitly through `TemporalAgent(tools=...)`
-with either name takes precedence, following Strands' normal sandbox-tool
-override behavior.
+By default, `TemporalSandbox.get_tools()` vends `sandbox_shell`, `sandbox_read`,
+`sandbox_write`, and `sandbox_edit`. The file tools use Strands' focused read,
+write, and edit implementations: read returns numbered text with optional paging
+or image/document content, write creates or overwrites a text file, and edit
+replaces an exact, unique string. They require absolute paths. These tools replace
+the deprecated `sandbox_file_editor`. A tool passed explicitly through
+`TemporalAgent(tools=...)` with the same name takes precedence, following Strands'
+normal sandbox-tool override behavior.
 
 Execution output is always buffered into the activity result so workflow replay
 observes the same ordered `StreamChunk` and `ExecutionResult` values. For live,
@@ -358,6 +364,9 @@ need to host a `WorkflowStream`.
 All sandbox Activity arguments and results are serialized into workflow history.
 Keep command output and files within the server's configured payload size limits;
 use external storage for large artifacts.
+`sandbox_read` and `sandbox_edit` record the entire file in a read-file Activity
+result, even when the read tool requests only a page of text. `sandbox_write`
+and `sandbox_edit` record the written content in a write-file Activity input.
 
 Do not put secret values directly in `env`, because those values are serialized
 into workflow history. Use `temporal_worker_env_ref()` to serialize only the

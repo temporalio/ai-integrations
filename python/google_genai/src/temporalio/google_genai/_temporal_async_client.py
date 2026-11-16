@@ -229,6 +229,25 @@ class TemporalAsyncClient(AsyncClient):
                 When not provided, every operation (model calls, files,
                 interactions, managed agents) defaults to a 60-second
                 ``start_to_close_timeout`` and Temporal's default retry policy.
+                ``heartbeat_timeout`` defaults to 10 seconds, also in a config
+                that leaves it out. These activities heartbeat on a timer at
+                half of it, so a cancel reaches a running call, and a lost
+                worker is noticed, within about 10 seconds. In Temporal Cloud
+                each heartbeat that reaches the service is an Action; with the
+                default, a call shorter than 5 seconds sends none. Temporal
+                caps ``heartbeat_timeout`` at ``start_to_close_timeout``, so a
+                shorter one (also from a per-call ``timeout``) makes heartbeats
+                come sooner. Set ``heartbeat_timeout`` to ``None`` or
+                ``timedelta(0)`` to turn heartbeats off. On Vertex AI,
+                google-genai refreshes credentials on the event loop for
+                ``interactions`` and ``agents``. A refresh can cause heartbeat
+                timeouts in other calls sharing the loop even when it takes
+                less than the heartbeat timeout. If refreshes can be slow,
+                set a longer ``heartbeat_timeout``, or ``None``. Version 1.0.0
+                adds timer heartbeats. Workers on earlier versions don't
+                heartbeat this way, so a call they run fails after 10 seconds
+                without a heartbeat.
+                The README says how to upgrade and roll back.
             streaming_topic: When set, ``generate_content_stream`` publishes each
                 streamed ``GenerateContentResponse`` to this
                 :class:`temporalio.contrib.workflow_streams.WorkflowStream`

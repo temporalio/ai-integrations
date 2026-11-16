@@ -23,3 +23,9 @@ junit/
 build/
 java/*/bin/
 java/*/gradle/dependency-locks/*.latest.lockfile
+
+# .NET
+dotnet/**/bin/
+dotnet/**/obj/
+dotnet/**/TestResults/
+dotnet/**/*.binlog

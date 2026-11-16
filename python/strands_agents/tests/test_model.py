@@ -2,8 +2,10 @@ import asyncio
 import concurrent.futures
 import importlib
 import inspect
+import logging
+import time
 from collections.abc import AsyncIterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -23,12 +25,14 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, _sync_calls
+from temporalio.strands_agents._heartbeat_decorator import auto_heartbeater
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.strands_agents._sync_calls import _MESSAGE
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Replayer, Worker
 from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
 from temporalio.workflow import NondeterminismError
-from tests.common import get_activities
+from tests.common import get_activities, get_heartbeat_timeouts
 from tests.mock_model import MockModel
 
 # The dotted name passes through the sandbox, so the Workflow gets the binding
@@ -72,11 +76,50 @@ async def test_model(client: Client):
 
     history = await handle.fetch_history()
     assert get_activities(history) == ["strands_get_model_config", "invoke_model"]
+    # The model call heartbeats by default. The config read runs synchronously,
+    # so it can't heartbeat and gets no heartbeat timeout.
+    assert get_heartbeat_timeouts(history) == [None, timedelta(seconds=10)]
 
     await Replayer(
         workflows=[ModelWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+# A factory blocks the event loop, so the heartbeat timer can't run while it
+# builds the model. One slower than the heartbeat timeout logs why.
+@pytest.mark.parametrize(("seconds", "warns"), [(0.3, True), (0.0, False)])
+def test_slow_model_factory_logs_a_warning(
+    caplog: pytest.LogCaptureFixture, seconds: float, warns: bool
+):
+    def factory() -> MockModel:
+        time.sleep(seconds)
+        return MockModel(["Done!"])
+
+    model_activity = ModelActivity({"slow": factory})
+    env = ActivityEnvironment()
+    env.info = replace(env.info, heartbeat_timeout=timedelta(milliseconds=100))
+    with caplog.at_level(logging.WARNING):
+        env.run(model_activity._get_model, "slow")
+    assert ("Building model 'slow' took" in caplog.text) == warns
+
+
+# The heartbeat timer counts from the start of the activity, so a factory that
+# blocks the event loop for less than the timeout only delays the first beat. A
+# timer that started at the first await would beat 1.2 seconds in, too late.
+async def test_heartbeat_timer_counts_from_the_start():
+    @auto_heartbeater
+    async def blocking_start() -> None:
+        time.sleep(0.7)
+        await asyncio.sleep(0.1)
+
+    beats: list[float] = []
+    start = time.monotonic()
+    env = ActivityEnvironment()
+    env.info = replace(env.info, heartbeat_timeout=timedelta(seconds=1))
+    env.on_heartbeat = lambda *_: beats.append(time.monotonic() - start)
+    await env.run(blocking_start)
+    assert beats and beats[0] < 1.0
 
 
 @tool

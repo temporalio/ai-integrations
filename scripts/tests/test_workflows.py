@@ -73,6 +73,9 @@ def test_non_ga_releases_use_environments_without_required_reviewers() -> None:
     assert python["publish-pypi"]["environment"]["name"] == "pypi"
     go = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())["jobs"]
     assert all("environment" not in job for job in go.values())
+    dotnet = yaml.safe_load((REPO / ".github/workflows/release-dotnet.yml").read_text())["jobs"]
+    assert dotnet["publish"]["environment"]["name"] == "nuget"
+    assert all("environment" not in job for name, job in dotnet.items() if name != "publish")
 
 
 @pytest.mark.parametrize("maturity,requires_approval", [
@@ -115,8 +118,8 @@ def test_ci_status_is_the_fan_in() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     status = doc["jobs"]["ci-status"]
     assert status["if"] == "always()"
-    assert set(status["needs"]) == {"changes", "conventions", "python", "java", "go", "typescript"}
-    for language in ("python", "java", "go", "typescript"):
+    assert set(status["needs"]) == {"changes", "conventions", "python", "java", "go", "typescript", "dotnet"}
+    for language in ("python", "java", "go", "typescript", "dotnet"):
         job = doc["jobs"][language]
         assert job["uses"] == f"./.github/workflows/_{language}-plugin.yml"
         assert "needs.changes.result == 'success'" in job["if"]
@@ -147,7 +150,52 @@ def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
     assert "make sync-latest" in sync["run"] and "make sync" in sync["run"]
 
 
-@pytest.mark.parametrize("language,sync_name", [("python", "Sync environment"), ("typescript", "Sync dependencies")])
+def test_dotnet_checks_package_and_clean_consumer_after_testing() -> None:
+    ci = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
+    assert ci["jobs"]["dotnet"]["with"]["deps"] == ci["jobs"]["python"]["with"]["deps"]
+    workflow = yaml.safe_load((REPO / ".github/workflows/_dotnet-plugin.yml").read_text())
+    assert workflow[True]["workflow_call"]["inputs"]["version"]["default"] == ""
+    for job in workflow["jobs"].values():
+        checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        assert checkout["with"] == {"ref": "${{ inputs.ref || github.sha }}", "persist-credentials": False}
+    test = workflow["jobs"]["test"]
+    # The version reaches build, test and pack through dotnet.mk's RELEASE_VERSION; no checkout file changes.
+    assert test["env"]["RELEASE_VERSION"] == "${{ inputs.version || '0.0.0' }}"
+    steps = test["steps"]
+    names = [step.get("name", "") for step in steps]
+    assert not any("version" in name.lower() for name in names), "the plugin tree is never modified for a release"
+    setup = next(step for step in steps if step.get("uses", "").startswith("actions/setup-dotnet@"))
+    # The SDK comes from the plugin's global.json; the cell's runtime is installed next to it for the tests.
+    assert setup["with"]["dotnet-version"] == "${{ matrix.runtime }}.x"
+    assert setup["with"]["global-json-file"] == "dotnet/${{ inputs.plugin }}/global.json"
+    assert setup["with"]["cache"] is True and setup["with"]["cache-dependency-path"].endswith("/**/packages.lock.json")
+    sdk = names.index("SDK is the global.json channel and the runtime under test is installed")
+    check = names.index("Check dependency resolution under the cooldown")
+    sync = names.index("Sync dependencies")
+    lint = names.index("Lint")
+    run_tests = names.index("Test")
+    build = names.index("Build and verify NuGet package")
+    reports = names.index("Upload test reports")
+    upload = names.index("Upload tested package")
+    assert sdk < check < sync < lint < run_tests < build < reports < upload
+    assert steps[lint]["run"] == 'cd "$PLUGIN_DIR" && make lint'
+    # Each cell runs the target framework of its runtime; the global.json SDK builds every framework.
+    assert steps[run_tests]["run"] == 'cd "$PLUGIN_DIR" && make test TEST_FRAMEWORK="net$RUNTIME"'
+    assert steps[run_tests]["env"] == {"RUNTIME": "${{ matrix.runtime }}"}
+    assert steps[build]["if"] == "matrix.dist"
+    assert "make build" in steps[build]["run"]
+    assert "check_dotnet_dist.py" in steps[build]["run"] and '--commit "$(git rev-parse HEAD)"' in steps[build]["run"]
+    assert "smoke_dotnet.py" in steps[build]["run"] and '--dist "$PLUGIN_DIR/dist"' in steps[build]["run"]
+    assert steps[reports]["if"] == "always()"
+    assert "${{ inputs.deps }}" in steps[reports]["with"]["name"], "nightly and release runs of one plugin differ in deps"
+    assert steps[upload]["if"] == "matrix.dist"
+    assert steps[upload]["with"]["name"] == "dist-dotnet-${{ inputs.plugin }}"
+    assert steps[upload]["with"]["if-no-files-found"] == "error" and steps[upload]["with"]["overwrite"] is True
+
+
+@pytest.mark.parametrize("language,sync_name", [
+    ("python", "Sync environment"), ("typescript", "Sync dependencies"), ("dotnet", "Sync dependencies"),
+])
 def test_cooldown_is_checked_before_installing_the_committed_lock(language: str, sync_name: str) -> None:
     workflow = yaml.safe_load((REPO / f".github/workflows/_{language}-plugin.yml").read_text())
     steps = workflow["jobs"]["test"]["steps"]
@@ -232,6 +280,7 @@ def test_go_release_source_must_be_main_reachable_for_tag_runs(plugin_repo: Path
 @pytest.mark.parametrize("language,skip_when", [
     ("python", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
     ("typescript", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
+    ("dotnet", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
     ("java", "github.event_name != 'workflow_dispatch' || inputs.deployment-id == ''"),
     # A Go tag is public once it exists, so only the branch dry run before tagging can stop it.
     ("go", "github.ref_type != 'tag' && github.event_name == 'workflow_dispatch'"),
@@ -247,29 +296,48 @@ def test_releases_check_the_nightly_run_after_the_version_policy(language: str, 
     assert step["run"].endswith('release_tool.py check-nightly --tag "$TAG"')
 
 
-def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
-    doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
-    for job in ("publish-testpypi", "publish-pypi"):
+# The publish jobs of each release workflow: the ones with an OIDC token, the action that uses it and the
+# job whose `if` carries the tests-or-recovery gate (for .NET that is the token-free check before the push).
+RELEASE_PUBLISHERS = {
+    "python": {"jobs": ("publish-testpypi", "publish-pypi"), "action": "pypa/gh-action-pypi-publish@", "gated": "publish-testpypi",
+               "environments": {"publish-testpypi": "testpypi", "publish-pypi": {"name": "pypi", "url": "${{ needs.prepare.outputs.release_url }}"}},
+               "final": "publish-pypi", "final_if": "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'",
+               "tag_step": "Parse tag", "final_needs": {"prepare", "smoke-testpypi"}},
+    "dotnet": {"jobs": ("publish",), "action": "NuGet/login@", "gated": "existing",
+               "environments": {"publish": {"name": "nuget", "url": "${{ needs.prepare.outputs.release_url }}"}},
+               "final": "publish", "final_if": "needs.existing.result == 'success' && needs.prepare.outputs.publish == 'true'",
+               "tag_step": "Parse .NET tag", "final_needs": {"prepare", "test", "existing"}},
+}
+
+
+@pytest.mark.parametrize("language", sorted(RELEASE_PUBLISHERS))
+def test_release_publish_jobs_are_inline_and_oidc_only(language: str) -> None:
+    spec = RELEASE_PUBLISHERS[language]
+    doc = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())
+    for job in spec["jobs"]:
         j = doc["jobs"][job]
         assert j["permissions"] == {"id-token": "write", "actions": "read"}
         assert "uses" not in j, "publish jobs must be inline (PyPI rejects reusable workflows as trusted publishers)"
         steps = [s.get("uses", "") for s in j["steps"]]
         assert not any("checkout" in s for s in steps), "publish jobs download artifacts only"
-        assert any(s.startswith("pypa/gh-action-pypi-publish@") for s in steps)
-    assert doc["jobs"]["publish-testpypi"]["environment"] == "testpypi"
-    assert doc["jobs"]["publish-pypi"]["environment"]["name"] == "pypi"
-    # Uploads require a tagged run's tests or validated artifact recovery; PyPI needs its policy gate.
-    assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
-    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
-    assert "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'" in doc["jobs"]["publish-pypi"]["if"]
+        assert any(s.startswith(spec["action"]) for s in steps)
+        assert j["environment"] == spec["environments"][job]
+    for name, job in doc["jobs"].items():
+        if name not in spec["jobs"]:
+            assert "id-token" not in job.get("permissions", {}), f"{name}: only the publish jobs hold an OIDC token"
+    # Uploads require a tagged run's tests or validated artifact recovery; the final registry needs its policy gate.
+    gated = doc["jobs"][spec["gated"]]
+    assert "needs.prepare.outputs.publish == 'true'" in gated["if"]
+    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in gated["if"]
+    assert spec["final_if"] in doc["jobs"][spec["final"]]["if"]
     assert doc[True]["release"]["types"] == ["published"]  # PyYAML parses the `on` key as boolean True
     assert "push" not in doc[True], "tag creation must not publish before release notes are reviewed"
-    assert doc["jobs"]["prepare"]["if"] == "github.event_name != 'release' || startsWith(github.event.release.tag_name, 'python/')"
+    assert doc["jobs"]["prepare"]["if"] == f"github.event_name != 'release' || startsWith(github.event.release.tag_name, '{language}/')"
     inputs = doc[True]["workflow_dispatch"]["inputs"]
     assert inputs["skip-publish"]["type"] == "boolean" and inputs["tag"]["type"] == "string"
     # A dispatch on a tag ref with a different tag input must be rejected before anything runs.
     prepare_steps = [s.get("name", "") for s in doc["jobs"]["prepare"]["steps"]]
-    assert prepare_steps.index("Dispatch inputs are consistent with the ref") < prepare_steps.index("Parse tag")
+    assert prepare_steps.index("Dispatch inputs are consistent with the ref") < prepare_steps.index(spec["tag_step"])
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     assert '[ "$SKIP_PUBLISH" = "false" ]' in gate["run"], "publish only on the literal false"
     tag = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "tag")
@@ -284,11 +352,13 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     assert doc["concurrency"]["group"] == "${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
 
 
-def test_published_release_is_verified_before_uploads_and_linked_from_deployment() -> None:
-    jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+@pytest.mark.parametrize("language", sorted(RELEASE_PUBLISHERS))
+def test_published_release_is_verified_before_uploads_and_linked_from_deployment(language: str) -> None:
+    spec = RELEASE_PUBLISHERS[language]
+    jobs = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]
     prepare = jobs["prepare"]
-    publish = jobs["publish-pypi"]
-    assert set(publish["needs"]) == {"prepare", "smoke-testpypi"}
+    publish = jobs[spec["final"]]
+    assert set(publish["needs"]) == spec["final_needs"]
     assert publish["environment"]["url"] == "${{ needs.prepare.outputs.release_url }}"
     assert prepare["outputs"]["release_url"] == "${{ steps.release.outputs.url }}"
     verify = next(step for step in prepare["steps"] if step.get("id") == "release")
@@ -301,7 +371,7 @@ def test_published_release_is_verified_before_uploads_and_linked_from_deployment
     assert summary["if"] == verify["if"]
 
 
-@pytest.mark.parametrize("language", ["python", "typescript", "java", "go"])
+@pytest.mark.parametrize("language", ["python", "typescript", "java", "go", "dotnet"])
 def test_publication_does_not_modify_the_reviewed_github_release(language: str) -> None:
     jobs = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]
     for job in jobs.values():
@@ -399,7 +469,7 @@ def test_release_recovery_rejects_dispatch_outside_main(ref_type: str, ref_name:
     assert result.returncode == 1 and "recovery must be dispatched on main" in result.stdout
 
 
-@pytest.mark.parametrize("language", ["python", "java"])
+@pytest.mark.parametrize("language", ["python", "java", "typescript", "go", "dotnet"])
 def test_release_checkouts_do_not_persist_credentials(language: str) -> None:
     doc = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())
     for name, job in doc["jobs"].items():

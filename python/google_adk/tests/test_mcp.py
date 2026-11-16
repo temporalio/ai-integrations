@@ -23,14 +23,19 @@ honors that call's ``factory_argument``, and always closes the toolset.
 """
 
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from google.adk.events import EventActions
 from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
+from google.adk.tools.mcp_tool.mcp_tool import McpTool
+from mcp.types import Tool
 
 from temporalio.google_adk._mcp import (
     TemporalMcpToolSetProvider,
     TemporalToolContext,
+    TemporalToolSession,
     _CallToolArguments,
     _GetToolsArguments,
 )
@@ -93,6 +98,8 @@ def _tool_context() -> TemporalToolContext:
         tool_confirmation=None,
         function_call_id=None,
         event_actions=EventActions(),
+        session=TemporalToolSession(app_name="test-app"),
+        user_id="test-user",
     )
 
 
@@ -124,6 +131,38 @@ async def test_call_tool_creates_and_closes_fresh_toolset_each_call():
     # One fresh toolset per call, and every one was closed.
     assert len(created) == 5
     assert all(t.closed for t in created)
+
+
+async def test_mcp_confirmation_returns_event_actions_without_calling_server():
+    session_manager = MagicMock(spec=MCPSessionManager)
+    tool = McpTool(
+        mcp_tool=Tool.model_validate(
+            {"name": "echo", "inputSchema": {"type": "object"}}
+        ),
+        mcp_session_manager=session_manager,
+        require_confirmation=True,
+    )
+    toolset = MagicMock(spec=McpToolset)
+    toolset.get_tools = AsyncMock(return_value=[tool])
+    toolset.close = AsyncMock()
+    provider = TemporalMcpToolSetProvider("confirmation", lambda _: toolset)
+    _, call_tool = provider._get_activities()
+    args = _call_tool_args()
+    args.tool_context.function_call_id = "call-1"
+
+    result = await call_tool(args)
+
+    assert result.result == {
+        "error": "This tool call requires confirmation, please approve or reject."
+    }
+    assert result.tool_context.event_actions.skip_summarization is True
+    assert result.tool_context.actions is result.tool_context.event_actions
+    confirmation = result.tool_context.event_actions.requested_tool_confirmations[
+        "call-1"
+    ]
+    assert confirmation.confirmed is False
+    session_manager.create_session.assert_not_called()
+    toolset.close.assert_awaited_once()
 
 
 async def test_get_tools_creates_and_closes_fresh_toolset():
@@ -226,3 +265,112 @@ async def test_call_tool_no_matching_tool_still_closes():
 
     assert len(created) == 1
     assert created[0].closed
+
+
+# ---------------------------------------------------------------------------
+# MCP protocol errors: retryability
+# ---------------------------------------------------------------------------
+
+
+def _mcp_error(code: int, message: str, data: Any) -> Exception:
+    try:
+        from mcp import (  # type: ignore[attr-defined]  # mcp>=2
+            MCPError,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+
+        return MCPError(code, message, data)
+    except ImportError:  # mcp<2
+        from mcp.shared.exceptions import (  # type: ignore[attr-defined]
+            McpError,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+        from mcp.types import ErrorData
+
+        return McpError(ErrorData(code=code, message=message, data=data))
+
+
+def _toolset_failing_list_tools(error: Exception) -> McpToolset:
+    """A real ``McpToolset`` whose MCP session fails ``tools/list``.
+
+    Only the session is faked, so the error reaches the activity the way ADK
+    really reports it (wrapped in a ``ConnectionError``).
+    """
+    from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+    from mcp import StdioServerParameters
+
+    class _FailingSession:
+        async def list_tools(self) -> Any:
+            raise error
+
+    toolset = McpToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(command="unused")
+        )
+    )
+
+    async def create_session(headers: Any = None) -> Any:  # pyright: ignore[reportUnusedParameter]
+        return _FailingSession()
+
+    setattr(toolset._mcp_session_manager, "create_session", create_session)
+    return toolset
+
+
+@pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
+@pytest.mark.parametrize(
+    ("code", "message", "data", "non_retryable"),
+    [
+        (-32602, "Invalid params", None, True),
+        (-32601, "Method not found", None, True),
+        (-32700, "Parse error", None, True),
+        (-32600, "Invalid request", {"why": "bad"}, True),
+        # Transient or unknown: stay retryable.
+        (-32603, "Internal error", None, False),
+        (-32001, "Request timed out", None, False),
+        # A server that lost our session: a retry reconnects, so keep retrying.
+        (-32600, "Session terminated", None, False),
+        (-32600, "Session not found", None, False),
+    ],
+)
+async def test_mcp_protocol_error_retryability(
+    operation: str,
+    code: int,
+    message: str,
+    data: Any,
+    non_retryable: bool,
+):
+    from temporalio.exceptions import ApplicationError
+
+    created: list[McpToolset] = []
+
+    def factory(_: Any) -> McpToolset:
+        toolset = _toolset_failing_list_tools(_mcp_error(code, message, data))
+        created.append(toolset)
+        return toolset
+
+    provider = TemporalMcpToolSetProvider("stateless_protocol_error", factory)
+    get_tools, call_tool = provider._get_activities()
+
+    with pytest.raises(ApplicationError) as exc_info:
+        if operation == "list-tools":
+            await get_tools(_GetToolsArguments(factory_argument=None))
+        else:
+            await call_tool(_call_tool_args())
+
+    assert exc_info.value.type == "MCPProtocolError"
+    assert exc_info.value.non_retryable is non_retryable
+    assert exc_info.value.message == message
+    # ADK's own error stays attached as the cause.
+    assert isinstance(exc_info.value.__cause__, ConnectionError)
+    assert len(created) == 1
+
+
+async def test_non_mcp_error_is_not_converted():
+    """Failures that are not MCP protocol errors propagate unchanged."""
+
+    def factory(arg: Any) -> McpToolset:
+        return cast(McpToolset, cast(object, _FakeToolset(arg, fail_get_tools=True)))
+
+    provider = TemporalMcpToolSetProvider("stateless_plain_error", factory)
+    get_tools, _ = provider._get_activities()
+
+    with pytest.raises(RuntimeError, match="get_tools failed"):
+        await get_tools(_GetToolsArguments(factory_argument=None))

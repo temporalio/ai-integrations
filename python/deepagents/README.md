@@ -99,6 +99,40 @@ Two things worth noticing:
 - Tools, real-I/O backends, human-in-the-loop, streaming, and continue-as-new
   each get a section below.
 
+## Model profiles
+
+Deep Agents sizes summarization from the model's LangChain profile
+(`max_input_tokens`). Only the model name reaches the Workflow, so fetch the
+profile of the Worker's model before building the agent:
+
+```python
+from temporalio import workflow
+from temporalio.deepagents import (
+    TemporalModel,
+    create_temporal_deep_agent,
+    get_model_profile,
+)
+
+
+@workflow.defn
+class ResearchAgent:
+    @workflow.run
+    async def run(self, question: str) -> None:
+        model = "anthropic:claude-haiku-4-5"
+        profile = await get_model_profile(model)
+        agent = create_temporal_deep_agent(
+            model=TemporalModel(model=model, profile=profile),
+            tools=[],
+        )
+        ...
+```
+
+`get_model_profile` runs one Activity, registered by `DeepAgentsPlugin`, that
+returns `model_provider(name).profile`, and History records the result, so a
+later change on the Worker does not affect runs in flight.
+`create_temporal_deep_agent` keeps a `TemporalModel`'s profile when it applies
+`activity_options`.
+
 ## Configuring activity options
 
 Per agent (recommended): `create_temporal_deep_agent(..., activity_options=...)`
@@ -130,6 +164,7 @@ from datetime import timedelta
 from langchain_core.tools import tool
 from temporalio import activity
 from temporalio.deepagents import activity_as_tool, tool_as_activity
+from temporalio.workflow import ActivityConfig
 
 
 @activity.defn
@@ -146,7 +181,8 @@ def web_search(query: str) -> str:
 
 # An existing Temporal activity, exposed to the agent as a tool:
 weather_tool = activity_as_tool(
-    get_weather, start_to_close_timeout=timedelta(seconds=30)
+    get_weather,
+    activity_options=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
 )
 # A LangChain tool whose body does I/O, moved into an activity:
 search_tool = tool_as_activity(
@@ -158,6 +194,16 @@ Pass both to `create_temporal_deep_agent(..., tools=[weather_tool,
 search_tool])`. An unwrapped, non-builtin tool runs in-workflow and the plugin
 warns at construction, so the choice is never silent. Deep Agents' pure
 built-ins (`write_todos`, state-backed file tools) stay in-workflow by design.
+
+`activity_as_tool` takes every activity option through `activity_options`, an
+`ActivityConfig`: timeouts (`start_to_close_timeout` or
+`schedule_to_close_timeout` is required), `retry_policy`, `summary` (default
+`"tool:<name>"`), `activity_id`, and routing such as `task_queue`. Route a slow
+tool to its own workers with `task_queue="weather-tools"` (a worker registered
+for `get_weather` must then poll that queue), or set `heartbeat_timeout` for an
+activity that heartbeats, so a lost worker is noticed at the heartbeat instead
+of at start-to-close. `arg` and `args` are reserved: the tool builds them from
+the model's call.
 
 Call `tool_as_activity(...)` at module import or worker startup on **every
 activity worker** that can receive `deepagents.invoke_tool`. Registration is

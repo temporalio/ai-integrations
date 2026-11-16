@@ -61,6 +61,18 @@ def _validate_http_options(http_options: HttpOptions | None) -> None:
         )
 
 
+def _with_default_heartbeat(config: ActivityConfig) -> ActivityConfig:
+    """Return a copy of ``config`` with a 10-second ``heartbeat_timeout`` if it has none.
+
+    A ``heartbeat_timeout`` the config sets wins, and ``None`` turns heartbeats
+    off. The Gemini activities heartbeat on a timer at half of it.
+    """
+    result: ActivityConfig = {**config}
+    if "heartbeat_timeout" not in result:
+        result["heartbeat_timeout"] = timedelta(seconds=10)
+    return result
+
+
 class _TemporalApiClient(BaseApiClient):  # pyright: ignore[reportUnusedClass]
     """A ``BaseApiClient`` that routes all API calls through Temporal activities.
 
@@ -92,7 +104,7 @@ class _TemporalApiClient(BaseApiClient):  # pyright: ignore[reportUnusedClass]
         self.api_key: str | None = None
         self.custom_base_url: str | None = None
 
-        self._activity_config = (
+        self._activity_config = _with_default_heartbeat(
             ActivityConfig(start_to_close_timeout=timedelta(seconds=60))
             if activity_config is None
             else activity_config

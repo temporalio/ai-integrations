@@ -346,6 +346,8 @@ new Worker({
 
 Each factory returns a fully configured `McpClient`. The connection is opened lazily on first use rather than at worker startup.
 
+A factory result must have callable `connect()`, `disconnect()`, `listTools()` and `callTool()` methods. An invalid result now fails the Activity without retries with type `MCPClientFactoryTypeError`. Fix these factories before upgrading; the next attempt of an in-flight Activity also runs this check.
+
 `TemporalMCPClient` takes `prefix` and `toolFilters`, which work as on Strands' `McpClient`: the agent sees `{prefix}_{name}`, and string and `RegExp` filters match the server's tool name. A callback filter receives the workflow-side `TemporalMCPTool` and runs in the workflow, so it must be deterministic. Tool calls send the server's own name. Set `prefix` here, not on the factory's `McpClient`: a factory `McpClient` with a `prefix` fails the `{name}-listTools` activity, which is retried until the worker is fixed. The factory's `toolFilters` still apply on the worker, before these. Each listing records the tools that the factory's `McpClient` returns in the workflow history, before these filters apply; for a server with many tools, filter on the factory or set `cacheTools: true`.
 
 ```ts
