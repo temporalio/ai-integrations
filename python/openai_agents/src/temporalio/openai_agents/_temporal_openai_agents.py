@@ -340,7 +340,7 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
                 raise
             try:
                 value = _lenient_construct(type_hint, json.loads(payload.data))
-            except Exception:
+            except (ValueError, TypeError):
                 # A value this fallback can't build fails with the strict error.
                 raise e from None
             return _list_decoded_iterators(value)

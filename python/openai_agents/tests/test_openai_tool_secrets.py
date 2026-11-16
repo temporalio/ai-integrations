@@ -189,11 +189,31 @@ def _drifted_payload(value: Any) -> Payload:
     ],
     ids=["caller-model", "validator-changing-its-input"],
 )
+@pytest.mark.parametrize("fallback_error", [None, ValueError, TypeError, RuntimeError])
 def test_lenient_fallback_raises_instead_of_returning_a_dict(
     value: pydantic.BaseModel,
+    fallback_error: type[Exception] | None,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    with pytest.raises(pydantic.ValidationError):
+    error = fallback_error("fallback failed") if fallback_error else None
+    if error is not None:
+
+        def fail(_type: Any, _value: Any) -> Any:
+            raise error
+
+        monkeypatch.setattr(
+            "temporalio.openai_agents._temporal_openai_agents._lenient_construct", fail
+        )
+
+    expected = (
+        RuntimeError if fallback_error is RuntimeError else pydantic.ValidationError
+    )
+    with pytest.raises(expected) as raised:
         OpenAIPayloadConverter().from_payload(_drifted_payload(value), type(value))
+    if fallback_error is RuntimeError:
+        assert raised.value.__cause__ is error
+    else:
+        assert raised.value.__suppress_context__
 
 
 def test_build_tool_reports_unreconstructed_dict():
