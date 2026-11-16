@@ -182,6 +182,59 @@ The configured payload converter rebuilds each value, as it would an Activity pa
 
 **Breaking change:** code that reads these values with dictionary access, such as `state["answer"]["value"]`, must use attribute access, such as `state["answer"].value`. Code that validates values again, such as `Answer.model_validate(value)` or `convert_to_messages(messages)`, keeps working, except `model_validate` in Workflow code with a model class the sandbox loaded itself; import its module with `imports_passed_through()` as above. Activity payloads keep their format and only gain type information, so older Workers read new payloads as before, and histories recorded before the upgrade replay unchanged, apart from the task cache case below. Results recorded before the upgrade still replay as dictionaries, so deploy Workflow code that reads Activity results by attribute with Worker Versioning or after open runs finish. Task cache keys for arguments that are models, dataclasses or sets now come from their class and contents, so a run that carries a task cache across continue-as-new can fail replay with a non-determinism error on the other version, after an upgrade or a rollback. Let such runs finish before you upgrade, or upgrade with Worker Versioning. Runs started on this version may not replay on an earlier one, so roll back with Worker Versioning.
 
+## Continue-as-new
+
+`cache()` returns the results of the Activity nodes and tasks called so far, as a dictionary. Pass it to the next run through `workflow.continue_as_new()` and give it to `graph(name, cache=...)` or `entrypoint(name, cache=...)` there. When the new run calls a node or task with the same input as a call in the cache, it gets the cached result and no Activity runs.
+
+```python
+from typing import Any
+
+from temporalio import workflow
+from temporalio.langgraph import cache, graph
+
+
+@workflow.defn
+class SummarizeWorkflow:
+    @workflow.run
+    async def run(
+        self, documents: list[str], carried: dict[str, Any] | None = None
+    ) -> list[str]:
+        app = graph("summarize", cache=carried).compile()
+        summaries = []
+        for document in documents:
+            if workflow.info().is_continue_as_new_suggested():
+                workflow.continue_as_new(args=[documents, cache()])
+            result = await app.ainvoke({"document": document})
+            summaries.append(result["summary"])
+        return summaries
+```
+
+The next run starts the loop again. The documents an earlier run finished come from the cache, and Activities run for the rest. A document that is in the list twice is an exception: see "What comes from the cache" below.
+
+The cache belongs to the Workflow run. `__init__`, `run`, Signal and Update handlers, and nodes and tasks that run in the Workflow share it, so you can call `graph()` and `entrypoint()` in any of them, and no other Workflow sees it. Every graph and entrypoint of the run uses it, and a call without `cache` keeps what an earlier call was given.
+
+### What comes from the cache
+
+Only results from an earlier run come from the cache, each once. A node or task that a run calls again with the same input runs its Activity again, as in LangGraph, so a poll loop sees its result change. When a run made the same call several times, the next run gets the latest result for the first such call and runs the others, and so does every run after it. The same holds for calls made in parallel, such as two `Send`s with the same argument. To get every result back, give each call an input of its own, for example an item's position in a list.
+
+Two calls are the same when the node or task, its arguments and the run `context` are equal. A Graph API node is identified by its graph and node name and a task by its module and function name, so two nodes that share a function keep separate results. The rest of the run's config, such as `thread_id`, `configurable` values and tags, is not compared.
+
+A cached result is returned whatever it holds, a human's answer to an `interrupt()` included. The cache cannot tell a call that the next run repeats from a new call with the same input, so pass it only to a run that starts the same work again. If the same request has to be asked again in the next run, put a value that tells the requests apart into the node's input.
+
+`cache()` holds the latest result of every different call the runs have made so far. It travels in the continue-as-new input, so it counts toward the payload size limit.
+
+### Values you carry yourself
+
+Equal arguments have equal values of equal types. Results that come from the cache keep their types. A message list or a Pydantic model that you carry through `workflow.continue_as_new()` yourself comes back as plain JSON unless the Workflow declares its type. A dictionary is not the same input as the object an Activity returned, so the node runs again, and it gets a dictionary where it got an object before.
+
+Carry such values with their types. One way is a typed Workflow parameter, for example a Pydantic model with `messages: list[AnyMessage]`, together with `pydantic_data_converter`. The other is to rebuild them before you call the graph: `TypeAdapter(list[AnyMessage]).validate_python(...)` for messages, `Answer.model_validate(...)` for a model. A graph whose state schema is a Pydantic model rebuilds its own fields. `convert_to_messages()` is not enough, and neither is passing the carried dictionaries into an `add_messages` state: LangChain rebuilds an `AIMessage` from a dictionary with `invalid_tool_calls` and `usage_metadata` in its `additional_kwargs`, which the message the Activity returned does not have.
+
+A message that a node returns without an `id` gets a random one in the Workflow, new in every run, so the nodes that get that message as input run again after continue-as-new. `ToolNode` returns its tool messages without an `id`.
+
+### Upgrading
+
+**Breaking change:** earlier versions returned a call's first result to every later call with the same input, in the same run too. They kept the cache in a context variable that Workflows on one Worker thread could share, and they identified a Graph API node by its function. A Workflow that makes the same call several times now runs an Activity for each one, and after continue-as-new it runs all but the first again: see "What comes from the cache". A run recorded on an earlier version fails replay on this one with a non-determinism error if the cache gave it a result for a call the same run had made before, a result of another Workflow, or, after continue-as-new, the result of a Graph API node. Let such runs finish before you upgrade, or upgrade with Worker Versioning. A chain of runs that continues as new across the upgrade runs its finished Graph API nodes once more, because the cache it carries identifies them by function. It still finds its task results. Runs started on this version may not replay on an earlier one, so roll back with Worker Versioning. Calling `graph()` or `entrypoint()` again no longer empties the cache, and `graph(name, cache=carried)` no longer adds results to `carried`: read them with `cache()`.
+
 ## Summaries
 
 Summaries are short, human-readable labels that show up in the Temporal UI and CLI, making it easier to see what each step of a run is doing.

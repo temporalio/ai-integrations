@@ -487,9 +487,16 @@ def wrap_execute_activity(
                 )
             langgraph_config["context_schema_id"] = schema_id
 
-        # Check task result cache (for continue-as-new deduplication).
+        # Check task result cache (for continue-as-new deduplication). The
+        # config LangGraph injects stays out of the key: it is not the
+        # caller's input, and its task and checkpoint IDs are new in every run.
         key = (
-            cache_key(task_id, args, kwargs, langgraph_config.get("context"))
+            cache_key(
+                task_id,
+                args,
+                {name: value for name, value in kwargs.items() if name != "config"},
+                langgraph_config.get("context"),
+            )
             if task_id
             else ""
         )
@@ -500,12 +507,12 @@ def wrap_execute_activity(
         # is never mistaken for a Command. Value types go under "<key>:types",
         # so older Workflows still find the plain entry.
         if task_id:
-            found_command, command = cache_lookup(f"{key}:command")
-            found_result, result = cache_lookup(key)
-            if found_command or found_result:
-                _, result_types = cache_lookup(f"{key}:types")
+            cached = cache_lookup(key)
+            if cached is not None:
                 return output_value(
-                    None if found_command else result, command, result_types
+                    cached.get(key),
+                    cached.get(f"{key}:command"),
+                    cached.get(f"{key}:types"),
                 )
 
         arg_types: list[Any] = []
@@ -530,12 +537,14 @@ def wrap_execute_activity(
 
         # Store in cache for future continue-as-new cycles.
         if task_id:
-            if output.langgraph_command is not None:
-                cache_put(f"{key}:command", output.langgraph_command)
-            else:
-                cache_put(key, output.result)
+            entries = (
+                {f"{key}:command": output.langgraph_command}
+                if output.langgraph_command is not None
+                else {key: output.result}
+            )
             if output.value_types:
-                cache_put(f"{key}:types", output.value_types)
+                entries[f"{key}:types"] = output.value_types
+            cache_put(key, entries)
 
         return output_value(output.result, output.langgraph_command, output.value_types)
 
