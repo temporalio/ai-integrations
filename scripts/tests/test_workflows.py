@@ -495,6 +495,7 @@ def test_java_matrix_runs_before_artifact_upload() -> None:
     assert 'spotlessCheck test' in test['run'] and 'spotlessApply' not in test['run']
     assert '-PreleaseVersion=$RELEASE_VERSION' in test['run']
     assert '-PspringBootVersion=$SPRING_BOOT_VERSION' in test['run']
+    assert '--offline' in test['run'] and '--offline' in build['run']
     assert build['if'] == upload['if'] == 'matrix.dist'
     assert 'check_java_dist.py' in build['run'] and 'smoke_java.py' in build['run']
     assert steps.index(test) < steps.index(build) < steps.index(upload)
@@ -510,16 +511,46 @@ def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> No
     assert doc[True]['workflow_call']['inputs']['deps']['default'] == 'locked'
     assert doc['jobs']['test']['env']['DEPS'] == '${{ inputs.deps }}'
     steps = doc['jobs']['test']['steps']
-    resolve = next(s for s in steps if s.get('name') == 'Resolve latest dependencies')
+    resolve = next(s for s in steps if s.get('name') == 'Resolve dependencies')
     test = next(s for s in steps if s.get('name') == 'Lint and test')
     build = next(s for s in steps if s.get('name') == 'Build and verify tested distributions')
-    assert resolve['if'] == "inputs.deps == 'latest'"
-    assert 'resolveAndLockAll --write-locks --refresh-dependencies' in resolve['run']
-    for step in (resolve, test, build):
+    assert 'if' not in resolve
+    assert 'resolve_java_dependencies.py' in resolve['run']
+    assert '--dependency-mode "$DEPS"' in resolve['run']
+    assert '--spring-boot-version "$SPRING_BOOT_VERSION"' in resolve['run']
+    assert '--version "$RELEASE_VERSION"' in resolve['run']
+    for step in (test, build):
         assert '-PdependencyMode=$DEPS' in step['run']
         assert '-PspringBootVersion=$SPRING_BOOT_VERSION' in step['run']
     assert '--write-locks' not in test['run'] + build['run']
     assert steps.index(resolve) < steps.index(test) < steps.index(build)
+
+
+def test_java_caches_are_isolated_by_matrix_and_locks_and_saved_only_after_success() -> None:
+    doc = yaml.safe_load((REPO / '.github/workflows/_java-plugin.yml').read_text())
+    steps = doc['jobs']['test']['steps']
+    setup = next(s for s in steps if s.get('uses', '').startswith('gradle/actions/setup-gradle@'))
+    assert setup['with']['cache-provider'] == 'external'
+    restore = next(s for s in steps if s.get('id') == 'gradle-cache')
+    save = next(s for s in steps if s.get('name') == 'Save Gradle cache')
+    key = restore['with']['key']
+    prefix = restore['with']['restore-keys'].strip()
+    for dimension in ('runner.os', 'runner.arch', 'inputs.plugin', 'matrix.runtime',
+                      "matrix.spring_boot || 'none'", 'inputs.deps'):
+        assert '${{ ' + dimension + ' }}' in key
+        assert '${{ ' + dimension + ' }}' in prefix
+    assert "format('java/{0}/gradle/**', inputs.plugin)" in key  # Wrapper and committed dependency locks.
+    assert "format('java/{0}/**/*.gradle*', inputs.plugin)" in key
+    assert "'java/_shared/*.gradle'" in key
+    assert "inputs.deps == 'latest' && github.run_id" in key  # Nightly snapshots must be refreshable.
+    assert restore['with']['path'] == save['with']['path']
+    assert save['with']['key'] == '${{ steps.gradle-cache.outputs.cache-primary-key }}'
+    assert "github.event.repository.default_branch" in save['if']
+    assert "steps.gradle-cache.outputs.cache-hit != 'true'" in save['if']
+    assert 'always()' not in save['if'] and 'failure()' not in save['if']
+    resolve = next(s for s in steps if s.get('name') == 'Resolve dependencies')
+    build = next(s for s in steps if s.get('name') == 'Build and verify tested distributions')
+    assert steps.index(restore) < steps.index(resolve) < steps.index(build) < steps.index(save)
 
 
 def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:

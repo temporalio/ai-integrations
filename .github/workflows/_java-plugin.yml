@@ -61,27 +61,46 @@ jobs:
           java-version: ${{ matrix.runtime }}
       - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
         with:
-          cache-provider: basic
+          cache-provider: external
+      # Each matrix variant needs its own complete cache, including its dependency locks.
+      - name: Restore Gradle cache
+        id: gradle-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: java-gradle-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.plugin }}-${{ matrix.runtime }}-${{ matrix.spring_boot || 'none' }}-${{ inputs.deps }}-${{ hashFiles(format('java/{0}/**/*.gradle*', inputs.plugin), format('java/{0}/gradle/**', inputs.plugin), 'java/_shared/*.gradle') }}-${{ inputs.deps == 'latest' && github.run_id || 'locked' }}
+          restore-keys: |
+            java-gradle-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.plugin }}-${{ matrix.runtime }}-${{ matrix.spring_boot || 'none' }}-${{ inputs.deps }}-
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version-file: scripts/pyproject.toml
-      - name: Resolve latest dependencies
-        if: inputs.deps == 'latest'
+      - name: Resolve dependencies
         run: |
-          cd "$PLUGIN_DIR"
-          ./gradlew --no-daemon "-PdependencyMode=$DEPS" "-PspringBootVersion=$SPRING_BOOT_VERSION" resolveAndLockAll --write-locks --refresh-dependencies
+          uv run --project scripts --locked python scripts/ci/resolve_java_dependencies.py \
+            --plugin-dir "$PLUGIN_DIR" --dependency-mode "$DEPS" \
+            --spring-boot-version "$SPRING_BOOT_VERSION" --version "$RELEASE_VERSION"
       - name: Lint and test
         run: |
           cd "$PLUGIN_DIR"
-          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" spotlessCheck test
+          ./gradlew --no-daemon --offline "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" spotlessCheck test
       - name: Build and verify tested distributions
         if: matrix.dist
         run: |
           cd "$PLUGIN_DIR"
-          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" stageDist
+          ./gradlew --no-daemon --offline "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" stageDist
           cd ../..
           uv run --project scripts --locked python scripts/ci/check_java_dist.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION"
           uv run --project scripts --locked python scripts/ci/smoke_java.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION"
+      - name: Save Gradle cache
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.gradle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ steps.gradle-cache.outputs.cache-primary-key }}
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

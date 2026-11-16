@@ -122,6 +122,14 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   Spring Boot major series. Run `resolveAndLockAll --write-locks --refresh-dependencies`
   first; subsequent test and build commands reuse a separate ignored latest lock.
   Ordinary CI and releases default to `-PdependencyMode=locked` and committed locks.
+- Shared Java CI resolves dependencies before offline lint, tests and packaging.
+  `scripts/ci/resolve_java_dependencies.py` allows three fresh Gradle invocations,
+  waiting 10 then 30 seconds only after transient dependency-download errors;
+  authentication, missing artifacts, TLS, integrity and lock failures remain terminal.
+  `resolveDependencies` preserves committed locks; latest mode uses `resolveAndLockAll`.
+  External Gradle caches are keyed by OS, architecture, plugin, Java, Boot, dependency
+  mode and build/lock inputs, with fallback only within the same matrix variant.
+  Successful default-branch jobs save caches; latest runs use a fresh snapshot key.
 
 ## TypeScript conventions
 
