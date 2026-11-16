@@ -3,9 +3,7 @@
 Everything here runs *inside* the workflow. The dispatch helpers
 (:func:`call_model` / :func:`call_tool` / :func:`call_backend_op`) are the single
 choke point through which the in-workflow model / tool / backend stubs reach
-their activities. Every dispatch runs its own Activity; only executions
-recorded before the ``deepagents.retire-result-cache`` patch consult the
-legacy continue-as-new result cache during replay.
+their activities. Every dispatch runs its own Activity.
 
 :func:`run_deep_agent` is the optional driver that adds continue-as-new
 state-carry around a native ``agent.ainvoke(...)`` — plain ``agent.ainvoke(...)``
@@ -27,8 +25,6 @@ from temporalio.exceptions import ApplicationError
 if TYPE_CHECKING:
     from langchain_core.language_models import ModelProfile
 
-# Reserved key under which the CAN result cache rides inside a state snapshot.
-_CACHE_KEY = "__temporal_cache__"
 _INPUT_CARRIED_KEY = "__temporal_input_in_transcript__"
 
 # Checkpointer classes that keep their state in the workflow's own memory and are
@@ -83,34 +79,6 @@ class DeepAgentsWorkflowError(ApplicationError):
 # ---------------------------------------------------------------------------
 
 
-def _legacy_lookup(kind: str, name: str, payload: Any) -> tuple[str | None, bool, Any]:
-    """Legacy-cache lookup: ``(key, hit, value)``; key is None on new executions."""
-    if not _legacy_result_cache():
-        return None, False, None
-    key = _serde.cache_key(kind, name, payload)
-    hit, value = _serde.cache_lookup(key)
-    return key, hit, value
-
-
-def _legacy_result_cache() -> bool:
-    """Whether this execution uses the legacy continue-as-new result cache.
-
-    New executions do not cache at all: repeated identical calls are
-    legitimate work (a re-issued tool call, a deliberate model resample, a
-    re-read after a write), and under the resume-from-transcript
-    continue-as-new semantics a continued run never re-executes prior
-    dispatches — so a carried cache entry could only ever serve a stale
-    result to a genuinely new call. Replay of a single run needs no cache:
-    history supplies recorded activity results.
-
-    Patch-gated because histories recorded under the legacy cache contain
-    dedup decisions (a repeated call answered with no activity scheduled);
-    replaying them without the cache would emit commands history does not
-    have.
-    """
-    return not workflow.patched("deepagents.retire-result-cache")
-
-
 async def call_model(
     activity_name: str,
     activity_input: _activity.ModelActivityInput,
@@ -119,23 +87,13 @@ async def call_model(
     **opts: Any,
 ) -> _activity.ModelActivityOutput:
     """Dispatch one model call as its own Activity."""
-    legacy_key, hit, cached = _legacy_lookup(
-        "model",
-        activity_input.model_name,
-        [activity_input.messages, activity_input.tool_schemas],
-    )
-    if hit:
-        return _activity.ModelActivityOutput(message=cached)
-    output = await workflow.execute_activity(
+    return await workflow.execute_activity(
         activity_name,
         activity_input,
         result_type=_activity.ModelActivityOutput,
         summary=summary,
         **opts,
     )
-    if legacy_key is not None:
-        _serde.cache_put(legacy_key, output.message)
-    return output
 
 
 async def call_tool(
@@ -145,25 +103,17 @@ async def call_tool(
     **opts: Any,
 ) -> _activity.ToolActivityOutput:
     """Dispatch one tool call as its own Activity."""
-    legacy_key, hit, cached = _legacy_lookup(
-        "tool", activity_input.tool_name, activity_input.args
-    )
-    if hit:
-        return _activity.ToolActivityOutput(message=cached)
     activity_input = dataclasses.replace(
         activity_input,
         arg_messages=_serde.find_tool_arg_messages(activity_input.args),
     )
-    output = await workflow.execute_activity(
+    return await workflow.execute_activity(
         _activity.INVOKE_TOOL,
         activity_input,
         result_type=_activity.ToolActivityOutput,
         summary=summary,
         **opts,
     )
-    if legacy_key is not None:
-        _serde.cache_put(legacy_key, output.message)
-    return output
 
 
 async def call_backend_op(
@@ -173,23 +123,13 @@ async def call_backend_op(
     **opts: Any,
 ) -> _activity.BackendOpOutput:
     """Dispatch one backend op as its own Activity."""
-    legacy_key, hit, cached = _legacy_lookup(
-        f"backend:{activity_input.backend_ref}",
-        activity_input.op,
-        [activity_input.args, activity_input.kwargs],
-    )
-    if hit:
-        return _activity.BackendOpOutput(result=cached)
-    output = await workflow.execute_activity(
+    return await workflow.execute_activity(
         _activity.BACKEND_OP,
         activity_input,
         result_type=_activity.BackendOpOutput,
         summary=summary,
         **opts,
     )
-    if legacy_key is not None:
-        _serde.cache_put(legacy_key, output.result)
-    return output
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +211,7 @@ async def run_deep_agent(
     limit, its messages and state files are carried into a fresh run via
     ``workflow.continue_as_new``. Todos are not restored as state:
     ``TodoListMiddleware`` marks them ``OmitFromInput``, so the graph drops
-    them from input. Only legacy executions carry the result cache.
+    them from input.
 
     By default (``continue_as_new_after=None``) the limit is the server's own
     recommendation — ``workflow.info().is_continue_as_new_suggested()`` — which
@@ -288,20 +228,10 @@ async def run_deep_agent(
     # re-threading the merged input would hand a dict to str-typed run
     # signatures and re-prepend carried messages on every later boundary.
     original_input = input
-    # Resume path: rehydrate the result cache and fold carried messages in.
+    # Resume path: fold carried messages in.
     if state_snapshot is not None:
-        # Only legacy executions consult the carried cache; on new
-        # executions the inbound legacy entries are dead weight, and at the
-        # upgrade hop a repeated identical call re-executes (conservative
-        # direction) rather than being served a possibly-stale carried result.
-        if _legacy_result_cache():
-            _serde.set_result_cache(dict(state_snapshot.get(_CACHE_KEY) or {}))
-        else:
-            _serde.set_result_cache({})
         input = _merge_snapshot(input, state_snapshot)
         input = _merge_files(input, state_snapshot)
-    else:
-        _serde.set_result_cache({})
 
     try:
         result = await agent.ainvoke(input)
@@ -341,8 +271,6 @@ async def run_deep_agent(
             # not in the transcript, so they need their own place here. An
             # empty mapping is kept too: it still replaces the input's files.
             snapshot["files"] = dict(files)
-        if _legacy_result_cache():
-            snapshot[_CACHE_KEY] = _serde.result_cache_snapshot() or {}
         # ``continue_as_new`` threads positional args into the next run via
         # ``args=``; the enclosing ``@workflow.run`` receives them as
         # ``(input, state_snapshot)``, so the carried input must keep the

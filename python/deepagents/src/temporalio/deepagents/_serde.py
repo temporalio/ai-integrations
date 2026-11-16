@@ -1,4 +1,4 @@
-"""Serialization helpers, a result cache, and worker-runtime configuration.
+"""Serialization helpers and worker-runtime configuration.
 
 The Deep Agents control loop runs *inside* the Temporal workflow, so the values
 that actually cross the workflow⇄activity boundary are a small set of LangChain
@@ -19,8 +19,6 @@ references, so neither survives a naive round-trip. This module owns:
 * the Pydantic data converter (``exclude_unset=True``) the plugin installs on
   the client and replayer, so message payloads stay small and round-trip
   cleanly;
-* a workflow-scoped result cache so model / tool results computed before a
-  ``continue_as_new`` are reused rather than recomputed after it;
 * the sandbox passthrough module list covering LangChain's transitive
   eager-import tree.
 
@@ -32,11 +30,8 @@ installed on the machine assembling the worker.
 from __future__ import annotations
 
 import base64
-import contextvars
 import copy
 import dataclasses
-import hashlib
-import json
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
@@ -492,51 +487,6 @@ def rebuild_runnable_config(data: dict[str, Any]) -> "RunnableConfig":
     # Double cast: a TypedDict and dict[str, Any] "insufficiently overlap"
     # for basedpyright's reportInvalidCast; object is the sanctioned bridge.
     return cast("RunnableConfig", cast(object, config))
-
-
-# ---------------------------------------------------------------------------
-# Result cache (continue-as-new dedup)
-# ---------------------------------------------------------------------------
-
-# Per-workflow state: set at the top of the workflow run, read by the model and
-# tool dispatch paths, snapshotted for continue-as-new. A ContextVar (not a
-# module-global keyed by run id) so update / signal handler tasks spawned by the
-# workflow inherit the same cache automatically.
-_result_cache: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
-    "_deepagents_result_cache", default=None
-)
-
-
-def set_result_cache(cache: dict[str, Any] | None) -> None:
-    """Seed the workflow-scoped result cache (e.g. carried across CAN)."""
-    _result_cache.set(dict(cache) if cache else {})
-
-
-def result_cache_snapshot() -> dict[str, Any] | None:
-    """Return a serializable copy of the cache, or ``None`` when empty."""
-    cache = _result_cache.get()
-    return dict(cache) if cache else None
-
-
-def cache_key(kind: str, call_id: str, args: Any) -> str:
-    """Stable key over ``(kind, call_id, args)`` for cache lookups."""
-    blob = json.dumps([kind, call_id, args], default=str, sort_keys=True)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-
-def cache_lookup(key: str) -> tuple[bool, Any]:
-    """Return ``(hit, value)`` for ``key`` in the active cache."""
-    cache = _result_cache.get()
-    if cache is not None and key in cache:
-        return True, cache[key]
-    return False, None
-
-
-def cache_put(key: str, value: Any) -> None:
-    """Record ``value`` under ``key`` when a cache is active for this run."""
-    cache = _result_cache.get()
-    if cache is not None:
-        cache[key] = value
 
 
 # ---------------------------------------------------------------------------

@@ -3,9 +3,7 @@
 ``run_deep_agent(continue_as_new_after=...)`` keeps a long conversation from
 bloating workflow history: once the current turn finishes past the threshold and
 there is still pending work, it snapshots the accumulated messages and continues
-into a fresh run. (The legacy result cache is retired for new executions —
-see ``deepagents.retire-result-cache``; ``test_state_snapshot_roundtrip`` below
-covers the _serde plumbing that only the legacy replay branch still uses.) Most tests use a plain
+into a fresh run. Most tests use a plain
 fake agent (no LangChain needed) so they boot a real Temporal server and exercise
 the continue-as-new machinery end to end. Two drive a real Deep Agent with a
 scripted model: its transcript holds LangChain message objects that must cross
@@ -28,7 +26,7 @@ from temporalio import workflow
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.common import RetryPolicy
 from temporalio.deepagents import DeepAgentsPlugin, _serde, run_deep_agent
-from temporalio.deepagents.workflow import _CACHE_KEY, _merge_snapshot
+from temporalio.deepagents.workflow import _merge_snapshot
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -86,22 +84,6 @@ async def test_can_threshold_and_cache(env: WorkflowEnvironment) -> None:
 
     assert result["messages"] == ["start", "step", "step", "step"], result
     assert result["todos"][0]["status"] == "completed"
-
-
-def test_state_snapshot_roundtrip() -> None:
-    # LEGACY-branch plumbing (deepagents.retire-result-cache unpatched): a
-    # carried cache rehydrates to the same hits during replay of pre-change
-    # histories. Delete alongside the patch's deprecate_patch cleanup.
-    _serde.set_result_cache({})
-    key = _serde.cache_key("model", "fake:model", [["m"], []])
-    _serde.cache_put(key, {"dumped": "message"})
-    snapshot = _serde.result_cache_snapshot()
-    assert snapshot and key in snapshot
-
-    # Simulate the continued run: a fresh cache seeded from the snapshot.
-    _serde.set_result_cache(dict(snapshot))
-    hit, value = _serde.cache_lookup(key)
-    assert hit and value == {"dumped": "message"}
 
 
 @workflow.defn
@@ -285,7 +267,6 @@ async def test_can_args_do_not_carry_messages(env: WorkflowEnvironment) -> None:
     assert "messages" not in carried_input, carried_input
     assert carried_input.get("config") == {"k": "v"}
     assert snapshot["messages"], snapshot
-    assert _CACHE_KEY not in snapshot
 
     replayer = Replayer(workflows=[ContinueAsNewWorkflow], plugins=[DeepAgentsPlugin()])
     await replayer.replay_workflow(hist)
