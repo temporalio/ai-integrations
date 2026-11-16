@@ -39,7 +39,7 @@ class StatefulStub extends StubModel {
 
 // Replay is promised only within a major (see AGENTS.md), so only the histories
 // in the current major's folder replay.
-const REPLAY_MAJOR = 1;
+const REPLAY_MAJOR = 2;
 
 const CHAINED_CALLS = [
   { previousResponseId: undefined, messages: 1 },
