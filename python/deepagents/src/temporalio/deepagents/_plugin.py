@@ -8,7 +8,8 @@ inside a ``@workflow.defn`` with no other changes:
 * installs the LangChain-aware data converter (composing, never clobbering, a
   user converter);
 * passes the LangChain / LangGraph / deepagents import tree through the workflow
-  sandbox;
+  sandbox, and imports, before a Workflow runs, the optional provider modules
+  that tree loads lazily;
 * wraps the worker run in a ``run_context`` that patches Deep Agents' model
   resolution seam (``deepagents.graph.resolve_model``) to auto-route bare
   ``model=`` strings through activities — regardless of how the user imported
@@ -193,6 +194,9 @@ class DeepAgentsPlugin(SimplePlugin):
             if runner is None:
                 raise ValueError("No WorkflowRunner provided to DeepAgentsPlugin.")
             if isinstance(runner, SandboxedWorkflowRunner):
+                # A Worker and a Replayer both come through here before they run
+                # a Workflow, and only the sandbox needs these imported first.
+                _serde.import_optional_provider_modules()
                 return replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(*modules),

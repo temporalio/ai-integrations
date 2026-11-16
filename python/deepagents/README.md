@@ -427,6 +427,66 @@ count.
   and the plugin warns if you pass one — prefer the snapshot + continue-as-new
   path above.
 
+## Sandbox passthrough
+
+The Workflow sandbox imports a module again for each Workflow run, and it
+refuses some things a module does at import. During a run it refuses more, such
+as reading the environment or the clock. A module that is passed through is
+imported once, by the Worker process, and every run shares it. On top of the
+SDK's own list, the plugin passes these modules through:
+
+`langchain`, `langchain_core`, `langchain_anthropic`, `langchain_aws`,
+`langchain_fireworks`, `langchain_openai`, `langgraph`, `deepagents`,
+`langsmith`, `numpy`, `pydantic`, `pydantic_core`, `anthropic`, `tiktoken`,
+`jsonpatch`, `jsonpointer`, `tenacity`, `orjson`, `httpx` and `httpcore`.
+
+The list covers `deepagents`, LangChain, LangGraph, LangSmith and libraries
+they import, so a Workflow file imports them without an import guard. Three
+entries are provider packages that these load from Workflow code only if they
+are installed: `deepagents` loads `langchain_aws` and `langchain_fireworks`
+when it builds an agent, and LangChain loads `langchain_openai` for
+provider-native structured output.
+
+To pass another module through, name it in `passthrough_modules`, which adds to
+the list:
+
+```python
+from temporalio.deepagents import DeepAgentsPlugin
+
+plugin = DeepAgentsPlugin(passthrough_modules=["my_company.schemas"])
+```
+
+Do this when Workflow code imports a module that the sandbox refuses. The error
+is `RestrictedWorkflowAccessError: Cannot access ... from inside a workflow`,
+and it ends with "mark the import as pass through". When the import is at the
+top of the Workflow file, creating the Worker fails with
+`RuntimeError: Failed validating workflow`. When it happens during a run, the
+Workflow Task fails and is retried, so the Workflow stays Running and makes no
+progress. For an import in your own Workflow file,
+`with workflow.unsafe.imports_passed_through():` around the import does the
+same.
+
+The sandbox passes an `importlib.import_module` call through only for a module
+the Worker process has already imported. That is how `deepagents` and LangChain
+load the three provider packages, so the plugin imports the installed ones when
+a Worker or Replayer that uses the sandbox is created. If a library loads your
+module that way, name it in `passthrough_modules` and also import it in the
+Worker process before you create the Worker.
+
+The sandbox does not restrict most of what a passed-through module does. Called
+from a Workflow, its code can read the clock or open a socket. Pass a module
+through only if Workflow code uses it deterministically.
+
+Earlier versions did not pass `langchain_aws`, `langchain_fireworks` and
+`langchain_openai` through, so with one of them installed the import failed
+during a run with `RestrictedWorkflowAccessError`. A run that caught that error
+and went on fails replay on this version with a `[TMPRL1100]` nondeterminism
+error, because the model Activity it skipped is now scheduled. `deepagents`'
+`RubricMiddleware` catches the error itself. On a Worker with `langchain_openai`
+installed, its grader recorded `grader_error` instead of a verdict when it asked
+for provider-native structured output, so that run fails replay too. Let such
+runs finish on the earlier version, or keep them there with Worker Versioning.
+
 ## Runtime behavior
 
 While a worker built with this plugin is running, the plugin wraps
