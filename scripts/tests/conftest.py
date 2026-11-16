@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import textwrap
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_VERSION = ">=0.13.0,<0.14"
 LICENSE_TEXT = "MIT License\n\nCopyright (c) 2026 Temporal Technologies Inc.\n\nPermission is hereby granted...\n"
 
@@ -111,9 +113,144 @@ def make_python_plugin(
     return d
 
 
+def dotnet_lock(packages: dict[str, str], framework: str = "net10.0") -> str:
+    """A packages.lock.json with one direct entry per package (NuGet lock format version 2)."""
+    entries = {
+        package: {"type": "Direct", "requested": f"[{version}, )", "resolved": version, "contentHash": "sha512-fake"}
+        for package, version in packages.items()
+    }
+    return json.dumps({"version": 2, "dependencies": {framework: entries}}, indent=2) + "\n"
+
+
+def make_dotnet_plugin(
+    root: Path,
+    name: str = "fakedotnet",
+    coordinate: str = "Temporalio.Extensions.Fakedotnet",
+    *,
+    maturity: str = "pre-release",
+) -> Path:
+    """Write a .NET plugin that satisfies check_conventions.py, plus the shared files it imports."""
+    shared = root / "dotnet" / "_shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    for source in ("dotnet.props", "dotnet.mk"):
+        (shared / source).write_bytes((REPO_ROOT / "dotnet" / "_shared" / source).read_bytes())
+    template = root / "dotnet" / "_template"
+    template.mkdir(parents=True, exist_ok=True)
+    (template / ".editorconfig").write_bytes((REPO_ROOT / "dotnet" / "_template" / ".editorconfig").read_bytes())
+    d = root / "dotnet" / name
+    lib = d / "src" / coordinate
+    tests = d / "tests" / f"{coordinate}.Tests"
+    lib.mkdir(parents=True, exist_ok=True)
+    tests.mkdir(parents=True, exist_ok=True)
+    (d / "plugin.toml").write_text(textwrap.dedent(f'''
+        [plugin]
+        name = "{name}"
+        language = "dotnet"
+        coordinate = "{coordinate}"
+        registry = "nuget"
+        root-api = "{coordinate}"
+        maturity = "{maturity}"
+        docs = "https://github.com/temporalio/ai-integrations/tree/main/dotnet/{name}"
+
+        [ci]
+        runtime-versions = ["10.0"]
+
+        [smoke]
+        imports = ["{coordinate}.FakedotnetPlugin"]
+    ''').lstrip())
+    (d / "Directory.Build.props").write_text(
+        '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" />\n</Project>\n'
+    )
+    (d / f"{coordinate}.slnx").write_text(
+        f'<Solution>\n  <Project Path="src/{coordinate}/{coordinate}.csproj" />\n'
+        f'  <Project Path="tests/{coordinate}.Tests/{coordinate}.Tests.csproj" />\n</Solution>\n'
+    )
+    (d / "global.json").write_text(json.dumps({
+        "sdk": {"version": "10.0.100", "rollForward": "latestFeature", "allowPrerelease": False},
+        "test": {"runner": "Microsoft.Testing.Platform"},
+    }, indent=2) + "\n")
+    (d / "nuget.config").write_text(textwrap.dedent('''
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" minPublishAgeHours="336" />
+          </packageSources>
+          <minPublishAgeExceptions>
+            <package pattern="Temporalio" />
+            <package pattern="Temporalio.*" />
+          </minPublishAgeExceptions>
+        </configuration>
+    ''').lstrip())
+    (d / ".editorconfig").write_bytes((template / ".editorconfig").read_bytes())
+    (d / "Makefile").write_text(f"PACKAGE := {coordinate}\ninclude ../_shared/dotnet.mk\n")
+    (d / "README.md").write_text(f"# {coordinate}\n\nSee https://github.com/temporalio/ai-integrations for details.\n")
+    (d / "LICENSE").write_bytes((root / "LICENSE").read_bytes())
+    (lib / f"{coordinate}.csproj").write_text(textwrap.dedent(f'''
+        <Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup>
+            <TargetFramework>net10.0</TargetFramework>
+            <PackageId>{coordinate}</PackageId>
+            <RootNamespace>{coordinate}</RootNamespace>
+            <Version>0.0.0</Version>
+            <IsPackable>true</IsPackable>
+            <Description>Fake plugin (Pre-release)</Description>
+            <PackageLicenseExpression>MIT</PackageLicenseExpression>
+            <PackageReadmeFile>README.md</PackageReadmeFile>
+            <PackageProjectUrl>https://github.com/temporalio/ai-integrations/tree/main/dotnet/{name}</PackageProjectUrl>
+          </PropertyGroup>
+          <ItemGroup>
+            <None Include="../../README.md" Pack="true" PackagePath="" />
+          </ItemGroup>
+          <ItemGroup>
+            <PackageReference Include="Temporalio" Version="1.22.0" />
+            <PackageReference Include="StyleCop.Analyzers" Version="1.3.180" PrivateAssets="all" />
+          </ItemGroup>
+        </Project>
+    ''').lstrip())
+    (lib / "FakedotnetPlugin.cs").write_text(
+        f"namespace {coordinate};\n\n/// <summary>Fixture plugin used to exercise the shared .NET build logic.</summary>\n"
+        f"public sealed class FakedotnetPlugin\n{{\n    /// <summary>Gets the plugin name.</summary>\n"
+        f"    public string Name {{ get; }} = \"{coordinate}\";\n}}\n"
+    )
+    (lib / "packages.lock.json").write_text(dotnet_lock({"Temporalio": "1.22.0", "StyleCop.Analyzers": "1.3.180"}))
+    (tests / f"{coordinate}.Tests.csproj").write_text(textwrap.dedent(f'''
+        <Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup>
+            <TargetFramework>net10.0</TargetFramework>
+            <OutputType>Exe</OutputType>
+            <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+            <GenerateDocumentationFile>false</GenerateDocumentationFile>
+          </PropertyGroup>
+          <ItemGroup>
+            <ProjectReference Include="../../src/{coordinate}/{coordinate}.csproj" />
+            <PackageReference Include="xunit.v3" Version="4.0.3" />
+            <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="2.5.3" />
+            <PackageReference Include="StyleCop.Analyzers" Version="1.3.180" PrivateAssets="all" />
+            <Using Include="Xunit" />
+          </ItemGroup>
+        </Project>
+    ''').lstrip())
+    (tests / "FakedotnetPluginTests.cs").write_text(
+        f"namespace {coordinate}.Tests;\n\npublic class FakedotnetPluginTests\n{{\n    [Fact]\n"
+        f"    public void Plugin_Has_Name()\n    {{\n        Assert.Equal(\"{coordinate}\", new FakedotnetPlugin().Name);\n    }}\n}}\n"
+    )
+    (tests / "packages.lock.json").write_text(dotnet_lock({
+        "xunit.v3": "4.0.3", "Microsoft.Testing.Extensions.TrxReport": "2.5.3", "StyleCop.Analyzers": "1.3.180",
+    }))
+    return d
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     return init_repo(tmp_path / "repo")
+
+
+@pytest.fixture
+def dotnet_repo(repo: Path) -> Path:
+    make_dotnet_plugin(repo)
+    commit_all(repo, "add fake .NET plugin")
+    return repo
 
 
 @pytest.fixture

@@ -574,6 +574,12 @@ Activity and are never shared across workflows.
 `temporalio.mcp.x.*`. Do not register the same MCP server name through
 both plugins on one worker; Temporal rejects the duplicate Activity types.
 
+A factory that returns something other than an `agents.mcp.MCPServer` fails
+the Activity with a non-retryable `ApplicationError` of type
+`MCPServerFactoryTypeError`. A factory that isn't callable makes
+`OpenAIAgentsPlugin(...)` raise `TypeError`, so the Worker doesn't start, even
+when no workflow uses that server.
+
 An optional `factory_argument` can select worker-side configuration such as a
 tenant endpoint:
 
@@ -726,31 +732,24 @@ caller's own cancellation still cancels the operation, and a cancellation that
 leaves the block wins over the block's `DedicatedWorkerFailure`, though not over
 an `ActivityError` from a session that failed for another reason.
 
-A run follows its session this way only once it records the patch marker
-`openai-agents-stateful-mcp-session-watch`, which it does at its first
-operation whose `config` has neither timeout. Histories recorded on an earlier
-version have no marker, so they schedule such operations as before and replay
-on this version, with two exceptions. A block whose last timer fired ahead of
-its session's end now raises `DedicatedWorkerFailure` with no cause, as above,
-so a run that hit this and caught the bare `CancelledError`, or that failed
-with it although it catches `ApplicationError` or `Exception` around the
-block, schedules different commands on this version. The same applies to a
-legacy run that raised `DedicatedWorkerFailure` in place of a cancellation
-when its session ended in the same workflow task. Let such open runs finish
-before upgrading, and expect replays of such closed runs (queries, replay
-tests) to fail. A run that continues on this version records the marker at its
-next such operation only if it scheduled none before the upgrade. Otherwise the
-Temporal Python SDK keeps the decision it made while replaying that earlier
-operation, so the run never records the marker and schedules such operations as
-before until it ends: one scheduled after its session ended waits until the
-caller cancels it or the run ends. A run with the marker fails replay on an
-earlier version, and so can any run whose session failed with
-`DedicatedWorkerFailure` (a refused retry or a refused describe) and that then
-went on, whether it caught the block's failure or a cancellation, and any run
-that caught that unmarked `DedicatedWorkerFailure` and went on, so do not roll
-back while such runs are open. Drain the earlier version's workers before starting this one: while
-workers of both versions run, a run whose session gets a refusal can fail
-replay when it moves from one to the other.
+Runs recorded on 1.x schedule such operations without watching the session, and
+some of them fail replay on this version: a run in which an operation with
+`cancellation_type=WAIT_CANCELLATION_COMPLETED` finished in the same workflow
+task as another activity, and two more cases. A block whose last timer fired
+ahead of its session's end now raises `DedicatedWorkerFailure` with no cause,
+as above, so a run that hit this and caught the bare `CancelledError`, or that
+failed with it although it catches `ApplicationError` or `Exception` around the
+block, schedules different commands on this version. The same applies to a 1.x
+run that raised `DedicatedWorkerFailure` in place of a cancellation when its
+session ended in the same workflow task. Let such open runs finish before
+upgrading, and expect replays of such closed runs (queries, replay tests) to
+fail. A run whose session failed with `DedicatedWorkerFailure` (a refused retry
+or a refused describe) and that then went on can fail replay on an earlier
+version, whether it caught the block's failure or a cancellation, and so can
+any run that caught a `DedicatedWorkerFailure` with no cause and went on, so do
+not roll back while such runs are open. Drain the earlier version's workers
+before starting this one: while workers of both versions run, a run whose
+session gets a refusal can fail replay when it moves from one to the other.
 
 ### Hosted MCP Tool
 
@@ -1119,9 +1118,7 @@ Model calls run in an Activity on the Worker, so they use the provider set on th
 `OpenAIAgentsPlugin(model_provider=...)`. To use several providers, set a `MultiProvider` with a
 prefix map there and choose a provider by model name. A Workflow cannot set its own provider:
 `Runner.run` raises `ValueError` when `RunConfig.model_provider` is anything other than the default.
-A run that started on an earlier version and already passed its own provider keeps using the
-Worker's provider, so that it replays; a run that passes one for the first time after the upgrade
-gets the error.
+A run recorded on 1.x that passed its own provider fails replay on this version.
 
 Without `model_provider`, the plugin uses an `OpenAIProvider` on the client set with the framework's
 `set_default_openai_client`, as it is: give that client `max_retries=0` to leave retries to Temporal.

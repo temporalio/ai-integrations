@@ -70,7 +70,7 @@ from temporalio.google_adk import (
 from temporalio.google_adk._model import (
     _with_serializable_response_schema,
 )
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 from temporalio.workflow import ActivityConfig
 from tests.helpers.decorators import WrapOnAccess, passthrough, unwrapped
 from tests.helpers.opentelemetry import dump_spans
@@ -1571,6 +1571,96 @@ def test_explicitly_set_none_preserved() -> None:
     serialized = json.loads(payloads[0].data)
 
     assert serialized["cache_config"] is None
+
+
+@activity.defn
+async def tag_city(city: str, *tags: str) -> str:
+    return f"{city}:{','.join(tags)}"
+
+
+@activity.defn
+class TagCity:
+    async def __call__(self, city: str, *tags: str) -> str:
+        return f"{city}:{','.join(tags)}"
+
+
+@pytest.mark.parametrize("activity_def", [tag_city, TagCity])
+@pytest.mark.asyncio
+async def test_activity_as_tool_passes_empty_var_positional(
+    activity_def: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADK leaves *tags out of the declaration, as it does for the plain
+    # function, so the model can't fill it and the activity gets no tags.
+    tool = temporalio.google_adk.workflow.activity_as_tool(
+        activity_def, start_to_close_timeout=timedelta(seconds=30)
+    )
+    native = tag_city if activity_def is tag_city else TagCity().__call__
+    declaration = FunctionTool(tool)._get_declaration()
+    native_declaration = FunctionTool(native)._get_declaration()
+    assert declaration is not None and native_declaration is not None
+    schema = declaration.parameters_json_schema
+    native_schema = native_declaration.parameters_json_schema
+    assert schema is not None and native_schema is not None
+    assert (schema["properties"], schema["required"]) == (
+        native_schema["properties"],
+        native_schema["required"],
+    )
+    assert list(schema["properties"]) == ["city"]
+    if activity_def is tag_city:
+        # Outside a Workflow the tool calls the activity itself.
+        assert await tool(city="Rome") == "Rome:"
+
+    calls: list[list[Any]] = []
+
+    async def execute_activity(_: Any, *args: Any, **kwargs: Any) -> str:
+        calls.append(list(args) or list(kwargs.get("args", [])))
+        return "ok"
+
+    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    await tool(city="Rome")
+    assert calls == [["Rome"]]
+
+
+@activity.defn
+async def count_tags(city: str, *tags: str) -> str:
+    return f"{city}:{len(tags)}"
+
+
+@workflow.defn
+class CountTagsWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        tool = temporalio.google_adk.workflow.activity_as_tool(
+            count_tags, start_to_close_timeout=timedelta(seconds=30)
+        )
+        return await tool(city="Rome")
+
+
+@pytest.mark.asyncio
+async def test_activity_as_tool_var_positional_replays(client: Client) -> None:
+    new_config = client.config()
+    new_config["plugins"] = [GoogleAdkPlugin()]
+    client = Client(**new_config)
+    task_queue = f"adk-var-args-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CountTagsWorkflow],
+        activities=[count_tags],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            CountTagsWorkflow.run,
+            id=f"adk-var-args-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        assert await handle.result() == "Rome:0"
+        history = await handle.fetch_history()
+    await Replayer(
+        workflows=[CountTagsWorkflow], plugins=[GoogleAdkPlugin()]
+    ).replay_workflow(history)
 
 
 def test_activity_as_tool_preserves_metadata() -> None:

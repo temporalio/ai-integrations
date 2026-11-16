@@ -1,8 +1,8 @@
 """Workflows for histories recorded with stateful MCP operations.
 
-``tests/histories/stateful-mcp-*-workflow-history.json`` were recorded with
-these workflows on earlier versions of the plugin, and
-``test_openai_replay.py`` replays them on this one.
+``tests/histories/<major>.x/stateful-mcp-*-workflow-history.json`` were
+recorded with these workflows, and ``test_openai_replay.py`` replays the
+current major's on this version.
 """
 
 import asyncio

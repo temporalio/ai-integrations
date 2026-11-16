@@ -1,0 +1,53 @@
+<Project>
+  <!-- Shared build conventions for every plugin under dotnet/. Dependencies, target frameworks
+       and package identity live in each plugin's csproj, never here or in a workflow. -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Known-vulnerability advisories stay visible as warnings; a new advisory on a transitive
+         dependency, or an outage of the vulnerability feed (NU1900), must not break unrelated
+         pull requests. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1900;NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <!-- Pinned to the SDK channel the plugins' global.json pins (the newest listed runtime), not `latest`:
+         the rule set must not follow the runner's newest feature band. Move it together with global.json. -->
+    <AnalysisLevel>10.0</AnalysisLevel>
+    <AnalysisMode>AllEnabledByDefault</AnalysisMode>
+    <!-- Style rules stay out of the build until dotnet/format#1800 is fixed; `make lint` covers them. -->
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <!-- The two globalconfigs below are listed explicitly; a .globalconfig dropped anywhere in a plugin
+         tree would otherwise be discovered by the compiler and change analyzer severities. -->
+    <DiscoverGlobalAnalyzerConfigFiles>false</DiscoverGlobalAnalyzerConfigFiles>
+    <!-- Package validation runs on pack: the package must be consumable on every framework it targets, and once
+         a plugin sets PackageValidationBaselineVersion to its first published version (release runbook), its
+         public API is compared with that baseline so a breaking change fails the build instead of shipping. -->
+    <EnablePackageValidation>true</EnablePackageValidation>
+    <IsPackable>false</IsPackable>
+    <Authors>Temporal</Authors>
+    <Company>Temporal Technologies Inc.</Company>
+    <PackageIcon>icon.png</PackageIcon>
+    <RepositoryUrl>https://github.com/temporalio/ai-integrations</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <!-- Generated sources under obj/ are not in the repository, so Source Link URLs for them would 404. -->
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- EditorConfigFiles is the list the compiler reads; the SDK only copies GlobalAnalyzerConfigFiles
+         into it while discovery is on. -->
+    <EditorConfigFiles Include="$(MSBuildThisFileDirectory)analyzers.globalconfig" />
+    <EditorConfigFiles Include="$(MSBuildThisFileDirectory)analyzers.tests.globalconfig"
+                       Condition="$(MSBuildProjectName.EndsWith('.Tests'))" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(IsPackable)' == 'true'">
+    <None Include="$(MSBuildThisFileDirectory)icon.png" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
+</Project>

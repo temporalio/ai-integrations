@@ -48,9 +48,9 @@ TEN_SECONDS = ActivityConfig(start_to_close_timeout=timedelta(seconds=10))
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
-from langchain_core.tools import tool  # noqa: E402
+from langchain_core.tools import StructuredTool, tool  # noqa: E402
 from langgraph.prebuilt import InjectedState  # noqa: E402
-from pydantic import BaseModel, ConfigDict  # noqa: E402
+from pydantic import BaseModel, ConfigDict, ValidationError  # noqa: E402
 
 
 def pairing_weather(city: str) -> str:
@@ -465,11 +465,6 @@ class KeywordOnlyActivity:
 
 
 @activity.defn
-async def varargs_activity(text: str, *more: str) -> str:
-    return text + "".join(more)
-
-
-@activity.defn
 async def kwargs_activity(text: str, **extra: str) -> str:
     return text + "".join(extra.values())
 
@@ -486,7 +481,6 @@ class BadAnnotationActivity(EchoClass):
         (NoCallActivity, "to have a __call__"),
         (KeywordOnlyActivity, "keyword-only argument 'text'"),
         (PartialKeywordEchoClass, "partialmethod binds an argument by keyword"),
-        (varargs_activity, r"\*more"),
         (kwargs_activity, r"\*\*extra"),
         (BadAnnotationActivity, "name 'Missing' is not defined"),
         (EchoClass("workflow"), "not an instance of it"),
@@ -495,6 +489,66 @@ class BadAnnotationActivity(EchoClass):
 def test_activity_as_tool_rejects(activity_ref: Any, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         activity_as_tool(activity_ref, activity_options=TEN_SECONDS)
+
+
+@activity.defn
+async def varargs_activity(text: str, *more: str) -> str:
+    return text + "".join(more)
+
+
+@activity.defn
+class VarargsClass:
+    async def __call__(self, text: str, *more: str) -> str:
+        return text + "".join(more)
+
+
+@activity.defn
+async def args_activity(text: str, *args: str) -> str:
+    return text + "".join(args)
+
+
+@activity.defn
+async def unannotated_varargs_activity(text: str, *more) -> str:  # pyright: ignore[reportMissingParameterType]
+    return text + "".join(more)
+
+
+@pytest.mark.parametrize(
+    ("activity_ref", "function", "name"),
+    [
+        (varargs_activity, varargs_activity, "more"),
+        (VarargsClass, varargs_activity, "more"),
+        # A plain parameter named args would clash with Pydantic's own field.
+        (args_activity, args_activity, "args"),
+        # Without an annotation LangChain still offers an array.
+        (unannotated_varargs_activity, unannotated_varargs_activity, "more"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_activity_as_tool_spreads_var_positional(
+    activity_ref: Any, function: Callable, name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # *args is offered as a list, as LangChain's own schema for the function
+    # offers it, and spread into the activity's arguments.
+    calls: list[Any] = []
+
+    async def execute_activity(_: Any, **kwargs: Any) -> str:
+        calls.append(kwargs["args"])
+        return "ok"
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    tool = activity_as_tool(activity_ref, activity_options=TEN_SECONDS)
+    native = StructuredTool.from_function(
+        coroutine=function, description="LangChain's schema"
+    )
+    assert tool.args == native.args
+    listed: dict[str, Any] = {"text": "a", name: ["b", "c"]}
+    await tool.ainvoke(listed)
+    await tool.ainvoke({"text": "a"})
+    assert calls == [["a", "b", "c"], ["a"]]
+    not_a_list: dict[str, Any] = {"text": "a", name: "bc"}
+    with pytest.raises(ValidationError):
+        await tool.ainvoke(not_a_list)
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 # Temporal AI Integrations
 
+[![.NET: 8, 9, and 10](https://img.shields.io/badge/.NET-8%20%7C%209%20%7C%2010-blue.svg)](dotnet/)
 [![Go: 1.26 and 1.27](https://img.shields.io/badge/go-1.26%20%7C%201.27-blue.svg)](https://go.dev/dl/)
 [![Java: 17, 21, and 25](https://img.shields.io/badge/java-17%20%7C%2021%20%7C%2025-blue.svg)](https://dev.java/)
 [![Python: 3.11 through 3.15](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14%20%7C%203.15-blue.svg)](https://www.python.org/downloads/)
@@ -12,6 +13,7 @@ cadence.
 
 | Plugin | Package |
 |---|---|
+| [`dotnet/microsoft-agent-framework`](dotnet/microsoft-agent-framework) | [![NuGet](https://img.shields.io/nuget/vpre/Temporalio.Extensions.MicrosoftAgentFramework.svg)](https://www.nuget.org/packages/Temporalio.Extensions.MicrosoftAgentFramework) (Pre-release) |
 | [`go/googleadk`](go/googleadk) | [![Go Reference](https://pkg.go.dev/badge/go.temporal.io/googleadk.svg)](https://pkg.go.dev/go.temporal.io/googleadk) (Public Preview) |
 | [`java/google-adk`](java/google-adk) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/google-adk.svg)](https://central.sonatype.com/artifact/io.temporal/google-adk) (Public Preview) |
 | [`java/spring-ai`](java/spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/spring-ai) (Public Preview) |

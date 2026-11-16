@@ -76,10 +76,8 @@ model call that downloaded a file returns no `request.body`. An
 `experimental_download` function given to `generateText` runs in the Workflow
 and is told that the model supports every URL.
 
-This change is behind a Workflow patch. An execution that started on an earlier
-version replays as it ran then, so an Activity that its `experimental_download`
-function scheduled still matches its Event History. The new behavior starts
-with the first model call that is not a replay.
+An execution that started on 1.x, in which an `experimental_download` function
+scheduled an Activity for a URL, doesn't replay on this version.
 
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
@@ -112,6 +110,18 @@ Activity, within about that timeout. A call shorter than half the timeout sends 
 heartbeat. Set `heartbeatTimeout: 0` to turn heartbeats off. Then a lost Worker
 is noticed only at `startToCloseTimeout`, and a cancellation request does not
 reach the Activity.
+
+Workers on 1.0.0 don't heartbeat on a timer. While both versions run, a call
+that this version schedules and a 1.0.0 Worker runs fails after 10 seconds
+without a heartbeat, and so does each retry.
+
+- To upgrade, deploy this version to the Workers that run the model Activities
+  first. If the same Workers run Workflows too, deploy it with
+  `heartbeatTimeout: 0` and remove that in a later deploy.
+- To roll back, first deploy with `heartbeatTimeout: 0`, then wait for the
+  calls scheduled before that deploy to finish: they keep the 10-second timeout.
+- Runs pinned with Worker Versioning avoid both, when their model Activities
+  use the Workflow's task queue.
 
 When `invokeModelStreaming` is retried, the new attempt publishes all of its
 stream parts to the topic again, after the parts the failed attempt published.
@@ -161,9 +171,8 @@ fails with `AbortSignal is not defined`, and `stepMs` fails with
 `DOMException is not defined` when its timer fires. Use the Activity
 `startToCloseTimeout` instead.
 
-The cancellation is behind a Workflow patch. An execution that started on an
-earlier version replays as it ran then, when an abort sent no command. The new
-behavior starts with the first model call that is not a replay. A call without
-an `abortSignal` records no patch marker.
+An execution that started on 1.x, in which a signal aborted while a model or
+embedding call ran, doesn't replay on this version: on 1.x the abort sent no
+command.
 
 Development details are in [typescript/README.md](../README.md).
