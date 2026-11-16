@@ -544,6 +544,9 @@ def test_java_caches_are_isolated_by_matrix_and_locks_and_saved_only_after_succe
     assert "'java/_shared/*.gradle'" in key
     assert "inputs.deps == 'latest' && github.run_id" in key  # Nightly snapshots must be refreshable.
     assert restore['with']['path'] == save['with']['path']
+    assert restore['with']['path'].splitlines() == [
+        '${{ env.GRADLE_USER_HOME }}/caches', '${{ env.GRADLE_USER_HOME }}/wrapper',
+    ]  # setup-gradle uses D:\\a\\.gradle on Windows, outside the user's home.
     assert save['with']['key'] == '${{ steps.gradle-cache.outputs.cache-primary-key }}'
     assert "github.event.repository.default_branch" in save['if']
     assert "steps.gradle-cache.outputs.cache-hit != 'true'" in save['if']

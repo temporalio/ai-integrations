@@ -68,8 +68,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
+            ${{ env.GRADLE_USER_HOME }}/caches
+            ${{ env.GRADLE_USER_HOME }}/wrapper
           key: java-gradle-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.plugin }}-${{ matrix.runtime }}-${{ matrix.spring_boot || 'none' }}-${{ inputs.deps }}-${{ hashFiles(format('java/{0}/**/*.gradle*', inputs.plugin), format('java/{0}/gradle/**', inputs.plugin), 'java/_shared/*.gradle') }}-${{ inputs.deps == 'latest' && github.run_id || 'locked' }}
           restore-keys: |
             java-gradle-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.plugin }}-${{ matrix.runtime }}-${{ matrix.spring_boot || 'none' }}-${{ inputs.deps }}-
@@ -98,8 +98,8 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
+            ${{ env.GRADLE_USER_HOME }}/caches
+            ${{ env.GRADLE_USER_HOME }}/wrapper
           key: ${{ steps.gradle-cache.outputs.cache-primary-key }}
       - name: Upload test reports
         if: always()

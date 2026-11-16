@@ -40,8 +40,12 @@ def is_transient_download_failure(output: str) -> bool:
 
 def resolve(plugin_dir: Path, dependency_mode: str, spring_boot_version: str, version: str) -> int:
     plugin_dir = plugin_dir.resolve()
+    # Python's Windows PATH may find the WSL launcher when asked for "bash".
+    # The relative batch path also avoids cmd.exe's quoting rules for paths with spaces.
+    wrapper = (["cmd.exe", "/d", "/c", "gradlew.bat"] if sys.platform == "win32"
+               else ["bash", str(plugin_dir / "gradlew")])
     command = [
-        "bash", str(plugin_dir / "gradlew"), "--no-daemon", "--console=plain", "--stacktrace",
+        *wrapper, "--no-daemon", "--console=plain", "--stacktrace",
         f"-PdependencyMode={dependency_mode}", f"-PspringBootVersion={spring_boot_version}",
         f"-PreleaseVersion={version}",
     ]

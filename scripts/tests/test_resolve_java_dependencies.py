@@ -20,9 +20,11 @@ class FakeGradle:
     def __init__(self, outcomes: list[tuple[int, str]]) -> None:
         self.outcomes = iter(outcomes)
         self.calls: list[list[str]] = []
+        self.directories: list[Path] = []
 
     def __call__(self, command: list[str], *, cwd: Path, **kwargs: object) -> FakeGradleProcess:
         self.calls.append(command)
+        self.directories.append(cwd)
         return FakeGradleProcess(*next(self.outcomes))
 
 
@@ -70,6 +72,24 @@ def test_permanent_failures_take_precedence_over_a_transient_error(failure: str)
 
 def test_test_failure_mentioning_network_is_not_retried() -> None:
     assert not resolver.is_transient_download_failure("Execution failed for task ':test'.\nUnknownHostException test FAILED")
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux", "darwin"])
+def test_uses_the_native_gradle_wrapper_from_the_plugin_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str,
+) -> None:
+    directory = tmp_path / "plugin with spaces"
+    directory.mkdir()
+    fake = FakeGradle([(0, "BUILD SUCCESSFUL\n")])
+    monkeypatch.setattr(resolver.sys, "platform", platform)
+    monkeypatch.setattr(resolver.subprocess, "Popen", fake)
+    assert resolver.resolve(directory, "locked", "", "0.0.0") == 0
+    assert fake.directories == [directory.resolve()]
+    if platform == "win32":
+        assert fake.calls[0][:4] == ["cmd.exe", "/d", "/c", "gradlew.bat"]
+        assert "bash" not in fake.calls[0]
+    else:
+        assert fake.calls[0][:2] == ["bash", str(directory / "gradlew")]
 
 
 @pytest.mark.parametrize("mode", ["locked", "latest"])
@@ -130,6 +150,17 @@ if [ "$count" -lt 3 ]; then
   printf '%s\\n' "Could not resolve dependencies: java.net.UnknownHostException: repo.maven.apache.org" >&2
   exit 1
 fi
+''')
+    (tmp_path / "gradlew.bat").write_text('''@echo off
+set /a count=0
+if exist attempts set /p count=<attempts
+set /a count+=1
+>attempts echo %count%
+if %count% LSS 3 (
+  1>&2 echo Could not resolve dependencies: java.net.UnknownHostException: repo.maven.apache.org
+  exit /b 1
+)
+exit /b 0
 ''')
     delays: list[int] = []
     monkeypatch.setattr(resolver.time, "sleep", delays.append)
