@@ -102,20 +102,36 @@ Two things worth noticing:
 ## Model profiles
 
 Deep Agents sizes summarization from the model's LangChain profile
-(`max_input_tokens`). Only the model name reaches the Workflow, so give the
-plugin each model's profile:
+(`max_input_tokens`). Only the model name reaches the Workflow, so fetch the
+profile of the Worker's model before building the agent:
 
 ```python
-from temporalio.deepagents import DeepAgentsPlugin
-
-plugin = DeepAgentsPlugin(
-    model_profiles={"anthropic:claude-haiku-4-5": {"max_input_tokens": 200_000}},
+from temporalio import workflow
+from temporalio.deepagents import (
+    TemporalModel,
+    create_temporal_deep_agent,
+    get_model_profile,
 )
+
+
+@workflow.defn
+class ResearchAgent:
+    @workflow.run
+    async def run(self, question: str) -> None:
+        model = "anthropic:claude-haiku-4-5"
+        profile = await get_model_profile(model)
+        agent = create_temporal_deep_agent(
+            model=TemporalModel(model=model, profile=profile),
+            tools=[],
+        )
+        ...
 ```
 
-A `TemporalModel` built with `profile=` keeps its own. The profile is read in
-Workflow code, so setting or changing it can change when an agent summarizes,
-and a run in flight across that change may fail replay.
+`get_model_profile` runs one Activity, registered by `DeepAgentsPlugin`, that
+returns `model_provider(name).profile`, and History records the result, so a
+later change on the Worker does not affect runs in flight.
+`create_temporal_deep_agent` keeps a `TemporalModel`'s profile when it applies
+`activity_options`.
 
 ## Configuring activity options
 

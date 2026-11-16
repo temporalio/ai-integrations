@@ -38,9 +38,6 @@ import json
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from langchain_core.language_models import ModelProfile
     from langchain_core.messages import BaseMessage
     from langchain_core.runnables import RunnableConfig
 
@@ -65,8 +62,6 @@ class Settings:
 
     model_activity_options: Any = None
     """``ActivityConfig`` or ``Mapping[model_name, ActivityConfig]``."""
-    model_profiles: Mapping[str, ModelProfile] | None = None
-    """LangChain model profiles keyed by model name."""
     streaming_topic: str | None = None
 
 
@@ -76,12 +71,10 @@ _settings = Settings()
 def set_settings(
     *,
     model_activity_options: Any = None,
-    model_profiles: Mapping[str, ModelProfile] | None = None,
     streaming_topic: str | None = None,
 ) -> None:
     """Install the worker-wide model dispatch defaults (called by the plugin)."""
     _settings.model_activity_options = model_activity_options
-    _settings.model_profiles = model_profiles
     _settings.streaming_topic = streaming_topic
 
 
