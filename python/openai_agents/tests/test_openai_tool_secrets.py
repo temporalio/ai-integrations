@@ -4,8 +4,9 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Collection
-from typing import Any, cast
+from typing import Any, Literal, cast
 
+import pydantic
 import pytest
 from agents import (
     Agent,
@@ -25,8 +26,10 @@ from agents import (
 )
 from agents.items import TResponseStreamEvent
 from agents.tool import ApplyPatchTool, ShellTool, ShellToolEnvironment
+from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 
 from temporalio import workflow
+from temporalio.api.common.v1 import Payload
 from temporalio.client import Client
 from temporalio.openai_agents import (
     ModelActivityParameters,
@@ -109,6 +112,88 @@ def test_lenient_activity_input_reconstructs_tools_and_handoffs():
     assert isinstance(tools[1], ApplyPatchTool)
     assert isinstance(tools[2], ShellTool)
     assert handoffs[0].agent_name == "helper"
+
+
+class _CallerResult(pydantic.BaseModel):
+    message: ResponseOutputMessage
+    responses: list[ModelResponse]
+
+
+class _InPlaceTagged(pydantic.BaseModel):
+    kind: Literal["a"]
+    record: ModelResponse
+
+    @pydantic.field_serializer("kind")
+    def _upper(self, kind: str) -> str:
+        return kind.upper()
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _lower(cls, value: Any) -> Any:
+        # Lowers the tag it sent in upper case, in the mapping it reads.
+        if isinstance(value, dict):
+            value["kind"] = value["kind"].lower()
+        return value
+
+
+class _LooseTagged(pydantic.BaseModel):
+    kind: Literal["a"]
+    record: dict[str, Any]
+
+
+class _TaggedEnvelope(pydantic.BaseModel):
+    item: _InPlaceTagged | _LooseTagged
+
+
+def _message() -> ResponseOutputMessage:
+    return ResponseOutputMessage(
+        id="msg_1",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(type="output_text", text="done", annotations=[])],
+    )
+
+
+def _response() -> ModelResponse:
+    return ModelResponse(output=[_message()], usage=Usage(), response_id="r1")
+
+
+def _drop_annotations(node: Any) -> None:
+    # An output_text part without annotations fails strict validation, as a
+    # drifted live response does.
+    if isinstance(node, dict):
+        node.pop("annotations", None)
+        for item in node.values():
+            _drop_annotations(item)
+    elif isinstance(node, list):
+        for item in node:
+            _drop_annotations(item)
+
+
+def _drifted_payload(value: Any) -> Payload:
+    payload = OpenAIPayloadConverter().to_payload(value)
+    raw = json.loads(payload.data)
+    _drop_annotations(raw)
+    payload.data = json.dumps(raw).encode()
+    return payload
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        _CallerResult(message=_message(), responses=[_response()]),
+        # The first variant lowers the tag in place before it fails, and the
+        # second one would accept what is left.
+        _TaggedEnvelope(item=_InPlaceTagged(kind="a", record=_response())),
+    ],
+    ids=["caller-model", "validator-changing-its-input"],
+)
+def test_lenient_fallback_raises_instead_of_returning_a_dict(
+    value: pydantic.BaseModel,
+):
+    with pytest.raises(pydantic.ValidationError):
+        OpenAIPayloadConverter().from_payload(_drifted_payload(value), type(value))
 
 
 def test_build_tool_reports_unreconstructed_dict():
