@@ -266,14 +266,21 @@ seconds. In Temporal Cloud each heartbeat that reaches the service is an Action:
 with the default, at most one every 8 seconds, and none for calls under 5
 seconds. Set `heartbeat_timeout` to `None` or `timedelta(0)` in
 `activity_config` to turn heartbeats off.
+Without heartbeats, a running call cannot receive cancellation. This includes
+interaction streams, which earlier versions heartbeated once per event even
+without a heartbeat timeout.
 
 Temporal caps `heartbeat_timeout` at `start_to_close_timeout`, including one set
-per call with `http_options.timeout`, so a shorter one makes beats come sooner.
+per model call with `http_options.timeout`, or with the Interactions and Agents
+`timeout` argument, so a shorter one makes beats come sooner. File and file
+search store uploads pass `http_options.timeout` to the HTTP client instead.
 
-The timer runs on the worker's event loop, so a call that blocks the loop for
-longer than the timeout fails that attempt. On Vertex AI, `interactions` and
-`agents` calls refresh credentials on the loop: on the first call, then about
-once an hour. If that can be slow, set a longer `heartbeat_timeout`, or `None`.
+The timer runs on the worker's event loop. Blocking the loop can cause heartbeat
+timeouts in every activity sharing it. On Vertex AI, `interactions` and `agents`
+calls refresh credentials on the loop: on the first call, then about once an
+hour. A slow refresh can also fail other running Gemini calls. If that can be
+slow, set a longer `heartbeat_timeout`, or `None`. The timer logs a warning if
+the gap between beats reaches the heartbeat timeout.
 
 **Breaking change when you upgrade or roll back:** earlier versions don't
 heartbeat on a timer. While both versions run, a call that this version
@@ -288,6 +295,22 @@ and so does each retry.
   calls scheduled before that deploy to finish: they keep the 10-second timeout.
 - Runs pinned with Worker Versioning avoid both, when their Gemini activities
   use the workflow's task queue.
+
+A config you pass replaces the defaults, so keep your activity timeouts when
+turning heartbeats off. For example, the upgrade and rollback config above is:
+
+```python
+from datetime import timedelta
+
+from temporalio.workflow import ActivityConfig
+
+client = TemporalAsyncClient(
+    activity_config=ActivityConfig(
+        start_to_close_timeout=timedelta(seconds=60),
+        heartbeat_timeout=None,
+    ),
+)
+```
 
 ## Retries & errors
 

@@ -51,7 +51,7 @@ from google.genai.types import HttpResponse as SdkHttpResponse
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 from temporalio.google_genai import (
     GoogleGenAIError,
     GoogleGenAIPlugin,
@@ -1471,7 +1471,7 @@ class _FakeAsyncStream:
 
 
 def _apply_plugin_with_mock_client(
-    client: Client, mock_responses: list[str], model_call_seconds: float = 0
+    client: Client, mock_responses: list[str], call_seconds: float = 0
 ) -> Client:
     """Create a real GoogleGenAIPlugin with real activities but a mocked client.
 
@@ -1479,19 +1479,18 @@ def _apply_plugin_with_mock_client(
     real ``GeminiApiCaller.activities()`` are registered, exercising the
     full activity code path.
     """
-    plugin = GoogleGenAIPlugin(_mock_gemini_client(mock_responses, model_call_seconds))
+    plugin = GoogleGenAIPlugin(_mock_gemini_client(mock_responses, call_seconds))
     config = client.config()
     config["plugins"] = [plugin]
     return Client(**config)
 
 
 def _mock_gemini_client(
-    mock_responses: list[str], model_call_seconds: float = 0
+    mock_responses: list[str], call_seconds: float = 0
 ) -> GeminiClient:
     """Build a ``genai.Client`` whose HTTP layer and file methods are mocked.
 
-    No network calls are made. Each non-streamed API call takes
-    ``model_call_seconds``.
+    No network calls are made. Each API call takes ``call_seconds``.
     """
     gemini = GeminiClient(api_key="fake-test-key")
 
@@ -1505,7 +1504,7 @@ def _mock_gemini_client(
                 f"No more mock responses (called {idx + 1} times, "
                 f"have {len(mock_responses)})"
             )
-        await asyncio.sleep(model_call_seconds)
+        await asyncio.sleep(call_seconds)
         return SdkHttpResponse(
             headers={"content-type": "application/json"},
             body=mock_responses[idx],
@@ -1521,6 +1520,7 @@ def _mock_gemini_client(
             )
 
         async def _gen():
+            await asyncio.sleep(call_seconds)
             yield SdkHttpResponse(
                 headers={"content-type": "application/json"},
                 body=mock_responses[idx],
@@ -1533,17 +1533,29 @@ def _mock_gemini_client(
 
     # Mock file operations at the high-level SDK interface (these are what
     # the real activities call).
+    async def delayed_response(value: Any, *_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.sleep(call_seconds)
+        return value
+
     gemini.aio.files.upload = AsyncMock(  # type: ignore[method-assign]
-        return_value=types.File(
-            name="files/mock-uploaded",
-            uri="https://fake.uri/files/mock-uploaded",
-            size_bytes=42,
+        side_effect=functools.partial(
+            delayed_response,
+            types.File(
+                name="files/mock-uploaded",
+                uri="https://fake.uri/files/mock-uploaded",
+                size_bytes=42,
+            ),
         )
     )
-    gemini.aio.files.download = AsyncMock(return_value=b"mock download content")  # type: ignore[method-assign]
+    gemini.aio.files.download = AsyncMock(  # type: ignore[method-assign]
+        side_effect=functools.partial(delayed_response, b"mock download content")
+    )
     gemini.aio.file_search_stores.upload_to_file_search_store = AsyncMock(  # type: ignore[method-assign]
-        return_value=types.UploadToFileSearchStoreOperation.model_validate(
-            {"name": "operations/mock-op"}
+        side_effect=functools.partial(
+            delayed_response,
+            types.UploadToFileSearchStoreOperation.model_validate(
+                {"name": "operations/mock-op"}
+            ),
         )
     )
 
@@ -1556,6 +1568,7 @@ def _mock_gemini_client(
     ]
 
     async def _interactions_create(*_args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(call_seconds)
         if kwargs.get("stream"):
             return _FakeAsyncStream(sse_events)
         return interaction
@@ -1563,7 +1576,11 @@ def _mock_gemini_client(
     mock_interactions = MagicMock()
     mock_interactions.create = _interactions_create
     mock_agents = MagicMock()
-    mock_agents.create = AsyncMock(return_value=_deserialize(make_agent_dict(), Agent))
+    mock_agents.create = AsyncMock(
+        side_effect=functools.partial(
+            delayed_response, _deserialize(make_agent_dict(), Agent)
+        )
+    )
     # The interactions/agents resources are cached lazily on the async client;
     # set them so the activities' client.aio.interactions/.agents calls hit the
     # mocks instead of the network.
@@ -1573,7 +1590,7 @@ def _mock_gemini_client(
 
 
 @pytest.mark.parametrize(
-    ("activity_config", "model_call_seconds", "heartbeat_timeout"),
+    ("activity_config", "call_seconds", "heartbeat_timeout"),
     [
         ("none", 0, timedelta(seconds=10)),
         ("no-heartbeat-timeout", 0, timedelta(seconds=10)),
@@ -1585,7 +1602,7 @@ def _mock_gemini_client(
 async def test_full_integration_with_mock_client(
     client: Client,
     activity_config: str,
-    model_call_seconds: float,
+    call_seconds: float,
     heartbeat_timeout: timedelta | None,
 ):
     """Run a workflow through real activities with a mocked genai.Client.
@@ -1610,7 +1627,7 @@ async def test_full_integration_with_mock_client(
             make_text_response("Grounded RAG answer"),  # RAG query with file_search
             make_text_response(""),  # file_search_stores.delete
         ],
-        model_call_seconds,
+        call_seconds,
     )
 
     async with new_worker(new_client, FullIntegrationWorkflow) as worker:
@@ -1645,6 +1662,60 @@ async def test_full_integration_with_mock_client(
         "interaction.completed",
     ]
     assert result["agent_id"] == "test-agent"
+
+
+@pytest.mark.parametrize("call", ["model", "interaction-stream"])
+async def test_workflow_cancellation_stops_gemini_call(client: Client, call: str):
+    """A timer heartbeat carries cancellation to a running SDK call."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def wait_for_cancel(*_args: Any, **_kwargs: Any) -> Any:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    gemini = _mock_gemini_client(
+        [make_text_response("")] * 4,
+    )
+    if call == "model":
+        gemini._api_client.async_request = wait_for_cancel  # type: ignore[assignment]
+    else:
+        stream = _FakeAsyncStream([])
+
+        async def blocked_stream() -> Any:
+            await wait_for_cancel()
+            yield None
+
+        stream._gen = blocked_stream  # type: ignore[method-assign]
+        create = gemini.aio.interactions.create
+
+        async def create_interaction(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("stream"):
+                return stream
+            return await create(*args, **kwargs)
+
+        gemini.aio.interactions.create = create_interaction  # type: ignore[method-assign]
+
+    config = client.config()
+    config["plugins"] = [GoogleGenAIPlugin(gemini)]
+    new_client = Client(**config)
+    async with new_worker(new_client, FullIntegrationWorkflow) as worker:
+        handle = await new_client.start_workflow(
+            FullIntegrationWorkflow.run,
+            args=["test prompt", "heartbeat-1s"],
+            id=f"gemini-cancel-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        await handle.cancel()
+        await asyncio.wait_for(cancelled.wait(), timeout=5)
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await handle.result()
+        assert isinstance(exc_info.value.cause, CancelledError)
 
 
 async def test_register_files_without_credentials_fails(client: Client):
@@ -2449,6 +2520,28 @@ async def test_activity_heartbeats_on_a_timer(
             await _run_real_activity(gemini, activity_name, req, env)
 
     assert bool(sent) == heartbeats
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+async def test_heartbeat_warns_when_event_loop_is_blocked(
+    blocked: bool, caplog: pytest.LogCaptureFixture
+):
+    """Warn when a blocked loop leaves a full timeout between heartbeats."""
+    from temporalio.google_genai._gemini_activity import _heartbeating
+
+    @_heartbeating
+    async def call() -> None:
+        if blocked:
+            time.sleep(0.25)
+        else:
+            await asyncio.sleep(0.25)
+        await asyncio.sleep(0.05)
+
+    env, sent = _heartbeat_counting_env(timedelta(milliseconds=200))
+    await env.run(call)
+
+    assert sent
+    assert ("Gemini activity heartbeat was delayed" in caplog.text) == blocked
 
 
 async def test_interaction_stream_does_not_heartbeat_per_event():
