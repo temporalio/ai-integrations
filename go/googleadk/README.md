@@ -1,5 +1,7 @@
 # Google ADK agents — Temporal integration (Go)
 
+Release stage: Generally Available.
+
 Make a [Google ADK](https://google.github.io/adk-docs/) (`adk-go`) agent **durable
 and replay-safe under Temporal** without rewriting the agent. The agent's
 orchestration loop runs inside a Temporal Workflow; each **LLM call** becomes a

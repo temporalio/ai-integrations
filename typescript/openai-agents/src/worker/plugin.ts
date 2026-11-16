@@ -1,7 +1,3 @@
-/**
- * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.
- */
-
 import { trace } from '@opentelemetry/api';
 import type { ModelProvider } from '@openai/agents-core';
 import { SimplePlugin } from '@temporalio/plugin';
@@ -141,8 +137,6 @@ function packageVersion(): string {
  * Temporal plugin integrating the OpenAI Agents SDK. Registers model
  * invocation Activities so Workflow-side ActivityBackedModel can delegate LLM
  * calls, and wires trace propagation between client/Workflow/Activity.
- *
- * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.
  */
 export class OpenAIAgentsPlugin extends SimplePlugin {
   /** The package version, reported in worker heartbeats. */
