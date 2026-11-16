@@ -40,7 +40,7 @@ import { replayScenario } from './workflows';
 
 // Replay is promised only within a major (see AGENTS.md), so only the histories
 // in the current major's folder replay.
-const REPLAY_MAJOR = 0;
+const REPLAY_MAJOR = 1;
 const historiesDir = path.resolve(__dirname, '../../src/__tests__/histories', `${REPLAY_MAJOR}.x`);
 const UPDATE_HISTORIES = process.env.UPDATE_ADK_HISTORIES === '1';
 
