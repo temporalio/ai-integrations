@@ -71,6 +71,12 @@ exclude-newer-package = { temporalio = false, temporalio-mcp = false }   # first
 link-mode = "copy"
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
 
+# TEMPORARY: the activity session API exists only on the unreleased sdk-python
+# dev/sticky-activities branch. Remove this source and raise the temporalio floor once
+# sdk-python releases activity sessions. Machine-local; CI and check_conventions.py fail on it.
+[tool.uv.sources]
+temporalio = { path = "/Users/justinschoeff/workplace/sdk/sdk-python-sticky-activities/dist/temporalio-1.34.0-cp310-abi3-macosx_11_0_arm64.whl" }
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Do not use log_cli since this shows logging for all tests, not just the ones
