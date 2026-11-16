@@ -156,6 +156,7 @@ class DeepAgentsPlugin(SimplePlugin):
             self._activities.invoke_model_streaming,
             self._activities.invoke_tool,
             self._activities.backend_op,
+            self._activities.get_model_profile,
         )
 
         super().__init__(

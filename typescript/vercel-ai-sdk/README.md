@@ -113,6 +113,18 @@ heartbeat. Set `heartbeatTimeout: 0` to turn heartbeats off. Then a lost Worker
 is noticed only at `startToCloseTimeout`, and a cancellation request does not
 reach the Activity.
 
+Workers on 1.0.0 don't heartbeat on a timer. While both versions run, a call
+that this version schedules and a 1.0.0 Worker runs fails after 10 seconds
+without a heartbeat, and so does each retry.
+
+- To upgrade, deploy this version to the Workers that run the model Activities
+  first. If the same Workers run Workflows too, deploy it with
+  `heartbeatTimeout: 0` and remove that in a later deploy.
+- To roll back, first deploy with `heartbeatTimeout: 0`, then wait for the
+  calls scheduled before that deploy to finish: they keep the 10-second timeout.
+- Runs pinned with Worker Versioning avoid both, when their model Activities
+  use the Workflow's task queue.
+
 When `invokeModelStreaming` is retried, the new attempt publishes all of its
 stream parts to the topic again, after the parts the failed attempt published.
 A subscriber that wants only the last attempt can discard what it has when a

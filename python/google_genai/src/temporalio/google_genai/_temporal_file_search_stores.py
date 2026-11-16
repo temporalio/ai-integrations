@@ -23,6 +23,7 @@ from temporalio.google_genai._models import (
 from temporalio.google_genai._temporal_api_client import (
     _TemporalApiClient,
     _validate_http_options,
+    _with_default_heartbeat,
 )
 from temporalio.workflow import ActivityConfig
 
@@ -45,7 +46,7 @@ class TemporalAsyncFileSearchStores(AsyncFileSearchStores):
     ) -> None:
         """Initialize with activity config for upload timeouts."""
         super().__init__(api_client)
-        self._activity_config = (
+        self._activity_config = _with_default_heartbeat(
             ActivityConfig(start_to_close_timeout=timedelta(seconds=60))
             if activity_config is None
             else activity_config
