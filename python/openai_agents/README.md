@@ -574,6 +574,12 @@ Activity and are never shared across workflows.
 `temporalio.mcp.x.*`. Do not register the same MCP server name through
 both plugins on one worker; Temporal rejects the duplicate Activity types.
 
+A factory that returns something other than an `agents.mcp.MCPServer` fails
+the Activity with a non-retryable `ApplicationError` of type
+`MCPServerFactoryTypeError`. A factory that isn't callable makes
+`OpenAIAgentsPlugin(...)` raise `TypeError`, so the Worker doesn't start, even
+when no workflow uses that server.
+
 An optional `factory_argument` can select worker-side configuration such as a
 tenant endpoint:
 
