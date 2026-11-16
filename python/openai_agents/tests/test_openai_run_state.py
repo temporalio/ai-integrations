@@ -54,19 +54,19 @@ from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.openai_agents import ModelSummaryProvider, TemporalAgent
-from temporalio.openai_agents._model_parameters import _ModelOptions
+from temporalio.openai_agents._model_options import _ModelOptions
 from temporalio.openai_agents._openai_runner import (
     TemporalOpenAIRunner,
-    _convert_agent,
+)
+from temporalio.openai_agents._temporal_model import (
+    TemporalModel,  # pyright: ignore[reportPrivateUsage]
 )
 from temporalio.openai_agents._temporal_model_provider import (
     _CaptureAgentFilter,  # pyright: ignore[reportPrivateUsage]
+    _current_agent,
     _TemporalModelProvider,  # pyright: ignore[reportPrivateUsage]
     capture_scope,
     install_model_provider,  # pyright: ignore[reportPrivateUsage]
-)
-from temporalio.openai_agents._temporal_model_stub import (
-    _TemporalModelStub,  # pyright: ignore[reportPrivateUsage]
 )
 from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
 from temporalio.workflow import ActivityConfig
@@ -279,7 +279,7 @@ async def _approve_and_resume(
 
 @pytest.mark.parametrize("streamed", [False, True])
 @pytest.mark.parametrize("use_handoff_object", [False, True])
-async def test_converted_handoff_restores_tool_use_after_resume(
+async def test_handoff_restores_tool_use_after_resume(
     streamed: bool, use_handoff_object: bool
 ) -> None:
     banker = _make_banker()
@@ -295,15 +295,14 @@ async def test_converted_handoff_restores_tool_use_after_resume(
         max_turns=10,
     )
     state.set_tool_use_tracker_snapshot({"Banker": ["transfer_funds"]})
-    converted = _convert_agent(_ModelOptions(), triage, None)
-    restored = await RunState.from_string(converted, state.to_string())
+    restored = await RunState.from_string(triage, state.to_string())
     model = ScriptedModel(
         lambda _instructions, _input: ResponseBuilders.output_message(
             "Transfer complete."
         )
     )
     result = await _run(
-        converted, restored, streamed=streamed, run_config=RunConfig(model=model)
+        triage, restored, streamed=streamed, run_config=RunConfig(model=model)
     )
     assert result.final_output == "Transfer complete."
     assert model.seen_model_settings[0].tool_choice is None
@@ -340,10 +339,7 @@ async def test_shared_handoff_target_restores_after_approval(
         return _banker_reply(instructions, input)
 
     config = RunConfig(model=ScriptedModel(reply))
-    converted = _convert_agent(_ModelOptions(), triage, None)
-    result = await _run(
-        converted, "Move 5 dollars.", streamed=streamed, run_config=config
-    )
+    result = await _run(triage, "Move 5 dollars.", streamed=streamed, run_config=config)
     assert len(result.interruptions) == 1
     restored = await RunState.from_string(triage, result.to_state().to_string())
     assert await _approve_and_resume(
@@ -375,10 +371,7 @@ async def test_shared_handoff_target_tool_restores_nested_approval(
         )
 
     config = RunConfig(model=ScriptedModel(reply))
-    converted = _convert_agent(_ModelOptions(), triage, None)
-    result = await _run(
-        converted, "Move 5 dollars.", streamed=streamed, run_config=config
-    )
+    result = await _run(triage, "Move 5 dollars.", streamed=streamed, run_config=config)
     assert len(result.interruptions) == 1
     restored = await RunState.from_string(triage, result.to_state().to_string())
     resumed = await _approve_and_resume(
@@ -390,7 +383,7 @@ async def test_shared_handoff_target_tool_restores_nested_approval(
 @pytest.mark.parametrize("streamed", [False, True])
 @pytest.mark.parametrize("change", ["instructions", "tools"])
 @pytest.mark.parametrize("graph", ["target", "downstream", "shared_cycle"])
-async def test_handoff_callback_updates_cached_graph(
+async def test_handoff_callback_updates_graph(
     streamed: bool,
     change: Literal["instructions", "tools"],
     graph: Literal["target", "downstream", "shared_cycle"],
@@ -439,10 +432,9 @@ async def test_handoff_callback_updates_cached_graph(
         return ResponseBuilders.output_message(instructions or "")
 
     config = RunConfig(model=ScriptedModel(reply))
-    converted = _convert_agent(_ModelOptions(), triage, None)
     for invocation in range(1, 3):
         result = await _run(
-            converted, "Move 5 dollars.", streamed=streamed, run_config=config
+            triage, "Move 5 dollars.", streamed=streamed, run_config=config
         )
         if change == "instructions":
             assert result.final_output == f"After callback {invocation}."
@@ -927,7 +919,7 @@ async def test_capture_filter_returns_user_result_unchanged():
     async def async_filter(_data: CallModelData[Any]) -> ModelInputData:
         return returned
 
-    provider = _TemporalModelProvider(_ModelOptions())
+    provider = _TemporalModelProvider()
     data = _call_data(agent)
 
     sync_config = provider.install(RunConfig(call_model_input_filter=sync_filter))
@@ -951,10 +943,7 @@ async def test_capture_filter_returns_user_result_unchanged():
         no_filter.call_model_input_filter(_call_data(agent))
 
 
-def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(workflow, "patched", lambda _: True)
+def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs():
     target = Agent(name="target", model=ScriptedModel(_banker_reply))
     middle = TemporalAgent(name="middle", handoffs=[target])
     starting = TemporalAgent(name="starting", handoffs=[middle])
@@ -966,21 +955,19 @@ def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs(
 
 async def test_capture_filter_resolves_agent_lazily_and_is_installed_once():
     agent = _make_banker()
-    params = _ModelOptions()
-    config = install_model_provider(params, RunConfig())
+    config = install_model_provider(RunConfig())
     provider = config.model_provider
     assert isinstance(provider, _TemporalModelProvider)
     stub = provider.get_model("gpt-4o")
-    assert isinstance(stub, _TemporalModelStub)
-    assert stub._current_agent is not None  # pyright: ignore[reportPrivateUsage]
-    assert stub._current_agent() is None  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(stub, TemporalModel)
+    assert _current_agent.get() is None  # pyright: ignore[reportPrivateUsage]
 
     assert config.call_model_input_filter is not None
     config.call_model_input_filter(_call_data(agent))
-    assert stub._current_agent() is agent  # pyright: ignore[reportPrivateUsage]
+    assert _current_agent.get() is agent  # pyright: ignore[reportPrivateUsage]
 
     # A nested run reuses the parent's provider and filter instead of wrapping them again.
-    nested = install_model_provider(params, config)
+    nested = install_model_provider(config)
     assert nested.model_provider is provider
     assert isinstance(nested.call_model_input_filter, _CaptureAgentFilter)
     assert nested.call_model_input_filter.wrapped is None
@@ -1014,12 +1001,12 @@ async def test_finished_runs_leave_no_agent_in_workflow_context(
 
 def test_capture_scope_restores_the_callers_context():
     outer_agent, inner_agent = _make_banker(), _make_triage(False)
-    config = install_model_provider(_ModelOptions(), RunConfig())
+    config = install_model_provider(RunConfig())
     provider = config.model_provider
     assert isinstance(provider, _TemporalModelProvider)
     stub = provider.get_model("gpt-4o")
-    assert isinstance(stub, _TemporalModelStub)
-    current_agent = stub._current_agent  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(stub, TemporalModel)
+    current_agent = _current_agent.get
     assert current_agent is not None
     assert config.call_model_input_filter is not None
     capture = config.call_model_input_filter

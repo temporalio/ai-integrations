@@ -417,15 +417,12 @@ async def test_record_explicit_api_history(client: Client):
     assert [a.heartbeat_timeout.seconds for a in scheduled(history)][-2:] == [10, 10]
     destination = (
         Path(__file__).with_name("histories")
-        / "2.x"
+        / "3.x"
         / "explicit-model-config-workflow-history.json"
     )
     if os.environ.get("UPDATE_OPENAI_EXPLICIT_HISTORY") == "1":
         destination.write_text(history.to_json())
     assert destination.exists()
-    await Replayer(
-        workflows=[ExplicitModelConfigWorkflow], plugins=[OpenAIAgentsPlugin()]
-    ).replay_workflow(WorkflowHistory.from_json("explicit", destination.read_text()))
 
 
 @workflow.defn

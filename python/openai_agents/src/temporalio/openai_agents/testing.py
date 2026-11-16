@@ -1,6 +1,6 @@
 """Testing utilities for OpenAI agents."""
 
-from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
 from datetime import timedelta
 from typing import Any
 
@@ -25,11 +25,7 @@ from openai.types.responses import (
 )
 
 from temporalio.client import Client
-from temporalio.openai_agents._mcp import (
-    StatefulMCPServerProvider,
-    StatelessMCPServerProvider,
-)
-from temporalio.openai_agents._model_parameters import (
+from temporalio.openai_agents._model_options import (
     ModelSummaryProvider,
     _ModelOptions,
 )
@@ -191,9 +187,6 @@ class AgentEnvironment:
         activity_config: ActivityConfig | None = None,
         model_provider: ModelProvider | None = None,
         model: Model | None = None,
-        mcp_server_providers: Sequence[
-            StatelessMCPServerProvider | StatefulMCPServerProvider
-        ] = (),
         register_activities: bool = True,
         add_temporal_spans: bool = True,
         use_otel_instrumentation: bool = False,
@@ -226,9 +219,6 @@ class AgentEnvironment:
                 Equivalent to model_provider=TestModelProvider(model).
                 Only one of model_provider or model should be provided.
                 If both are provided, model_provider will be used.
-            mcp_server_providers: Legacy MCP server providers to register with the
-                worker. Deprecated; use ``mcp_servers`` for new MCP v2
-                integrations.
             mcp_servers: Named OpenAI MCP server factories to register with the worker.
             mcp_connection_idle_timeout: How long idle modern connections are reused.
                 None disables idle eviction, and zero disables reuse.
@@ -256,7 +246,6 @@ class AgentEnvironment:
             self._model_provider = model_provider
         elif model is not None:
             self._model_provider = TestModelProvider(model)
-        self._mcp_server_providers = mcp_server_providers
         self._mcp_servers = mcp_servers
         self._mcp_connection_idle_timeout = mcp_connection_idle_timeout
         self._register_activities = register_activities
@@ -277,7 +266,6 @@ class AgentEnvironment:
             streaming_batch_interval=self._model_options.streaming_batch_interval,
             summary_provider=self._model_options.summary_provider,
             model_provider=self._model_provider,
-            mcp_server_providers=self._mcp_server_providers,
             mcp_servers=self._mcp_servers,
             mcp_connection_idle_timeout=self._mcp_connection_idle_timeout,
             register_activities=self._register_activities,

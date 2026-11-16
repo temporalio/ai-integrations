@@ -11,10 +11,9 @@ from typing import Any
 from agents import Agent, Model, ModelProvider, ModelSettings, RunConfig
 from agents.run_config import CallModelData, CallModelInputFilter, ModelInputData
 
-from temporalio.openai_agents._model_parameters import _ModelOptions
+from temporalio.openai_agents._model_options import _ModelOptions
 from temporalio.openai_agents._temporal_agent import TemporalAgent
 from temporalio.openai_agents._temporal_model import TemporalModel
-from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 
 _current_agent: ContextVar[Agent[Any] | None] = ContextVar(
     "temporal_openai_agents_current_agent", default=None
@@ -39,29 +38,25 @@ def effective_model_options(
     """Resolve Worker, model, agent, then run overrides per field."""
     layers = [_current_model_defaults.get() or _ModelOptions()]
     if agent is not None and isinstance(agent.model, TemporalModel):
-        layers.append(agent.model.model_params)
+        layers.append(agent.model._options)
     elif agent is None and model is not None:
-        layers.append(model.model_params)
+        layers.append(model._options)
     if isinstance(agent, TemporalAgent):
         layers.append(agent._model_options())
     run_model = _current_run_model.get()
     if run_model is not None:
-        layers.append(run_model.model_params)
+        layers.append(run_model._options)
     return _ModelOptions.merge(*layers)
 
 
-def validate_agent(agent: Agent[Any], *, explicit: bool) -> None:
+def validate_agent(agent: Agent[Any]) -> None:
     """Refuse models that would run provider code inside the Workflow."""
-    if agent.model is not None and not isinstance(
-        agent.model, (str, _TemporalModelStub)
-    ):
+    if agent.model is not None and not isinstance(agent.model, (str, TemporalModel)):
         raise ValueError(
             "Temporal workflows require a model name to be a string or TemporalModel in the agent."
         )
-    if (
-        explicit
-        and not isinstance(agent, TemporalAgent)
-        and not isinstance(agent.model, TemporalModel)
+    if not isinstance(agent, TemporalAgent) and not isinstance(
+        agent.model, TemporalModel
     ):
         raise ValueError(
             "Use TemporalAgent for string or implicit models, or Agent(model=TemporalModel(...))."
@@ -99,10 +94,9 @@ class _CaptureAgentFilter:
     """A ``call_model_input_filter`` that records the active agent, then defers to the user's."""
 
     def __init__(
-        self, wrapped: CallModelInputFilter | None, *, explicit: bool, streaming: bool
+        self, wrapped: CallModelInputFilter | None, *, streaming: bool
     ) -> None:
         self.wrapped = wrapped
-        self.explicit = explicit
         self.streaming = streaming
 
     def __call__(
@@ -114,9 +108,8 @@ class _CaptureAgentFilter:
             ValueError: If the agent could call a provider inside the Workflow,
                 or uses an implicit/string model without TemporalAgent on a new run.
         """
-        validate_agent(data.agent, explicit=self.explicit)
-        if self.explicit:
-            effective_model_options(data.agent).config(streaming=self.streaming)
+        validate_agent(data.agent)
+        effective_model_options(data.agent).config(streaming=self.streaming)
         _current_agent.set(data.agent)
         if self.wrapped is None:
             return data.model_data
@@ -133,47 +126,27 @@ class _TemporalModelProvider(ModelProvider):
     when a run ends.
     """
 
-    def __init__(
-        self,
-        model_params: _ModelOptions,
-        *,
-        explicit: bool = False,
-        streaming: bool = False,
-    ) -> None:
-        self._model_params = model_params
-        self.explicit = explicit
+    def __init__(self, *, streaming: bool = False) -> None:
         self.streaming = streaming
 
     def get_model(self, model_name: str | None) -> Model:
-        """Return a stub that runs the model call as a Temporal activity."""
-        if self.explicit:
-            return TemporalModel(model_name)
-        return _TemporalModelStub(
-            model_name,
-            model_params=self._model_params,
-            agent=None,
-            current_agent=_current_agent.get,
-            current_run_model_settings=_current_run_model_settings.get,
-        )
+        """Return the durable model for a name or the Worker's default model."""
+        return TemporalModel(model_name)
 
     def install(self, run_config: RunConfig) -> RunConfig:
         """Return ``run_config`` using this provider and an agent-capturing input filter."""
         user_filter = run_config.call_model_input_filter
         if isinstance(user_filter, _CaptureAgentFilter):
             user_filter = user_filter.wrapped
-        capture_filter = _CaptureAgentFilter(
-            user_filter, explicit=self.explicit, streaming=self.streaming
-        )
+        capture_filter = _CaptureAgentFilter(user_filter, streaming=self.streaming)
         return dataclasses.replace(
             run_config, model_provider=self, call_model_input_filter=capture_filter
         )
 
 
 def install_model_provider(
-    model_params: _ModelOptions,
     run_config: RunConfig,
     *,
-    explicit: bool = False,
     streaming: bool = False,
 ) -> RunConfig:
     """Route model resolution in ``run_config`` through the Temporal model provider.
@@ -181,10 +154,9 @@ def install_model_provider(
     A nested run inherits the parent's provider when the execution mode agrees.
     """
     provider = run_config.model_provider
-    if not isinstance(provider, _TemporalModelProvider) or (
-        provider.explicit != explicit or provider.streaming != streaming
+    if (
+        not isinstance(provider, _TemporalModelProvider)
+        or provider.streaming != streaming
     ):
-        provider = _TemporalModelProvider(
-            model_params, explicit=explicit, streaming=streaming
-        )
+        provider = _TemporalModelProvider(streaming=streaming)
     return provider.install(run_config)

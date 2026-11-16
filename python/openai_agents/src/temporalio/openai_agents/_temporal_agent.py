@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from agents import Agent, TContext
 
-from temporalio.openai_agents._model_parameters import (
+from temporalio.openai_agents._model_options import (
     ModelSummaryProvider,
     _ModelOptions,
 )

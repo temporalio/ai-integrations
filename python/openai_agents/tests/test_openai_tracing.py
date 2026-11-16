@@ -60,7 +60,7 @@ from temporalio.openai_agents import (
     TemporalAgent,
     _temporal_openai_agents,
 )
-from temporalio.openai_agents._model_parameters import _ModelOptions
+from temporalio.openai_agents._model_options import _ModelOptions
 from temporalio.openai_agents._otel_trace_interceptor import (
     OTelOpenAIAgentsContextPropagationInterceptor,
 )

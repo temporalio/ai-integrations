@@ -6,8 +6,7 @@ The agent reads workflow-facing settings from the workflow-side server it
 holds, never from the factory's server. A setting there that the plugin can
 neither apply nor safely ignore is rejected with a non-retryable error.
 
-This module needs no ``mcp`` extra, so both the MCP v2 backend and the
-deprecated providers can use it.
+The MCP backend checks these settings before it connects to the server.
 """
 
 import inspect

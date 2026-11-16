@@ -5,7 +5,6 @@ import importlib.metadata
 import json
 import threading
 import typing
-import warnings
 from collections.abc import (
     AsyncGenerator,
     Callable,
@@ -45,7 +44,7 @@ from temporalio.converter import (
 )
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import ModelActivity
-from temporalio.openai_agents._model_parameters import (
+from temporalio.openai_agents._model_options import (
     ModelSummaryProvider,
     _ModelOptions,
 )
@@ -70,8 +69,6 @@ from temporalio.workflow import ActivityConfig
 if typing.TYPE_CHECKING:
     from temporalio.openai_agents import (
         SandboxClientProvider,
-        StatefulMCPServerProvider,
-        StatelessMCPServerProvider,
     )
     from temporalio.openai_agents._otel_trace_processor import (
         OTelTracingProcessorAdapter,
@@ -148,7 +145,7 @@ def _uninstall_otel_instrumentation() -> None:
 
 @contextmanager
 def _set_open_ai_agent_temporal_overrides(
-    model_params: _ModelOptions,
+    model_options: _ModelOptions,
     start_spans_in_replay: bool = False,
 ):
     previous_runner = get_default_agent_runner()
@@ -158,7 +155,7 @@ def _set_open_ai_agent_temporal_overrides(
     )
 
     try:
-        set_default_agent_runner(TemporalOpenAIRunner(model_params))
+        set_default_agent_runner(TemporalOpenAIRunner(model_options))
         set_trace_provider(provider)
         yield provider
     finally:
@@ -384,9 +381,6 @@ class OpenAIAgentsPlugin(SimplePlugin):
         self,
         activity_config: ActivityConfig | None = None,
         model_provider: ModelProvider | None = None,
-        mcp_server_providers: Sequence[
-            "StatelessMCPServerProvider | StatefulMCPServerProvider"
-        ] = (),
         sandbox_clients: Sequence["SandboxClientProvider"] = (),
         register_activities: bool = True,
         add_temporal_spans: bool = True,
@@ -414,12 +408,6 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 combined with a static activity_config summary.
             model_provider: Optional model provider for custom model implementations.
                 Useful for testing or custom model integrations.
-            mcp_server_providers: Legacy MCP server providers to register with the
-                worker. Deprecated; use ``mcp_servers`` for new MCP v2
-                integrations. A provider's server with a callable
-                ``tool_filter``, a ``require_approval`` policy that can ask for
-                approval, a ``tool_meta_resolver``, or a tool guardrail is
-                rejected in every MCP operation; a static filter is applied.
             mcp_servers: Named OpenAI MCP server factories to register on the worker.
                 Each factory may declare at most one positional parameter, which
                 receives the workflow's ``factory_argument`` (``None`` when the
@@ -458,7 +446,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 Use with caution in production environments.
 
         """
-        model_params = _ModelOptions(
+        model_options = _ModelOptions(
             activity_config=activity_config or ActivityConfig(),
             use_local_activity=use_local_activity,
             streaming_topic=streaming_topic,
@@ -467,18 +455,9 @@ class OpenAIAgentsPlugin(SimplePlugin):
         )
 
         self._use_otel_instrumentation = use_otel_instrumentation
-        if mcp_server_providers:
-            warnings.warn(
-                "mcp_server_providers is deprecated; use mcp_servers with "
-                "workflow.temporal_mcp_server() instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         mcp_activities = None
         if mcp_servers:
-            # The shared Activity layer requires MCP v2, but the legacy OpenAI
-            # provider path remains importable with MCP v1.
+            # Keep optional MCP dependencies lazy until a server is configured.
             try:
                 from temporalio.mcp._activities import _MCPActivities
                 from temporalio.openai_agents._mcp_backend import (
@@ -517,14 +496,6 @@ class OpenAIAgentsPlugin(SimplePlugin):
 
             if mcp_activities:
                 new_activities.extend(mcp_activities.activities)
-
-            server_names = [server.name for server in mcp_server_providers]
-            if len(server_names) != len(set(server_names)):
-                raise ValueError(
-                    "More than one mcp server registered with the same name. Please provide unique names."
-                )
-            for mcp_server in mcp_server_providers:
-                new_activities.extend(mcp_server._get_activities())
 
             sandbox_names = [sc.name for sc in sandbox_clients]
             if len(sandbox_names) != len(set(sandbox_names)):
@@ -580,14 +551,14 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 async with mcp_activities.run_context():
                     with self.tracing_context():
                         with _set_open_ai_agent_temporal_overrides(
-                            model_params,
+                            model_options,
                             start_spans_in_replay=use_otel_instrumentation,
                         ):
                             yield
             else:
                 with self.tracing_context():
                     with _set_open_ai_agent_temporal_overrides(
-                        model_params,
+                        model_options,
                         start_spans_in_replay=use_otel_instrumentation,
                     ):
                         yield

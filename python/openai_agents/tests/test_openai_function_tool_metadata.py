@@ -52,8 +52,7 @@ from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
     _build_tools_and_handoffs,
 )
-from temporalio.openai_agents._model_parameters import _ModelOptions
-from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._temporal_model import TemporalModel
 from temporalio.openai_agents._temporal_openai_agents import OpenAIPayloadConverter
 from temporalio.openai_agents._temporal_worker_env_ref import _WorkerEnvRefResolver
 from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
@@ -134,11 +133,9 @@ def _responses_tools(tools: list[Tool]) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], Converter.convert_tools(tools, []).tools)
 
 
-def _stub() -> _TemporalModelStub:
-    return _TemporalModelStub(
+def _stub() -> TemporalModel:
+    return TemporalModel(
         model_name="gpt-5",
-        model_params=_ModelOptions(),
-        agent=None,
     )
 
 

@@ -45,8 +45,7 @@ from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
     _build_tools_and_handoffs,
 )
-from temporalio.openai_agents._model_parameters import _ModelOptions
-from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._temporal_model import TemporalModel
 from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _WorkerEnvRefResolver,
@@ -117,10 +116,8 @@ def test_build_tool_reports_unreconstructed_dict():
 
 
 def _round_trip_activity_input(tool: Tool) -> tuple[bytes, ActivityModelInput]:
-    stub = _TemporalModelStub(
+    stub = TemporalModel(
         model_name="gpt-5",
-        model_params=_ModelOptions(),
-        agent=None,
     )
     activity_input, _summary = stub._build_activity_input(
         system_instructions=None,
