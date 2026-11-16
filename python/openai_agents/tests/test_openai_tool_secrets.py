@@ -3,7 +3,7 @@
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Collection
+from collections.abc import AsyncIterator, Callable, Collection
 from typing import Any, Literal, cast
 
 import pydantic
@@ -69,10 +69,35 @@ OTHER_ENV_NAME = "TEMPORAL_TEST_OTHER_TOOL_SECRET"
 _RESOLVER_ALLOWING_TEST_NAMES = _WorkerEnvRefResolver([ENV_NAME, OTHER_ENV_NAME])
 
 
-def test_lenient_activity_input_reconstructs_tools_and_handoffs():
+_FUNCTION_CALL: TResponseInputItem = {
+    "type": "function_call",
+    "call_id": "call_1",
+    "name": "get_weather",
+    "arguments": "{}",
+}
+
+
+def _invalid_tracing(raw: dict[str, Any]) -> None:
+    raw["tracing"] = "invalid-enum-value"
+
+
+def _null_namespace(raw: dict[str, Any]) -> None:
+    # An explicit None that the next model input's item type does not allow.
+    raw["input"][0]["namespace"] = None
+
+
+@pytest.mark.parametrize(
+    "model_input,drift",
+    [("hi", _invalid_tracing), ([_FUNCTION_CALL], _null_namespace)],
+    ids=["invalid-tracing", "explicit-null-in-input-item"],
+)
+def test_lenient_activity_input_reconstructs_tools_and_handoffs(
+    model_input: str | list[TResponseInputItem],
+    drift: Callable[[dict[str, Any]], None],
+):
     activity_input: ActivityModelInput = {
         "model_name": "gpt-5",
-        "input": "hi",
+        "input": model_input,
         "model_settings": ModelSettings(),
         "tools": [
             FunctionToolInput(
@@ -96,7 +121,7 @@ def test_lenient_activity_input_reconstructs_tools_and_handoffs():
     converter = OpenAIPayloadConverter()
     payload = converter.to_payload(activity_input)
     raw = json.loads(payload.data)
-    raw["tracing"] = "invalid-enum-value"
+    drift(raw)
     payload.data = json.dumps(raw).encode()
 
     received = converter.from_payload(payload, ActivityModelInput)
@@ -182,18 +207,83 @@ def _drifted_payload(value: Any) -> Payload:
 @pytest.mark.parametrize(
     "value",
     [
-        _CallerResult(message=_message(), responses=[_response()]),
         # The first variant lowers the tag in place before it fails, and the
         # second one would accept what is left.
         _TaggedEnvelope(item=_InPlaceTagged(kind="a", record=_response())),
     ],
-    ids=["caller-model", "validator-changing-its-input"],
+    ids=["validator-changing-its-input"],
 )
 def test_lenient_fallback_raises_instead_of_returning_a_dict(
     value: pydantic.BaseModel,
 ):
     with pytest.raises(pydantic.ValidationError):
         OpenAIPayloadConverter().from_payload(_drifted_payload(value), type(value))
+
+
+class _ExtraResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    message: ResponseOutputMessage
+
+
+class _AliasedResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(serialize_by_alias=True)
+    record: ModelResponse = pydantic.Field(alias="Record")
+
+
+_MessageMap = pydantic.RootModel[dict[str, ResponseOutputMessage]]
+
+
+def _is_message(value: Any) -> bool:
+    return (
+        isinstance(value, ResponseOutputMessage)
+        and isinstance(value.content[0], ResponseOutputText)
+        and value.content[0].text == "done"
+    )
+
+
+def _is_response(value: Any) -> bool:
+    return isinstance(value, ModelResponse) and _is_message(value.output[0])
+
+
+@pytest.mark.parametrize(
+    "value,type_,check",
+    [
+        (
+            _CallerResult(message=_message(), responses=[_response()]),
+            _CallerResult,
+            lambda got: _is_message(got.message) and _is_response(got.responses[0]),
+        ),
+        (
+            _CallerResult(message=_message(), responses=[_response()]),
+            _CallerResult | None,
+            lambda got: isinstance(got, _CallerResult) and _is_message(got.message),
+        ),
+        (
+            _MessageMap({"a": _message()}),
+            _MessageMap,
+            lambda got: _is_message(got.root["a"]),
+        ),
+        (
+            _AliasedResult.model_validate({"Record": _response()}),
+            _AliasedResult,
+            lambda got: _is_response(got.record),
+        ),
+        (
+            _ExtraResult.model_validate({"message": _message(), "note": "kept"}),
+            _ExtraResult,
+            lambda got: (
+                _is_message(got.message) and got.model_extra == {"note": "kept"}
+            ),
+        ),
+    ],
+    ids=["caller-model", "optional-caller-model", "root-model", "alias", "extra-field"],
+)
+def test_lenient_fallback_rebuilds_caller_models(
+    value: Any, type_: Any, check: Callable[[Any], bool]
+):
+    received = OpenAIPayloadConverter().from_payload(_drifted_payload(value), type_)
+
+    assert check(received)
 
 
 def test_build_tool_reports_unreconstructed_dict():
