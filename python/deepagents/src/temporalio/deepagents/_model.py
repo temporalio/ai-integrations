@@ -58,11 +58,6 @@ def _as_message_chunk(message: Any) -> Any:
     )
 
 
-# Patch id for rebuilding ContextOverflowError from a failed model Activity.
-# Never change it: it is recorded in histories as a marker.
-_CONTEXT_OVERFLOW_PATCH = "deepagents.context-overflow-recovery"
-
-
 async def _call_model(
     activity_name: str,
     activity_input: _activity.ModelActivityInput,
@@ -74,8 +69,6 @@ async def _call_model(
 
     Deep Agents' summarization middleware summarizes and retries only when the
     model call raises an overflow it recognizes; an ``ActivityError`` is not one.
-    Histories recorded before this change let the ``ActivityError`` propagate,
-    and the Workflow may have handled it, so they keep that behavior.
     """
     from temporalio.deepagents.workflow import call_model
 
@@ -86,7 +79,6 @@ async def _call_model(
         if (
             isinstance(cause, ApplicationError)
             and cause.type == _activity.CONTEXT_OVERFLOW_ERROR_TYPE
-            and workflow.patched(_CONTEXT_OVERFLOW_PATCH)
         ):
             raise ContextOverflowError(cause.message) from error
         raise
