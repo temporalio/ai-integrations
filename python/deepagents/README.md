@@ -99,6 +99,40 @@ Two things worth noticing:
 - Tools, real-I/O backends, human-in-the-loop, streaming, and continue-as-new
   each get a section below.
 
+## Model profiles
+
+Deep Agents sizes summarization from the model's LangChain profile
+(`max_input_tokens`). Only the model name reaches the Workflow, so fetch the
+profile of the Worker's model before building the agent:
+
+```python
+from temporalio import workflow
+from temporalio.deepagents import (
+    TemporalModel,
+    create_temporal_deep_agent,
+    get_model_profile,
+)
+
+
+@workflow.defn
+class ResearchAgent:
+    @workflow.run
+    async def run(self, question: str) -> None:
+        model = "anthropic:claude-haiku-4-5"
+        profile = await get_model_profile(model)
+        agent = create_temporal_deep_agent(
+            model=TemporalModel(model=model, profile=profile),
+            tools=[],
+        )
+        ...
+```
+
+`get_model_profile` runs one Activity, registered by `DeepAgentsPlugin`, that
+returns `model_provider(name).profile`, and History records the result, so a
+later change on the Worker does not affect runs in flight.
+`create_temporal_deep_agent` keeps a `TemporalModel`'s profile when it applies
+`activity_options`.
+
 ## Configuring activity options
 
 Per agent (recommended): `create_temporal_deep_agent(..., activity_options=...)`

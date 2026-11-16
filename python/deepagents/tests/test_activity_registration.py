@@ -237,6 +237,7 @@ def _alias_all(
 
 _BUILTIN_NAMES = [
     "deepagents.backend_op",
+    "deepagents.get_model_profile",
     "deepagents.invoke_model",
     "deepagents.invoke_model_streaming",
     "deepagents.invoke_tool",
