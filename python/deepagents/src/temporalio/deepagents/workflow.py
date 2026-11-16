@@ -267,6 +267,10 @@ async def run_deep_agent(
 ) -> Any:
     """Drive ``agent.ainvoke(input)`` with continue-as-new state carry.
 
+    .. warning::
+        Continue-as-new through this function is experimental. When it
+        triggers and what the snapshot holds may change in future versions.
+
     Once a completed turn leaves pending todos and history has grown past the
     limit, its messages and state files are carried into a fresh run via
     ``workflow.continue_as_new``. Todos are not restored as state:

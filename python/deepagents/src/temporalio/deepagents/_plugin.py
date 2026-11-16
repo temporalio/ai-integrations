@@ -4,7 +4,7 @@
 ``deepagents`` code — ``create_deep_agent(...).ainvoke(...)`` — runs durably
 inside a ``@workflow.defn`` with no other changes:
 
-* registers the four activities that carry the nondeterministic work;
+* registers the five activities that carry the nondeterministic work;
 * installs the LangChain-aware data converter (composing, never clobbering, a
   user converter);
 * passes the LangChain / LangGraph / deepagents import tree through the workflow
@@ -69,7 +69,11 @@ class DeepAgentsPlugin(SimplePlugin):
         model_activity_options: ``ActivityConfig`` (or ``Mapping[model_name,
             ActivityConfig]``) for the model activities — timeouts, retry policy.
         tool_activity_options: ``ActivityConfig`` (or ``Mapping[tool_name,
-            ActivityConfig]``) default for tools wrapped with ``tool_as_activity``.
+            ActivityConfig]``) for tools wrapped with ``tool_as_activity``. Read
+            when ``tool_as_activity`` is called, so a tool wrapped before the
+            plugin is constructed does not get it. Its
+            ``start_to_close_timeout`` replaces the one passed to
+            ``tool_as_activity``; that call's ``activity_options`` win over it.
         backends: Map of names to worker-side backend factories used by
             ``TemporalBackend("name", ...)``. Factories accept zero arguments or
             one positional ``factory_argument`` and return a backend, synchronously
@@ -77,8 +81,9 @@ class DeepAgentsPlugin(SimplePlugin):
             workflow supplies no argument.
             Configure the same names on every worker polling backend activities;
             credentials and connections belong in these factories.
-        streaming_topic: When set, model calls stream through the streaming
-            activity and publish chunk batches to this workflow-streams topic.
+        streaming_topic: When set, a model call that LangChain streams runs in
+            the streaming activity, which publishes chunk batches to this
+            workflow-streams topic. ``agent.ainvoke(...)`` does not stream.
         streaming_batch_interval: How long the streaming activity coalesces
             chunks before publishing a batch.
         passthrough_modules: Extra sandbox-passthrough modules, merged with the

@@ -14,9 +14,9 @@ the user three explicit ways to move that work to an activity:
 * :class:`TemporalBackend` — wrap a real-I/O backend so each file/exec op runs
   as an activity.
 
-The choice is always explicit: an unwrapped non-builtin tool runs in-workflow,
-and the plugin warns at construction so that is a conscious decision, never a
-silent one.
+An unwrapped non-builtin tool runs in-workflow. The plugin warns about one
+passed in the ``tools=`` keyword of ``create_deep_agent``; it does not check
+``tools`` passed by position or a sub-agent's tools.
 
 Registries here live in a ``temporalio``-namespaced (sandbox-passthrough) module
 and are process-local. Tools must be registered at startup in every activity
@@ -500,9 +500,14 @@ def tool_as_activity(
     invoked in-workflow, dispatches ``deepagents.invoke_tool`` instead of running
     the tool body inline.
 
-    Call this at module import or worker startup on every process that can
-    execute tool activities. Registration inside a workflow alone does not
-    make the tool available in another worker process.
+    Call this at the top level of the module that defines the tool, on every
+    process that can execute tool activities, and import that module in the
+    workflow file under ``workflow.unsafe.imports_passed_through()``. A tool
+    defined in code the workflow sandbox loads (the workflow file, a module it
+    imports without that guard, or the body of ``run``) is registered as the
+    sandbox's copy, and the activity then runs that copy under the sandbox's
+    restrictions. Registration inside a workflow alone does not make the tool
+    available in another worker process.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import BaseTool, StructuredTool
