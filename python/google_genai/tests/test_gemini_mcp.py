@@ -717,14 +717,14 @@ async def test_mcp_stale_record_does_not_remove_replacement():
     finish = asyncio.Event()
 
     @asynccontextmanager
-    async def old_factory():
+    async def old_factory() -> AsyncGenerator[Any, None]:
         yield object()
         closing.set()
         await finish.wait()
         raise RuntimeError("old close failed")
 
     @asynccontextmanager
-    async def new_factory():
+    async def new_factory() -> AsyncGenerator[Any, None]:
         yield object()
 
     old = _mcp._ConnectionRecord(server, old_factory, timedelta(seconds=30))
