@@ -700,6 +700,34 @@ Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools`
 - Set connection options on `mcp.Client`. Strands `MCPClient` options without an `mcp.Client` counterpart, such as `startup_timeout`, no longer apply.
 - Workflows started on earlier versions that use MCP tools must finish on workers running them before those workers are upgraded.
 
+## Activity sessions (experimental)
+
+`session_options` runs the activities a workflow starts inside that workflow's activity session, so they are routed to the worker running the workflow:
+
+```python
+from temporalio.common import ActivitySessionOptions, UseWorkflowSession
+from temporalio.worker import Worker, WorkerSessionConfig
+
+worker = Worker(
+    client,
+    task_queue="strands",
+    workflows=[MyAgentWorkflow],
+    plugins=[
+        StrandsPlugin(
+            session_options=ActivitySessionOptions(placement=UseWorkflowSession()),
+        )
+    ],
+    session_config=WorkerSessionConfig(),
+)
+```
+
+- The option applies to every non-local activity started on the workflow's own task queue by any workflow on the worker, including workflows that don't use agents: model, MCP and sandbox activities, activity tools and hooks, and your own `workflow.execute_activity` calls.
+- An enclosing `workflow.activity_session(...)` scope wins; the plugin only fills activities that have no session options.
+- Activities on other task queues and local activities are unchanged.
+- Every `Worker` and `Replayer` using the plugin must have `session_config=WorkerSessionConfig(...)`, passed to its constructor or set by a plugin listed before `StrandsPlugin`. Otherwise construction raises `ValueError`.
+- The Temporal server must have sticky activity execution enabled.
+- Activity sessions are experimental and may change without notice.
+
 ## Observability
 
 `StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:

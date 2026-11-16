@@ -11,13 +11,20 @@ from strands.models import BedrockModel, Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
 from strands.types.exceptions import ContextWindowOverflowException
 
+from temporalio.common import ActivitySessionOptions
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.exceptions import ApplicationError
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkflowRunner
+from temporalio.worker import (
+    ReplayerConfig,
+    WorkerConfig,
+    WorkerSessionConfig,
+    WorkflowRunner,
+)
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
+from ._activity_session_interceptor import _ActivitySessionInterceptor
 from ._failure_converter import (
     strands_failure_converter_class,
     strands_failure_converter_class_keeping_caller,
@@ -88,6 +95,7 @@ class StrandsPlugin(SimplePlugin):
         sandboxes: dict[str, SandboxFactory] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
+        session_options: ActivitySessionOptions | None = None,
     ) -> None:
         """Build the plugin from optional model, MCP, and sandbox factories.
 
@@ -96,7 +104,27 @@ class StrandsPlugin(SimplePlugin):
 
         A sandbox factory may return an async context manager when its adapter
         needs cleanup after the Activity finishes.
+
+        Args:
+            models: Model factories by name.
+            mcp_clients: MCP client factories by server name.
+            sandboxes: Sandbox factories by name.
+            mcp_connection_idle_timeout: How long an idle MCP connection is
+                kept open.
+            resolvable_worker_env_vars: Worker environment variables that
+                sandbox command ``env`` references may resolve.
+            session_options: Experimental. Activity session options applied to
+                every non-local activity a workflow on this worker starts on
+                the workflow's own task queue without session options,
+                including model, MCP, sandbox, activity-tool and the user's
+                own activities. A user's ``workflow.activity_session(...)``
+                scope wins. When set, every ``Worker`` and ``Replayer`` using
+                this plugin must have
+                ``session_config=temporalio.worker.WorkerSessionConfig(...)``,
+                passed to the constructor or set by a plugin listed before
+                this one; otherwise configuration raises ``ValueError``.
         """
+        self._session_options = session_options
         default_name: str | None = None
         if models is None:
             models = {"bedrock": _default_bedrock_model}
@@ -154,7 +182,33 @@ class StrandsPlugin(SimplePlugin):
             # context any further; fail the workflow instead of retrying the task forever.
             workflow_failure_exception_types=[ContextWindowOverflowException],
             run_context=mcp_plugin.run_context if mcp_plugin else None,
+            interceptors=(
+                [_ActivitySessionInterceptor(session_options)]
+                if session_options is not None
+                else None
+            ),
         )
+
+    def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
+        """See base class; also requires ``session_config`` with sessions."""
+        config = super().configure_worker(config)
+        self._check_session_config(config.get("session_config"))
+        return config
+
+    def configure_replayer(self, config: ReplayerConfig) -> ReplayerConfig:
+        """See base class; also requires ``session_config`` with sessions."""
+        config = super().configure_replayer(config)
+        self._check_session_config(config.get("session_config"))
+        return config
+
+    def _check_session_config(self, session_config: WorkerSessionConfig | None) -> None:
+        if self._session_options is not None and session_config is None:
+            raise ValueError(
+                "StrandsPlugin(session_options=...) requires session_config; "
+                "pass session_config=temporalio.worker.WorkerSessionConfig(...) to "
+                "Worker(...)/Replayer(...) or set it in a plugin listed before "
+                "StrandsPlugin"
+            )
 
     def version(self) -> str:
         """Return this package's version, which worker heartbeats report."""
