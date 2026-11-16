@@ -201,6 +201,35 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
                 if field.name in value
             }
         )
+    if (
+        _is_union(type_)
+        and not _is_openai_type(type_)
+        and (fitting := _one_fitting_type(type_, value)) is not None
+    ):
+        return _lenient_construct(fitting, value)
+    if (
+        isinstance(type_, type)
+        and issubclass(type_, pydantic.BaseModel)
+        and not _is_openai_type(type_)
+    ):
+        # Build the openai models in a caller's model; Pydantic validates the rest.
+        if type_.__pydantic_root_model__:
+            root = type_.model_fields["root"].annotation
+            return _validated(type_, value, _lenient_construct(root, value))
+        if isinstance(value, dict):
+            annotations: dict[str, typing.Any] = {}
+            for name, field in type_.model_fields.items():
+                annotations[name] = field.annotation
+                if field.alias:
+                    annotations.setdefault(field.alias, field.annotation)
+            return _validated(
+                type_,
+                value,
+                {
+                    key: _lenient_construct(annotations.get(key, object), item)
+                    for key, item in value.items()
+                },
+            )
     if _holds_caller_class(type_):
         # construct_type returns these as decoded JSON.
         return _validated(type_, value)
@@ -249,15 +278,40 @@ _ENCODER = pydantic_core.SchemaSerializer(
 )
 
 
-def _validated(type_: typing.Any, raw: typing.Any) -> typing.Any:
-    """Validate ``raw`` as ``type_``; the result must encode back to ``raw``."""
-    # Validators can change their input in place.
+def _validated(
+    type_: typing.Any, raw: typing.Any, prepared: typing.Any = None
+) -> typing.Any:
+    """Validate ``prepared`` (or ``raw``) as ``type_``; it must encode back to ``raw``."""
+    # Validators can change their input in place, and ``prepared`` can share it.
     expected = copy.deepcopy(raw)
-    result = pydantic.TypeAdapter(type_).validate_python(raw)
+    result = pydantic.TypeAdapter(type_).validate_python(
+        raw if prepared is None else prepared
+    )
     encoded = _ENCODER.to_json(result, by_alias=True, exclude_unset=True)
     if json.loads(encoded) != expected:
         raise ValueError("the decoded value does not encode back to the payload")
     return result
+
+
+_SCALARS = (str, int, float, bool)
+
+
+def _one_fitting_type(type_: typing.Any, value: typing.Any) -> typing.Any:
+    """The one type in ``X | None`` or ``str | list[X]`` that ``value`` can be."""
+    args = typing.get_args(type_)
+    if value is None:
+        return type(None) if type(None) in args else None
+    rest = [arg for arg in args if arg is not type(None)]
+    if len(rest) == 1:
+        return rest[0]
+    lists = [arg for arg in rest if typing.get_origin(arg) is list]
+    if (
+        isinstance(value, list)
+        and len(lists) == 1
+        and all(arg in _SCALARS for arg in rest if arg is not lists[0])
+    ):
+        return lists[0]
+    return None
 
 
 # The iterator type pydantic decodes ``Iterable`` fields to. It cannot be

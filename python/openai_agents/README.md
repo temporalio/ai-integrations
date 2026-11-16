@@ -245,9 +245,12 @@ The plugin automatically handles several important setup tasks:
 OpenAI's response models can lag behind the live API, so a value that holds a model response can
 fail strict validation when it's decoded. When that happens, the plugin builds the OpenAI models in
 it without validating them, like the OpenAI SDK does with live responses. If the value holds one of
-your own Pydantic models, Pydantic validates it from the decoded JSON, and the result has to encode
-back to the same JSON. If that's not possible, decoding fails with the original validation error.
-Before 2.0.0, you got a plain `dict` instead.
+your own Pydantic models, the plugin builds the OpenAI models inside it first. Pydantic then
+validates your model, and the result has to encode back to the same JSON. If that's not possible,
+decoding fails with the original validation error. Before 2.0.0, you got a plain `dict` instead.
+
+**Note:** your model is validated from Python data here, so a field like `datetime | str` next to
+such a response keeps the string.
 
 **Important:** if you upgrade from 1.x, Workflow code that read such a value as a `dict` fails, and
 a Signal whose argument can't be decoded is dropped. Keep runs that started on 1.x on that version
