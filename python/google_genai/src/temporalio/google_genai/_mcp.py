@@ -22,6 +22,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
+from inspect import iscoroutine
 
 from mcp import ClientSession
 from mcp.types import (
@@ -127,6 +128,8 @@ class _ConnectionRecord:
             context = factory()
             if not isinstance(context, AbstractAsyncContextManager):
                 kind = type(context)
+                if iscoroutine(context):
+                    context.close()
                 raise ApplicationError(
                     f"MCP server factory {self._server!r} returned "
                     f"{kind.__module__}.{kind.__qualname__}, not an async context manager",

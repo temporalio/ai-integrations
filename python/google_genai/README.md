@@ -211,6 +211,10 @@ A factory that doesn't return an async context manager now fails the Activity
 without retries (`MCPServerFactoryTypeError`). Fix it before upgrading: a
 corrected Worker won't resume an Activity that already failed.
 
+A factory that isn't callable makes `GoogleGenAIPlugin(...)` raise `TypeError`
+during construction, so the Worker won't start, even if no Workflow uses that
+server. Fix these factories before upgrading too.
+
 ## Streaming
 
 `generate_content_stream` works as usual — the workflow iterates chunks (batched
