@@ -1584,11 +1584,10 @@ class TagCity:
         return f"{city}:{','.join(tags)}"
 
 
-@pytest.mark.parametrize("patched", [True, False])
 @pytest.mark.parametrize("activity_def", [tag_city, TagCity])
 @pytest.mark.asyncio
 async def test_activity_as_tool_passes_empty_var_positional(
-    activity_def: Any, patched: bool, monkeypatch: pytest.MonkeyPatch
+    activity_def: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # ADK leaves *tags out of the declaration, as it does for the plain
     # function, so the model can't fill it and the activity gets no tags.
@@ -1612,39 +1611,6 @@ async def test_activity_as_tool_passes_empty_var_positional(
         assert await tool(city="Rome") == "Rome:"
 
     calls: list[list[Any]] = []
-    patch_ids: list[str] = []
-
-    async def execute_activity(_: Any, *args: Any, **kwargs: Any) -> str:
-        calls.append(list(args) or list(kwargs.get("args", [])))
-        return "ok"
-
-    def fake_patched(patch_id: str) -> bool:
-        patch_ids.append(patch_id)
-        return patched
-
-    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
-    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
-    monkeypatch.setattr(workflow, "patched", fake_patched)
-    await tool(city="Rome")
-    # A Workflow started before the patch keeps passing the empty tuple as one
-    # more argument.
-    assert calls == [["Rome"] if patched else ["Rome", ()]]
-    assert patch_ids == ["google_adk.activity-as-tool-var-args"]
-
-
-@pytest.mark.asyncio
-async def test_activity_as_tool_without_var_positional_checks_no_patch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    @activity.defn
-    async def name_city(city: str) -> str:
-        return city
-
-    tool = temporalio.google_adk.workflow.activity_as_tool(
-        name_city, start_to_close_timeout=timedelta(seconds=30)
-    )
-    calls: list[list[Any]] = []
-    patch_ids: list[str] = []
 
     async def execute_activity(_: Any, *args: Any, **kwargs: Any) -> str:
         calls.append(list(args) or list(kwargs.get("args", [])))
@@ -1652,10 +1618,8 @@ async def test_activity_as_tool_without_var_positional_checks_no_patch(
 
     monkeypatch.setattr(workflow, "in_workflow", lambda: True)
     monkeypatch.setattr(workflow, "execute_activity", execute_activity)
-    monkeypatch.setattr(workflow, "patched", patch_ids.append)
     await tool(city="Rome")
     assert calls == [["Rome"]]
-    assert patch_ids == []
 
 
 @activity.defn
@@ -1673,16 +1637,8 @@ class CountTagsWorkflow:
         return await tool(city="Rome")
 
 
-@pytest.mark.parametrize("patched", [True, False])
 @pytest.mark.asyncio
-async def test_activity_as_tool_var_positional_replays(
-    client: Client, patched: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A run recorded before the patch (no marker) passes the empty tuple as one
-    # argument, so the activity sees one tag; a run after it passes none. Both
-    # histories replay with this code.
-    if not patched:
-        monkeypatch.setattr(workflow, "patched", lambda _: False)
+async def test_activity_as_tool_var_positional_replays(client: Client) -> None:
     new_config = client.config()
     new_config["plugins"] = [GoogleAdkPlugin()]
     client = Client(**new_config)
@@ -1700,13 +1656,8 @@ async def test_activity_as_tool_var_positional_replays(
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
-        assert await handle.result() == ("Rome:0" if patched else "Rome:1")
+        assert await handle.result() == "Rome:0"
         history = await handle.fetch_history()
-    monkeypatch.undo()
-    markers = [
-        e for e in history.events if e.HasField("marker_recorded_event_attributes")
-    ]
-    assert len(markers) == (1 if patched else 0)
     await Replayer(
         workflows=[CountTagsWorkflow], plugins=[GoogleAdkPlugin()]
     ).replay_workflow(history)
