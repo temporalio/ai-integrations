@@ -74,9 +74,12 @@ class OpenAIAgentsTraceInboundInterceptor implements WorkflowInboundCallsInterce
         addTemporalSpans: configHeader.addTemporalSpans ?? false,
         useOtelInstrumentation: configHeader.useOtelInstrumentation ?? false,
         // Store only the client-explicitly-set fields; the runner applies
-        // DEFAULT_MODEL_ACTIVITY_OPTIONS as the base layer so pre-baked defaults
-        // don't clobber the runner's defaultModelParams.
-        modelParams: configHeader.modelParams ?? {},
+        // DEFAULT_MODEL_OPTIONS as the base layer so pre-baked defaults
+        // don't clobber the runner's activityOptions.
+        activityOptions: configHeader.activityOptions,
+        useLocalActivity: configHeader.useLocalActivity,
+        streamingTopic: configHeader.streamingTopic,
+        streamingBatchInterval: configHeader.streamingBatchInterval,
       };
       setPluginConfig(headerConfig);
     }
@@ -298,7 +301,10 @@ function injectConfigHeaderFromStore(headers: Headers): Headers {
   return injectAgentsConfigHeader(headers, {
     addTemporalSpans: config.addTemporalSpans,
     useOtelInstrumentation: config.useOtelInstrumentation,
-    modelParams: config.modelParams,
+    activityOptions: config.activityOptions,
+    useLocalActivity: config.useLocalActivity,
+    streamingTopic: config.streamingTopic,
+    streamingBatchInterval: config.streamingBatchInterval,
   });
 }
 

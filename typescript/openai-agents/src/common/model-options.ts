@@ -14,11 +14,14 @@ export interface ModelSummaryProvider {
   ): string;
 }
 
-export interface ModelActivityOptions extends Omit<ActivityOptions, 'summary'> {
+/** Model execution settings; scheduling uses the SDK's own ActivityOptions. */
+export interface TemporalModelOptions {
+  /** Temporal SDK scheduling options, merged per field with inherited defaults. */
+  activityOptions?: ActivityOptions;
   /** Use local Activities instead of regular Activities. @default false */
   useLocalActivity?: boolean;
-  /** Activity summary shown in the Temporal UI. String for static text, ModelSummaryProvider for dynamic. */
-  summary?: string | ModelSummaryProvider;
+  /** Deterministic dynamic Activity summary; static text uses activityOptions.summary. */
+  summaryProvider?: ModelSummaryProvider;
   /**
    * Topic that the streaming model Activity publishes raw model stream events to
    * for live external consumption. Required when running with `{ stream: true }`;
@@ -39,24 +42,42 @@ export interface ModelActivityOptions extends Omit<ActivityOptions, 'summary'> {
 
 /**
  * Plugin-side model Activity options propagated to Workflows via the
- * `__openai_agents_config` header. The function form of `summary`
- * is excluded because functions cannot survive JSON serialization.
+ * `__openai_agents_config` header. summaryProvider is Workflow-authored because
+ * functions cannot survive JSON serialization.
  */
-export type SerializableModelActivityOptions = Omit<ModelActivityOptions, 'summary'> & {
-  /** Static summary string used as a tracing summary override. */
-  summary?: string;
-};
+export type SerializableModelOptions = Omit<TemporalModelOptions, 'summaryProvider'>;
 
-export const DEFAULT_MODEL_ACTIVITY_OPTIONS: SerializableModelActivityOptions = {
-  startToCloseTimeout: '60s',
+export type ResolvedModelOptions = TemporalModelOptions & { activityOptions: ActivityOptions };
+
+export const DEFAULT_MODEL_OPTIONS: ResolvedModelOptions = {
+  activityOptions: { startToCloseTimeout: '60s' },
   useLocalActivity: false,
 };
+
+/** Merge SDK scheduling options per field and keep execution settings separate. */
+export function mergeModelOptions(...layers: (Readonly<TemporalModelOptions> | undefined)[]): ResolvedModelOptions {
+  const result: ResolvedModelOptions = { activityOptions: {} };
+  for (const layer of [DEFAULT_MODEL_OPTIONS, ...layers]) {
+    if (layer === undefined) continue;
+    // A higher-layer static or dynamic summary replaces the inherited summary choice.
+    if (layer.activityOptions?.summary !== undefined || layer.summaryProvider !== undefined) {
+      delete result.activityOptions.summary;
+      delete result.summaryProvider;
+    }
+    for (const [key, value] of Object.entries(layer)) {
+      if (key !== 'activityOptions' && value !== undefined) Object.assign(result, { [key]: value });
+    }
+    for (const [key, value] of Object.entries(layer.activityOptions ?? {})) {
+      if (value !== undefined) Object.assign(result.activityOptions, { [key]: value });
+    }
+  }
+  return result;
+}
 
 export const STREAMING_TOPIC_NOT_CONFIGURED = {
   type: 'StreamingTopicNotConfigured',
   message:
-    "Streaming requires a streamingTopic. Set it via the plugin's modelParams on the client, " +
-    "via the runner's defaultModelParams, on TemporalModel options, or in run's modelActivityOptions. " +
+    'Streaming requires a streamingTopic. Set it on the Client plugin, runner, TemporalModel, or run options. ' +
     'Host a WorkflowStream in your Workflow to use run(agent, input, { stream: true }).',
 } as const;
 

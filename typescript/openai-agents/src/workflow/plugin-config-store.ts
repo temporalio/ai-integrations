@@ -5,12 +5,11 @@
 // using the same V8 isolate — workflowId alone would let the old run's
 // dispose wipe the new run's entry.
 import { workflowInfo } from '@temporalio/workflow';
-import type { SerializableModelActivityOptions } from '../common/model-activity-options';
+import type { SerializableModelOptions } from '../common/model-options';
 
-export interface PluginConfig {
+export interface PluginConfig extends SerializableModelOptions {
   addTemporalSpans: boolean;
   useOtelInstrumentation: boolean;
-  modelParams: SerializableModelActivityOptions;
 }
 
 const configByRun = new Map<string, PluginConfig>();

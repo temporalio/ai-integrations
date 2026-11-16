@@ -103,7 +103,8 @@ export async function streamingLocalActivityWorkflow(prompt: string): Promise<st
     model: 'gpt-4o-mini',
   });
   const runner = new TemporalOpenAIRunner({
-    defaultModelParams: { streamingTopic: 'events', useLocalActivity: true },
+    streamingTopic: 'events',
+    useLocalActivity: true,
   });
   try {
     const result = await runner.run(agent, prompt, { stream: true });
@@ -289,7 +290,7 @@ export async function agentToolRunConfigWorkflow(prompt: string): Promise<string
     tools: [expert.asTool({ toolName: 'ask_expert' }), specialist.asTool({ toolName: 'ask_specialist' })],
   });
   const runner = new TemporalOpenAIRunner({
-    defaultModelParams: { startToCloseTimeout: '17 seconds', summary: 'runner default' },
+    activityOptions: { startToCloseTimeout: '17 seconds', summary: 'runner default' },
   });
   const result = await runner.run(lead, prompt, {
     runConfig: { model: 'run-model', modelSettings: { temperature: 0.33, toolChoice: 'auto' } },
@@ -507,7 +508,7 @@ export async function nestedToolCancelWorkflow(input: {
     tools: [nested.asTool({ toolName: 'ask_nested' })],
     toolUseBehavior: input.stopOnFirstTool ? 'stop_on_first_tool' : 'run_llm_again',
   });
-  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  const runner = new TemporalOpenAIRunner({ streamingTopic: 'events' });
   if (!input.stream) return (await runner.run(lead, 'go', { maxTurns: input.maxTurns })).finalOutput ?? '';
   const result = await runner.run(lead, 'go', { stream: true, maxTurns: input.maxTurns });
   for await (const _event of result);
@@ -524,7 +525,7 @@ export async function activityToolCancelWorkflow(stream: boolean): Promise<strin
     parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
   });
   const agent = new Agent({ name: 'Holder', model: 'gpt-4o-mini', tools: [holdTool] });
-  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  const runner = new TemporalOpenAIRunner({ streamingTopic: 'events' });
   if (!stream) return (await runner.run(agent, 'go')).finalOutput ?? '';
   const result = await runner.run(agent, 'go', { stream: true });
   for await (const _event of result);
@@ -726,7 +727,7 @@ export async function agentToolStreamWorkflow(
     });
   if (!onAfterStart) register();
   const lead = new Agent({ name: 'Lead', instructions: 'Use the tool.', model: 'lead-model', tools: [askStreamer] });
-  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events', useLocalActivity } });
+  const runner = new TemporalOpenAIRunner({ streamingTopic: 'events', useLocalActivity });
   const running = runner.run(lead, prompt);
   if (onAfterStart) register();
   const result = await running;
@@ -1074,7 +1075,7 @@ export async function summaryAgentWorkflow(): Promise<string> {
     handoffs: [desk],
   });
   const runner = new TemporalOpenAIRunner({
-    defaultModelParams: { summary: { provide: (agent) => `agent:${agent?.name ?? 'none'}` } },
+    summaryProvider: { provide: (agent) => `agent:${agent?.name ?? 'none'}` },
   });
   const first = await runner.run(lead, 'go');
   for (const interruption of first.interruptions) first.state.approve(interruption);

@@ -17,17 +17,17 @@ import {
   proxyLocalActivities,
   type ActivityInterfaceFor,
   type LocalActivityInterfaceFor,
-  type ActivityOptions,
   type LocalActivityOptions,
 } from '@temporalio/workflow';
 import { ApplicationFailure } from '@temporalio/common';
 import {
-  DEFAULT_MODEL_ACTIVITY_OPTIONS,
+  mergeModelOptions,
   STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
   STREAMING_TOPIC_NOT_CONFIGURED,
-  type ModelActivityOptions,
+  type TemporalModelOptions,
+  type ResolvedModelOptions,
   type ModelSummaryProvider,
-} from '../common/model-activity-options';
+} from '../common/model-options';
 import {
   fromSerializedStreamEvent,
   type InvokeModelActivityInput,
@@ -82,8 +82,8 @@ interface ModelActivities {
 }
 
 interface ModelCallContext {
-  defaults: ModelActivityOptions;
-  overrides: ModelActivityOptions;
+  defaults: TemporalModelOptions;
+  overrides: TemporalModelOptions;
   run: ModelCallRun;
   streaming: boolean;
 }
@@ -95,20 +95,15 @@ function currentModelCall(): ModelCallContext | undefined {
   return modelCallContext.getStore?.();
 }
 
-/** Merge per field without mutating caller-owned configuration; undefined inherits. */
-function mergeOptions(...layers: (Readonly<ModelActivityOptions> | undefined)[]): ModelActivityOptions {
-  const result: ModelActivityOptions = { ...DEFAULT_MODEL_ACTIVITY_OPTIONS };
-  for (const layer of layers) {
-    if (layer === undefined) continue;
-    for (const [key, value] of Object.entries(layer)) {
-      if (value !== undefined) Object.assign(result, { [key]: value });
-    }
-  }
-  return result;
-}
-
 /** Validate before the SDK starts a streamed run or schedules a model Activity. */
-function validateOptions(options: ModelActivityOptions, streaming: boolean): void {
+function validateOptions(options: ResolvedModelOptions, streaming: boolean): void {
+  if (options.activityOptions.summary !== undefined && options.summaryProvider !== undefined) {
+    throw ApplicationFailure.create({
+      message: 'Set either activityOptions.summary or summaryProvider for a model call.',
+      type: 'ConflictingModelSummary',
+      nonRetryable: true,
+    });
+  }
   if (streaming && options.streamingTopic === undefined) {
     throw ApplicationFailure.create({ ...STREAMING_TOPIC_NOT_CONFIGURED, nonRetryable: true });
   }
@@ -117,9 +112,6 @@ function validateOptions(options: ModelActivityOptions, streaming: boolean): voi
   }
   if (options.useLocalActivity) {
     const supported = new Set([
-      'useLocalActivity',
-      'streamingTopic',
-      'streamingBatchInterval',
       'summary',
       'startToCloseTimeout',
       'scheduleToCloseTimeout',
@@ -128,21 +120,21 @@ function validateOptions(options: ModelActivityOptions, streaming: boolean): voi
       'cancellationType',
       'eventGroups',
     ]);
-    const unsupported = Object.keys(options).filter((key) => !supported.has(key));
+    const unsupported = Object.keys(options.activityOptions).filter((key) => !supported.has(key));
     if (unsupported.length > 0) {
       throw ApplicationFailure.create({
         message: `Local model Activities do not support options: ${unsupported.sort().join(', ')}`,
-        type: 'UnsupportedLocalModelActivityOptions',
+        type: 'UnsupportedLocalActivityOptions',
         nonRetryable: true,
       });
     }
   }
 }
 
-function optionsForAgent(context: ModelCallContext, agent: Agent<any, any>): ModelActivityOptions {
+function optionsForAgent(context: ModelCallContext, agent: Agent<any, any>): ResolvedModelOptions {
   // Follow upstream: an agent's own model wins over the run's fallback.
   const selected = agent.model || context.run.model();
-  return mergeOptions(
+  return mergeModelOptions(
     context.defaults,
     selected instanceof TemporalModel ? selected.options : undefined,
     context.overrides
@@ -157,35 +149,33 @@ export function validateCurrentModelOptions(agent: Agent<any, any>): void {
 
 /**
  * A Workflow-safe OpenAI Agents Model that invokes the provider configured on the Worker.
- * Use it as `Agent({ model: new TemporalModel(name, options) })`, or as a runConfig.model fallback.
- * Model options override the client/runner defaults; run.modelActivityOptions wins per field.
+ * Use `Agent({ model: new TemporalModel(name, { activityOptions }) })`, or a runConfig.model fallback.
+ * Model activityOptions override the client/runner defaults; run activityOptions wins per field.
  * Credentials and provider clients remain on the Worker.
  */
 export class TemporalModel implements Model {
   readonly modelName: string;
-  readonly options: Readonly<ModelActivityOptions>;
+  readonly options: Readonly<TemporalModelOptions>;
 
-  constructor(modelName = '', options: ModelActivityOptions = {}) {
+  constructor(modelName = '', options: TemporalModelOptions = {}) {
     if (typeof modelName !== 'string') throw new TypeError('TemporalModel modelName must be a string');
     this.modelName = modelName;
-    this.options = { ...options };
+    this.options = { ...options, activityOptions: { ...options.activityOptions } };
   }
 
-  private effectiveOptions(streaming: boolean): ModelActivityOptions {
+  private effectiveOptions(streaming: boolean): ResolvedModelOptions {
     const context = currentModelCall();
-    const options = mergeOptions(context?.defaults, this.options, context?.overrides);
+    const options = mergeModelOptions(context?.defaults, this.options, context?.overrides);
     validateOptions(options, streaming);
     return options;
   }
 
   private createActivities(
-    options: ModelActivityOptions
+    options: ResolvedModelOptions
   ): ActivityInterfaceFor<ModelActivities> | LocalActivityInterfaceFor<ModelActivities> {
-    const { useLocalActivity, streamingTopic: _topic, streamingBatchInterval: _interval, summary, ...rest } = options;
-    const activityOptions = { ...rest, summary: typeof summary === 'string' ? summary : undefined };
-    return useLocalActivity
-      ? proxyLocalActivities<ModelActivities>(activityOptions as LocalActivityOptions)
-      : proxyActivities<ModelActivities>(activityOptions as ActivityOptions);
+    return options.useLocalActivity
+      ? proxyLocalActivities<ModelActivities>(options.activityOptions as LocalActivityOptions)
+      : proxyActivities<ModelActivities>(options.activityOptions);
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
@@ -202,8 +192,8 @@ export class TemporalModel implements Model {
         request: this.toWire(request, agent, context?.run.modelSettings()),
       };
 
-      const modelSummary = options.summary;
-      if (modelSummary && typeof modelSummary !== 'string') {
+      const modelSummary = options.summaryProvider;
+      if (modelSummary !== undefined) {
         const provider = modelSummary as ModelSummaryProvider;
         const systemInstructions = request.systemInstructions;
         const summary = provider.provide(agent, systemInstructions, request.input);
@@ -236,8 +226,8 @@ export class TemporalModel implements Model {
     const events = await withGenerationSpan(async (span) => {
       span.spanData.model = this.modelName;
 
-      const modelSummary = options.summary;
-      if (modelSummary && typeof modelSummary !== 'string') {
+      const modelSummary = options.summaryProvider;
+      if (modelSummary !== undefined) {
         const provider = modelSummary as ModelSummaryProvider;
         const summary = provider.provide(agent, request.systemInstructions, request.input);
         return activities.invokeModelStreamActivity.executeWithOptions({ summary }, [input]);
@@ -306,19 +296,19 @@ export class TemporalModel implements Model {
 /** Resolves string names and carries Activity defaults through nested SDK runs. */
 export class ActivityBackedModelProvider implements ModelProvider {
   constructor(
-    private readonly modelParams: ModelActivityOptions,
-    private readonly overrides: ModelActivityOptions = {},
+    private readonly options: TemporalModelOptions,
+    private readonly overrides: TemporalModelOptions = {},
     private readonly run?: ModelCallRun
   ) {}
 
   forRun(run: ModelCallRun): ActivityBackedModelProvider {
-    return new ActivityBackedModelProvider(this.modelParams, this.overrides, run);
+    return new ActivityBackedModelProvider(this.options, this.overrides, run);
   }
 
   withContext<T>(callback: () => T, streaming: boolean): T {
     if (this.run === undefined) throw new Error('Model provider must be bound to an agent run');
     return modelCallContext.run(
-      { defaults: this.modelParams, overrides: this.overrides, run: this.run, streaming },
+      { defaults: this.options, overrides: this.overrides, run: this.run, streaming },
       callback
     );
   }
@@ -326,7 +316,7 @@ export class ActivityBackedModelProvider implements ModelProvider {
   validateAgent(agent: Agent<any, any>, fallback: string | Model | undefined, streaming: boolean): void {
     const selected = agent.model || fallback;
     validateOptions(
-      mergeOptions(this.modelParams, selected instanceof TemporalModel ? selected.options : undefined, this.overrides),
+      mergeModelOptions(this.options, selected instanceof TemporalModel ? selected.options : undefined, this.overrides),
       streaming
     );
   }

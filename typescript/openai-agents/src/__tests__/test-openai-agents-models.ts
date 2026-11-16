@@ -15,13 +15,17 @@ import EventType = temporal.api.enums.v1.EventType;
 
 const test = makeOpenAIAgentsTestFunction();
 
-// Compile-time check: plugin + client-interceptor modelParams reject function/object summary.
+// Compile-time check: plugin + client-interceptor activityOptions reject function/object summary.
 {
   const _provider = null! as FakeModelProvider;
-  // @ts-expect-error — modelParams.summary must be string, not function/object
-  new OpenAIAgentsPlugin({ modelProvider: _provider, modelParams: { summary: { provide: () => 'x' } } });
-  // @ts-expect-error — modelParams.summary must be string, not function/object
-  new OpenAIAgentsTraceClientInterceptor({ modelParams: { summary: { provide: () => 'x' } } });
+  // @ts-expect-error — activityOptions.summary must be string, not function/object
+  new OpenAIAgentsPlugin({ modelProvider: _provider, activityOptions: { summary: { provide: () => 'x' } } });
+  // @ts-expect-error — activityOptions.summary must be string, not function/object
+  new OpenAIAgentsTraceClientInterceptor({ activityOptions: { summary: { provide: () => 'x' } } });
+  // @ts-expect-error — dynamic summary providers must stay in Workflow code
+  new OpenAIAgentsPlugin({ modelProvider: _provider, summaryProvider: { provide: () => 'x' } });
+  // @ts-expect-error — dynamic summary providers must stay in Workflow code
+  new OpenAIAgentsTraceClientInterceptor({ summaryProvider: { provide: () => 'x' } });
 }
 
 test('Local activity mode uses local activities for model calls', async (t) => {
@@ -31,7 +35,7 @@ test('Local activity mode uses local activities for model calls', async (t) => {
     plugins: [
       new OpenAIAgentsPlugin({
         modelProvider: new FakeModelProvider([textResponse('Local activity response')]),
-        modelParams: { useLocalActivity: true, startToCloseTimeout: '60s' },
+        activityOptions: { startToCloseTimeout: '60s' }, useLocalActivity: true,
       }),
     ],
   });
@@ -41,7 +45,7 @@ test('Local activity mode uses local activities for model calls', async (t) => {
     connection: (t.context as any).env.connection,
     interceptors: [
       new OpenAIAgentsTraceClientInterceptor({
-        modelParams: { useLocalActivity: true, startToCloseTimeout: '60s' },
+        activityOptions: { startToCloseTimeout: '60s' }, useLocalActivity: true,
       }),
     ],
   });
@@ -82,7 +86,7 @@ test('summary string is passed through to model activity', async (t) => {
     plugins: [
       new OpenAIAgentsPlugin({
         modelProvider: new FakeModelProvider([textResponse('Summary test response')]),
-        modelParams: { summary: 'Custom model summary' },
+        activityOptions: { summary: 'Custom model summary' },
       }),
     ],
   });
@@ -92,7 +96,7 @@ test('summary string is passed through to model activity', async (t) => {
     connection: (t.context as any).env.connection,
     interceptors: [
       new OpenAIAgentsTraceClientInterceptor({
-        modelParams: { summary: 'Custom model summary' },
+        activityOptions: { summary: 'Custom model summary' },
       }),
     ],
   });

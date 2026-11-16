@@ -9,7 +9,7 @@ import type { BundleOptions, InjectedSinks, ReplayWorkerOptions, Worker, WorkerO
 import { OpenAIAgentsTraceClientInterceptor } from '../client/trace-interceptor';
 import { AGENT_TRACING_SINK_NAME, type AgentTracingSinks } from '../common/agent-sink-types';
 import { MCP_STATEFUL_SUFFIX } from '../common/mcp-types';
-import type { SerializableModelActivityOptions } from '../common/model-activity-options';
+import type { SerializableModelOptions } from '../common/model-options';
 import { isReplaySafeTracerProvider } from '../common/tracing-bridge';
 import { createModelActivity } from './activities';
 import { ensureActivityTracingProcessorRegistered } from './activity-tracing';
@@ -76,7 +76,7 @@ export interface OpenAIAgentsPluginInterceptorOptions {
   useOtelInstrumentation?: boolean;
 }
 
-export interface OpenAIAgentsPluginOptions {
+export interface OpenAIAgentsPluginOptions extends SerializableModelOptions {
   /** Model provider used to resolve model names to Model instances. */
   modelProvider: ModelProvider;
   /** MCP server providers whose Activities will be auto-registered. */
@@ -109,11 +109,6 @@ export interface OpenAIAgentsPluginOptions {
    * @experimental Worker environment variable references are experimental and may change without notice.
    */
   resolvableWorkerEnvVars?: readonly string[];
-  /**
-   * Default Model Activity options (timeouts, retry, Task Queue, etc.).
-   * Propagated to the Workflow via the `__openai_agents_config` header.
-   */
-  modelParams?: SerializableModelActivityOptions;
   /**
    * Trace interceptor options. Propagated to the Workflow via the
    * `__openai_agents_config` header and applied to Activities directly.
@@ -218,7 +213,10 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
           new OpenAIAgentsTraceClientInterceptor({
             addTemporalSpans: interceptorOpts?.addTemporalSpans,
             useOtelInstrumentation: interceptorOpts?.useOtelInstrumentation,
-            modelParams: options.modelParams,
+            activityOptions: options.activityOptions,
+            useLocalActivity: options.useLocalActivity,
+            streamingTopic: options.streamingTopic,
+            streamingBatchInterval: options.streamingBatchInterval,
           }),
         ],
       },

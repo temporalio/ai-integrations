@@ -57,7 +57,7 @@ test.serial(
       connection: t.context.env.connection,
       interceptors: [
         new OpenAIAgentsTraceClientInterceptor({
-          modelParams: {
+          activityOptions: {
             startToCloseTimeout: '5m',
             scheduleToCloseTimeout: '30m',
             heartbeatTimeout: '7s',
@@ -203,8 +203,9 @@ test('effective local and streaming options are refused before scheduling a mode
   await worker.runUntil(async () => {
     const handle = await startWorkflow(temporalModelValidationWorkflow, {});
     t.deepEqual(await handle.result(), [
-      'UnsupportedLocalModelActivityOptions',
-      'UnsupportedLocalModelActivityOptions',
+      'UnsupportedLocalActivityOptions',
+      'UnsupportedLocalActivityOptions',
+      'ConflictingModelSummary',
       'StreamingTopicNotConfigured',
       'StreamingLocalActivityUnsupported',
     ]);
@@ -223,7 +224,7 @@ for (const kind of ['model', 'run', 'fallback'] as const) {
     });
     const client = new WorkflowClient({
       connection: t.context.env.connection,
-      interceptors: [new OpenAIAgentsTraceClientInterceptor({ modelParams: { useLocalActivity: true } })],
+      interceptors: [new OpenAIAgentsTraceClientInterceptor({ useLocalActivity: true })],
     });
     await worker.runUntil(async () => {
       const handle = await client.start(temporalModelStreamingWorkflow, {

@@ -45,7 +45,7 @@ async function main() {
   const connection = await NativeConnection.connect();
   const plugin = new OpenAIAgentsPlugin({
     modelProvider: new OpenAIProvider(),
-    modelParams: { startToCloseTimeout: '30s' },
+    activityOptions: { startToCloseTimeout: '30s' },
   });
 
   const worker = await Worker.create({
@@ -193,20 +193,21 @@ The agent passed to `RunState.fromString` must define the same tool names, hando
 
 Pass `{ stream: true }` to `run()` to stream incremental events as the model responds. The call returns the upstream `StreamedRunResult`, an async-iterable of agent-SDK stream events. Inside a Workflow, each model call executes as a streaming Activity (`invokeModelStreamActivity`) that consumes `Model.getStreamedResponse` and returns the collected list of native model events. The Workflow yields those events deterministically from the Activity's return value — it never polls the live stream, so replay stays deterministic.
 
-External consumers (UIs, tracing pipelines) observe events as they arrive by hosting a [`WorkflowStream`](../workflow-streams/README.md) in the Workflow and subscribing with `WorkflowStreamClient`. The streaming Activity publishes each event to the topic configured on `modelParams.streamingTopic`. The topic is required for streaming runs; calling `run(agent, input, { stream: true })` without a configured topic throws before any Activity is scheduled.
+External consumers (UIs, tracing pipelines) observe events as they arrive by hosting a [`WorkflowStream`](../workflow-streams/README.md) in the Workflow and subscribing with `WorkflowStreamClient`. The streaming Activity publishes each event to `streamingTopic`. The topic is required for streaming runs; calling `run(agent, input, { stream: true })` without a configured topic throws before any Activity is scheduled.
 
-Streaming requires a `streamingTopic`. Set it on the `modelParams` of the plugin registered on the **Client** — the Client interceptor injects the config header into every Workflow-starting call:
+Streaming requires a `streamingTopic`. Set it on the plugin registered on the **Client** — the Client interceptor injects the config header into every Workflow-starting call:
 
 ```ts
 const plugin = new OpenAIAgentsPlugin({
   modelProvider: new OpenAIProvider(),
-  modelParams: { streamingTopic: 'events', streamingBatchInterval: '100ms' },
+  streamingTopic: 'events',
+  streamingBatchInterval: '100ms',
 });
 
 const client = new Client({ connection, plugins: [plugin] });
 ```
 
-Workflows started without that Client — by a Schedule or the Temporal UI/CLI — receive no config header. Supply Workflow-authored defaults through the runner's `defaultModelParams`; unlike the header, these can carry a function-form `summary`. Host a `WorkflowStream` in the Workflow to receive the publishes:
+Workflows started without that Client — by a Schedule or the Temporal UI/CLI — receive no config header. Supply Workflow-authored defaults through the runner's constructor options; these can also carry a deterministic `summaryProvider`. Host a `WorkflowStream` in the Workflow to receive the publishes:
 
 ```ts
 import { Agent } from '@openai/agents-core';
@@ -216,7 +217,7 @@ import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 export async function streamingWorkflow(prompt: string): Promise<string> {
   new WorkflowStream();
   const agent = new Agent({ name: 'Assistant', instructions: '...' });
-  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  const runner = new TemporalOpenAIRunner({ streamingTopic: 'events' });
   const result = await runner.run(agent, prompt, { stream: true });
   for await (const event of result) {
     if (event.type === 'raw_model_stream_event' && event.data.type === 'output_text_delta') {
@@ -227,7 +228,7 @@ export async function streamingWorkflow(prompt: string): Promise<string> {
 }
 ```
 
-The two layers combine per field: the Client's `modelParams` overrides the runner's `defaultModelParams`.
+The two layers combine per field: Client settings override runner defaults, including individual fields of `activityOptions`.
 
 External subscribers receive the unwrapped native model events directly:
 
@@ -297,20 +298,20 @@ Another `OpenAIAgentsPlugin`'s Activity counts as the same only when it was buil
 
 The Client plugin injects the OpenAI Agents config header into Workflow-starting calls. Attach one `OpenAIAgentsPlugin` instance per Client or Connection configuration. If multiple instances are chained, the last config header wins.
 
-`modelParams` controls scheduling for the model Activity:
+`activityOptions` controls scheduling for the model Activity:
 
 ```ts
 const plugin = new OpenAIAgentsPlugin({
   modelProvider: new OpenAIProvider(),
-  modelParams: {
+  activityOptions: {
     startToCloseTimeout: '30s',
     retry: { maximumAttempts: 5, initialInterval: '1s' },
-    useLocalActivity: false,
   },
+  useLocalActivity: false,
 });
 ```
 
-See `ModelActivityOptions` for the public field list. `summary` can be a string in plugin config; `ModelSummaryProvider` functions are intentionally not serialized into Workflow headers.
+`activityOptions` uses the Temporal SDK's `ActivityOptions` interface, including static `summary` text. A deterministic `summaryProvider` can be set in Workflow code on the runner, model, or run; callbacks are not serialized into Workflow headers.
 
 ### Per-agent and per-run model Activity options
 
@@ -323,8 +324,10 @@ import { TemporalModel, TemporalOpenAIRunner } from '@temporalio/openai-agents/w
 const researcher = new Agent({
   name: 'Researcher',
   model: new TemporalModel('gpt-5', {
-    startToCloseTimeout: '20m',
-    retry: { maximumAttempts: 3 },
+    activityOptions: {
+      startToCloseTimeout: '20m',
+      retry: { maximumAttempts: 3 },
+    },
   }),
 });
 const runner = new TemporalOpenAIRunner();
@@ -332,13 +335,13 @@ const result = await runner.run(researcher, 'Research this topic');
 
 // Override the Activity configuration for this run, including inherited agent-as-tool runs.
 const followUp = await runner.run(researcher, 'Summarize the findings', {
-  modelActivityOptions: { startToCloseTimeout: '5m' },
+  activityOptions: { startToCloseTimeout: '5m' },
 });
 ```
 
 Options merge per field, with later layers winning: package defaults → runner
-`defaultModelParams` → Client `modelParams` → the selected `TemporalModel`'s options
-→ `run(..., { modelActivityOptions })`. Undefined values inherit; defined values
+`activityOptions` → Client `activityOptions` → the selected `TemporalModel`'s `activityOptions`
+→ `run(..., { activityOptions })`. Undefined values inherit; defined values
 such as `false` and `0` override a lower layer. Supplied option objects are copied.
 An omitted model name (`new TemporalModel()`) uses the Worker's default model.
 Provider clients and credentials stay on the Worker; the Model object and summary
@@ -346,14 +349,17 @@ callbacks stay in the Workflow.
 
 `runConfig.model` can also be a `TemporalModel`, as a fallback for agents that name
 no model. The agent's own model still wins, including its Model-specific Activity
-options. Use `modelActivityOptions` to override Activity settings for the whole
+options. Use `activityOptions` to override Activity settings for the whole
 run independently of model selection. Concurrent runs keep separate overrides,
 even when agents share one Model. Nested `agent.asTool()` runs inherit the run's
 overrides; a separate `TemporalOpenAIRunner.run()` uses the options given to that call.
 
-Both new option locations accept `ModelActivityOptions`, including `summary`
-(static text or a deterministic `ModelSummaryProvider`), `useLocalActivity`,
-`streamingTopic`, and `streamingBatchInterval`. Streaming requires a topic and
+Use `activityOptions` for SDK scheduling fields. Set `useLocalActivity`,
+`streamingTopic`, `streamingBatchInterval`, and a deterministic `summaryProvider`
+alongside it in the runner, model, or run options. The same precedence applies to
+these settings. A higher-layer `activityOptions.summary` or `summaryProvider`
+replaces an inherited summary choice; setting both in one layer is refused.
+Streaming requires a topic and
 regular Activities. Explicit options unsupported by local Activities, such as
 `taskQueue`, `heartbeatTimeout`, or `priority`, are refused before the model call.
 A local call forwards supported scheduling options, including
@@ -864,7 +870,7 @@ Most applications use two import paths: `@temporalio/openai-agents` in Worker an
 | `@temporalio/openai-agents/otel`                 | Worker or Client | Replay-safe OpenTelemetry setup                             |
 | `@temporalio/openai-agents/workflow-interceptor` | Worker bundling  | Manual `workflowInterceptorModules` wiring without a plugin |
 
-`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
+`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, the SDK's `ActivityOptions` type, `TemporalModelOptions`, hosted tool credential types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
 
 `@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `TemporalModel`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool` (deprecated), `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`.
 
@@ -898,7 +904,7 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Agent context           | Supported                | Activity tools receive a copy                                                                  |
 | `continueAsNew`         | Supported                | Plugin config propagates to the continuation                                                   |
 | Child Workflows         | Supported                | Plugin config propagates to children                                                           |
-| Local Activities        | Supported                | Set `useLocalActivity: true` in `modelParams`                                                  |
+| Local Activities        | Supported                | Set `useLocalActivity: true` on the plugin, runner, model, or run                               |
 | Run model               | Supported                | `runConfig.model` names the model for agents that set none                                     |
 | Streaming               | Supported (experimental) | `run(agent, input, { stream: true })`; requires `streamingTopic` and a hosted `WorkflowStream` |
 | Voice agents            | Not supported            |                                                                                                |

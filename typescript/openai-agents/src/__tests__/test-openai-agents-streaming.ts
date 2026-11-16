@@ -22,17 +22,17 @@ test('Streaming: external subscriber and in-workflow result see the same events'
     plugins: [
       new OpenAIAgentsPlugin({
         modelProvider: new StreamingFakeModelProvider(events),
-        modelParams: { streamingTopic: 'events', streamingBatchInterval: '50ms' },
+        streamingTopic: 'events', streamingBatchInterval: '50ms',
       }),
     ],
   });
 
-  // Match the modelParams the plugin uses so the config header carries streamingTopic.
+  // Match the activityOptions the plugin uses so the config header carries streamingTopic.
   const wfClient = new WorkflowClient({
     connection: (t.context as any).env.connection,
     interceptors: [
       new OpenAIAgentsTraceClientInterceptor({
-        modelParams: { streamingTopic: 'events', streamingBatchInterval: '50ms' },
+        streamingTopic: 'events', streamingBatchInterval: '50ms',
       }),
     ],
   });

@@ -22,7 +22,7 @@ test('interceptor.startWithDetails: injects __openai_agents_config header into t
   const interceptor = makeInterceptor({
     addTemporalSpans: true,
     useOtelInstrumentation: false,
-    modelParams: { startToCloseTimeout: '99s' },
+    activityOptions: { startToCloseTimeout: '99s' },
   });
 
   let capturedHeaders: Record<string, any> | undefined;
@@ -48,12 +48,12 @@ test('interceptor.startWithDetails: injects __openai_agents_config header into t
   t.deepEqual(decoded, {
     addTemporalSpans: true,
     useOtelInstrumentation: false,
-    modelParams: { startToCloseTimeout: '99s' },
+    activityOptions: { startToCloseTimeout: '99s' },
   });
 });
 
 test('interceptor.signalWithStart: injects __openai_agents_config header', async (t) => {
-  const interceptor = makeInterceptor({ modelParams: { startToCloseTimeout: '77s' } });
+  const interceptor = makeInterceptor({ activityOptions: { startToCloseTimeout: '77s' } });
 
   let capturedHeaders: Record<string, any> | undefined;
   const next = async (input: WorkflowSignalWithStartInput): Promise<string> => {
@@ -74,11 +74,11 @@ test('interceptor.signalWithStart: injects __openai_agents_config header', async
 
   t.truthy(capturedHeaders?.[AGENTS_CONFIG_HEADER_KEY]);
   const decoded = extractAgentsConfigHeader(capturedHeaders!);
-  t.is(decoded?.modelParams?.startToCloseTimeout, '77s');
+  t.is(decoded?.activityOptions?.startToCloseTimeout, '77s');
 });
 
 test('interceptor.startUpdateWithStart: injects __openai_agents_config on the workflow-start headers', async (t) => {
-  const interceptor = makeInterceptor({ modelParams: { startToCloseTimeout: '55s' } });
+  const interceptor = makeInterceptor({ activityOptions: { startToCloseTimeout: '55s' } });
 
   let capturedWorkflowStartHeaders: Record<string, any> | undefined;
   const next = async (input: WorkflowStartUpdateWithStartInput): Promise<WorkflowStartUpdateWithStartOutput> => {
@@ -104,19 +104,18 @@ test('interceptor.startUpdateWithStart: injects __openai_agents_config on the wo
 
   t.truthy(capturedWorkflowStartHeaders?.[AGENTS_CONFIG_HEADER_KEY]);
   const decoded = extractAgentsConfigHeader(capturedWorkflowStartHeaders!);
-  t.is(decoded?.modelParams?.startToCloseTimeout, '55s');
+  t.is(decoded?.activityOptions?.startToCloseTimeout, '55s');
 });
 
-test('interceptor: config header round-trips all three options (addTemporalSpans, useOtelInstrumentation, modelParams)', async (t) => {
-  const modelParams = {
-    startToCloseTimeout: '60s' as const,
+test('interceptor: config header round-trips tracing flags and model execution options', async (t) => {
+  const modelOptions = {
+    activityOptions: { startToCloseTimeout: '60s' as const, summary: 'Custom summary' },
     useLocalActivity: true,
-    summary: 'Custom summary',
   };
   const interceptor = makeInterceptor({
     addTemporalSpans: true,
     useOtelInstrumentation: true,
-    modelParams,
+    ...modelOptions,
   });
 
   let capturedHeaders: Record<string, any> | undefined;
@@ -139,7 +138,7 @@ test('interceptor: config header round-trips all three options (addTemporalSpans
   t.deepEqual(decoded, {
     addTemporalSpans: true,
     useOtelInstrumentation: true,
-    modelParams,
+    ...modelOptions,
   });
 });
 

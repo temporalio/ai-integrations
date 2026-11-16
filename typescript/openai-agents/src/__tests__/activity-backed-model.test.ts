@@ -8,7 +8,7 @@ import {
   type SpanData,
 } from '@openai/agents-core';
 import { TemporalModel } from '../workflow/temporal-model';
-import type { ModelSummaryProvider } from '../common/model-activity-options';
+import type { ModelSummaryProvider } from '../common/model-options';
 import { streamingTextEvents } from './stubs/openai-agents-fakes';
 
 function minimalRequest(): ModelRequest {
@@ -57,14 +57,11 @@ test('getStreamedResponse: dynamic summary routes through executeWithOptions', a
       return 'dynamic summary';
     },
   };
-  const model = new TemporalModel(
-    'gpt-4o',
-    {
-      startToCloseTimeout: '60s',
-      streamingTopic: 'events',
-      summary: provider,
-    }
-  );
+  const model = new TemporalModel('gpt-4o', {
+    activityOptions: { startToCloseTimeout: '60s' },
+    streamingTopic: 'events',
+    summaryProvider: provider,
+  });
   const fake = fakeStreamActivities(events);
   (model as any).createActivities = () => fake.activities;
 
@@ -81,7 +78,10 @@ test('getStreamedResponse: dynamic summary routes through executeWithOptions', a
 
 test('getStreamedResponse: no dynamic summary uses the plain proxy call', async (t) => {
   const events = streamingTextEvents('hi');
-  const model = new TemporalModel('gpt-4o', { startToCloseTimeout: '60s', streamingTopic: 'events' });
+  const model = new TemporalModel('gpt-4o', {
+    activityOptions: { startToCloseTimeout: '60s' },
+    streamingTopic: 'events',
+  });
   const fake = fakeStreamActivities(events);
   (model as any).createActivities = () => fake.activities;
 
@@ -110,7 +110,10 @@ test.serial('getStreamedResponse: opens a generation span carrying the model nam
   getGlobalTraceProvider().setDisabled(false);
 
   try {
-    const model = new TemporalModel('gpt-4o-mini', { startToCloseTimeout: '60s', streamingTopic: 'events' });
+    const model = new TemporalModel('gpt-4o-mini', {
+      activityOptions: { startToCloseTimeout: '60s' },
+      streamingTopic: 'events',
+    });
     (model as any).createActivities = () => fakeStreamActivities(events).activities;
     await withTrace('test', async () => {
       await drain(model.getStreamedResponse(minimalRequest()));

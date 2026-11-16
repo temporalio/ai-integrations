@@ -94,7 +94,7 @@ test('temporalSandboxClient defaults activity config only when omitted', (t) => 
 
 async function runForSandboxValidation(agent: Agent<any, any>, sandbox?: any): Promise<unknown> {
   const runner = Object.create(TemporalOpenAIRunner.prototype) as TemporalOpenAIRunner;
-  Object.assign(runner, { modelParams: {} });
+  Object.assign(runner, { modelOptions: { activityOptions: {} } });
   return runner.run(agent, 'hello', sandbox === undefined ? undefined : { runConfig: { sandbox } }).then(
     () => undefined,
     (error) => error
