@@ -391,7 +391,10 @@ def load_carried_messages(carried: Any) -> list[Any]:
     """
     from langchain_core.load import load
 
-    return [load(m) if _is_dumped_message(m) else m for m in carried]
+    return [
+        load(m, allowed_objects=_ALLOWED_OBJECTS) if _is_dumped_message(m) else m
+        for m in carried
+    ]
 
 
 # The ``id`` prefix ``dumpd`` writes for every class in ``langchain_core.messages``.
