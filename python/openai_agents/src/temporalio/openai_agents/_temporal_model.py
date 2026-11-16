@@ -149,6 +149,11 @@ class TemporalModel(Model):
             summary_provider=summary_provider,
         )
 
+    @property
+    def model(self) -> str | None:
+        """Expose the model identifier used by upstream sandbox capabilities."""
+        return self.model_name
+
     def get_default_model_settings(self) -> ModelSettings | None:
         """Expose upstream model-name defaults without constructing a provider client."""
         return get_default_model_settings(self.model_name)

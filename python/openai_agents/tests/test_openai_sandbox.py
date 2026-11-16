@@ -10,12 +10,14 @@ from typing import Any, Literal
 import pytest
 from agents import Agent, FunctionTool, RunConfig, Runner, Tool
 from agents.sandbox import Capability, Manifest, SandboxAgent, SandboxRunConfig
+from agents.sandbox.capabilities import Compaction
 from agents.sandbox.errors import (
     ExecTransportError,
     SandboxError,
     WorkspaceArchiveReadError,
 )
 from agents.sandbox.manifest import Environment
+from agents.sandbox.runtime_agent_preparation import prepare_sandbox_agent
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.pty_types import PtyExecUpdate
 from agents.sandbox.session.sandbox_client import (
@@ -133,6 +135,32 @@ def test_has_sandbox_agent_circular_with_sandbox():
     b: Agent[Any] = TemporalAgent[None](name="b", handoffs=[a])
     a.handoffs = [b, sandbox]
     assert _has_sandbox_agent(b) is True
+
+
+@pytest.mark.parametrize(
+    "model_name,run_model_name,threshold",
+    [
+        ("gpt-5.4", None, 942818),
+        ("gpt-4o", None, 115200),
+        ("gpt-4o", "gpt-5.4", 942818),
+        (None, "gpt-5.4", 942818),
+        (None, None, 240000),
+        ("custom-model", None, 240000),
+    ],
+)
+def test_temporal_model_sandbox_compaction(
+    model_name: str | None, run_model_name: str | None, threshold: int
+):
+    agent = SandboxAgent[None](name="sandbox", model=TemporalModel(model_name))
+    prepared = prepare_sandbox_agent(
+        agent=agent,
+        session=_MockSandboxSession(),
+        capabilities=[Compaction()],
+        run_config_model=TemporalModel(run_model_name) if run_model_name else None,
+    )
+    assert prepared.model_settings.extra_args == {
+        "context_management": [{"type": "compaction", "compact_threshold": threshold}]
+    }
 
 
 # ── temporal_sandbox_client helper tests ──

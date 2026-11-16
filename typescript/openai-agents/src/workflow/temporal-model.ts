@@ -163,6 +163,11 @@ export class TemporalModel implements Model {
     this.options = { ...options, activityOptions: { ...options.activityOptions } };
   }
 
+  /** Model identifier used by upstream sandbox capabilities. */
+  get model(): string {
+    return this.modelName;
+  }
+
   private effectiveOptions(streaming: boolean): ResolvedModelOptions {
     const context = currentModelCall();
     const options = mergeModelOptions(context?.defaults, this.options, context?.overrides);

@@ -4,6 +4,8 @@ import {
   Manifest,
   SandboxAgent,
   SandboxError,
+  compaction,
+  prepareSandboxAgent,
   type SandboxExecResult,
   type SandboxSession,
   type SandboxSessionState,
@@ -52,7 +54,37 @@ import { workerEnvValue } from '../common/worker-env-vars';
 import { TemporalSandboxClient, temporalSandboxClient } from '../workflow/sandbox-client';
 import { TemporalSandboxSession } from '../workflow/sandbox-session';
 import { TemporalOpenAIRunner } from '../workflow/runner';
+import { TemporalModel } from '../workflow/temporal-model';
 import { FakeSandboxClient, FakeSandboxSession } from './stubs/sandbox-fakes';
+
+for (const [name, modelName, runModelName, threshold] of [
+  ['agent model', 'gpt-5.4', undefined, 942818],
+  ['smaller agent model', 'gpt-4o', undefined, 115200],
+  ['run fallback', undefined, 'gpt-5.4', 942818],
+  ['agent precedence', 'gpt-4o', 'gpt-5.4', 115200],
+  ['unnamed model', '', undefined, undefined],
+  ['unknown model', 'custom-model', undefined, 240000],
+] as const) {
+  test(`TemporalModel preserves sandbox compaction parameters: ${name}`, (t) => {
+    const prepare = (temporal: boolean) =>
+      prepareSandboxAgent({
+        agent: new SandboxAgent({
+          name: 'sandbox',
+          model: temporal && modelName !== undefined ? new TemporalModel(modelName) : modelName,
+        }),
+        session: new FakeSandboxSession(),
+        capabilities: [compaction()],
+        runConfigModel: temporal && runModelName !== undefined ? new TemporalModel(runModelName) : runModelName,
+      });
+    const providerData = prepare(true).modelSettings.providerData;
+    t.deepEqual(providerData, prepare(false).modelSettings.providerData);
+    if (threshold !== undefined) {
+      t.deepEqual(providerData, {
+        context_management: [{ type: 'compaction', compact_threshold: threshold }],
+      });
+    }
+  });
+}
 
 function activityMap(provider: SandboxClientProvider): Record<string, (...args: any[]) => Promise<any>> {
   return provider._getActivities();
