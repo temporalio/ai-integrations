@@ -6,7 +6,7 @@ Run from ``python/microsoft_agent_framework`` with the same environment ``make t
 
 Each recorder runs one of the suite's workflows against a local dev server
 with scripted chat clients and an in-process MCP server, then writes
-``handle.fetch_history()`` as JSON under ``tests/histories``. A file that
+``handle.fetch_history()`` as JSON under ``tests/histories/<REPLAY_MAJOR>.x``. A file that
 exists is not replaced: a recording made before a release stays as it is
 (``tests/histories/README.md``). ``--suffix NAME`` writes ``<scenario>-NAME.json``
 next to the old files for a new shape; ``--overwrite "<reason>"`` replaces
@@ -43,7 +43,10 @@ from tests.test_approval import ApprovalWorkflow, Decision
 from tests.test_mcp import MCPInput, MCPWorkflow
 from tests.test_streaming import StreamingWorkflow, StreamInput
 
-HISTORIES = Path(__file__).with_name("histories")
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 0
+HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
 
 
 async def _record(

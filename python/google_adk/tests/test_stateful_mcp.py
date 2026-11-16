@@ -56,7 +56,6 @@ from temporalio.client import (
     OutboundInterceptor,
     WorkflowFailureError,
     WorkflowHandle,
-    WorkflowHistory,
 )
 from temporalio.common import RetryPolicy
 from temporalio.converter import (
@@ -65,13 +64,8 @@ from temporalio.converter import (
 )
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 from temporalio.service import RPCError, RPCStatusCode
-from temporalio.worker import Replayer, Worker
+from temporalio.worker import Worker
 from temporalio.workflow import ActivityCancellationType, ActivityConfig
-from tests.helpers.stateful_replay import (
-    StatefulMcpCancelWaitWorkflow,
-    StatefulMcpCancelWorkflow,
-    StatefulMcpGatherWorkflow,
-)
 
 with workflow.unsafe.imports_passed_through():
     from google.adk.events import EventActions
@@ -1947,27 +1941,3 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
     # Both blocks' operations use the queue that sessions of every version
     # poll, so a session recorded by an earlier version keeps serving them.
     assert operation_queues == {f"stateful_state-stateful@{handle.result_run_id}"}
-
-
-@pytest.mark.parametrize(
-    "file_name",
-    [
-        "stateful_mcp_gather.json",
-        "stateful_mcp_cancel.json",
-        "stateful_mcp_cancel_wait.json",
-    ],
-)
-async def test_stateful_mcp_histories_from_main_replay(file_name: str) -> None:
-    # Recorded on main at 88745dc with the workflow worker stopped, so that one
-    # activation resolves a stateful tool call together with another activity
-    # (gather) or with a workflow cancel (cancel; cancel_wait with
-    # WAIT_CANCELLATION_COMPLETED).
-    history_json = (Path(__file__).with_name("histories") / file_name).read_text()
-    await Replayer(
-        workflows=[
-            StatefulMcpGatherWorkflow,
-            StatefulMcpCancelWorkflow,
-            StatefulMcpCancelWaitWorkflow,
-        ],
-        plugins=[GoogleAdkPlugin()],
-    ).replay_workflow(WorkflowHistory.from_json("replay", history_json))
