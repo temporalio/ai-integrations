@@ -279,8 +279,7 @@ The timer runs on the worker's event loop. Blocking the loop can cause heartbeat
 timeouts in every activity sharing it. On Vertex AI, `interactions` and `agents`
 calls refresh credentials on the loop: on the first call, then about once an
 hour. A slow refresh can also fail other running Gemini calls. If that can be
-slow, set a longer `heartbeat_timeout`, or `None`. The timer logs a warning if
-the gap between beats reaches the heartbeat timeout.
+slow, set a longer `heartbeat_timeout`, or `None`.
 
 **Breaking change when you upgrade or roll back:** earlier versions don't
 heartbeat on a timer. While both versions run, a call that this version

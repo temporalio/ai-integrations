@@ -2522,28 +2522,6 @@ async def test_activity_heartbeats_on_a_timer(
     assert bool(sent) == heartbeats
 
 
-@pytest.mark.parametrize("blocked", [False, True])
-async def test_heartbeat_warns_when_event_loop_is_blocked(
-    blocked: bool, caplog: pytest.LogCaptureFixture
-):
-    """Warn when a blocked loop leaves a full timeout between heartbeats."""
-    from temporalio.google_genai._gemini_activity import _heartbeating
-
-    @_heartbeating
-    async def call() -> None:
-        if blocked:
-            time.sleep(0.25)
-        else:
-            await asyncio.sleep(0.25)
-        await asyncio.sleep(0.05)
-
-    env, sent = _heartbeat_counting_env(timedelta(milliseconds=200))
-    await env.run(call)
-
-    assert sent
-    assert ("Gemini activity heartbeat was delayed" in caplog.text) == blocked
-
-
 async def test_interaction_stream_does_not_heartbeat_per_event():
     """A stream heartbeats on the timer only, not once per event."""
     env, sent = _heartbeat_counting_env(timedelta(seconds=10))

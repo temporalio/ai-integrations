@@ -148,23 +148,10 @@ def _heartbeating(fn: _F) -> _F:
             return await fn(*args, **kwargs)
         interval = timeout.total_seconds() / 2
         loop = asyncio.get_running_loop()
-        last_beat = loop.time()
         handle: asyncio.TimerHandle
 
         def beat() -> None:
-            nonlocal handle, last_beat
-            now = loop.time()
-            elapsed = now - last_beat
-            if elapsed >= timeout.total_seconds():
-                activity.logger.warning(
-                    "Gemini activity heartbeat was delayed for %.1f s "
-                    "(heartbeat timeout: %g s). The worker's event loop may "
-                    "be blocked, so other running activities may also miss "
-                    "heartbeats. This attempt may fail with a heartbeat timeout.",
-                    elapsed,
-                    timeout.total_seconds(),
-                )
-            last_beat = now
+            nonlocal handle
             handle = loop.call_later(interval, beat)
             activity.heartbeat()
 
