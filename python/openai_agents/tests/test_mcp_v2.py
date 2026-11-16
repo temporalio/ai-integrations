@@ -296,13 +296,18 @@ def test_factory_that_does_not_return_an_mcp_server_is_non_retryable(
 ) -> None:
     value = make_value()
     kind = type(value)
-    # Passed in place of the factory, the value fails when the Worker is built.
-    with pytest.raises(TypeError) as type_error:
-        openai_agents.OpenAIAgentsPlugin(mcp_servers={"hello": value})
-    assert str(type_error.value) == (
-        f"MCP server factory 'hello' is {kind.__module__}.{kind.__qualname__}, "
-        "not callable"
-    )
+    # Passed in place of the factory, the value fails when the Worker is built,
+    # with the deprecated stateful provider too.
+    for build in (
+        lambda: openai_agents.OpenAIAgentsPlugin(mcp_servers={"hello": value}),
+        lambda: openai_agents.StatefulMCPServerProvider("hello", value),
+    ):
+        with pytest.raises(TypeError) as type_error:
+            build()
+        assert str(type_error.value) == (
+            f"MCP server factory 'hello' is {kind.__module__}.{kind.__qualname__}, "
+            "not callable"
+        )
 
     with pytest.raises(ApplicationError) as err:
         create_backend(lambda: value)
