@@ -2,8 +2,9 @@
 """Report nightly CI and Dependabot update failures as GitHub issues.
 
 Reads the jobs of the current workflow run through `gh api`, maps reusable
-workflow job names such as `Python (openai_agents) / ...` and `Go (googleadk) / ...`
-to a plugin, and keeps exactly one open issue per failing plugin labelled `nightly`.
+workflow job names such as `Python (openai_agents) / ...`, `Go (googleadk) / ...`
+and `.NET (microsoft-agent-framework) / ...` to a plugin, and keeps exactly one open issue
+per failing plugin labelled `nightly`.
 Passing plugins with an open issue get a comment and are closed.
 
 With --dependabot, also track Dependabot update jobs separately. Security-update
@@ -25,9 +26,11 @@ from pathlib import Path, PurePosixPath
 
 from _common import discover_plugins, repo_root
 
-# Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`, `name: TypeScript`) joined with the reusable workflow's
-# job name; test_nightly_report.py asserts the two stay in step.
-JOB_RE = re.compile(r"^(?P<language>Python|Java|Go|TypeScript) \((?P<plugin>[^)]+)\) / ")
+# Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`, `name: TypeScript`, `name: .NET`)
+# joined with the reusable workflow's job name; test_nightly_report.py asserts the two stay in step.
+JOB_RE = re.compile(r"^(?P<language>Python|Java|Go|TypeScript|\.NET) \((?P<plugin>[^)]+)\) / ")
+# Issue keys are `<language root folder>/<plugin>`: `.lower()` of the job's language, except `.NET`, whose root is `dotnet`.
+KEY_PREFIX = {".NET": "dotnet"}
 LABEL = "nightly"
 FAILED = {"failure", "timed_out"}
 DEPENDABOT_LABEL = "dependabot-failure"
@@ -68,7 +71,8 @@ def classify(jobs: list[dict]) -> tuple[set[str], set[str]]:
         m = JOB_RE.match(job.get("name", ""))
         if not m or not job.get("conclusion"):
             continue
-        plugin = f"{m.group('language').lower()}/{m.group('plugin')}"
+        language = m.group("language")
+        plugin = f"{KEY_PREFIX.get(language, language.lower())}/{m.group('plugin')}"
         seen.add(plugin)
         if job["conclusion"] in FAILED:
             failing.add(plugin)

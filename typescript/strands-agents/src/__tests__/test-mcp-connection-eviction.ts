@@ -6,8 +6,11 @@
  * fake `McpClient`, so no Temporal server or workflow is needed.
  */
 import test from 'ava';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { McpClient } from '@strands-agents/sdk';
+import { ApplicationFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
+import { StrandsPlugin } from '..';
 import { buildCallToolActivity, buildListToolsActivity, McpConnections } from '../temporal-mcp-client';
 import type { CallToolInput } from '../temporal-mcp-client';
 
@@ -61,6 +64,70 @@ function deferred<T = void>() {
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const input = (toolName: string): CallToolInput => ({ toolName, args: {} });
+
+for (const operation of ['listTools', 'callTool']) {
+  test(`${operation} rejects invalid MCP factory results before connecting`, async (t) => {
+    const calls: string[] = [];
+    const methods = ['connect', 'disconnect', 'listTools', 'callTool'] as const;
+    const client = Object.fromEntries(methods.map((method) => [method, async () => calls.push(method)]));
+    const invalidResults: [unknown, string][] = [
+      [undefined, 'undefined'],
+      [null, 'null'],
+      [{}, 'Object'],
+      ...methods.map((method): [unknown, string] => [{ ...client, [method]: undefined }, 'Object']),
+      ...methods.map((method): [unknown, string] => [{ ...client, [method]: 1 }, 'Object']),
+      // The MCP SDK's Client, which has close() in place of disconnect().
+      [new Client({ name: 'test-client', version: '1.0.0' }), 'Client'],
+    ];
+    let result: unknown;
+    let factoryCalls = 0;
+    const factory = (): McpClient => {
+      factoryCalls++;
+      return result as McpClient;
+    };
+    const connections = new McpConnections();
+    const activity: (args: CallToolInput & { server: string }) => Promise<unknown> = operation === 'listTools'
+      ? buildListToolsActivity('invalid', factory, connections)
+      : buildCallToolActivity('invalid', factory, connections);
+    for (const [value, kind] of invalidResults) {
+      // Passed in place of the factory, the value fails when the Worker is built.
+      t.throws(() => new StrandsPlugin({ mcpClients: { invalid: value as () => McpClient } }), {
+        instanceOf: TypeError,
+        message: `MCP client factory 'invalid' is ${kind}, not a function.`,
+      });
+
+      result = value;
+      const err = await t.throwsAsync(new MockActivityEnvironment().run(activity, { ...input('echo'), server: 'invalid' }), {
+        instanceOf: ApplicationFailure,
+      });
+      t.true(err!.nonRetryable);
+      t.is(err!.type, 'MCPClientFactoryTypeError');
+      t.is(
+        err!.message,
+        `MCP client factory 'invalid' returned ${kind}, not a client with connect(), disconnect(), listTools() and callTool() methods.`
+      );
+    }
+    t.is(factoryCalls, invalidResults.length);
+    t.deepEqual(calls, []);
+  });
+
+  test(`${operation} preserves an MCP factory exception`, async (t) => {
+    const failure = new Error('factory failed');
+    let factoryCalls = 0;
+    const factory = (): McpClient => {
+      factoryCalls++;
+      throw failure;
+    };
+    const connections = new McpConnections();
+    const activity: (args: CallToolInput & { server: string }) => Promise<unknown> = operation === 'listTools'
+      ? buildListToolsActivity('failure', factory, connections)
+      : buildCallToolActivity('failure', factory, connections);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      t.is(await t.throwsAsync(new MockActivityEnvironment().run(activity, { ...input('echo'), server: 'failure' })), failure);
+    }
+    t.is(factoryCalls, 2);
+  });
+}
 
 test('a failed callTool does not close the shared connection under an in-flight sibling call', async (t) => {
   const server = 'siblingServer';

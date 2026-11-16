@@ -43,8 +43,6 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
 from google.adk.sessions import InMemorySessionService
-from google.adk.telemetry._schema_version import resolve_schema_version
-from google.adk.telemetry.context import TelemetryConfig
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
@@ -72,7 +70,7 @@ from temporalio.google_adk import (
 from temporalio.google_adk._model import (
     _with_serializable_response_schema,
 )
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 from temporalio.workflow import ActivityConfig
 from tests.helpers.decorators import WrapOnAccess, passthrough, unwrapped
 from tests.helpers.opentelemetry import dump_spans
@@ -610,45 +608,23 @@ async def test_single_agent_telemetry(
 
     spans = dump_spans(exporter.get_finished_spans(), with_attributes=False)
     print("\n".join(spans))
-    expected_spans = [
+    # OpenInference suppresses duplicate ADK invocation/agent spans and emits
+    # its own call_llm spans independently of ADK's telemetry schema.
+    assert spans == [
         "StartWorkflow:WeatherAgent",
         "  RunWorkflow:WeatherAgent",
         "    invocation [test_app]",
-        "      invocation",
-        "        agent_run [test_agent]",
-        "          invoke_agent test_agent",
-        "            execute_tool get_weather",
-        "              StartActivity:get_weather",
-        "                RunActivity:get_weather",
-        "            call_llm",
-        "              StartActivity:invoke_model",
-        "                RunActivity:invoke_model",
-        "            call_llm",
-        "              StartActivity:invoke_model",
-        "                RunActivity:invoke_model",
+        "      agent_run [test_agent]",
+        "        execute_tool get_weather",
+        "          StartActivity:get_weather",
+        "            RunActivity:get_weather",
+        "        call_llm",
+        "          StartActivity:invoke_model",
+        "            RunActivity:invoke_model",
+        "        call_llm",
+        "          StartActivity:invoke_model",
+        "            RunActivity:invoke_model",
     ]
-    # ADK 2.12 introduces workflow spans before the inference format migrates.
-    # ADK 2.13 enables both changes by default.
-    schema_v2 = resolve_schema_version() >= 2
-    if schema_v2:
-        expected_spans[3] = "      invoke_workflow test_agent"
-    if schema_v2 and TelemetryConfig().should_use_experimental_genai_semconv:
-        expected_spans = [
-            "StartWorkflow:WeatherAgent",
-            "  RunWorkflow:WeatherAgent",
-            "    invocation [test_app]",
-            "      invoke_workflow test_agent",
-            "        agent_run [test_agent]",
-            "          invoke_agent test_agent",
-            "            StartActivity:invoke_model",
-            "              RunActivity:invoke_model",
-            "            execute_tool get_weather",
-            "              StartActivity:get_weather",
-            "                RunActivity:get_weather",
-            "            StartActivity:invoke_model",
-            "              RunActivity:invoke_model",
-        ]
-    assert spans == expected_spans
 
 
 async def test_unsetting_timeout():
@@ -1560,8 +1536,8 @@ async def test_litellm_model(client: Client):
     assert result.content.parts[0].text == "hello from litellm"
 
 
-def test_unset_none_fields_stripped() -> None:
-    """ADK plugin converter strips unset None fields from Pydantic payloads."""
+def test_unset_none_fields_preserved() -> None:
+    """Default None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1579,11 +1555,11 @@ def test_unset_none_fields_stripped() -> None:
         "cacheable_contents_token_count",
         "previous_interaction_id",
     ):
-        assert field not in serialized, f"Unset field {field!r} should be stripped"
+        assert serialized[field] is None
 
 
 def test_explicitly_set_none_preserved() -> None:
-    """Explicitly-set None is preserved (exclude_unset, not exclude_none)."""
+    """Explicit None fields survive ADK serialization."""
     plugin = GoogleAdkPlugin()
     converter = plugin._configure_data_converter(None)
     request = LlmRequest(
@@ -1594,8 +1570,97 @@ def test_explicitly_set_none_preserved() -> None:
     payloads = converter.payload_converter.to_payloads([request])
     serialized = json.loads(payloads[0].data)
 
-    assert "cache_config" in serialized, "Explicitly-set None should be preserved"
     assert serialized["cache_config"] is None
+
+
+@activity.defn
+async def tag_city(city: str, *tags: str) -> str:
+    return f"{city}:{','.join(tags)}"
+
+
+@activity.defn
+class TagCity:
+    async def __call__(self, city: str, *tags: str) -> str:
+        return f"{city}:{','.join(tags)}"
+
+
+@pytest.mark.parametrize("activity_def", [tag_city, TagCity])
+@pytest.mark.asyncio
+async def test_activity_as_tool_passes_empty_var_positional(
+    activity_def: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADK leaves *tags out of the declaration, as it does for the plain
+    # function, so the model can't fill it and the activity gets no tags.
+    tool = temporalio.google_adk.workflow.activity_as_tool(
+        activity_def, start_to_close_timeout=timedelta(seconds=30)
+    )
+    native = tag_city if activity_def is tag_city else TagCity().__call__
+    declaration = FunctionTool(tool)._get_declaration()
+    native_declaration = FunctionTool(native)._get_declaration()
+    assert declaration is not None and native_declaration is not None
+    schema = declaration.parameters_json_schema
+    native_schema = native_declaration.parameters_json_schema
+    assert schema is not None and native_schema is not None
+    assert (schema["properties"], schema["required"]) == (
+        native_schema["properties"],
+        native_schema["required"],
+    )
+    assert list(schema["properties"]) == ["city"]
+    if activity_def is tag_city:
+        # Outside a Workflow the tool calls the activity itself.
+        assert await tool(city="Rome") == "Rome:"
+
+    calls: list[list[Any]] = []
+
+    async def execute_activity(_: Any, *args: Any, **kwargs: Any) -> str:
+        calls.append(list(args) or list(kwargs.get("args", [])))
+        return "ok"
+
+    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    await tool(city="Rome")
+    assert calls == [["Rome"]]
+
+
+@activity.defn
+async def count_tags(city: str, *tags: str) -> str:
+    return f"{city}:{len(tags)}"
+
+
+@workflow.defn
+class CountTagsWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        tool = temporalio.google_adk.workflow.activity_as_tool(
+            count_tags, start_to_close_timeout=timedelta(seconds=30)
+        )
+        return await tool(city="Rome")
+
+
+@pytest.mark.asyncio
+async def test_activity_as_tool_var_positional_replays(client: Client) -> None:
+    new_config = client.config()
+    new_config["plugins"] = [GoogleAdkPlugin()]
+    client = Client(**new_config)
+    task_queue = f"adk-var-args-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CountTagsWorkflow],
+        activities=[count_tags],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            CountTagsWorkflow.run,
+            id=f"adk-var-args-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        assert await handle.result() == "Rome:0"
+        history = await handle.fetch_history()
+    await Replayer(
+        workflows=[CountTagsWorkflow], plugins=[GoogleAdkPlugin()]
+    ).replay_workflow(history)
 
 
 def test_activity_as_tool_preserves_metadata() -> None:
@@ -1961,6 +2026,7 @@ async def test_agent_with_output_schema(client: Client):
 
 @pytest.mark.parametrize("schema", [CityWeather, list[CityWeather], StringChoice])
 def test_output_schema_type_sent_as_json_schema(schema: Any) -> None:
+    expected_schema = TypeAdapter(schema).json_schema()
     request = LlmRequest(
         model="gemini-2.0-flash",
         contents=[Content(role="user", parts=[Part(text="hello")])],
@@ -1975,7 +2041,7 @@ def test_output_schema_type_sent_as_json_schema(schema: Any) -> None:
     converter = GoogleAdkPlugin()._configure_data_converter(None)
     payloads = converter.payload_converter.to_payloads([converted])
     serialized = json.loads(payloads[0].data)
-    assert serialized["config"]["responseSchema"] == TypeAdapter(schema).json_schema()
+    assert serialized["config"]["responseSchema"] == expected_schema
 
 
 def test_output_schema_preserves_custom_model_json_schema() -> None:

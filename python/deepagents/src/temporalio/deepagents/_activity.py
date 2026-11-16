@@ -42,6 +42,7 @@ INVOKE_MODEL = "deepagents.invoke_model"
 INVOKE_MODEL_STREAMING = "deepagents.invoke_model_streaming"
 INVOKE_TOOL = "deepagents.invoke_tool"
 BACKEND_OP = "deepagents.backend_op"
+GET_MODEL_PROFILE = "deepagents.get_model_profile"
 
 CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
 """``ApplicationError.type`` of a model call the provider rejected as too long."""
@@ -336,7 +337,7 @@ def _default_model_provider(model_name: str) -> Any:
 
 
 class DeepAgentActivities:
-    """Holds the worker-side dependencies and exposes the four activities.
+    """Holds the worker-side dependencies and exposes the activities.
 
     An instance is created by ``DeepAgentsPlugin``
     and its bound methods are registered on the worker.
@@ -368,6 +369,12 @@ class DeepAgentActivities:
         if bind_kwargs:
             model = model.bind(**bind_kwargs)
         return model
+
+    @activity.defn(name=GET_MODEL_PROFILE)
+    async def get_model_profile(self, model_name: str) -> dict[str, Any] | None:
+        """Return the LangChain profile of the model the provider builds for a name."""
+        profile = getattr(self._model_provider(model_name), "profile", None)
+        return dict(profile) if profile else None
 
     @activity.defn(name=INVOKE_MODEL)
     @_auto_heartbeater

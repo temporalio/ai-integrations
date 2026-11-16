@@ -6,17 +6,32 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import TracebackType
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import EventActions
+from google.adk.models.llm_request import LlmRequest
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset
-from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool import McpTool, McpToolset
 from google.adk.tools.tool_confirmation import ToolConfirmation
 from google.adk.tools.tool_context import ToolContext
-from google.genai import types
 from google.genai.types import FunctionDeclaration
+from mcp.types import (
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+)
+
+try:
+    from mcp import (  # type: ignore[attr-defined]  # mcp>=2
+        MCPError as McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
+except ImportError:  # mcp<2
+    from mcp.shared.exceptions import (  # type: ignore[attr-defined,assignment,no-redef]
+        McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1.workflow_pb2 import (
@@ -50,6 +65,14 @@ class _ToolResult:
     is_long_running: bool
     custom_metadata: dict[str, Any] | None
     function_declaration: FunctionDeclaration | None
+    fenced_function_declaration: FunctionDeclaration | None = None
+
+
+@dataclass
+class TemporalToolSession:
+    """ADK application identity available inside a tool activity."""
+
+    app_name: str
 
 
 @dataclass
@@ -62,6 +85,13 @@ class TemporalToolContext:
     tool_confirmation: ToolConfirmation | None
     function_call_id: str | None
     event_actions: EventActions
+    session: TemporalToolSession | None = None
+    user_id: str | None = None
+
+    @property
+    def actions(self) -> EventActions:
+        """Event actions for the current tool call, matching ADK's context."""
+        return self.event_actions
 
     def request_confirmation(
         self,
@@ -97,6 +127,57 @@ class _CallToolArguments:
     name: str
     arguments: dict[str, Any]
     tool_context: TemporalToolContext
+
+
+# JSON-RPC errors that a retry of the same request cannot fix.  INTERNAL_ERROR,
+# timeouts, unknown codes and a lost session (see ``_protocol_error``) stay
+# retryable.
+_NON_RETRYABLE_PROTOCOL_ERRORS = frozenset(
+    {PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS}
+)
+
+# A server answers HTTP 404 for a session it no longer knows (for example after
+# a restart); MCP reports it only as INVALID_REQUEST with no data and one of
+# these messages.  Reconnecting fixes it, so it must stay retryable.
+_SESSION_LOST_MESSAGES = frozenset({"Session terminated", "Session not found"})
+
+
+def _find_mcp_error(err: BaseException) -> McpError | None:
+    """Return the MCP protocol error behind ``err``, if any.
+
+    ADK does not raise the ``McpError`` itself: ``McpToolset.get_tools`` wraps
+    it in a ``ConnectionError``, so it is looked up along the ``__cause__``
+    chain of ``err``.
+    """
+    seen: set[int] = set()
+    cause: BaseException | None = err
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, McpError):
+            return cast(McpError, cause)
+        seen.add(id(cause))
+        cause = cause.__cause__
+    return None
+
+
+def _protocol_error(err: McpError) -> ApplicationError:
+    """Convert an MCP protocol error to an ``ApplicationError``.
+
+    Errors a retry cannot fix (invalid request/params, unknown method, parse
+    error) are non-retryable so the activity does not keep retrying them.
+    """
+    error = err.error
+    session_lost = (
+        error.code == INVALID_REQUEST
+        and error.data is None
+        and error.message in _SESSION_LOST_MESSAGES
+    )
+    details = (error.code,) if error.data is None else (error.code, error.data)
+    return ApplicationError(
+        error.message,
+        *details,
+        type="MCPProtocolError",
+        non_retryable=error.code in _NON_RETRYABLE_PROTOCOL_ERRORS and not session_lost,
+    )
 
 
 class TemporalMcpToolSetProvider:
@@ -153,9 +234,17 @@ class TemporalMcpToolSetProvider:
                         tool.is_long_running,
                         tool.custom_metadata,
                         tool._get_declaration(),
+                        tool._build_fenced_declaration()
+                        if isinstance(tool, McpTool)
+                        else None,
                     )
                     for tool in tools
                 ]
+            except Exception as err:
+                mcp_error = _find_mcp_error(err)
+                if mcp_error is not None:
+                    raise _protocol_error(mcp_error) from err
+                raise
             finally:
                 await toolset.close()
 
@@ -184,13 +273,59 @@ class TemporalMcpToolSetProvider:
                     tool_context=args.tool_context,  #  type:ignore
                 )
                 return _CallToolResult(result=result, tool_context=args.tool_context)
+            except Exception as err:
+                mcp_error = _find_mcp_error(err)
+                if mcp_error is not None:
+                    raise _protocol_error(mcp_error) from err
+                raise
             finally:
                 await toolset.close()
 
         return get_tools, call_tool
 
 
-class _TemporalTool(BaseTool):
+class _RecordedMcpTool(McpTool):
+    def __init__(self, tool: BaseTool, fenced_declaration: FunctionDeclaration) -> None:
+        # This adapter only runs request preparation; execution stays in Activities.
+        BaseTool.__init__(
+            self,
+            name=tool.name,
+            description=tool.description,
+            is_long_running=tool.is_long_running,
+            custom_metadata=tool.custom_metadata,
+        )
+        self._declaration = cast(FunctionDeclaration, tool._get_declaration())
+        self._fenced_declaration = fenced_declaration
+
+    def _get_declaration(self) -> FunctionDeclaration:
+        return self._declaration
+
+    def _build_fenced_declaration(self) -> FunctionDeclaration:
+        return self._fenced_declaration
+
+
+class _TemporalBaseTool(BaseTool):
+    _declaration: FunctionDeclaration | None
+    _fenced_declaration: FunctionDeclaration | None
+
+    def _get_declaration(self) -> FunctionDeclaration | None:
+        return self._declaration
+
+    async def process_llm_request(
+        self, *, tool_context: ToolContext, llm_request: LlmRequest
+    ) -> None:
+        if self._fenced_declaration is None:
+            await super().process_llm_request(
+                tool_context=tool_context, llm_request=llm_request
+            )
+        else:
+            await _RecordedMcpTool(self, self._fenced_declaration).process_llm_request(
+                tool_context=tool_context, llm_request=llm_request
+            )
+            llm_request.tools_dict[self.name] = self
+
+
+class _TemporalTool(_TemporalBaseTool):
     def __init__(
         self,
         set_name: str,
@@ -202,6 +337,7 @@ class _TemporalTool(BaseTool):
         description: str,
         is_long_running: bool = False,
         custom_metadata: dict[str, Any] | None = None,
+        fenced_declaration: FunctionDeclaration | None = None,
     ):
         super().__init__(
             name=name,
@@ -215,9 +351,7 @@ class _TemporalTool(BaseTool):
             start_to_close_timeout=timedelta(minutes=1)
         )
         self._declaration = declaration
-
-    def _get_declaration(self) -> types.FunctionDeclaration | None:
-        return self._declaration
+        self._fenced_declaration = fenced_declaration
 
     async def run_async(
         self, *, args: dict[str, Any], tool_context: ToolContext
@@ -232,6 +366,8 @@ class _TemporalTool(BaseTool):
                     tool_confirmation=tool_context.tool_confirmation,
                     function_call_id=tool_context.function_call_id,
                     event_actions=tool_context._event_actions,
+                    session=TemporalToolSession(tool_context.session.app_name),
+                    user_id=tool_context.user_id,
                 ),
             ),
             result_type=_CallToolResult,
@@ -327,6 +463,7 @@ class TemporalMcpToolSet(BaseToolset):
                 description=tool_result.description,
                 is_long_running=tool_result.is_long_running,
                 custom_metadata=tool_result.custom_metadata,
+                fenced_declaration=tool_result.fenced_function_declaration,
             )
             for tool_result in tool_results
         ]
@@ -834,6 +971,9 @@ class TemporalStatefulMcpToolSetProvider:
                     tool.is_long_running,
                     tool.custom_metadata,
                     tool._get_declaration(),
+                    tool._build_fenced_declaration()
+                    if isinstance(tool, McpTool)
+                    else None,
                 )
                 for tool in tools
             ]
@@ -933,7 +1073,7 @@ class TemporalStatefulMcpToolSetProvider:
         return (connect,)
 
 
-class _TemporalStatefulTool(BaseTool):
+class _TemporalStatefulTool(_TemporalBaseTool):
     def __init__(
         self,
         set_name: str,
@@ -945,6 +1085,7 @@ class _TemporalStatefulTool(BaseTool):
         description: str,
         is_long_running: bool = False,
         custom_metadata: dict[str, Any] | None = None,
+        fenced_declaration: FunctionDeclaration | None = None,
     ):
         super().__init__(
             name=name,
@@ -956,9 +1097,7 @@ class _TemporalStatefulTool(BaseTool):
         self._session = session
         self._config = config
         self._declaration = declaration
-
-    def _get_declaration(self) -> types.FunctionDeclaration | None:
-        return self._declaration
+        self._fenced_declaration = fenced_declaration
 
     @_handle_worker_failure
     async def run_async(
@@ -974,6 +1113,8 @@ class _TemporalStatefulTool(BaseTool):
                     tool_confirmation=tool_context.tool_confirmation,
                     function_call_id=tool_context.function_call_id,
                     event_actions=tool_context._event_actions,
+                    session=TemporalToolSession(tool_context.session.app_name),
+                    user_id=tool_context.user_id,
                 ),
             ),
             result_type=_CallToolResult,
@@ -1184,6 +1325,7 @@ class TemporalStatefulMcpToolSet(BaseToolset):
                 description=tool_result.description,
                 is_long_running=tool_result.is_long_running,
                 custom_metadata=tool_result.custom_metadata,
+                fenced_declaration=tool_result.fenced_function_declaration,
             )
             for tool_result in tool_results
         ]

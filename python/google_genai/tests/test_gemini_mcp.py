@@ -19,6 +19,8 @@ Plus the server-side pass-through paths that need no shim code:
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
 import sys
 from collections.abc import AsyncGenerator
@@ -56,7 +58,10 @@ from tests.test_gemini import (
 )
 
 _ECHO_SERVER = str(Path(__file__).parent / "echo_mcp_server.py")
-_HISTORIES = Path(__file__).parent / "histories"
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 1
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
 
 
 @asynccontextmanager
@@ -484,7 +489,7 @@ def test_interactions_mcp_steps_rehydrate():
 # ---------------------------------------------------------------------------
 
 
-def _failing_factory(error: Exception):
+def _failing_factory(error: Exception, *, fail_on_connect: bool = False):
     class _FailingSession:
         async def list_tools(self) -> Any:
             raise error
@@ -494,9 +499,95 @@ def _failing_factory(error: Exception):
 
     @asynccontextmanager
     async def factory() -> AsyncGenerator[Any, None]:
+        if fail_on_connect:
+            raise error
         yield _FailingSession()
 
     return factory
+
+
+@pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
+@pytest.mark.parametrize("value_kind", ["none", "object", "coroutine"])
+async def test_mcp_factory_return_type_is_non_retryable(
+    operation: str, value_kind: str, recwarn: pytest.WarningsRecorder
+):
+    from temporalio.exceptions import ApplicationError
+    from temporalio.google_genai import _mcp
+    from temporalio.google_genai._models import _McpCallToolRequest
+
+    async def coroutine() -> None:
+        pass
+
+    value: Any = None
+    if value_kind == "object":
+        value = object()
+    elif value_kind == "coroutine":
+        value = coroutine()
+    server = "invalid-factory"
+    kind = type(value)
+    coroutine_id = id(value) if value_kind == "coroutine" else None
+
+    # Passed in place of the factory, the value fails when the Worker is built.
+    with pytest.raises(TypeError) as type_error:
+        _mcp.build_mcp_activities({server: value})
+    assert str(type_error.value) == (
+        f"MCP server factory {server!r} is "
+        f"{kind.__module__}.{kind.__qualname__}, not callable"
+    )
+    del type_error
+
+    owner_task_id: int | None = None
+
+    def factory() -> Any:
+        nonlocal owner_task_id
+        owner_task_id = id(asyncio.current_task())
+        return value
+
+    # The error must reach only the Activity. asyncio reports a task whose error
+    # nobody read when the task is collected.
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+
+    def report(_: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if id(context.get("task", context.get("future"))) == owner_task_id:
+            reported.append(context)
+        elif previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(report)
+    try:
+        if operation == "list-tools":
+            call = _mcp.build_list_tools_activity(server, factory)()
+        else:
+            call = _mcp.build_call_tool_activity(server, factory)(
+                _McpCallToolRequest(name="echo", arguments={})
+            )
+        with pytest.raises(ApplicationError) as exc_info:
+            await call
+        assert exc_info.value.type == "MCPServerFactoryTypeError"
+        assert exc_info.value.non_retryable
+        assert f"MCP server factory {server!r} returned" in exc_info.value.message
+        assert server not in _mcp._CONNECTIONS
+        # Let the loop run its pending callbacks, which still reference the
+        # connection, before collecting.
+        del exc_info
+        del value
+        await asyncio.sleep(0)
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous_handler)
+    assert reported == []
+    assert [
+        str(warning.message)
+        for warning in recwarn
+        if coroutine_id is not None
+        and issubclass(warning.category, RuntimeWarning)
+        and id(warning.source) == coroutine_id
+        and "was never awaited" in str(warning.message)
+    ] == []
 
 
 @pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
@@ -560,20 +651,160 @@ async def test_mcp_protocol_error_retryability(
 
 
 @pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
-async def test_mcp_transport_error_evicts_connection(operation: str):
+@pytest.mark.parametrize("fail_on_connect", [False, True])
+async def test_mcp_transport_error_evicts_connection(
+    operation: str, fail_on_connect: bool
+):
+    from temporalio.api.failure.v1 import Failure
+    from temporalio.converter import DefaultFailureConverter, DefaultPayloadConverter
     from temporalio.google_genai import _mcp
     from temporalio.google_genai._models import _McpCallToolRequest
 
     server = f"transport-err-{uuid4()}"
-    err = RuntimeError("Connection closed")
-    factory = _failing_factory(err)
-    if operation == "list-tools":
-        call = _mcp.build_list_tools_activity(server, factory)()
-    else:
-        call = _mcp.build_call_tool_activity(server, factory)(
-            _McpCallToolRequest(name="echo", arguments={})
+    err = (
+        ConnectionRefusedError("Connection refused")
+        if fail_on_connect
+        else RuntimeError("Connection closed")
+    )
+    connect = _failing_factory(err, fail_on_connect=fail_on_connect)
+    owner_task_id: int | None = None
+
+    def factory() -> AbstractAsyncContextManager[Any]:
+        nonlocal owner_task_id
+        owner_task_id = id(asyncio.current_task())
+        return connect()
+
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+
+    def report(_: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if id(context.get("task", context.get("future"))) == owner_task_id:
+            reported.append(context)
+        elif previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(report)
+    try:
+        if operation == "list-tools":
+            call = _mcp.build_list_tools_activity(server, factory)()
+        else:
+            call = _mcp.build_call_tool_activity(server, factory)(
+                _McpCallToolRequest(name="echo", arguments={})
+            )
+        with pytest.raises(type(err)) as exc_info:
+            await call
+        assert exc_info.value is err
+        assert server not in _mcp._CONNECTIONS
+        failure = Failure()
+        DefaultFailureConverter().to_failure(
+            exc_info.value, DefaultPayloadConverter(), failure
         )
-    with pytest.raises(RuntimeError) as exc_info:
-        await call
-    assert exc_info.value is err
-    assert server not in _mcp._CONNECTIONS
+        assert not failure.application_failure_info.non_retryable
+        del exc_info, err, factory, connect
+        await asyncio.sleep(0)
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous_handler)
+    assert reported == []
+
+
+async def test_mcp_stale_record_does_not_remove_replacement():
+    """A closing/failing old connection must not touch its replacement."""
+    from temporalio.google_genai import _mcp
+
+    server = f"stale-{uuid4()}"
+    closing = asyncio.Event()
+    finish = asyncio.Event()
+
+    @asynccontextmanager
+    async def old_factory() -> AsyncGenerator[Any, None]:
+        yield object()
+        closing.set()
+        await finish.wait()
+        raise RuntimeError("old close failed")
+
+    @asynccontextmanager
+    async def new_factory() -> AsyncGenerator[Any, None]:
+        yield object()
+
+    old = _mcp._ConnectionRecord(server, old_factory, timedelta(seconds=30))
+    _mcp._CONNECTIONS[server] = old
+    await old.session()
+    close = asyncio.create_task(_mcp._evict_connection(server))
+    await closing.wait()
+    new = _mcp._ConnectionRecord(server, new_factory, timedelta(seconds=30))
+    _mcp._CONNECTIONS[server] = new
+    await new.session()
+    finish.set()
+    await close
+    # The old owner's failure must not drop the replacement from the pool.
+    assert _mcp._CONNECTIONS.get(server) is new
+    assert not new._owner.done()
+
+    # A stale idle-eviction must not close the replacement either.
+    await old._maybe_evict()
+    assert _mcp._CONNECTIONS.get(server) is new
+    assert not new._owner.done()
+    await _mcp._evict_connection(server)
+
+
+async def test_cancelling_one_mcp_caller_leaves_the_other_waiting() -> None:
+    """Cancelling one waiter must not cancel the shared MCP connect."""
+    from temporalio.google_genai import _mcp
+
+    session = object()
+    connected = asyncio.Event()
+    release = asyncio.Event()
+
+    def factory() -> Any:
+        @asynccontextmanager
+        async def connect() -> AsyncGenerator[Any, None]:
+            connected.set()
+            await release.wait()
+            yield session
+
+        return connect()
+
+    server = f"cancel-one-{uuid4()}"
+    first = asyncio.create_task(
+        _mcp.get_connection(server, factory, timedelta(minutes=5))
+    )
+    second: asyncio.Task[tuple[Any, Any]] | None = None
+    try:
+        await connected.wait()
+        second = asyncio.create_task(
+            _mcp.get_connection(server, factory, timedelta(minutes=5))
+        )
+        record = _mcp._CONNECTIONS[server]
+        for _ in range(50):
+            if record._inflight >= 2 and not record._ready.done():
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("second caller did not wait on the shared connect")
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        # The connect, and the caller nobody cancelled, keep going.
+        assert not record._ready.cancelled()
+        assert not record._owner.done()
+        assert not second.done()
+
+        release.set()
+        got, held = await second
+        assert got is session
+        held.release()
+    finally:
+        release.set()
+        pending = [
+            task for task in (first, second) if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await _mcp._evict_connection(server)

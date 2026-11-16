@@ -4,8 +4,9 @@ import { CancelledFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
 import { OpenAIAgentsPlugin } from '..';
-import { nestedToolCancelWorkflow } from './workflows/openai-agents';
+import { activityToolCancelWorkflow, nestedToolCancelWorkflow } from './workflows/openai-agents';
 import { textResponse, toolCallResponse, type FakeModel } from './stubs/openai-agents';
+import { toolCallModelProvider } from './stubs/openai-agents-fakes';
 import { makeOpenAIAgentsTestFunction, replay } from './helpers/openai-agents';
 import EventType = temporal.api.enums.v1.EventType;
 
@@ -67,6 +68,46 @@ for (const [title, stopOnFirstTool, stream, expectCancelled, maxTurns] of [
       }
       // If the run ends before its nested model call, the assertions below report how.
       await Promise.race([nestedCalled, handle.result().catch(() => undefined)]);
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      release();
+      t.true(err?.cause instanceof CancelledFailure, String(err?.cause));
+      const { events } = await handle.fetchHistory();
+      t.is(events?.at(-1)?.eventType, EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED);
+      await replay(t, handle);
+    });
+  });
+}
+
+for (const stream of [false, true]) {
+  test(`Cancelling during an Activity tool cancels a ${stream ? 'streamed ' : ''}run`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    let toolStarted!: () => void;
+    const toolCalled = new Promise<void>((resolve) => (toolStarted = resolve));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: toolCallModelProvider('holdTool', {}),
+          modelParams: { streamingTopic: 'events' },
+        }),
+      ],
+      activities: {
+        holdTool: async () => {
+          toolStarted();
+          await released;
+          return 'held';
+        },
+      },
+    });
+
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(activityToolCancelWorkflow, {
+        args: [stream],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      await Promise.race([toolCalled, handle.result().catch(() => undefined)]);
       await handle.cancel();
       const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
       release();

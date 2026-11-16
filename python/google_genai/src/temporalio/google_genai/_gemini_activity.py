@@ -8,12 +8,14 @@ they never appear in workflow event history.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import functools
 import io
-from collections.abc import Generator, Sequence
+from collections.abc import Awaitable, Generator, Sequence
 from contextlib import AsyncExitStack, contextmanager
 from datetime import timedelta
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar, cast
 
 import google.auth.credentials
 from google.genai import Client as GeminiClient
@@ -126,10 +128,46 @@ def _upload_source(
     return file_path
 
 
+_F = TypeVar("_F", bound=Callable[..., Awaitable[Any]])
+
+
+def _heartbeating(fn: _F) -> _F:
+    """Heartbeat every half heartbeat timeout while ``fn`` runs.
+
+    A cancel reaches a running Activity only in a heartbeat's response. The
+    beats come from a timer, not from the call's progress, so a call shorter
+    than half the timeout sends none. ``call_later`` starts the timer at once,
+    where a task would wait for the call's first await, so code that blocks
+    the event loop before then only delays the first beat.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        timeout = activity.info().heartbeat_timeout
+        if not timeout:
+            return await fn(*args, **kwargs)
+        interval = timeout.total_seconds() / 2
+        loop = asyncio.get_running_loop()
+        handle: asyncio.TimerHandle
+
+        def beat() -> None:
+            nonlocal handle
+            handle = loop.call_later(interval, beat)
+            activity.heartbeat()
+
+        handle = loop.call_later(interval, beat)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            handle.cancel()
+
+    return cast(_F, wrapper)
+
+
 async def _drain_interaction_stream(
     stream: Any,
 ) -> _GeminiInteractionStreamedResponse:
-    """Collect every SSE event from an interaction stream, heartbeating per event.
+    """Collect every SSE event from an interaction stream.
 
     ``stream`` is the SDK's async streaming response; its concrete class is not a
     stable public name, so it is typed structurally — only ``async with`` /
@@ -138,7 +176,6 @@ async def _drain_interaction_stream(
     events: list[dict[str, Any]] = []
     async with stream:
         async for event in stream:
-            activity.heartbeat()
             events.append(
                 event.model_dump(by_alias=True, exclude_none=True, mode="json")
             )
@@ -166,6 +203,7 @@ class GeminiApiCaller:
         """Return activities that route SDK calls through this client."""
 
         @activity.defn
+        @_heartbeating
         async def gemini_api_client_async_request(
             req: _GeminiApiRequest,
         ) -> _GeminiApiResponse:
@@ -187,6 +225,7 @@ class GeminiApiCaller:
             )
 
         @activity.defn
+        @_heartbeating
         async def gemini_api_client_async_request_streamed(
             req: _GeminiApiRequest,
         ) -> _GeminiApiStreamedResponse:
@@ -240,6 +279,7 @@ class GeminiApiCaller:
             return _GeminiApiStreamedResponse(chunks=chunks)
 
         @activity.defn
+        @_heartbeating
         async def gemini_files_upload(
             req: _GeminiUploadFileRequest,
         ) -> types.File:
@@ -252,6 +292,7 @@ class GeminiApiCaller:
                 )
 
         @activity.defn
+        @_heartbeating
         async def gemini_files_download(
             req: _GeminiDownloadFileRequest,
         ) -> bytes | None:
@@ -264,6 +305,7 @@ class GeminiApiCaller:
                 )
 
         @activity.defn
+        @_heartbeating
         async def gemini_files_register(
             req: _GeminiRegisterFilesRequest,
         ) -> types.RegisterFilesResponse:
@@ -289,6 +331,7 @@ class GeminiApiCaller:
                 )
 
         @activity.defn
+        @_heartbeating
         async def gemini_file_search_stores_upload(
             req: _GeminiUploadToFileSearchStoreRequest,
         ) -> types.UploadToFileSearchStoreOperation:
@@ -305,6 +348,7 @@ class GeminiApiCaller:
                 )
 
         @activity.defn
+        @_heartbeating
         async def gemini_interactions_create(
             req: _GeminiInteractionRequest,
         ) -> dict[str, Any]:
@@ -315,6 +359,7 @@ class GeminiApiCaller:
             return interaction.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
+        @_heartbeating
         async def gemini_interactions_create_streamed(
             req: _GeminiInteractionRequest,
         ) -> _GeminiInteractionStreamedResponse:
@@ -327,6 +372,7 @@ class GeminiApiCaller:
                 return await _drain_interaction_stream(stream)
 
         @activity.defn
+        @_heartbeating
         async def gemini_interactions_get(
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:
@@ -338,6 +384,7 @@ class GeminiApiCaller:
             return interaction.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
+        @_heartbeating
         async def gemini_interactions_get_streamed(
             req: _GeminiInteractionIdRequest,
         ) -> _GeminiInteractionStreamedResponse:
@@ -350,6 +397,7 @@ class GeminiApiCaller:
                 return await _drain_interaction_stream(stream)
 
         @activity.defn
+        @_heartbeating
         async def gemini_interactions_delete(
             req: _GeminiInteractionIdRequest,
         ) -> Any:
@@ -358,6 +406,7 @@ class GeminiApiCaller:
                 return await self._client.aio.interactions.delete(req.id, **req.params)
 
         @activity.defn
+        @_heartbeating
         async def gemini_interactions_cancel(
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:
@@ -369,6 +418,7 @@ class GeminiApiCaller:
             return interaction.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
+        @_heartbeating
         async def gemini_agents_create(
             req: _GeminiInteractionRequest,
         ) -> dict[str, Any]:
@@ -378,6 +428,7 @@ class GeminiApiCaller:
             return agent.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
+        @_heartbeating
         async def gemini_agents_list(
             req: _GeminiInteractionRequest,
         ) -> dict[str, Any]:
@@ -387,6 +438,7 @@ class GeminiApiCaller:
             return response.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
+        @_heartbeating
         async def gemini_agents_get(
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:
@@ -396,6 +448,7 @@ class GeminiApiCaller:
             return agent.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
+        @_heartbeating
         async def gemini_agents_delete(
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:

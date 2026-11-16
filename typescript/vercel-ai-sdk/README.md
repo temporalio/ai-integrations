@@ -43,6 +43,11 @@ streamed `error` part. The Workflow receives an `ActivityFailure` whose `cause`
 is that `ApplicationFailure`. Other errors, such as a 408, 409, 429 or 5xx response or
 a lost connection, are retried under the Activity's retry policy.
 
+MCP client factories must resolve to a client with callable `tools()` and
+`close()` methods. An invalid result now fails the Activity without retries with
+type `MCPClientFactoryTypeError`. Fix these factories before upgrading: the next
+attempt of an in-flight Activity also runs this check.
+
 File data given as a `Uint8Array` crosses the Activity boundary as a base64
 string, because Temporal's JSON payload converter does not keep `Uint8Array`
 values. This applies to prompt file parts and to files the model generates. A
@@ -71,10 +76,8 @@ model call that downloaded a file returns no `request.body`. An
 `experimental_download` function given to `generateText` runs in the Workflow
 and is told that the model supports every URL.
 
-This change is behind a Workflow patch. An execution that started on an earlier
-version replays as it ran then, so an Activity that its `experimental_download`
-function scheduled still matches its Event History. The new behavior starts
-with the first model call that is not a replay.
+An execution that started on 1.x, in which an `experimental_download` function
+scheduled an Activity for a URL, doesn't replay on this version.
 
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
@@ -101,11 +104,24 @@ object. To use models from more than one provider, give one `AiSdkPlugin` a
 ## Heartbeats and streaming
 
 The model and embedding Activities get a 10-second `heartbeatTimeout` unless you
-set one in the provider options. While they wait on the provider, they heartbeat
-at half that timeout, so a lost Worker is noticed, and a cancellation request
-reaches the Activity, within about that time. Set `heartbeatTimeout: 0` to turn
-this off. Then a lost Worker is noticed only at `startToCloseTimeout`, and a
-cancellation request does not reach a call that is waiting on the provider.
+set one in the provider options. They heartbeat every half of that timeout while
+they run, so a lost Worker is noticed, and a cancellation request reaches the
+Activity, within about that timeout. A call shorter than half the timeout sends no
+heartbeat. Set `heartbeatTimeout: 0` to turn heartbeats off. Then a lost Worker
+is noticed only at `startToCloseTimeout`, and a cancellation request does not
+reach the Activity.
+
+Workers on 1.0.0 don't heartbeat on a timer. While both versions run, a call
+that this version schedules and a 1.0.0 Worker runs fails after 10 seconds
+without a heartbeat, and so does each retry.
+
+- To upgrade, deploy this version to the Workers that run the model Activities
+  first. If the same Workers run Workflows too, deploy it with
+  `heartbeatTimeout: 0` and remove that in a later deploy.
+- To roll back, first deploy with `heartbeatTimeout: 0`, then wait for the
+  calls scheduled before that deploy to finish: they keep the 10-second timeout.
+- Runs pinned with Worker Versioning avoid both, when their model Activities
+  use the Workflow's task queue.
 
 When `invokeModelStreaming` is retried, the new attempt publishes all of its
 stream parts to the topic again, after the parts the failed attempt published.
@@ -155,9 +171,8 @@ fails with `AbortSignal is not defined`, and `stepMs` fails with
 `DOMException is not defined` when its timer fires. Use the Activity
 `startToCloseTimeout` instead.
 
-The cancellation is behind a Workflow patch. An execution that started on an
-earlier version replays as it ran then, when an abort sent no command. The new
-behavior starts with the first model call that is not a replay. A call without
-an `abortSignal` records no patch marker.
+An execution that started on 1.x, in which a signal aborted while a model or
+embedding call ran, doesn't replay on this version: on 1.x the abort sent no
+command.
 
 Development details are in [typescript/README.md](../README.md).

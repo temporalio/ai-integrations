@@ -1,5 +1,6 @@
 import zlib
 from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
 
 from temporalio.api.common.v1 import Payload
@@ -16,9 +17,23 @@ def get_activities(history: WorkflowHistory) -> list[str]:
     ]
 
 
+def get_heartbeat_timeouts(history: WorkflowHistory) -> list[timedelta | None]:
+    return [
+        event.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+        or None
+        for event in history.events
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ]
+
+
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 1
+
+
 def load_history(name: str, workflow_id: str = "legacy-replay") -> WorkflowHistory:
-    """Load the recorded history ``tests/histories/<name>.json``."""
-    path = Path(__file__).parent / "histories" / f"{name}.json"
+    """Load the recorded history ``tests/histories/<REPLAY_MAJOR>.x/<name>.json``."""
+    path = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x" / f"{name}.json"
     return WorkflowHistory.from_json(workflow_id, path.read_text())
 
 

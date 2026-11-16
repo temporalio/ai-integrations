@@ -10,6 +10,7 @@ import uuid
 import warnings
 from collections.abc import Sequence
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -26,7 +27,12 @@ from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 with workflow.unsafe.imports_passed_through():
     from langchain_core.messages import HumanMessage
 
-    from temporalio.deepagents import DeepAgentsPlugin, TemporalModel
+    from temporalio.deepagents import (
+        DeepAgentsPlugin,
+        TemporalModel,
+        create_temporal_deep_agent,
+        get_model_profile,
+    )
     from temporalio.deepagents._activity import (
         DeepAgentActivities,
         ModelActivityInput,
@@ -305,3 +311,59 @@ async def test_repeated_identical_model_call_resamples(
     assert out == "first answer|second answer", out
     counts = await count_scheduled_activities(handle)
     assert counts["deepagents.invoke_model"] == 2, counts
+
+
+@workflow.defn
+class ModelProfileWorkflow:
+    @workflow.run
+    async def run(self, model_name: str) -> Any:
+        profile = await get_model_profile(model_name)
+        return TemporalModel(model=model_name, profile=profile).profile
+
+
+@pytest.mark.asyncio
+async def test_get_model_profile_reads_the_workers_model(
+    env: WorkflowEnvironment,
+) -> None:
+    # Deep Agents sizes summarization from model.profile (#374).
+    profiles = {"fake:profiled": {"max_input_tokens": 200_000}}
+    plugin = DeepAgentsPlugin(
+        model_provider=lambda name: FakeModel(["unused"], profile=profiles.get(name)),
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-model-profile",
+        workflows=[ModelProfileWorkflow],
+        plugins=[plugin],
+    ):
+        results = []
+        for name in ("fake:profiled", "fake:model"):
+            handle = await env.client.start_workflow(
+                ModelProfileWorkflow.run,
+                name,
+                id=f"da-model-profile-{uuid.uuid4()}",
+                task_queue="da-model-profile",
+            )
+            results.append(await handle.result())
+            counts = await count_scheduled_activities(handle)
+            assert counts["deepagents.get_model_profile"] == 1, counts
+    assert results == [{"max_input_tokens": 200_000}, None]
+
+
+def test_activity_options_keep_the_models_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "deepagents",
+        SimpleNamespace(create_deep_agent=lambda **kwargs: kwargs),
+    )
+    options = {"start_to_close_timeout": timedelta(seconds=30)}
+    built = create_temporal_deep_agent(
+        model=TemporalModel(model="fake:model", profile={"max_input_tokens": 200_000}),
+        activity_options=options,
+    )
+    assert built["model"].activity_options == options
+    assert built["model"].profile == {"max_input_tokens": 200_000}

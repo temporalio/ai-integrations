@@ -207,6 +207,14 @@ carries the server name. Tool discovery and calls run as `{name}-list-tools` /
 model. Set `cache_tools=True` to list a server's tools once per workflow instead
 of per turn.
 
+A factory that doesn't return an async context manager now fails the Activity
+without retries (`MCPServerFactoryTypeError`). Fix it before upgrading: a
+corrected Worker won't resume an Activity that already failed.
+
+A factory that isn't callable makes `GoogleGenAIPlugin(...)` raise `TypeError`
+during construction, so the Worker won't start, even if no Workflow uses that
+server. Fix these factories before upgrading too.
+
 ## Streaming
 
 `generate_content_stream` works as usual — the workflow iterates chunks (batched
@@ -256,6 +264,67 @@ the SDK to parse); the topic is purely for external real-time observation. If
 raises `GoogleGenAIError`. Tune flush cadence with
 `TemporalAsyncClient(streaming_topic=..., streaming_batch_interval=...)`
 (default 100ms).
+
+## Heartbeats
+
+The Gemini activities, except `activity_as_tool` and MCP, heartbeat every half
+`heartbeat_timeout`, which defaults to 10 seconds, even in an `activity_config`
+that leaves it out. So a cancel or a lost worker is noticed within about 10
+seconds. In Temporal Cloud each heartbeat that reaches the service is an Action:
+with the default, at most one every 8 seconds, and none for calls under 5
+seconds. Set `heartbeat_timeout` to `None` or `timedelta(0)` in
+`activity_config` to turn heartbeats off.
+Without heartbeats, a running call cannot receive cancellation. This includes
+interaction streams, which earlier versions heartbeated once per event even
+without a heartbeat timeout.
+
+Heartbeats show that the worker is alive; they don't track stream progress.
+A quiet interaction stream can stay alive until its HTTP timeout or
+`start_to_close_timeout`, instead of failing when no event arrives within
+`heartbeat_timeout`.
+
+Temporal caps `heartbeat_timeout` at `start_to_close_timeout`, including one set
+per model call with `http_options.timeout`, or with the Interactions and Agents
+`timeout` argument, so a shorter one makes beats come sooner. `files.upload`,
+`files.download`, `files.register_files`, and file search store uploads pass
+`http_options.timeout` to the HTTP client instead.
+
+The timer runs on the worker's event loop. Blocking the loop can cause heartbeat
+timeouts in every activity sharing it. On Vertex AI, `interactions` and `agents`
+calls refresh credentials on the loop: on the first call, then about once an
+hour. A slow refresh can also fail other running Gemini calls. If that can be
+slow, set a longer `heartbeat_timeout`, or `None`.
+
+**Breaking change when you upgrade or roll back:**
+`temporalio-google-genai` 1.0.0 adds timer heartbeats and the 10-second default.
+A call scheduled with this default and run by a worker without timer
+heartbeats fails after 10 seconds without a heartbeat, and so does each retry.
+
+- To upgrade to 1.0.0, deploy it to the workers that run the Gemini activities
+  first. If the same workers run workflows too, deploy it with
+  `heartbeat_timeout=None` in `activity_config` and remove that in a later
+  deploy.
+- To roll back from 1.0.0, first deploy it with `heartbeat_timeout=None`, then
+  wait for calls scheduled before that deploy to finish: they keep the
+  10-second timeout.
+- Runs pinned with Worker Versioning avoid both, when their Gemini activities
+  use the workflow's task queue.
+
+A config you pass replaces the defaults, so keep your activity timeouts when
+turning heartbeats off. For example, the upgrade and rollback config above is:
+
+```python
+from datetime import timedelta
+
+from temporalio.workflow import ActivityConfig
+
+client = TemporalAsyncClient(
+    activity_config=ActivityConfig(
+        start_to_close_timeout=timedelta(seconds=60),
+        heartbeat_timeout=None,
+    ),
+)
+```
 
 ## Retries & errors
 

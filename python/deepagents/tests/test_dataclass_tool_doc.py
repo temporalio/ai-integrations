@@ -8,6 +8,7 @@ import pytest
 
 from temporalio import activity
 from temporalio.deepagents import activity_as_tool
+from temporalio.workflow import ActivityConfig
 
 
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="requires deferred annotations")
@@ -26,6 +27,6 @@ def test_dataclass_tool_omits_generated_docstring() -> None:
 
     tool = activity_as_tool(
         activity.defn(UndocumentedActivity),
-        start_to_close_timeout=timedelta(seconds=10),
+        activity_options=ActivityConfig(start_to_close_timeout=timedelta(seconds=10)),
     )
     assert tool.description == "Temporal activity UndocumentedActivity."

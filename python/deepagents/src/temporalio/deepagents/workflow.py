@@ -19,11 +19,14 @@ import dataclasses
 import importlib
 import warnings
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
 from temporalio.exceptions import ApplicationError
+
+if TYPE_CHECKING:
+    from langchain_core.language_models import ModelProfile
 
 # Reserved key under which the CAN result cache rides inside a state snapshot.
 _CACHE_KEY = "__temporal_cache__"
@@ -456,7 +459,9 @@ def create_temporal_deep_agent(
     elif activity_options is not None:
         if isinstance(model, TemporalModel):
             model = TemporalModel(
-                model=model.model, activity_options=dict(activity_options)
+                model=model.model,
+                activity_options=dict(activity_options),
+                profile=model.profile,
             )
         else:
             raise ValueError(
@@ -469,3 +474,24 @@ def create_temporal_deep_agent(
     else:
         kwargs["model"] = model
     return deepagents_mod.create_deep_agent(*args, **kwargs)
+
+
+async def get_model_profile(
+    model: str, *, activity_options: Mapping[str, Any] | None = None
+) -> ModelProfile | None:
+    """Return the LangChain profile of the Worker's model ``model`` from an Activity.
+
+    Deep Agents sizes summarization from ``model.profile`` (``max_input_tokens``),
+    and only the model name reaches the Workflow. Await this before building the
+    agent and pass the result to ``TemporalModel(profile=...)``. The profile is
+    recorded in History, so a later change on the Worker does not affect runs in
+    flight. The Activity runs with the model's activity options, overridden by
+    ``activity_options``.
+    """
+    from temporalio.deepagents._model import _resolve_activity_options
+
+    return await workflow.execute_activity(
+        _activity.GET_MODEL_PROFILE,
+        model,
+        **_resolve_activity_options(model, activity_options),
+    )

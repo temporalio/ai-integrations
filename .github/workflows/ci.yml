@@ -5,6 +5,7 @@
 #   conventions  -> repository invariants + tooling tests (always)
 #   python       -> _python-plugin.yml once per changed Python plugin (locked deps; newest on nightly)
 #   typescript   -> _typescript-plugin.yml once per changed TypeScript plugin
+#   dotnet       -> _dotnet-plugin.yml once per changed .NET plugin
 #   go           -> _go-plugin.yml once per changed Go plugin (same dependency modes)
 #   ci-status    -> the ONLY required status check; skipped jobs count as success
 #
@@ -46,6 +47,7 @@ jobs:
       typescript: ${{ steps.detect.outputs.typescript }}
       java: ${{ steps.detect.outputs.java }}
       go: ${{ steps.detect.outputs.go }}
+      dotnet: ${{ steps.detect.outputs.dotnet }}
       any: ${{ steps.detect.outputs.any }}
       scripts_only: ${{ steps.detect.outputs.scripts_only }}
       mode: ${{ steps.detect.outputs.mode }}
@@ -131,6 +133,21 @@ jobs:
       plugin: ${{ matrix.plugin }}
       deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
 
+  dotnet:
+    name: .NET
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.dotnet != '[]'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJson(needs.changes.outputs.dotnet) }}
+    uses: ./.github/workflows/_dotnet-plugin.yml
+    with:
+      plugin: ${{ matrix.plugin }}
+      deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
+
   go:
     name: Go
     needs: changes
@@ -148,7 +165,7 @@ jobs:
 
   nightly-report:
     name: Nightly report
-    needs: [changes, python, java, go, typescript]
+    needs: [changes, python, java, go, typescript, dotnet]
     if: always() && github.event_name == 'schedule' && needs.changes.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -169,7 +186,7 @@ jobs:
 
   ci-status:
     name: ci-status
-    needs: [changes, conventions, python, java, go, typescript]
+    needs: [changes, conventions, python, java, go, typescript, dotnet]
     if: always()
     runs-on: ubuntu-latest
     steps:

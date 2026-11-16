@@ -6,10 +6,10 @@
  * so every workflow task replays.
  */
 import { randomUUID } from 'crypto';
-import test from 'ava';
+import test, { type ExecutionContext } from 'ava';
 import { withTrace, withCustomSpan } from '@openai/agents-core';
 import { Client, WorkflowFailedError } from '@temporalio/client';
-import { ApplicationFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure, type Workflow } from '@temporalio/common';
 import type { WorkflowBundleWithSourceMap } from '@temporalio/worker';
 import { bundleWorkflowCode, NativeConnection } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
@@ -22,7 +22,13 @@ import {
   SandboxClientProvider,
   DEDICATED_WORKER_FAILURE_TYPE,
 } from '..';
-import { FakeModelProvider, textResponse, toolCallResponse, handoffResponse } from './stubs/openai-agents-fakes';
+import {
+  FakeModelProvider,
+  textResponse,
+  toolCallResponse,
+  toolCallModelProvider,
+  handoffResponse,
+} from './stubs/openai-agents-fakes';
 import { FakeSandboxClient } from './stubs/sandbox-fakes';
 import { installOtelCollector, installAgentSdkCollector } from './helpers/openai-agents-spans';
 import { startLocalWithRetry } from './helpers/environment';
@@ -33,6 +39,7 @@ import {
   retryableModelWorkflow,
   nonRetryableModelWorkflow,
   toolFailureWorkflow,
+  guardrailFailureWorkflow,
   brokenStatefulMcpWorkflow,
   crashSignal,
   traceableSignal,
@@ -856,20 +863,26 @@ test('Non-retryable model error fails workflow with classified ApplicationFailur
   });
 });
 
+/** `cause` is retryable, and its cause is `failingTool`'s `ActivityFailure`, which carries `reason`. */
+function assertFailingToolChain(t: ExecutionContext, cause: unknown, reason: string): void {
+  t.false((cause as ApplicationFailure).nonRetryable);
+  const activityFailure = (cause as ApplicationFailure).cause;
+  t.true(activityFailure instanceof ActivityFailure, String(activityFailure));
+  const failure = activityFailure?.cause;
+  t.true(failure instanceof ApplicationFailure, String(failure));
+  t.is((failure as ApplicationFailure).type, 'ToolFailed');
+  t.deepEqual((failure as ApplicationFailure).details, [reason]);
+}
+
 test('Activity-backed tool failure crashes workflow with AgentsWorkflowError (Python parity)', async (t) => {
   await withTestEnv(async (env) => {
     const taskQueue = `tool-fail-${randomUUID()}`;
     // Python parity: when an activity-backed tool throws, the failure is NOT
     // fed back to the agent loop; it propagates as an ActivityFailure and the
-    // runner wraps it as a non-retryable AgentsWorkflowError, crashing the
-    // workflow. The model only needs the first toolCallResponse; the second
-    // turn never happens.
-    const modelProvider = new FakeModelProvider(() => {
-      function* gen() {
-        yield toolCallResponse('failingTool', { reason: 'no-reason' });
-      }
-      return gen();
-    });
+    // runner wraps it as an AgentsWorkflowError, crashing the workflow. The
+    // model answers every request with the tool call, so the retried run fails
+    // the same way.
+    const modelProvider = toolCallModelProvider('failingTool', { reason: 'no-reason' });
     const plugin = new OpenAIAgentsPlugin({ modelProvider });
     const worker = await Worker.create({
       connection: env.nativeConnection,
@@ -880,22 +893,109 @@ test('Activity-backed tool failure crashes workflow with AgentsWorkflowError (Py
     });
     const client = new Client({ connection: env.connection, plugins: [plugin] });
     await worker.runUntil(async () => {
-      const err = (await t.throwsAsync(
-        client.workflow.execute(toolFailureWorkflow, {
-          args: ['use the failing tool please'],
-          workflowId: `tool-fail-${randomUUID()}`,
-          taskQueue,
-          workflowExecutionTimeout: '30 seconds',
-        }),
-        { instanceOf: WorkflowFailedError }
-      )) as WorkflowFailedError;
+      const handle = await client.workflow.start(toolFailureWorkflow, {
+        args: ['use the failing tool please'],
+        workflowId: `tool-fail-${randomUUID()}`,
+        taskQueue,
+        workflowExecutionTimeout: '30 seconds',
+        retry: { maximumAttempts: 2 },
+      });
+      const err = (await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError })) as WorkflowFailedError;
+      t.not((await handle.describe()).runId, handle.firstExecutionRunId);
 
       const cause = err.cause;
       t.true(cause instanceof ApplicationFailure, 'cause must be ApplicationFailure');
       t.is((cause as ApplicationFailure).type, 'AgentsWorkflowError');
+      assertFailingToolChain(t, cause, 'no-reason');
     });
   });
 });
+
+const failedActivityCases: [string, Workflow, unknown[], string, boolean][] = [
+  [
+    'A failed Activity tool fails a streamed run with AgentsWorkflowError',
+    toolFailureWorkflow,
+    ['go', true],
+    'no-reason',
+    true,
+  ],
+  [
+    'A guardrail whose Activity failed fails the run with AgentsWorkflowError',
+    guardrailFailureWorkflow,
+    ['go'],
+    'guardrail',
+    false,
+  ],
+];
+
+for (const [title, workflow, args, reason, retried] of failedActivityCases) {
+  test(title, async (t) => {
+    await withTestEnv(async (env) => {
+      const taskQueue = `tool-fail-${randomUUID()}`;
+      const plugin = new OpenAIAgentsPlugin({
+        modelProvider: toolCallModelProvider('failingTool', { reason: 'no-reason' }),
+      });
+      const worker = await Worker.create({
+        connection: env.nativeConnection,
+        plugins: [plugin],
+        workflowBundle: sharedWorkflowBundle,
+        activities,
+        taskQueue,
+      });
+      const client = new Client({ connection: env.connection, plugins: [plugin] });
+      await worker.runUntil(async () => {
+        const handle = await client.workflow.start(workflow, {
+          args,
+          workflowId: `tool-fail-${randomUUID()}`,
+          taskQueue,
+          workflowExecutionTimeout: '30 seconds',
+          ...(retried && { retry: { maximumAttempts: 2 } }),
+        });
+        const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+        if (retried) {
+          t.not((await handle.describe()).runId, handle.firstExecutionRunId);
+        }
+        t.true(err?.cause instanceof ApplicationFailure, String(err?.cause));
+        t.is((err?.cause as ApplicationFailure).type, 'AgentsWorkflowError');
+        assertFailingToolChain(t, err?.cause, reason);
+      });
+    });
+  });
+}
+
+for (const stream of [false, true]) {
+  test(`A Workflow retry policy doesn't retry a ${stream ? 'streamed run' : 'run'} whose tool threw a non-retryable ApplicationFailure`, async (t) => {
+    await withTestEnv(async (env) => {
+      const taskQueue = `tool-retry-${randomUUID()}`;
+      const plugin = new OpenAIAgentsPlugin({ modelProvider: toolCallModelProvider('rejectingTool', {}) });
+      const worker = await Worker.create({
+        connection: env.nativeConnection,
+        plugins: [plugin],
+        workflowBundle: sharedWorkflowBundle,
+        activities,
+        taskQueue,
+      });
+      const client = new Client({ connection: env.connection, plugins: [plugin] });
+      await worker.runUntil(async () => {
+        const handle = await client.workflow.start(toolFailureWorkflow, {
+          args: ['go', stream],
+          workflowId: `tool-retry-${randomUUID()}`,
+          taskQueue,
+          workflowExecutionTimeout: '30 seconds',
+          retry: { maximumAttempts: 2 },
+        });
+        const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+        t.is((await handle.describe()).runId, handle.firstExecutionRunId);
+        t.true(err?.cause instanceof ApplicationFailure, String(err?.cause));
+        t.is((err?.cause as ApplicationFailure).type, 'AgentsWorkflowError');
+        t.true((err?.cause as ApplicationFailure).nonRetryable);
+        const failure = err?.cause?.cause;
+        t.true(failure instanceof ApplicationFailure, String(failure));
+        t.is((failure as ApplicationFailure).type, 'ToolRejected');
+      });
+    });
+  });
+}
 
 test('Stateful MCP dedicated-worker failure produces DedicatedWorkerFailure', async (t) => {
   await withTestEnv(async (env) => {
