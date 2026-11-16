@@ -182,6 +182,29 @@ The configured payload converter rebuilds each value, as it would an Activity pa
 
 **Breaking change:** code that reads these values with dictionary access, such as `state["answer"]["value"]`, must use attribute access, such as `state["answer"].value`. Code that validates values again, such as `Answer.model_validate(value)` or `convert_to_messages(messages)`, keeps working, except `model_validate` in Workflow code with a model class the sandbox loaded itself; import its module with `imports_passed_through()` as above. Activity payloads keep their format and only gain type information, so older Workers read new payloads as before, and histories recorded before the upgrade replay unchanged, apart from the task cache case below. Results recorded before the upgrade still replay as dictionaries, so deploy Workflow code that reads Activity results by attribute with Worker Versioning or after open runs finish. Task cache keys for arguments that are models, dataclasses or sets now come from their class and contents, so a run that carries a task cache across continue-as-new can fail replay with a non-determinism error on the other version, after an upgrade or a rollback. Let such runs finish before you upgrade, or upgrade with Worker Versioning. Runs started on this version may not replay on an earlier one, so roll back with Worker Versioning.
 
+## Error Handlers
+
+A default error handler, set with `set_node_defaults(error_handler=...)`, runs when a node fails, as in LangGraph. LangGraph adds the handler as a node when the graph is compiled, so it takes no `execute_in` label and always runs in the Workflow. It must be deterministic.
+
+```python
+from langgraph.errors import NodeError
+
+async def recover(state: State, error: NodeError) -> dict[str, str]:
+    return {"status": f"{error.node} failed"}
+
+g = StateGraph(State)
+g.set_node_defaults(error_handler=recover)
+g.add_node("charge", charge, metadata={"execute_in": "activity"})
+```
+
+When an Activity node fails, the handler runs after Temporal's retries are used up. `error.error` is then the `ActivityError`. Its `cause` is an `ApplicationError` if the node raised an exception, or a `TimeoutError` if the Activity timed out.
+
+A Workflow cancellation that arrives while an Activity node runs can reach the handler the same way, with a `CancelledError` as the `cause`. If the handler returns, the Workflow completes instead of closing as cancelled. To keep the cancellation, raise `error.error` again when `temporalio.exceptions.is_cancelled_exception(error.error)` is true.
+
+With LangGraph before 1.2.18, `ainvoke` still raises a handled error if the failed node ran in parallel with another node.
+
+A handler for a single node, set with `add_node(..., error_handler=...)`, is not supported: `LangGraphPlugin` raises `ValueError` for it.
+
 ## Summaries
 
 Summaries are short, human-readable labels that show up in the Temporal UI and CLI, making it easier to see what each step of a run is doing.

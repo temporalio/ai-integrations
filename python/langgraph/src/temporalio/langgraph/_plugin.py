@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.metadata
 import inspect
 import sys
@@ -423,6 +424,10 @@ def graph(
 ) -> StateGraph[Any, Any, Any, Any]:
     """Retrieve a registered graph by name.
 
+    Each call returns a shallow copy of the graph with its own nodes, so
+    ``compile()`` can add to it and set node defaults without changing the
+    registered graph.
+
     Args:
         name: Graph name as registered with LangGraphPlugin.
         cache: Optional task result cache from a previous cache() call.
@@ -437,7 +442,14 @@ def graph(
         )
     if name not in graphs:
         raise KeyError(f"Graph {name!r} not found. Available graphs: {list(graphs)}")
-    return graphs[name]
+    # compile() adds the default error handler's node to its builder, raising
+    # if the node is already there, and sets node defaults on the node specs.
+    # The registered builder serves every run on the Worker, so copy both. The
+    # copied specs share their runnables, which hold the Activity wrappers.
+    registered = graphs[name]
+    builder = copy.copy(registered)
+    builder.nodes = {key: copy.copy(node) for key, node in registered.nodes.items()}
+    return builder
 
 
 def entrypoint(
