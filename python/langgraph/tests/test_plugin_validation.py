@@ -5,15 +5,25 @@ from __future__ import annotations
 import importlib.metadata
 from dataclasses import make_dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 import pytest
 from langchain_core.runnables import RunnableLambda
-from langgraph.func import task  # pyright: ignore[reportMissingTypeStubs]
+from langgraph.cache.memory import (  # pyright: ignore[reportMissingTypeStubs]
+    InMemoryCache,
+)
+from langgraph.func import (  # pyright: ignore[reportMissingTypeStubs]
+    entrypoint,
+    task,
+)
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime
-from langgraph.types import RetryPolicy  # pyright: ignore[reportMissingTypeStubs]
+from langgraph.types import (  # pyright: ignore[reportMissingTypeStubs]
+    CachePolicy,
+    RetryPolicy,
+    TimeoutPolicy,
+)
 from pytest import raises
 from typing_extensions import TypedDict
 
@@ -138,6 +148,132 @@ def test_task_retry_policy_raises() -> None:
 
     with raises(ValueError, match="retry_policy"):
         LangGraphPlugin(tasks=[my_task])
+
+
+def test_node_defaults_retry_policy_raises() -> None:
+    """compile() gives nodes the builder's defaults after the plugin is built."""
+    g = StateGraph(State)
+    g.set_node_defaults(retry_policy=RetryPolicy(max_attempts=3))
+    g.add_node("node", async_node, metadata={"execute_in": "activity"})
+    g.add_edge(START, "node")
+
+    with raises(ValueError, match="Graph validation has a LangGraph retry_policy"):
+        LangGraphPlugin(graphs={"validation": g})
+
+
+def test_entrypoint_retry_policy_raises() -> None:
+    @entrypoint(retry_policy=RetryPolicy(max_attempts=3))
+    async def program(x: int) -> int:
+        return x
+
+    with raises(ValueError, match="Entrypoint program has a LangGraph retry_policy"):
+        LangGraphPlugin(entrypoints={"program": program})
+
+
+def _node_route(**policy: Any) -> dict[str, Any]:
+    g = StateGraph(State)
+    g.add_node("node", async_node, metadata={"execute_in": "activity"}, **policy)
+    g.add_edge(START, "node")
+    return {"graphs": {"validation": g}}
+
+
+def _node_defaults_route(**policy: Any) -> dict[str, Any]:
+    g = StateGraph(State)
+    g.set_node_defaults(**policy)
+    g.add_node("node", async_node, metadata={"execute_in": "activity"})
+    g.add_edge(START, "node")
+    return {"graphs": {"validation": g}}
+
+
+def _task_route(**policy: Any) -> dict[str, Any]:
+    decorator: Any = task(**policy)
+
+    @decorator  # pyright: ignore[reportUntypedFunctionDecorator]
+    async def my_task(x: int) -> int:
+        return x + 1
+
+    return {"tasks": [my_task]}
+
+
+def _entrypoint_route(**policy: Any) -> dict[str, Any]:
+    @entrypoint(**policy)
+    async def program(x: int) -> int:
+        return x
+
+    return {"entrypoints": {"program": program}}
+
+
+@pytest.mark.parametrize(
+    ("route", "owner"),
+    [
+        (_node_route, "Node validation.node"),
+        (_node_defaults_route, "Graph validation"),
+        (_task_route, "Task my_task"),
+        (_entrypoint_route, "Entrypoint program"),
+    ],
+    ids=["node", "node_defaults", "task", "entrypoint"],
+)
+@pytest.mark.parametrize(
+    ("policy", "option"),
+    [
+        ({"timeout": TimeoutPolicy(idle_timeout=5)}, "idle_timeout"),
+        ({"timeout": TimeoutPolicy(run_timeout=30, idle_timeout=5)}, "idle_timeout"),
+        ({"cache_policy": CachePolicy(ttl=60)}, "cache_policy ttl"),
+    ],
+    ids=["idle_timeout", "run_and_idle_timeout", "cache_ttl"],
+)
+def test_idle_timeout_and_cache_ttl_raise(
+    route: Callable[..., dict[str, Any]],
+    owner: str,
+    policy: dict[str, Any],
+    option: str,
+) -> None:
+    with raises(ValueError, match=f"{owner} has a LangGraph {option}"):
+        LangGraphPlugin(**route(**policy))
+
+
+def test_entrypoint_cache_raises() -> None:
+    @entrypoint(cache=InMemoryCache())
+    async def program(x: int) -> int:
+        return x
+
+    with raises(ValueError, match="Entrypoint program has a LangGraph cache set"):
+        LangGraphPlugin(entrypoints={"program": program})
+
+
+_with_supported_policies: Any = task(
+    timeout=TimeoutPolicy(run_timeout=30), cache_policy=CachePolicy()
+)
+
+
+@_with_supported_policies
+async def supported_policies_task(x: int) -> int:
+    return x + 1
+
+
+@entrypoint(timeout=30, cache_policy=CachePolicy())
+async def supported_policies_entrypoint(x: int) -> int:
+    return await supported_policies_task(x)
+
+
+def test_run_timeout_and_cache_policy_without_ttl_are_accepted() -> None:
+    g = StateGraph(State)
+    g.set_node_defaults(timeout=30, cache_policy=CachePolicy())
+    g.add_node(
+        "node",
+        async_node,
+        metadata={"execute_in": "activity"},
+        timeout=TimeoutPolicy(run_timeout=30),
+        cache_policy=CachePolicy(),
+    )
+    g.add_edge(START, "node")
+
+    LangGraphPlugin(
+        graphs={"validation": g},
+        entrypoints={"supported": supported_policies_entrypoint},
+        tasks=[supported_policies_task],
+        activity_options={"supported_policies_task": {"execute_in": "activity"}},
+    )
 
 
 def test_context_schema_id_conflict_raises() -> None:

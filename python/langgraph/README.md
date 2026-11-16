@@ -327,6 +327,23 @@ Streaming has **at-least-once** delivery per activity attempt. When an activity-
 
 We recommend the [Temporal LangSmith Plugin](https://github.com/temporalio/ai-integrations/tree/main/python/langsmith) to trace your LangGraph Workflows and Activities.
 
+## Unsupported LangGraph options
+
+Temporal retries Activities, and Workflow code must be deterministic, so the plugin refuses the LangGraph options below. `LangGraphPlugin(...)` raises `ValueError` when a graph, task or entrypoint sets one.
+
+- `retry_policy` on `add_node`, `set_node_defaults`, `@task` and `@entrypoint`. LangGraph would schedule a failed node's Activity again from the Workflow, on top of Temporal's retries. Set a Temporal `retry_policy` in the [Activity options](#activity-options) instead.
+- `TimeoutPolicy(idle_timeout=...)` on `add_node`, `set_node_defaults`, `@task`, `@entrypoint` and `Send`. LangGraph times it with the system clock, so a run can't replay after the timeout fires. Use `run_timeout` instead, or a Temporal `heartbeat_timeout` with `activity.heartbeat()` calls in an `async def` node that runs as an Activity.
+- `CachePolicy(ttl=...)` on `add_node`, `set_node_defaults`, `@task` and `@entrypoint`. LangGraph's `InMemoryCache` expires entries by the system clock, so a run may not replay after an entry expires. Use a cache policy without `ttl`.
+- `cache` on `@entrypoint`. Every Workflow run on the Worker gets the same entrypoint object, so one run would get another run's results. An entrypoint then has no LangGraph cache, so a cache policy on it or on its tasks does nothing.
+
+A `Send` is created while the graph runs, so the plugin checks its `timeout` then: a node that a `Send` runs under an `idle_timeout` fails with a non-retryable `ApplicationError`, which fails the Workflow unless your code catches it.
+
+A `run_timeout` works, and a number or a `timedelta` passed as `timeout` sets one. In a Workflow its timer is a Temporal timer. When it fires, the Workflow gets LangGraph's `NodeTimeoutError` and asks Temporal to cancel the node's Activity. Don't branch on the error's `elapsed` or on its message: LangGraph measures the elapsed time with the system clock, so it differs on replay.
+
+A cache policy without `ttl` works with a cache that the Workflow creates, such as `graph("my-graph").compile(cache=InMemoryCache())`. The plugin doesn't see the cache you pass to `compile()`. A cache that outlives a Workflow run, such as one from a module imported with `workflow.unsafe.imports_passed_through()`, is shared by every run on the Worker: a run gets another run's results and its History then fails replay.
+
+**Breaking change:** the plugin accepted these options before, except `retry_policy` on `add_node` and `@task`. Building the plugin with one of them now raises `ValueError`, so the Worker doesn't start, and a `Send` with an `idle_timeout` fails its Workflow. Remove the option or replace it as described above. That can change the commands of a run that used the option: a LangGraph retry leaves a timer and another Activity in the History, and a LangGraph timeout leaves a timer. Let such runs finish before you upgrade, or upgrade with Worker Versioning.
+
 ## Stores are not supported
 
 LangGraph's `Store` (e.g. `InMemoryStore` passed via `graph.compile(store=...)` or `@entrypoint(store=...)`) isn't accessible inside Activity-wrapped nodes: the Store holds live state that can't cross the Activity boundary, and Activities may run on a different worker than the Workflow. If you pass a store, the plugin logs a warning on first use and `runtime.store` is `None` inside nodes.

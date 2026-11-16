@@ -32,6 +32,7 @@ from temporalio.langgraph._langgraph_config import (
     context_schema_id,
     get_langgraph_config,
     is_context_schema,
+    refuse_idle_timeout,
     set_langgraph_config,
     strip_runnable_config,
 )
@@ -448,6 +449,8 @@ def wrap_execute_activity(
         return output["result"]
 
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        refuse_idle_timeout()
+
         # LangGraph may inject a RunnableConfig as the 'config' kwarg. Strip it
         # down to a serializable subset so it can cross the activity boundary;
         # callbacks, stores, etc. aren't serializable.
