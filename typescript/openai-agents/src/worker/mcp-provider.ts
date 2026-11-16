@@ -8,10 +8,17 @@ import {
   TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
 } from '../common/mcp-types';
 
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `MCPServerStdio`.
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
+  return (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+}
+
 /** Refuse a factory that isn't a function when the provider is built, not in every MCP Activity. */
 export function assertMCPServerFactory(name: string, factory: unknown): void {
   if (typeof factory !== 'function') {
-    throw new TypeError(`MCP server factory '${name}' is not a function.`);
+    throw new TypeError(`MCP server factory '${name}' is ${describeValue(factory)}, not a function.`);
   }
 }
 

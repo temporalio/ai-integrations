@@ -52,13 +52,19 @@ test('StatelessMCPServerProvider rejects invalid factory results before connecti
 });
 
 test('MCP server providers refuse a factory that is not a function when they are built', (t) => {
-  for (const value of [undefined, null, 42, fakeServer(undefined)]) {
-    const factory = value as unknown as () => MCPServer;
+  const invalidFactories: [unknown, string][] = [
+    [undefined, 'undefined'],
+    [null, 'null'],
+    [42, 'number'],
+    [fakeServer(undefined), 'Object'],
+  ];
+  for (const [value, kind] of invalidFactories) {
+    const factory = value as () => MCPServer;
     for (const build of [
       () => new StatelessMCPServerProvider('files', factory),
       () => new StatefulMCPServerProvider('files', factory, undefined as never),
     ]) {
-      t.throws(build, { instanceOf: TypeError, message: "MCP server factory 'files' is not a function." });
+      t.throws(build, { instanceOf: TypeError, message: `MCP server factory 'files' is ${kind}, not a function.` });
     }
   }
 });
