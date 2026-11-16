@@ -711,6 +711,46 @@ async def test_mcp_transport_error_evicts_connection(
     assert reported == []
 
 
+async def test_mcp_stale_record_does_not_remove_replacement():
+    """A closing/failing old connection must not touch its replacement."""
+    from temporalio.google_genai import _mcp
+
+    server = f"stale-{uuid4()}"
+    closing = asyncio.Event()
+    finish = asyncio.Event()
+
+    @asynccontextmanager
+    async def old_factory() -> AsyncGenerator[Any, None]:
+        yield object()
+        closing.set()
+        await finish.wait()
+        raise RuntimeError("old close failed")
+
+    @asynccontextmanager
+    async def new_factory() -> AsyncGenerator[Any, None]:
+        yield object()
+
+    old = _mcp._ConnectionRecord(server, old_factory, timedelta(seconds=30))
+    _mcp._CONNECTIONS[server] = old
+    await old.session()
+    close = asyncio.create_task(_mcp._evict_connection(server))
+    await closing.wait()
+    new = _mcp._ConnectionRecord(server, new_factory, timedelta(seconds=30))
+    _mcp._CONNECTIONS[server] = new
+    await new.session()
+    finish.set()
+    await close
+    # The old owner's failure must not drop the replacement from the pool.
+    assert _mcp._CONNECTIONS.get(server) is new
+    assert not new._owner.done()
+
+    # A stale idle-eviction must not close the replacement either.
+    await old._maybe_evict()
+    assert _mcp._CONNECTIONS.get(server) is new
+    assert not new._owner.done()
+    await _mcp._evict_connection(server)
+
+
 async def test_cancelling_one_mcp_caller_leaves_the_other_waiting() -> None:
     """Cancelling one waiter must not cancel the shared MCP connect."""
     from temporalio.google_genai import _mcp
