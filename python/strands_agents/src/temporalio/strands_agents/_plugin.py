@@ -175,6 +175,13 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
     # wrapper takes none.
     import mcp
 
+    # Fail when the plugin is built, not on every activity attempt.
+    if not callable(factory):
+        kind = type(factory)  # type: ignore[reportUnreachable]
+        raise TypeError(
+            f"MCP server factory {server!r} is "
+            f"{kind.__module__}.{kind.__qualname__}, not callable"
+        )
     try:
         if sys.version_info >= (3, 14):
             import annotationlib  # type: ignore[reportUnreachable]
@@ -203,6 +210,9 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
         client = factory()
         if not isinstance(client, mcp.Client):
             kind = type(client)
+            if inspect.iscoroutine(client):
+                # An async factory; close it so Python doesn't warn it was never awaited.
+                client.close()
             raise ApplicationError(
                 f"MCP server factory {server!r} returned "
                 f"{kind.__module__}.{kind.__qualname__}, not mcp.Client; "

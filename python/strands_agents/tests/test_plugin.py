@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import importlib.metadata
+import inspect
 import sys
 import typing
 from collections.abc import AsyncGenerator
@@ -320,6 +321,11 @@ def _client_on_a_function() -> mcp.Client:
     return mcp.Client(typing.cast(typing.Any, lambda: None))
 
 
+async def _async_client() -> mcp.Client:
+    # A factory written as async def returns a coroutine, not a client.
+    return mcp.Client("https://example.com/mcp")
+
+
 @pytest.mark.parametrize(
     ("factory", "message", "error_type"),
     [
@@ -338,12 +344,29 @@ def _client_on_a_function() -> mcp.Client:
             "(see the upgrade notes in the plugin README)",
             "MCPServerFactoryTransportError",
         ),
+        (
+            _async_client,
+            "MCP server factory 'old' returned builtins.coroutine, not mcp.Client; "
+            "mcp_clients factories must return an mcp.Client "
+            "(see the upgrade notes in the plugin README)",
+            "MCPServerFactoryTypeError",
+        ),
     ],
 )
 async def test_mcp_factory_that_returns_the_wrong_client_is_non_retryable(
     factory: typing.Callable[[], typing.Any], message: str, error_type: str
 ) -> None:
-    plugin = StrandsPlugin(models={}, mcp_clients={"old": factory})
+    value = factory()
+    kind = type(value)
+    # Passed in place of the factory, the value fails when the plugin is built.
+    with pytest.raises(TypeError) as type_error:
+        StrandsPlugin(models={}, mcp_clients={"old": value})
+    assert str(type_error.value) == (
+        f"MCP server factory 'old' is {kind.__module__}.{kind.__qualname__}, "
+        "not callable"
+    )
+
+    plugin = StrandsPlugin(models={}, mcp_clients={"old": lambda: value})
     activities = typing.cast(list[typing.Any], plugin.activities)
     list_tools = next(
         a
@@ -357,6 +380,9 @@ async def test_mcp_factory_that_returns_the_wrong_client_is_non_retryable(
     assert error.value.message == message
     assert error.value.type == error_type
     assert error.value.non_retryable
+    if inspect.iscoroutine(value):
+        # Closed, so Python doesn't warn that it was never awaited.
+        assert inspect.getcoroutinestate(value) == inspect.CORO_CLOSED
 
 
 def test_plugin_reports_package_version() -> None:
