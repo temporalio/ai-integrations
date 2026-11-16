@@ -150,6 +150,11 @@ Errors a retry cannot fix (parse and invalid-request errors,
 unknown methods, invalid params, protocol-version, header and capability
 mismatches, and URL elicitation) are also non-retryable.
 
+A factory that returns something other than an `mcp.Client` fails the Activity
+with a non-retryable `ApplicationError` of type `MCPServerFactoryTypeError`. A
+factory that isn't callable makes `MCPPlugin(...)` raise `TypeError`, so the
+Worker doesn't start, even when no workflow uses that server.
+
 Internal server errors, closed connections, request timeouts and transport
 exceptions stay retryable. So does a lost session: when a server on an older MCP
 protocol answers HTTP 404 for a session it no longer knows (for example after a
