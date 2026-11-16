@@ -68,7 +68,9 @@ dev = [
   "openinference-instrumentation-openai-agents>=2,<3",
   "opentelemetry-sdk>=1.26,<2",
   "openai-agents[litellm]>=0.22,<0.25; python_version < '3.15'",  # fastuuid does not support Python 3.15 yet.
-  "litellm>=1.108.0,<2; python_version < '3.15'",
+  # LiteLLM 1.108.3 is the first OpenAI 3-compatible stable release allowing patched filelock 4.
+  "litellm>=1.108.3,<2; python_version < '3.15'",
+  "filelock>=4.2.1,<5; python_version < '3.15'",
 ]
 
 [tool.uv]
