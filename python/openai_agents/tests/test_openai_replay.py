@@ -9,7 +9,7 @@ from temporalio.worker import Replayer
 from tests.test_openai_model_parameters import ExplicitModelConfigWorkflow
 
 # The explicit API starts a new major; earlier histories remain archived.
-REPLAY_MAJOR = 3
+REPLAY_MAJOR = 2
 HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
 
 

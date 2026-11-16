@@ -367,12 +367,12 @@ Replace `summary_override="text"` with `activity_config["summary"]`, and
 `ModelActivityParameters` class and the uncommitted
 `workflow.model_activity_parameters` context manager are removed without aliases.
 
-This API starts a new major version (3.x). Earlier-major histories do not replay on
+This API starts a new major version (2.x). Earlier-major histories do not replay on
 this version: the agent-copying and model-provider compatibility paths and their
 patch gates are removed. Finish open runs on their existing Worker Deployment
 version before upgrading, or keep that deployment available for those runs and
 route only new runs to this version. Do not move an in-flight run to the new
-Worker version. Replay tests cover newly recorded 3.x histories; earlier-major
+Worker version. Replay tests cover newly recorded 2.x histories; earlier-major
 histories remain archived in the repository.
 
 The deprecated MCP providers and workflow helpers are also removed:
