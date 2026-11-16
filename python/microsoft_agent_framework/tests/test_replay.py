@@ -1,6 +1,6 @@
 """Recorded histories replay through a ``Replayer`` configured with the plugin.
 
-The histories under ``tests/histories`` were recorded by ``tests/record_histories.py``
+The histories under ``tests/histories/<REPLAY_MAJOR>.x`` were recorded by ``tests/record_histories.py``
 from the same workflows the suite runs. A recording made before a release
 stays as it is; a change that needs a new one adds a file next to it
 (``tests/histories/README.md``), and every file in the directory replays here.
@@ -8,20 +8,17 @@ stays as it is; a change that needs a new one adds a file next to it
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from temporalio.client import Client, WorkflowHistory
 from temporalio.microsoft_agent_framework import MicrosoftAgentFrameworkPlugin
 from temporalio.worker import Replayer
-from tests.record_histories import RECORDERS
+from tests.record_histories import HISTORIES, RECORDERS
 from tests.test_agent import ToolLoopWorkflow
 from tests.test_approval import ApprovalWorkflow
 from tests.test_mcp import MCPWorkflow
 from tests.test_streaming import StreamingWorkflow
 
-HISTORIES = Path(__file__).with_name("histories")
 WORKFLOWS = [ToolLoopWorkflow, ApprovalWorkflow, StreamingWorkflow, MCPWorkflow]
 
 

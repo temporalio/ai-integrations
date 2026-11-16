@@ -15,7 +15,7 @@
     <Using Include="Xunit" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="Histories/*.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Histories/**/*.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
