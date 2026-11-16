@@ -35,7 +35,8 @@ class ReplayHistoryTest {
                 .setWorkflowClientOptions(
                     WorkflowClientOptions.newBuilder().setPlugins(plugin).build())
                 .build());
-    try (InputStream history = getClass().getResourceAsStream("/histories/" + REPLAY_MAJOR + ".x/hitl_workflow.json")) {
+    try (InputStream history =
+        getClass().getResourceAsStream("/histories/" + REPLAY_MAJOR + ".x/hitl_workflow.json")) {
       assertNotNull(history, "recorded history is missing");
       Worker worker = testEnv.newWorker("replay");
       worker.registerWorkflowImplementationTypes(HitlWorkflowTest.ApprovalWorkflowImpl.class);
