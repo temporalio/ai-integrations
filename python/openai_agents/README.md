@@ -835,9 +835,11 @@ Pass that manifest to `SandboxRunConfig(manifest=...)`. This reads `PROD_OPENAI_
 
 ⚠️ **Pre-release** - This functionality is subject to change prior to General Availability.
 
-The sandbox integration lets `SandboxAgent` from the OpenAI Agents SDK execute inside a remote or local sandbox (Daytona, Docker, E2B, local Unix, etc.) while keeping all coordination durable in Temporal.
+The sandbox integration lets `SandboxAgent` from the OpenAI Agents SDK execute inside a sandbox, such as one hosted by Daytona, E2B or Modal, while keeping all coordination durable in Temporal.
 
-Every sandbox operation — creating a session, running commands, reading/writing files, PTY interactions — is dispatched as a Temporal activity. This means sandbox work is fully observable, retryable, and recoverable like any other activity, and sandbox session state is serialized with the workflow so it survives worker restarts.
+Every sandbox operation — creating a session, running commands, reading/writing files, PTY interactions — is dispatched as a Temporal activity. This means sandbox work is fully observable, retryable, and recoverable like any other activity, and sandbox session state is serialized with the workflow. With a hosted backend, any worker can reconnect to the sandbox from that state, so a session survives worker restarts.
+
+The Docker and Unix-local backends run the sandbox on the worker's own machine, where other workers can't reach it, so they are supported for local development only, with a single worker. In production, use a hosted backend.
 
 ### Architecture
 
@@ -881,7 +883,7 @@ async def main():
                 ),
                 sandbox_clients=[
                     SandboxClientProvider("daytona", DaytonaSandboxClient()),
-                    SandboxClientProvider("local", UnixLocalSandboxClient()),
+                    SandboxClientProvider("local", UnixLocalSandboxClient()),  # local development only
                 ],
             ),
         ],
@@ -947,7 +949,7 @@ result = await Runner.run(
     )),
 )
 
-# Run a different task on the "local" backend
+# Run a different task on the "local" backend (local development only)
 result = await Runner.run(
     agent, prompt,
     run_config=RunConfig(sandbox=SandboxRunConfig(

@@ -617,11 +617,13 @@ Adding a resolver to a Workflow that has open runs, including moving one off the
 
 An OpenAI Agents SDK `SandboxAgent` runs commands, edits files, and keeps a workspace inside a sandbox. This plugin dispatches each of those operations as an Activity.
 
-Process handles returned by `exec` remain usable across Activities only when the sandbox backend can reconnect them after `resume`; Unix-local and Docker backends cannot.
+The Docker and Unix-local backends run the sandbox on the Worker's own machine, where other Workers can't reach it, so they're supported for local development only, with a single Worker. For production, use a hosted backend, such as E2B, Modal or Daytona from `@openai/agents-extensions`.
 
-A `SandboxAgent` needs the Worker that created its sandbox if its manifest has an in-container mount or a mount upstream can't verify after persistence, because upstream refuses to resume such a session.
+A process started by `exec` outlives the Worker holding the session only if the backend can reconnect it after `resume`; Docker and Unix-local can't.
 
-Register your sandbox backend client under a name on the Worker plugin:
+In-container mounts that need `withInContainerMountCredentialExposureAcknowledged()` or `withInContainerMountBroadCredentialExposureAcknowledged()` on the manifest aren't supported, because that acknowledgement never reaches the Worker. A sandbox with any other in-container mount, or a mount upstream can't verify after persistence, needs the Worker that created it, even on a hosted backend, because upstream refuses to resume such a session.
+
+Register your sandbox backend client under a name on the Worker plugin. This example uses Unix-local, for local development:
 
 ```ts
 import { UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';

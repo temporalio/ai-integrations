@@ -2,12 +2,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test from 'ava';
-import { Agent, handoff } from '@openai/agents-core';
+import { Agent, UserError, handoff } from '@openai/agents-core';
 import { UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';
 import {
   Manifest,
   SandboxAgent,
   SandboxError,
+  type SandboxClientResumeOptions,
   type SandboxExecResult,
   type SandboxPreservedSessionReuseOptions,
   type SandboxSession,
@@ -289,6 +290,49 @@ test('resume delegates to the real client', async (t) => {
   t.is(result.state.sessionId, state.sessionId);
 });
 
+test.serial('resume passes its client options to the backend', async (t) => {
+  const options: (SandboxClientResumeOptions | undefined)[] = [];
+  class OptionsClient extends FakeSandboxClient {
+    override async resume(state: SandboxSessionState, received?: SandboxClientResumeOptions): Promise<SandboxSession> {
+      options.push(received);
+      return super.resume(state);
+    }
+  }
+  const acts = activityMap(new SandboxClientProvider('fake', new OptionsClient()));
+  const { state } = await createSession(acts);
+
+  await inWorkflow(acts, () =>
+    temporalSandboxClient('fake').resume(reviveWorkflowSessionState(state), { clientOptions: { image: 'other' } })
+  );
+  t.deepEqual(options[0]?.clientOptions, { image: 'other' });
+});
+
+test.serial("resume takes a mount's credentials from the trusted manifest and keeps the run's other entries", async (t) => {
+  const mount = {
+    type: 's3_mount',
+    bucket: 'bucket',
+    mountPath: 'data',
+    mountStrategy: { type: 'modal_cloud_bucket' },
+    accessKeyId: 'AKIA',
+    secretAccessKey: 'secret',
+  } as const;
+  const saved = await temporalSandboxClient('fake').deserializeSessionState({
+    sessionId: 'saved',
+    providerState: {},
+    manifest: serializeManifestRecord(
+      new Manifest({ entries: { data: mount, 'notes.txt': { type: 'file', content: 'added during the run' } } })
+    ),
+  });
+  const client = new FakeSandboxClient();
+
+  await inWorkflow(activityMap(new SandboxClientProvider('fake', client)), () =>
+    temporalSandboxClient('fake').resume(saved, { trustedManifest: new Manifest({ entries: { data: mount } }) })
+  );
+  const { entries } = client.session.state.manifest;
+  t.like(entries.data, { accessKeyId: 'AKIA', secretAccessKey: 'secret' });
+  t.like(entries['notes.txt'], { content: 'added during the run' });
+});
+
 test("a reuse check refreshes the live session's environment from the trusted manifest", async (t) => {
   const variable = 'OPENAI_AGENTS_TEST_REUSE_SECRET';
   process.env[variable] = 'sk-reuse-sentinel';
@@ -374,6 +418,22 @@ test("a reuse check passes the trusted manifest and client options to the backen
   t.deepEqual(client.session.state.environment, { KEY: 'old' });
 });
 
+test("a reuse check fails non-retryably when the backend's own check throws a UserError", async (t) => {
+  const client = Object.assign(new FakeSandboxClient(), {
+    canReusePreservedOwnedSession: async () => {
+      throw new UserError('invalid client options');
+    },
+  });
+  const acts = activityMap(new SandboxClientProvider('fake', client));
+  const { state } = await createSession(acts);
+
+  const err = await t.throwsAsync(acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({ state }), {
+    instanceOf: ApplicationFailure,
+    message: 'invalid client options',
+  });
+  t.true(err?.nonRetryable);
+});
+
 test('a reuse check of a Docker session refuses a trusted manifest that removes a variable', async (t) => {
   const client = Object.assign(new FakeSandboxClient(), { backendId: 'docker' });
   const acts = activityMap(new SandboxClientProvider('docker', client));
@@ -440,17 +500,17 @@ test("a reuse check answers false for a session upstream won't resume after a Wo
   t.false(await acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({ state }));
 });
 
-test('a reuse check rethrows a transient failure to rehydrate the session', async (t) => {
+test("a reuse check rethrows a failure to rehydrate the session other than upstream's refusal", async (t) => {
   const { state } = await createSession(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())));
   const client = Object.assign(new FakeSandboxClient(), {
     resume: async () => {
-      throw new SandboxError('backend unreachable', 'exec_transport_error', { retryable: true });
+      throw new SandboxError('provider auth expired', 'provider_error', { retryable: false });
     },
   });
   const acts = activityMap(new SandboxClientProvider('fake', client));
 
   await t.throwsAsync(acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({ state }), {
-    message: 'backend unreachable',
+    message: 'provider auth expired',
   });
 });
 

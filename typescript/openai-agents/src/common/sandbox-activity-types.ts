@@ -115,7 +115,9 @@ export interface SandboxCreateSessionInput {
 
 export interface SandboxResumeSessionInput {
   state: SerializedSandboxSessionState;
+  trustedManifest?: EncodedManifest;
   archiveLimits?: SandboxArchiveLimits | null;
+  clientOptions?: Record<string, unknown>;
 }
 
 export interface SandboxSessionStateInput {

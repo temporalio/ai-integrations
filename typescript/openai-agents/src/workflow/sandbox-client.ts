@@ -22,7 +22,6 @@ import {
   reviveWorkflowSessionState,
   sandboxSpanName,
   serializeSessionEnvelope,
-  withTrustedManifest,
   type EncodedManifest,
   type SandboxSessionResult,
   type SerializedSandboxSessionState,
@@ -86,7 +85,7 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
     options?: SandboxClientResumeOptions
   ): Promise<SandboxSessionLike<TemporalSandboxSessionState>> {
     const envelope = serializeSessionEnvelope(state.sessionId, state, state.providerState);
-    const { trustedManifest, archiveLimits } = options ?? {};
+    const { trustedManifest, archiveLimits, clientOptions } = options ?? {};
     const result = await maybeTemporalSpan(
       sandboxSpanName(SANDBOX_CLIENT_RESUME_SUFFIX),
       () =>
@@ -94,8 +93,10 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
           `${this._name}${SANDBOX_CLIENT_RESUME_SUFFIX}`,
           [
             {
-              state: trustedManifest ? withTrustedManifest(envelope, encodeManifest(trustedManifest)) : envelope,
+              state: envelope,
+              trustedManifest: trustedManifest && encodeManifest(trustedManifest),
               archiveLimits,
+              clientOptions,
             },
           ],
           this._config

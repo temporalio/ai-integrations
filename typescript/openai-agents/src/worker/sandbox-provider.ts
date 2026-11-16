@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import {
+  UserError,
   getCurrentTrace,
   withCustomSpan,
   type ApplyPatchOperation,
@@ -13,7 +14,7 @@ import type {
   SandboxSession,
   SandboxSessionState,
 } from '@openai/agents-core/sandbox';
-import { SandboxError, isEnvValueReference } from '@openai/agents-core/sandbox';
+import { SandboxError, SandboxMountError, isEnvValueReference } from '@openai/agents-core/sandbox';
 import {
   deserializeHostPathGrantRedactionMetadata,
   isStringRecord,
@@ -137,12 +138,14 @@ function unsupportedOperation(name: string, operation: string): never {
  * Wraps a real `SandboxClient` with a unique name so multiple sandbox
  * backends can be registered on a single Temporal Worker. Each provider gets
  * its own set of Activities whose names are prefixed with the provider name.
- * Live sessions are cached by session id. Any Worker can serve a session's
- * Activities because a cache miss is self-healed via `client.resume()`,
- * except for a session whose manifest has an in-container mount, or a mount
- * upstream can't verify after persistence, such as one with
- * `dockerVolumeMountStrategy()` and `driverOptions`: upstream refuses to
- * resume it, so its Activities fail on a cache miss.
+ * Live sessions are cached by session id. Docker and Unix-local run the sandbox
+ * on the Worker's own machine, so they're for local development with a single
+ * Worker. With a hosted backend, any Worker can serve a session's Activities
+ * because a cache miss is self-healed via `client.resume()`, except for a
+ * session whose manifest has an in-container mount, or a mount upstream can't
+ * verify after persistence, such as one with `dockerVolumeMountStrategy()` and
+ * `driverOptions`: upstream refuses to resume it, so its Activities fail on a
+ * cache miss.
  *
  * On the Worker side, pass providers to the plugin:
  *
@@ -210,11 +213,15 @@ export class SandboxClientProvider {
 
   /**
    * Backends refuse a resumed state whose mounts or path grant `hostPath`s weren't rebound from a trusted
-   * manifest; the Workflow sends that manifest in the envelope.
+   * manifest: the one the Workflow sends, or else the envelope's own.
    */
-  private async resumableState(payload: SerializedSandboxSessionState): Promise<SandboxSessionState> {
-    const trusted = decodeManifest(payload.manifest, this._resolvableWorkerEnvVars);
-    const state = rebindPersistedMountCredentials(await this.rehydrateState(payload), trusted);
+  private async resumableState(
+    payload: SerializedSandboxSessionState,
+    trustedManifest?: EncodedManifest
+  ): Promise<SandboxSessionState> {
+    const trusted = decodeManifest(trustedManifest ?? payload.manifest, this._resolvableWorkerEnvVars);
+    const saved = trustedManifest ? withTrustedManifest(payload, trustedManifest) : payload;
+    const state = rebindPersistedMountCredentials(await this.rehydrateState(saved), trusted);
     const grants = new Map(trusted.extraPathGrants.map((grant) => [grant.path, grant]));
     const { extraPathGrants } = state.manifest;
     for (const [index, grant] of extraPathGrants.entries()) extraPathGrants[index] = grants.get(grant.path) ?? grant;
@@ -224,7 +231,10 @@ export class SandboxClientProvider {
     return state;
   }
 
-  private async session(payload: SerializedSandboxSessionState): Promise<SandboxSession> {
+  private async session(
+    payload: SerializedSandboxSessionState,
+    trustedManifest?: EncodedManifest
+  ): Promise<SandboxSession> {
     const existing = this._sessions.get(payload.sessionId);
     if (existing) return existing;
     // The agents run loop executes tools in parallel, so several Activities can
@@ -241,7 +251,7 @@ export class SandboxClientProvider {
     }
     const resume = this.client.resume.bind(this.client);
     const resumePromise = (async (): Promise<SandboxSession> => {
-      const session = await resume(await this.resumableState(payload));
+      const session = await resume(await this.resumableState(payload, trustedManifest));
       this._sessions.set(payload.sessionId, session);
       return session;
     })();
@@ -311,10 +321,10 @@ export class SandboxClientProvider {
         input: SandboxResumeSessionInput
       ): Promise<SandboxSessionResult> => {
         if (!this.client.resume) unsupportedOperation(n, 'resume');
-        const session = await this.client.resume(
-          await this.resumableState(input.state),
-          input.archiveLimits !== undefined ? { archiveLimits: input.archiveLimits } : undefined
-        );
+        const session = await this.client.resume(await this.resumableState(input.state, input.trustedManifest), {
+          archiveLimits: input.archiveLimits,
+          clientOptions: input.clientOptions,
+        });
         this._sessions.set(input.state.sessionId, session);
         return this.sessionResult(input.state.sessionId, session);
       },
@@ -343,12 +353,10 @@ export class SandboxClientProvider {
       ): Promise<boolean> => {
         let state: SandboxSessionState;
         try {
-          ({ state } = await this.session(
-            input.trustedManifest ? withTrustedManifest(input.state, input.trustedManifest) : input.state
-          ));
+          ({ state } = await this.session(input.state, input.trustedManifest));
         } catch (err) {
           // On a cache miss, upstream refuses to resume some sessions, such as one with an in-container mount.
-          if (err instanceof SandboxError && err.retryable === false) return false;
+          if (err instanceof SandboxMountError && err.code === 'mount_config_invalid') return false;
           throw err;
         }
         const trustedManifest =
@@ -364,15 +372,22 @@ export class SandboxClientProvider {
         ) {
           return false;
         }
-        if (
-          this.client.canReusePreservedOwnedSession &&
-          !(await this.client.canReusePreservedOwnedSession(state, {
-            clientOptions: input.clientOptions,
-            revalidateManifestEntries: input.revalidateManifestEntries,
-            trustedManifest,
-          }))
-        ) {
-          return false;
+        if (this.client.canReusePreservedOwnedSession) {
+          let reusable: boolean;
+          try {
+            reusable = await this.client.canReusePreservedOwnedSession(state, {
+              clientOptions: input.clientOptions,
+              revalidateManifestEntries: input.revalidateManifestEntries,
+              trustedManifest,
+            });
+          } catch (err) {
+            // Upstream fails the run here. A SandboxError says whether a retry helps; any other UserError won't.
+            if (err instanceof UserError && !(err instanceof SandboxError)) {
+              throw ApplicationFailure.create({ message: err.message, type: err.name, nonRetryable: true, cause: err });
+            }
+            throw err;
+          }
+          if (!reusable) return false;
         }
         // Upstream refuses to resume a live session without a trusted manifest, so there is nothing to refresh.
         if (!trustedManifest) return true;
