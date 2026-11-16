@@ -6,7 +6,7 @@ from typing import Any, TypeVar
 from strands.sandbox import ExecutionResult, FileInfo, OutputFile, Sandbox, StreamChunk
 from strands.sandbox.errors import SandboxPathNotFoundError, SandboxTimeoutError
 from strands.types.tools import AgentTool
-from strands.vended_tools import make_file_editor, make_shell
+from strands.vended_tools import make_edit, make_read, make_shell, make_write
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
@@ -148,10 +148,12 @@ class TemporalSandbox(Sandbox):
         )
 
     def get_tools(self) -> list[AgentTool]:
-        """Vend Strands' standard shell and file-editor sandbox tools."""
+        """Vend Strands' shell, read, write, and edit sandbox tools."""
         return [
-            make_file_editor(sandbox=self, name="sandbox_file_editor"),
             make_shell(sandbox=self, name="sandbox_shell"),
+            make_read(sandbox=self, name="sandbox_read"),
+            make_write(sandbox=self, name="sandbox_write"),
+            make_edit(sandbox=self, name="sandbox_edit"),
         ]
 
     async def _execute(
