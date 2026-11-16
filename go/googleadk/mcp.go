@@ -691,8 +691,9 @@ func (a *Activities) mcpToolset(ctx context.Context, name string) (tool.Toolset,
 	defer a.mcpMu.Unlock()
 	if a.mcpClosed {
 		// Close is terminal: rebuilding here would cache a toolset nothing will
-		// ever close. Non-retryable — the worker is shutting down.
-		return nil, newApplicationError(ErrorTypeMCP, false, nil,
+		// ever close. Retryable, so another worker on the Task Queue can run
+		// the call.
+		return nil, newApplicationError(ErrorTypeMCP, true, nil,
 			"MCP toolsets are closed (Activities.Close was called)")
 	}
 	if ts, ok := a.mcpCache[name]; ok {

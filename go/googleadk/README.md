@@ -200,10 +200,17 @@ outside Temporal. To use another model, build the agent with
   remote tools (full declarations, including parameters) via `ListMcpTools` and
   executes calls via `CallMcpTool`. The live, stateful `mcptoolset.New(...)` runs
   worker-side, never in the workflow. Your `MCPFactory` runs at most once per
-  toolset name — the toolset is cached and shared across calls — and the plugin
-  closes any cached toolset that implements `Close() error` at worker stop
-  automatically; with manual wiring, call `Activities.Close` yourself after
-  `worker.Run` returns. A tool's own error, such as an MCP `isError` result,
+  toolset name: the toolset is cached and shared across calls. The plugin
+  closes any cached toolset that implements `Close() error`, as ADK's
+  `mcptoolset` does, after the worker has stopped; with manual wiring, call
+  `Activities.Close` yourself once `Stop` has returned, or once `worker.Run`
+  has returned after its interrupt channel stopped the worker. An MCP
+  Activity that reaches an `Activities` value after `Close` fails with a
+  retryable `googleadk.McpError`, so Temporal retries it and another worker on
+  the Task Queue can run it. Set `worker.Options.WorkerStopTimeout` to let MCP
+  calls in flight finish before the worker stops and the toolsets close;
+  without it the worker cancels them.
+  A tool's own error, such as an MCP `isError` result,
   reaches the model once, as it does without Temporal; `CallMcpTool` succeeds
   and is not retried. The plugin counts an error as the tool's own when it
   wraps no other error and is not an `ApplicationError`. ADK's MCP tools wrap
