@@ -246,14 +246,13 @@ PRs are squash-merged, so the PR title becomes the commit subject and a line in 
 release notes. Start each title with the plugin it changes:
 
 ```
-[openai-agents-python] breaking: remove the gates that kept 1.x runs replaying
-[mcp-python] say that `timedelta(0)` also turns heartbeats off
+[python/openai_agents] breaking: remove the gates that kept 1.x runs replaying
+[python/mcp] say that `timedelta(0)` also turns heartbeats off
 ```
 
-- The tag is the plugin's folder name with `_` replaced by `-`, then its language:
-  `python/openai_agents` is `openai-agents-python`, and `typescript/vercel-ai-sdk` is
-  `vercel-ai-sdk-typescript`. `go/googleadk` is `google-adk-go`.
-- A PR that changes two plugins lists both: `[strands-agents-python, deepagents-python]`. One that
+- The tag is the plugin's folder path, as written in its release tags: `python/openai_agents`,
+  `typescript/vercel-ai-sdk`, `go/googleadk`.
+- A PR that changes two plugins lists both: `[python/strands_agents, python/deepagents]`. One that
   changes many plugins uses `[all]`, and one that changes no plugin uses `[repo]`.
 - Write the text after the tag in lowercase, and don't repeat the plugin's name. Start with
   `breaking:` when the change is breaking. Other PRs get no type word.
