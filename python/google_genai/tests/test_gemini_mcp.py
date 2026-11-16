@@ -56,7 +56,10 @@ from tests.test_gemini import (
 )
 
 _ECHO_SERVER = str(Path(__file__).parent / "echo_mcp_server.py")
-_HISTORIES = Path(__file__).parent / "histories"
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 1
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
 
 
 @asynccontextmanager

@@ -19,6 +19,10 @@ import org.junit.jupiter.api.Test;
  */
 class ReplayHistoryTest {
 
+  // Replay is promised only within a major (see AGENTS.md), so only the histories
+  // in the current major's folder replay.
+  private static final int REPLAY_MAJOR = 0;
+
   @Test
   void hitlHistory_replaysWithThePlugin() throws Exception {
     GoogleAdkPlugin plugin =
@@ -31,7 +35,7 @@ class ReplayHistoryTest {
                 .setWorkflowClientOptions(
                     WorkflowClientOptions.newBuilder().setPlugins(plugin).build())
                 .build());
-    try (InputStream history = getClass().getResourceAsStream("/histories/hitl_workflow.json")) {
+    try (InputStream history = getClass().getResourceAsStream("/histories/" + REPLAY_MAJOR + ".x/hitl_workflow.json")) {
       assertNotNull(history, "recorded history is missing");
       Worker worker = testEnv.newWorker("replay");
       worker.registerWorkflowImplementationTypes(HitlWorkflowTest.ApprovalWorkflowImpl.class);

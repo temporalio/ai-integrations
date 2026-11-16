@@ -7,10 +7,14 @@ namespace Temporalio.Extensions.MicrosoftAgentFramework.Tests;
 
 public class ReplayTests
 {
+    // Replay is promised only within a major (see AGENTS.md), so only the histories
+    // in the current major's folder replay.
+    private const int ReplayMajor = 0;
+
     [Fact]
     public async Task Histories_ReplayThroughPlugin()
     {
-        var directory = Path.Combine(AppContext.BaseDirectory, "Histories");
+        var directory = Path.Combine(AppContext.BaseDirectory, "Histories", $"{ReplayMajor}.x");
         var files = Directory.Exists(directory) ? Directory.GetFiles(directory, "*.json").OrderBy(f => f, StringComparer.Ordinal).ToList() : [];
         Assert.True(files.Count >= 11, $"expected at least eleven recorded histories under {directory}, found {files.Count}");
 

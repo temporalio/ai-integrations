@@ -17,6 +17,11 @@ from tests.test_google_adk_agents import (
     WeatherModel,
 )
 
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 0
+HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
+
 
 @pytest.mark.parametrize(
     "file_name",
@@ -28,7 +33,7 @@ from tests.test_google_adk_agents import (
     ],
 )
 async def test_replay(file_name: str) -> None:
-    with (Path(__file__).with_name("histories") / file_name).open("r") as f:
+    with (HISTORIES / file_name).open("r") as f:
         history_json = f.read()
 
         LLMRegistry.register(ResearchModel)

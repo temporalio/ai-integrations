@@ -46,7 +46,11 @@ with workflow.unsafe.imports_passed_through():
 # the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-_HISTORY = Path(__file__).parent / "histories" / "legacy_dedup_repeated_tool_calls.json"
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 0
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
+_HISTORY = _HISTORIES / "legacy_dedup_repeated_tool_calls.json"
 
 
 @tool("pairing_weather")
@@ -105,8 +109,6 @@ with workflow.unsafe.imports_passed_through():
 from temporalio.deepagents import _activity
 from temporalio.deepagents._tools import register_tool
 from temporalio.deepagents.workflow import call_tool
-
-_HISTORIES = Path(__file__).parent / "histories"
 
 
 @_lc_tool("legacy_echo")

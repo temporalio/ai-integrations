@@ -37,6 +37,10 @@ class StatefulStub extends StubModel {
   }
 }
 
+// Replay is promised only within a major (see AGENTS.md), so only the histories
+// in the current major's folder replay.
+const REPLAY_MAJOR = 0;
+
 const CHAINED_CALLS = [
   { previousResponseId: undefined, messages: 1 },
   { previousResponseId: 'resp_1', messages: 1 },
@@ -49,7 +53,9 @@ function scheduledActivities(history: temporal.api.history.v1.IHistory): string[
 test('a stateful run recorded before the stateful flag replays on the stateless path', async (t) => {
   // Recorded with `statefulAgent` on 3af00d9, whose config activity returns no `stateful` flag: the
   // run scheduled `invokeModel`, where a config with the flag schedules `strandsInvokeStatefulModel`.
-  const history = await loadHistory(path.resolve(__dirname, '../../src/__tests__/histories/stateful-before-flag.json'));
+  const history = await loadHistory(
+    path.resolve(__dirname, '../../src/__tests__/histories', `${REPLAY_MAJOR}.x`, 'stateful-before-flag.json')
+  );
   await t.notThrowsAsync(
     Worker.runReplayHistory(
       {

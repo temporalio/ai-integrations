@@ -1,6 +1,6 @@
 """Histories recorded before the model config read fail replay.
 
-The fixtures in ``histories/`` were recorded on ``5e91c26`` (upstream main
+The fixtures in ``histories/0.x/`` were recorded on ``5e91c26`` (upstream main
 before the bytes change) against a local dev server, by running the workflows
 below unchanged. Each shape is recorded twice, because the wire format of
 ``bytes`` depends on the data converter in use:

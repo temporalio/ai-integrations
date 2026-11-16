@@ -1949,6 +1949,12 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
     assert operation_queues == {f"stateful_state-stateful@{handle.result_run_id}"}
 
 
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 0
+HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
+
+
 @pytest.mark.parametrize(
     "file_name",
     [
@@ -1962,7 +1968,7 @@ async def test_stateful_mcp_histories_from_main_replay(file_name: str) -> None:
     # activation resolves a stateful tool call together with another activity
     # (gather) or with a workflow cancel (cancel; cancel_wait with
     # WAIT_CANCELLATION_COMPLETED).
-    history_json = (Path(__file__).with_name("histories") / file_name).read_text()
+    history_json = (HISTORIES / file_name).read_text()
     await Replayer(
         workflows=[
             StatefulMcpGatherWorkflow,

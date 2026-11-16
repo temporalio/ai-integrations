@@ -4,7 +4,7 @@ namespace Temporalio.Extensions.MicrosoftAgentFramework.Tests;
 
 /// <summary>
 /// Writes a run's history under TestResults/recorded-histories when
-/// MICROSOFT_AGENT_FRAMEWORK_RECORD_HISTORIES is set, so the files under Histories/ can be refreshed from a
+/// MICROSOFT_AGENT_FRAMEWORK_RECORD_HISTORIES is set, so the files in the current major's folder under Histories/ can be refreshed from a
 /// real run. Tests behave the same with or without the variable.
 /// </summary>
 public static class HistoryRecorder

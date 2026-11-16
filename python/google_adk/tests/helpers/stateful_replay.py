@@ -1,6 +1,6 @@
 """Workflows for histories recorded with stateful MCP operations.
 
-``tests/histories/stateful_mcp_*.json`` were recorded with these workflows on
+``tests/histories/0.x/stateful_mcp_*.json`` were recorded with these workflows on
 earlier versions of the plugin, and ``test_stateful_mcp.py`` replays them on
 this one.
 """
