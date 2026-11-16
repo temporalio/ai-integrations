@@ -18,9 +18,6 @@ if TYPE_CHECKING:
     from google.adk.workflow import FunctionNode
 
 _TOOL_CONTEXT_PARAM = "tool_context"
-# Workflows started before this patch pass an activity's empty *args as one
-# extra argument; keep that on replay.
-_VAR_ARGS_PATCH = "google_adk.activity-as-tool-var-args"
 
 
 @dataclass(frozen=True)
@@ -502,7 +499,7 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
             else:
                 return result
 
-        if has_var_args and workflow.patched(_VAR_ARGS_PATCH):
+        if has_var_args:
             # bound.args spreads *args; bound.arguments holds it as one tuple.
             activity_args = list(bound.args)
 
