@@ -124,6 +124,8 @@ Stateful model calls run as their own activities, `strands_invoke_stateful_model
 
 A run that continues as new starts with no messages when its model is stateful, so it needs the model state it carries. If that run's workers do not have this version, or its config activity runs on a worker that does not, it treats the model as stateless, ignores the carried response id and starts the model's conversation over. Keep such runs on upgraded workers, and do not roll workers back to an earlier version while they continue as new.
 
+A model call that fails with a context window overflow raises `ContextWindowOverflowException` in the workflow, so Strands reduces the conversation and calls the model again, as it does natively. Releases before 1.0 let the overflow reach the workflow as an `ActivityError`, and later builds of `main` gated the change with a patch marker, which this version no longer reads. So a run that hit an overflow before you deploy this version fails to replay on it with `[TMPRL1100]`, and a run that hits one on this version fails to replay on an earlier version. Let those runs finish on their original workers before you upgrade, or keep them there with Worker Versioning, and do not roll workers back to an earlier version while runs that hit an overflow on this version are open.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. The plugin's default Bedrock model also disables Botocore retries. When supplying your own model factory, disable that provider client's retries as shown in the Bedrock example above.
