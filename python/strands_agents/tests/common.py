@@ -28,7 +28,7 @@ def get_heartbeat_timeouts(history: WorkflowHistory) -> list[timedelta | None]:
 
 # Replay is promised only within a major (see AGENTS.md), so only the histories
 # in the current major's folder replay.
-REPLAY_MAJOR = 0
+REPLAY_MAJOR = 1
 
 
 def load_history(name: str, workflow_id: str = "legacy-replay") -> WorkflowHistory:
