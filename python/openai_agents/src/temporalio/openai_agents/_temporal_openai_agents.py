@@ -1,5 +1,6 @@
 """Initialize Temporal OpenAI Agents overrides."""
 
+import asyncio
 import copy
 import dataclasses
 import importlib.metadata
@@ -10,6 +11,7 @@ import typing
 import warnings
 from collections.abc import (
     AsyncGenerator,
+    Awaitable,
     Callable,
     Collection,
     Generator,
@@ -62,8 +64,11 @@ from temporalio.openai_agents._temporal_worker_env_ref import (
 from temporalio.openai_agents._trace_interceptor import (
     OpenAIAgentsContextPropagationInterceptor,
 )
+from temporalio.openai_agents.sandbox._on_host_sandbox_client_provider import (
+    OnHostSandboxClientProvider,
+)
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkflowRunner
+from temporalio.worker import Worker, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 if typing.TYPE_CHECKING:
@@ -403,7 +408,9 @@ class OpenAIAgentsPlugin(SimplePlugin):
     2. Sets up tracing interceptors for OpenAI agent interactions
     3. Registers model execution activities
     4. Automatically registers MCP server activities and manages their lifecycles
-    5. Manages the OpenAI agent runtime overrides during worker execution
+    5. Registers sandbox activities, and runs a Worker for each
+       ``OnHostSandboxClientProvider``
+    6. Manages the OpenAI agent runtime overrides during worker execution
 
     Example:
         >>> from temporalio.client import Client
@@ -444,7 +451,9 @@ class OpenAIAgentsPlugin(SimplePlugin):
         mcp_server_providers: Sequence[
             "StatelessMCPServerProvider | StatefulMCPServerProvider"
         ] = (),
-        sandbox_clients: Sequence["SandboxClientProvider"] = (),
+        sandbox_clients: Sequence[
+            "SandboxClientProvider | OnHostSandboxClientProvider"
+        ] = (),
         register_activities: bool = True,
         add_temporal_spans: bool = True,
         use_otel_instrumentation: bool = False,
@@ -482,10 +491,14 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 eviction, and zero disables reuse.
             sandbox_clients: Sequence of named sandbox client providers to register
                 on the worker.  Each provider pairs a unique name with a real
-                ``BaseSandboxClient`` (e.g. ``DaytonaSandboxClient``,
-                ``UnixLocalSandboxClient``).  On the workflow side, use
+                ``BaseSandboxClient`` (e.g. ``DaytonaSandboxClient`` in a
+                ``SandboxClientProvider``, ``DockerSandboxClient`` in an
+                ``OnHostSandboxClientProvider``).  On the workflow side, use
                 ``temporal_sandbox_client``
-                with the matching name to target the correct backend.
+                with the matching name to target the correct backend. The worker
+                also runs a Worker on the Task Queue of each
+                ``OnHostSandboxClientProvider``, unless ``register_activities``
+                is false.
                 Warning: sandbox_clients is experimental and behavior may change in future versions.
                 Use with caution in production environments.
             register_activities: Whether to register activities during the worker execution.
@@ -553,6 +566,12 @@ class OpenAIAgentsPlugin(SimplePlugin):
             )
 
         resolvable_env_vars = _snapshot_resolvable_env_vars(resolvable_worker_env_vars)
+        self._resolvable_env_vars = resolvable_env_vars
+        self._on_host_providers: list[OnHostSandboxClientProvider] = (
+            [p for p in sandbox_clients if isinstance(p, OnHostSandboxClientProvider)]
+            if register_activities
+            else []
+        )
 
         # Delay activity construction until they are actually needed
         def add_activities(
@@ -656,6 +675,84 @@ class OpenAIAgentsPlugin(SimplePlugin):
             run_context=lambda: run_context(),
         )
 
+    async def run_worker(
+        self, worker: Worker, next: Callable[[Worker], Awaitable[None]]
+    ) -> None:
+        """Run the worker, and with it a Worker for each ``OnHostSandboxClientProvider``.
+
+        When one of them stops, the others are shut down.
+        """
+        if not self._on_host_providers:
+            return await super().run_worker(worker, next)
+        await super().run_worker(
+            worker, lambda main: self._run_with_on_host_workers(main, next)
+        )
+
+    async def _run_with_on_host_workers(
+        self, worker: Worker, next: Callable[[Worker], Awaitable[None]]
+    ) -> None:
+        from temporalio.client import Client
+
+        # The main Worker's client without its plugins, so this plugin doesn't
+        # configure or run the on-host Workers as main Workers.
+        client_config = worker.client.config(active_config=True)
+        client_config["plugins"] = []
+        client = Client(**client_config)
+        # Their sandbox operations ran on the main Worker before, so they keep its
+        # interceptors.
+        interceptors = worker.config(active_config=True).get("interceptors", [])
+        on_host: list[Worker] = []
+        try:
+            for provider in self._on_host_providers:
+                try:
+                    on_host.append(
+                        Worker(
+                            client,
+                            task_queue=provider.task_queue,
+                            activities=provider._get_activities(
+                                self._resolvable_env_vars
+                            ),
+                            interceptors=interceptors,
+                        )
+                    )
+                except Exception as err:
+                    # Core refuses a second Worker on the queue, such as from
+                    # another Worker in this process that uses the provider.
+                    raise RuntimeError(
+                        "Cannot start the Worker of OnHostSandboxClientProvider "
+                        f"{provider.name!r} on Task Queue {provider.task_queue!r}: {err}"
+                    ) from err
+        except Exception:
+            await asyncio.gather(
+                _discard_unstarted(worker, next),
+                *(_discard_unstarted(w, Worker.run) for w in on_host),
+            )
+            raise
+
+        workers = [worker, *on_host]
+        runs = [
+            asyncio.ensure_future(next(worker)),
+            *(asyncio.ensure_future(w.run()) for w in on_host),
+        ]
+        try:
+            await asyncio.wait(runs, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stops = [
+                asyncio.create_task(w.shutdown())
+                for w, run in zip(workers, runs)
+                if not run.done()
+            ]
+            try:
+                results = await asyncio.gather(*runs, return_exceptions=True)
+            finally:
+                # A run that failed before its Worker started never completes a
+                # shutdown.
+                for stop in stops:
+                    stop.cancel()
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
     def version(self) -> str:
         """Return this package's version, which worker heartbeats report."""
         try:
@@ -695,3 +792,16 @@ class OpenAIAgentsPlugin(SimplePlugin):
             # Clean up OTEL instrumentation
             if otel_instrumentation_installed:
                 _uninstall_otel_instrumentation()
+
+
+async def _discard_unstarted(
+    worker: Worker, run: Callable[[Worker], Awaitable[None]]
+) -> None:
+    """Run a Worker that was never started to a shutdown, so it releases its Task Queue."""
+    stop = asyncio.create_task(worker.shutdown())
+    try:
+        await run(worker)
+    except Exception:
+        pass
+    finally:
+        stop.cancel()

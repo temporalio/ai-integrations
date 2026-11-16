@@ -8,7 +8,7 @@ model instance rather than a positional arg list.
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from agents.sandbox import Manifest
 from agents.sandbox.session.sandbox_client import BaseSandboxClientOptions
@@ -18,6 +18,7 @@ from agents.sandbox.types import User
 from pydantic import (
     BaseModel,
     BeforeValidator,
+    ConfigDict,
     PlainSerializer,
     SerializeAsAny,
     field_validator,
@@ -39,6 +40,31 @@ JsonSafeBytes = Annotated[
     BeforeValidator(_coerce_bytes),
     PlainSerializer(lambda v: b64encode(v).decode("ascii"), return_type=str),
 ]
+
+# ---------------------------------------------------------------------------
+# Session state of a sandbox pinned to the Worker process that created it.
+# ---------------------------------------------------------------------------
+
+
+class OnHostSandboxSessionState(SandboxSessionState):
+    """The Workflow's state of a sandbox created by an ``OnHostSandboxClientProvider``.
+
+    It records the Task Queue of the Worker process holding the sandbox, and the
+    Workflow sends every operation on the sandbox there. It also carries the
+    backend's own state, as undeclared fields with the backend's ``type`` in
+    ``backend_type``, so a Worker with that queue can rebuild the session with
+    the backend's ``resume()`` when OpenAI's SDK resumes it. OpenAI saves and
+    restores session states by ``type``, so all of it survives a pause and
+    continue-as-new.
+    """
+
+    # Pydantic merges this with the base model's config.
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["temporal_on_host"] = "temporal_on_host"  # type: ignore[assignment]
+    backend_type: str
+    task_queue: str
+
 
 # ---------------------------------------------------------------------------
 # Shared base for all argument models that carry a session state field.

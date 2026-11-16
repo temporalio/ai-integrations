@@ -25,6 +25,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
 )
 from temporalio.openai_agents.sandbox._temporal_sandbox_session import (
     TemporalSandboxSession,
+    _session_activity_config,
 )
 from temporalio.workflow import ActivityConfig
 
@@ -35,7 +36,10 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
     No inner client is needed -- session creation, resumption, and deletion are
     all handled by activities whose names are prefixed with the provider
     ``name`` (e.g. ``"daytona-sandbox_create_session"``).  The real
-    ``BaseSandboxClient`` lives inside :class:`SandboxClientProvider` on the worker.
+    ``BaseSandboxClient`` lives inside :class:`SandboxClientProvider` or
+    :class:`OnHostSandboxClientProvider` on the worker. Creation runs on the
+    configured Task Queue, and operations on a sandbox from an
+    ``OnHostSandboxClientProvider`` go to the Task Queue in its state.
 
     Users should never need to instantiate this directly -- use
     :func:`temporalio.openai_agents.workflow.temporal_sandbox_client`
@@ -100,7 +104,7 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
             f"{self._name}-sandbox_client_resume",
             arg=ResumeSessionArgs(state=state),
             result_type=SessionResult,
-            **self._config,
+            **_session_activity_config(self._config, state),
         )
         return self._wrap_session(
             TemporalSandboxSession(
@@ -118,7 +122,7 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
         await workflow.execute_activity(
             f"{self._name}-sandbox_client_delete",
             arg=StopArgs(state=session.state),
-            **self._config,
+            **_session_activity_config(self._config, session.state),
         )
         return session
 

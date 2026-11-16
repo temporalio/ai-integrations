@@ -1,14 +1,25 @@
 """Tests for sandbox validation in TemporalOpenAIRunner."""
 
+import asyncio
 import io
+import json
+import socket
 import uuid
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
 
 import pytest
-from agents import Agent, FunctionTool, RunConfig, Runner, Tool
+from agents import (
+    Agent,
+    FunctionTool,
+    ModelResponse,
+    RunConfig,
+    Runner,
+    RunState,
+    Tool,
+)
 from agents.sandbox import Capability, Manifest, SandboxAgent, SandboxRunConfig
 from agents.sandbox.errors import (
     ExecTransportError,
@@ -31,11 +42,12 @@ from pydantic import BaseModel, TypeAdapter
 from pydantic_core import to_json
 
 from temporalio import workflow
-from temporalio.client import Client, WorkflowFailureError
+from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.openai_agents import (
     AgentsWorkflowError,
     ModelActivityParameters,
+    OnHostSandboxClientProvider,
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
     SandboxClientProvider,
@@ -49,6 +61,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     CreateSessionArgs,
     ExecArgs,
     HydrateWorkspaceArgs,
+    OnHostSandboxSessionState,
     PersistWorkspaceArgs,
     PersistWorkspaceResult,
     PtyExecStartArgs,
@@ -58,10 +71,12 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ReadResult,
     ResumeSessionArgs,
     RunningArgs,
+    RunningResult,
     SessionResult,
     StartArgs,
     StopArgs,
     WriteArgs,
+    _HasState,
 )
 from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ExecResult as ExecResultModel,
@@ -1559,6 +1574,743 @@ async def test_sandbox_e2e_runner(client: Client):
     assert mock_session.stop_calls >= 1, "session.stop() not called"
     assert mock_session.shutdown_calls >= 1, "session.shutdown() not called"
     assert mock_sandbox_client.delete_calls == 1, "client.delete() not called"
+
+
+# ── OnHostSandboxClientProvider ──
+
+
+class _DockerLikeClient(_MockSandboxClient):
+    backend_id = "docker"
+
+
+class _UnixLocalLikeClient(_MockSandboxClient):
+    backend_id = "unix_local"
+
+
+@pytest.mark.parametrize("client_type", [_DockerLikeClient, _UnixLocalLikeClient])
+def test_sandbox_client_provider_refuses_docker_and_unix_local(
+    client_type: type[_MockSandboxClient],
+):
+    with pytest.raises(ValueError, match="Use OnHostSandboxClientProvider"):
+        SandboxClientProvider("local", client_type())
+    # The on-host provider takes them.
+    OnHostSandboxClientProvider("local", client_type())
+
+
+def test_an_on_host_providers_task_queue_is_name_at_worker_name():
+    named = OnHostSandboxClientProvider("docker", _MockSandboxClient(), worker_name="a")
+    assert named.task_queue == "docker@a"
+    unnamed = OnHostSandboxClientProvider("docker", _MockSandboxClient())
+    assert unnamed.task_queue == f"docker@{socket.gethostname()}"
+
+
+class _BackendSessionState(SandboxSessionState):
+    """A backend's state with a field of its own.
+
+    Workflow sandboxes re-import this module and register their own copy of the
+    class by its ``type``, so a parsed state can be another copy: check ``type``,
+    not ``isinstance``.
+    """
+
+    type: Literal["test_backend"] = "test_backend"  # type: ignore
+    container_id: str = "backend-container"
+
+
+def _lost_state() -> OnHostSandboxSessionState:
+    return OnHostSandboxSessionState(
+        manifest=Manifest(),
+        snapshot=NoopSnapshot(id=str(uuid.uuid4())),
+        backend_type="test",
+        task_queue="mock@gone",
+    )
+
+
+def _on_host_activities(
+    client: _MockSandboxClient,
+) -> tuple[OnHostSandboxClientProvider, dict[str, Any]]:
+    provider = OnHostSandboxClientProvider("mock", client, worker_name="box")
+    return provider, {
+        act.__temporal_activity_definition.name: act  # type: ignore[attr-defined, union-attr]
+        for act in provider._get_activities(())
+    }
+
+
+_CREATE_ARGS = CreateSessionArgs(
+    snapshot_spec=None, manifest=Manifest(), client_options=None
+)
+
+
+def _backend_session() -> _MockSandboxSession:
+    session = _MockSandboxSession()
+    session.state = _BackendSessionState(
+        manifest=Manifest(), snapshot=NoopSnapshot(id=str(uuid.uuid4()))
+    )
+    return session
+
+
+async def test_an_on_host_provider_returns_its_own_state_with_its_task_queue():
+    session = _backend_session()
+    _, acts = _on_host_activities(_MockSandboxClient(session))
+
+    results = [
+        await acts["mock-sandbox_client_create"](_CREATE_ARGS),
+        await acts["mock-sandbox_session_start"](StartArgs(state=session.state)),
+        await acts["mock-sandbox_session_stop"](StopArgs(state=session.state)),
+    ]
+
+    for result in results:
+        # As the Workflow receives it.
+        state = SessionResult.model_validate(result.model_dump(mode="json")).state
+        assert isinstance(state, OnHostSandboxSessionState)
+        assert state.task_queue == "mock@box"
+        assert state.session_id == session.state.session_id
+        assert state.backend_type == "test_backend"
+        assert state.model_dump()["container_id"] == "backend-container"
+
+
+async def test_an_on_host_provider_resumes_a_session_it_holds_without_the_backend():
+    client = _MockSandboxClient()
+    _, acts = _on_host_activities(client)
+    created = await acts["mock-sandbox_client_create"](_CREATE_ARGS)
+
+    resumed = await acts["mock-sandbox_client_resume"](
+        ResumeSessionArgs(state=created.state)
+    )
+
+    assert resumed.state == created.state
+    assert client.resume_calls == 0
+
+
+async def test_an_on_host_provider_rebuilds_a_session_it_does_not_hold_with_the_backends_resume_once():
+    session = _backend_session()
+    client = _MockSandboxClient(session)
+    _, acts = _on_host_activities(client)
+    created = await acts["mock-sandbox_client_create"](_CREATE_ARGS)
+    # The state as the Workflow keeps it, sent to a process that doesn't hold it,
+    # such as this Worker after a restart.
+    saved = ResumeSessionArgs.model_validate_json(
+        ResumeSessionArgs(state=created.state).model_dump_json()
+    )
+    _, restarted = _on_host_activities(client)
+
+    resumed = await restarted["mock-sandbox_client_resume"](saved)
+    await restarted["mock-sandbox_session_exec"](
+        ExecArgs(state=resumed.state, command=["true"])
+    )
+    await restarted["mock-sandbox_client_resume"](
+        ResumeSessionArgs(state=resumed.state)
+    )
+
+    assert client.resume_calls == 1
+    # The backend got its own state back.
+    rebuilt = session.state.model_dump()
+    assert rebuilt["type"] == "test_backend"
+    assert rebuilt["container_id"] == "backend-container"
+    assert rebuilt["session_id"] == created.state.session_id
+    assert "task_queue" not in rebuilt
+    assert "backend_type" not in rebuilt
+    assert isinstance(resumed.state, OnHostSandboxSessionState)
+    assert resumed.state.task_queue == "mock@box"
+
+
+async def test_an_on_host_provider_does_not_resume_a_state_it_did_not_return():
+    client = _MockSandboxClient()
+    _, acts = _on_host_activities(client)
+
+    with pytest.raises(ApplicationError) as err:
+        await acts["mock-sandbox_client_resume"](ResumeSessionArgs(state=_make_state()))
+
+    assert err.value.type == "SandboxLost"
+    assert client.resume_calls == 0
+
+
+_SESSION_OPERATIONS: list[tuple[str, Callable[[SandboxSessionState], _HasState]]] = [
+    ("sandbox_session_exec", lambda s: ExecArgs(state=s, command=["true"])),
+    ("sandbox_session_read", lambda s: ReadArgs(state=s, path="/f")),
+    ("sandbox_session_write", lambda s: WriteArgs(state=s, path="/f", data=b"")),
+    ("sandbox_session_running", lambda s: RunningArgs(state=s)),
+    ("sandbox_session_persist_workspace", lambda s: PersistWorkspaceArgs(state=s)),
+    (
+        "sandbox_session_hydrate_workspace",
+        lambda s: HydrateWorkspaceArgs(state=s, data=b""),
+    ),
+    (
+        "sandbox_session_pty_exec_start",
+        lambda s: PtyExecStartArgs(state=s, command=["true"]),
+    ),
+    (
+        "sandbox_session_pty_write_stdin",
+        lambda s: PtyWriteStdinArgs(state=s, session_id=1, chars=""),
+    ),
+    ("sandbox_session_start", lambda s: StartArgs(state=s)),
+    ("sandbox_session_stop", lambda s: StopArgs(state=s)),
+    ("sandbox_session_shutdown", lambda s: StopArgs(state=s)),
+]
+
+
+@pytest.mark.parametrize(
+    "operation,args", _SESSION_OPERATIONS, ids=[op for op, _ in _SESSION_OPERATIONS]
+)
+async def test_an_operation_other_than_resume_on_a_session_an_on_host_provider_does_not_hold_fails_with_sandbox_lost(
+    operation: str, args: Callable[[SandboxSessionState], _HasState]
+):
+    client = _MockSandboxClient()
+    _, acts = _on_host_activities(client)
+
+    with pytest.raises(ApplicationError) as err:
+        await acts[f"mock-{operation}"](args(_lost_state()))
+
+    assert err.value.type == "SandboxLost"
+    assert err.value.non_retryable
+    assert "'mock@gone'" in str(err.value)
+    assert client.resume_calls == 0
+
+
+async def test_deleting_a_session_an_on_host_provider_does_not_hold_does_nothing():
+    client = _MockSandboxClient()
+    _, acts = _on_host_activities(client)
+
+    await acts["mock-sandbox_client_delete"](StopArgs(state=_lost_state()))
+
+    assert client.delete_calls == 0
+    assert client.resume_calls == 0
+
+
+async def test_an_on_host_provider_keeps_a_shut_down_session_until_it_deletes_it():
+    client = _MockSandboxClient()
+    provider, acts = _on_host_activities(client)
+    state = (await acts["mock-sandbox_client_create"](_CREATE_ARGS)).state
+
+    await acts["mock-sandbox_session_shutdown"](StopArgs(state=state))
+    assert client.inner_session.shutdown_calls == 1
+    await acts["mock-sandbox_client_delete"](StopArgs(state=state))
+
+    assert client.delete_calls == 1
+    assert not provider._sessions
+    with pytest.raises(ApplicationError, match="is lost"):
+        await acts["mock-sandbox_session_exec"](ExecArgs(state=state, command=["x"]))
+
+
+_ON_HOST_STATE = OnHostSandboxSessionState(
+    manifest=Manifest(),
+    snapshot=NoopSnapshot(id="on-host"),
+    backend_type="test",
+    task_queue="mock@box",
+)
+
+
+@pytest.mark.parametrize("on_host", [True, False], ids=["on-host", "no-queue"])
+async def test_the_workflow_sends_a_sessions_operations_to_the_task_queue_in_its_state(
+    monkeypatch: pytest.MonkeyPatch, on_host: bool
+):
+    state = _ON_HOST_STATE if on_host else _make_state()
+    results: dict[Any, Any] = {
+        ExecResultModel: ExecResultModel(stdout=b"", stderr=b"", exit_code=0),
+        ReadResult: ReadResult(data=b""),
+        RunningResult: RunningResult(is_running=True),
+        PersistWorkspaceResult: PersistWorkspaceResult(data=b""),
+        PtyExecUpdateResult: PtyExecUpdateResult(
+            process_id=None, output=b"", exit_code=0, original_token_count=None
+        ),
+        SessionResult: SessionResult(state=state, supports_pty=True),
+        None: None,
+    }
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def execute_activity(
+        name: str,
+        *,
+        arg: Any,  # type: ignore[reportUnusedParameter]
+        result_type: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        calls.append((name, kwargs))
+        return results[result_type]
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    config = ActivityConfig(start_to_close_timeout=timedelta(seconds=30))
+    client = TemporalSandboxClient("mock", config)
+    session = TemporalSandboxSession("mock", config, state)
+
+    await client.create(options=_TestSandboxClientOptions())
+    await client.resume(state)
+    await session.exec("true")
+    await session.read(Path("/f"))
+    await session.write(Path("/f"), io.BytesIO(b""))
+    await session.running()
+    await session.persist_workspace()
+    await session.hydrate_workspace(io.BytesIO(b""))
+    await session.pty_exec_start("true")
+    await session.pty_write_stdin(session_id=1, chars="")
+    await session.start()
+    await session.stop()
+    await session.shutdown()
+    await client.delete(session)
+
+    create, *operations = calls
+    assert create == (
+        "mock-sandbox_client_create",
+        {"start_to_close_timeout": timedelta(seconds=30)},
+    )
+    assert len(operations) == 13
+    for name, kwargs in operations:
+        assert kwargs["start_to_close_timeout"] == timedelta(seconds=30), name
+        assert kwargs.get("task_queue") == ("mock@box" if on_host else None), name
+
+
+async def test_an_on_host_state_keeps_the_backends_fields_and_its_task_queue_through_a_saved_run_state():
+    _, acts = _on_host_activities(_MockSandboxClient(_backend_session()))
+    created = await acts["mock-sandbox_client_create"](_CREATE_ARGS)
+    # As the Workflow receives it.
+    state = SessionResult.model_validate_json(created.model_dump_json()).state
+    client = TemporalSandboxClient("mock")
+
+    # How OpenAI saves a session state in a RunState and reads it back.
+    payload = json.loads(json.dumps(client.serialize_session_state(state)))
+    restored = client.deserialize_session_state(payload)
+    # And as an Activity argument or a continue-as-new input carries it.
+    carried = ResumeSessionArgs.model_validate_json(
+        ResumeSessionArgs(state=restored).model_dump_json()
+    ).state
+
+    for kept in (restored, carried):
+        assert isinstance(kept, OnHostSandboxSessionState)
+        assert kept.task_queue == "mock@box"
+        assert kept.backend_type == "test_backend"
+        assert kept.model_dump()["container_id"] == "backend-container"
+
+
+class _LifecycleSession(_MockSandboxSession):
+    def __init__(
+        self,
+        client: "_LifecycleSandboxClient",
+        number: int,
+        state: SandboxSessionState | None = None,
+    ) -> None:
+        super().__init__()
+        self.state = state or _BackendSessionState(
+            manifest=Manifest(),
+            snapshot=NoopSnapshot(id=str(uuid.uuid4())),
+            container_id=f"container-{number}",
+        )
+        self._lifecycle = client
+        self.number = number
+
+    async def _exec_internal(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        commands = self._lifecycle.workspaces[self.number]
+        commands.append(str(command[-1]))
+        self._lifecycle.events.append(f"exec#{self.number}")
+        output = f"#{self.number} ran {','.join(commands)}"
+        return ExecResult(stdout=output.encode(), stderr=b"", exit_code=0)
+
+
+class _LifecycleSandboxClient(_MockSandboxClient):
+    """A machine's sandboxes: numbered sessions, and workspaces that outlive them.
+
+    Records each lifecycle event. Like a backend's saved workspace, a session's
+    commands survive its delete, and ``resume()`` finds them by the container id
+    in its state.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[str] = []
+        self.live: list[int] = []
+        self.workspaces: dict[int, list[str]] = {}
+
+    async def create(
+        self,
+        *,
+        snapshot: Any = None,
+        manifest: Manifest | None = None,
+        options: BaseSandboxClientOptions | None = None,
+    ) -> SandboxSession:
+        number = len(self.workspaces) + 1
+        self.workspaces[number] = []
+        self.events.append(f"create#{number}")
+        self.live.append(number)
+        return self._wrap_session(_LifecycleSession(self, number))
+
+    async def resume(self, state: SandboxSessionState) -> SandboxSession:
+        saved = state.model_dump()
+        assert saved["type"] == "test_backend"
+        number = int(saved["container_id"].removeprefix("container-"))
+        self.events.append(f"resume#{number}")
+        self.live.append(number)
+        return self._wrap_session(_LifecycleSession(self, number, state))
+
+    async def delete(self, session: SandboxSession) -> SandboxSession:
+        inner = session._inner
+        assert isinstance(inner, _LifecycleSession)
+        self.events.append(f"delete#{inner.number}")
+        self.live.remove(inner.number)
+        return session
+
+
+@workflow.defn
+class OnHostOperationsWorkflow:
+    """Creates a session, waits for ``proceed``, runs each command, and deletes it.
+
+    Returns the commands' outputs, or the failure type of the first that failed.
+    """
+
+    def __init__(self) -> None:
+        self._created = False
+        self._proceed = False
+
+    @workflow.query
+    def session_created(self) -> bool:
+        return self._created
+
+    @workflow.signal
+    def proceed(self) -> None:
+        self._proceed = True
+
+    @workflow.run
+    async def run(self, commands: list[str]) -> str:
+        client = temporal_sandbox_client("lifecycle")
+        session = await client.create(options=_TestSandboxClientOptions())
+        self._created = True
+        await workflow.wait_condition(lambda: self._proceed)
+        outputs: list[str] = []
+        try:
+            for cmd in commands:
+                outputs.append((await session.exec(cmd)).stdout.decode())
+        except ActivityError as err:
+            if not isinstance(err.cause, ApplicationError):
+                raise
+            outputs.append(f"failed: {err.cause.type}")
+        finally:
+            await client.delete(session)
+        return "\n".join(outputs)
+
+
+class _ApprovalCapability(Capability):
+    """Runs commands through ``run_now``, and through ``run_approved`` after an approval."""
+
+    def __init__(self) -> None:
+        super().__init__(type="approval_test_sandbox")
+        self._session: BaseSandboxSession | None = None
+
+    def bind(self, session: BaseSandboxSession) -> None:
+        self._session = session
+
+    def tools(self) -> list[Tool]:
+        session = self._session
+
+        async def run(ctx: Any, args: str) -> str:  # type: ignore[reportUnusedParameter]
+            result = await session.exec(json.loads(args)["cmd"])  # type: ignore[union-attr]
+            return result.stdout.decode()
+
+        params = {
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"],
+        }
+        return [
+            FunctionTool(
+                name="run_now",
+                description="Run a command",
+                params_json_schema=params,
+                on_invoke_tool=run,
+            ),
+            FunctionTool(
+                name="run_approved",
+                description="Run a command once approved",
+                params_json_schema=params,
+                on_invoke_tool=run,
+                needs_approval=True,
+            ),
+        ]
+
+
+@workflow.defn
+class OnHostApprovalWorkflow:
+    """Runs a sandbox agent until it pauses for approval, approves, and resumes.
+
+    ``how`` is where it resumes: ``"in_place"``, after a ``continue_as_new``
+    (``"continue_as_new"``), or once the ``resume`` signal arrives
+    (``"on_signal"``). Returns the resumed run's command outputs.
+    """
+
+    def __init__(self) -> None:
+        self._paused = False
+        self._resume = False
+
+    @workflow.query
+    def paused(self) -> bool:
+        return self._paused
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+    @workflow.run
+    async def run(self, how: str, saved: str | None = None) -> str:
+        agent = SandboxAgent[None](
+            name="on-host-approval", capabilities=[_ApprovalCapability()]
+        )
+        run_config = RunConfig(
+            sandbox=SandboxRunConfig(
+                client=temporal_sandbox_client("lifecycle"),
+                options=_TestSandboxClientOptions(),
+            )
+        )
+        if saved is None:
+            result = await Runner.run(agent, "run commands", run_config=run_config)
+            state = result.to_state()
+            for interruption in result.interruptions:
+                state.approve(interruption)
+            if how == "continue_as_new":
+                workflow.continue_as_new(args=[how, state.to_string()])
+            self._paused = True
+            if how == "on_signal":
+                await workflow.wait_condition(lambda: self._resume)
+        else:
+            state = await RunState.from_string(agent, saved)
+        resumed = await Runner.run(agent, state, run_config=run_config)
+        return "\n".join(
+            str(item.output)
+            for item in resumed.new_items
+            if item.type == "tool_call_output_item"
+        )
+
+
+_APPROVAL_RESPONSES = [
+    ResponseBuilders.tool_call(
+        '{"cmd": "first"}', "run_now", call_id="call-first", item_id="item-first"
+    ),
+    ResponseBuilders.tool_call(
+        '{"cmd": "second"}',
+        "run_approved",
+        call_id="call-second",
+        item_id="item-second",
+    ),
+    ResponseBuilders.output_message("Done."),
+]
+
+
+def _on_host_client(
+    client: Client,
+    backend: _LifecycleSandboxClient,
+    worker_name: str,
+    responses: list[ModelResponse] | None = None,
+) -> Client:
+    plugin = OpenAIAgentsPlugin(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30)
+        ),
+        model_provider=TestModelProvider(
+            TestModel.returning_responses(responses or [])
+        ),
+        sandbox_clients=[
+            OnHostSandboxClientProvider("lifecycle", backend, worker_name=worker_name)
+        ],
+    )
+    config = client.config()
+    config["plugins"] = [plugin]
+    return Client(**config)
+
+
+async def _until_created(handle: WorkflowHandle[Any, str]) -> None:
+    while not await handle.query(OnHostOperationsWorkflow.session_created):
+        await asyncio.sleep(0.1)
+
+
+async def _scheduled_queues(handle: WorkflowHandle[Any, Any]) -> list[tuple[str, str]]:
+    return [
+        (
+            event.activity_task_scheduled_event_attributes.activity_type.name,
+            event.activity_task_scheduled_event_attributes.task_queue.name,
+        )
+        for event in (await handle.fetch_history()).events
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+
+
+async def test_every_operation_on_an_on_host_sandbox_runs_on_the_worker_that_created_it(
+    client: Client,
+):
+    first = _LifecycleSandboxClient()
+    second = _LifecycleSandboxClient()
+    commands = ["a", "b", "c", "d", "e", "f"]
+    task_queue = str(uuid.uuid4())
+
+    async with new_worker(
+        _on_host_client(client, first, "A"),
+        OnHostOperationsWorkflow,
+        task_queue=task_queue,
+        max_cached_workflows=0,
+    ) as worker_a:
+        # Only A runs, so A creates the sandbox.
+        handle = await worker_a.client.start_workflow(
+            OnHostOperationsWorkflow.run,
+            commands,
+            id=f"on-host-operations-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        await _until_created(handle)
+        # B, as another process would, has its own connection. It also polls the
+        # shared queue, so it runs some of the Workflow Tasks and could take any
+        # Activity sent there.
+        other_connection = await Client.connect(
+            client.service_client.config.target_host, namespace=client.namespace
+        )
+        async with new_worker(
+            _on_host_client(other_connection, second, "B"),
+            OnHostOperationsWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            await handle.signal(OnHostOperationsWorkflow.proceed)
+            output = await handle.result()
+        queues = await _scheduled_queues(handle)
+
+    assert output == "\n".join(
+        f"#1 ran {','.join(commands[: i + 1])}" for i in range(len(commands))
+    )
+    assert queues[0] == ("lifecycle-sandbox_client_create", task_queue)
+    assert {queue for _, queue in queues[1:]} == {"lifecycle@A"}
+    assert first.events == ["create#1", *["exec#1"] * len(commands), "delete#1"]
+    assert second.events == []
+
+
+async def test_a_restart_in_the_middle_of_a_step_loses_an_on_host_sandbox_and_deleting_it_does_nothing(
+    client: Client,
+):
+    before = _LifecycleSandboxClient()
+    after = _LifecycleSandboxClient()
+    task_queue = str(uuid.uuid4())
+
+    async with new_worker(
+        _on_host_client(client, before, "restarted"),
+        OnHostOperationsWorkflow,
+        task_queue=task_queue,
+    ) as worker:
+        handle = await worker.client.start_workflow(
+            OnHostOperationsWorkflow.run,
+            ["a"],
+            id=f"on-host-restart-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        await _until_created(handle)
+
+    # The new process has the same name, so it polls the same queue, but holds no
+    # sandbox.
+    async with new_worker(
+        _on_host_client(client, after, "restarted"),
+        OnHostOperationsWorkflow,
+        task_queue=task_queue,
+    ):
+        await handle.signal(OnHostOperationsWorkflow.proceed)
+        output = await handle.result()
+
+    assert output == "failed: SandboxLost"
+    assert after.events == []
+    # The plugin doesn't clean up the sandbox the old process left behind.
+    assert before.live == [1]
+    failures = [
+        event.activity_task_failed_event_attributes.failure
+        for event in (await handle.fetch_history()).events
+        if event.HasField("activity_task_failed_event_attributes")
+    ]
+    # SandboxLost is not retried, and the delete succeeds.
+    assert len(failures) == 1
+    assert failures[0].application_failure_info.non_retryable
+
+
+@pytest.mark.parametrize("how", ["in_place", "continue_as_new"])
+async def test_an_on_host_sandbox_comes_back_after_an_approval_pause(
+    client: Client, how: str
+):
+    backend = _LifecycleSandboxClient()
+    task_queue = str(uuid.uuid4())
+
+    async with new_worker(
+        _on_host_client(client, backend, "paused", _APPROVAL_RESPONSES),
+        OnHostApprovalWorkflow,
+        task_queue=task_queue,
+    ) as worker:
+        handle = await worker.client.start_workflow(
+            OnHostApprovalWorkflow.run,
+            args=[how, None],
+            id=f"on-host-approval-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        output = await handle.result()
+        # The resumed run, after a continue-as-new.
+        queues = await _scheduled_queues(worker.client.get_workflow_handle(handle.id))
+
+    # The resumed run's items include the paused run's, and the second command
+    # ran in the same workspace as the first.
+    assert output == "#1 ran first\n#1 ran first,second"
+    # OpenAI's SDK deletes the sandbox at the pause and resumes it after.
+    assert backend.events == [
+        "create#1",
+        "exec#1",
+        "delete#1",
+        "resume#1",
+        "exec#1",
+        "delete#1",
+    ]
+    assert ("lifecycle-sandbox_client_resume", "lifecycle@paused") in queues
+    for name, queue in queues:
+        if name.startswith("lifecycle-") and name != "lifecycle-sandbox_client_create":
+            assert queue == "lifecycle@paused", name
+
+
+async def test_an_on_host_sandbox_paused_across_a_worker_restart_comes_back_through_the_backends_resume(
+    client: Client,
+):
+    # The same machine, so the backend finds the sandbox's saved workspace.
+    machine = _LifecycleSandboxClient()
+    task_queue = str(uuid.uuid4())
+
+    async with new_worker(
+        _on_host_client(client, machine, "restarted", _APPROVAL_RESPONSES[:2]),
+        OnHostApprovalWorkflow,
+        task_queue=task_queue,
+    ) as worker:
+        handle = await worker.client.start_workflow(
+            OnHostApprovalWorkflow.run,
+            args=["on_signal", None],
+            id=f"on-host-approval-restart-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        while not await handle.query(OnHostApprovalWorkflow.paused):
+            await asyncio.sleep(0.1)
+
+    # A new process with the same name, which holds no sandbox.
+    async with new_worker(
+        _on_host_client(client, machine, "restarted", _APPROVAL_RESPONSES[2:]),
+        OnHostApprovalWorkflow,
+        task_queue=task_queue,
+    ):
+        await handle.signal(OnHostApprovalWorkflow.resume)
+        output = await handle.result()
+
+    # The resumed run's items include the paused run's, and the second command
+    # ran in the same workspace as the first.
+    assert output == "#1 ran first\n#1 ran first,second"
+    assert machine.events == [
+        "create#1",
+        "exec#1",
+        "delete#1",
+        "resume#1",
+        "exec#1",
+        "delete#1",
+    ]
+    assert ("lifecycle-sandbox_client_resume", "lifecycle@restarted") in (
+        await _scheduled_queues(handle)
+    )
 
 
 # ── JsonSafeBytes lossless serialization tests ──

@@ -12,7 +12,8 @@ import { ensureActivityTracingProcessorRegistered } from './activity-tracing';
 import { makeAgentTracingSink } from './agent-sink-bridge';
 import type { HostedToolCredentialsResolver } from './hosted-tool-credentials';
 import type { StatelessMCPServerProvider } from './mcp-provider';
-import type { SandboxClientProvider } from './sandbox-provider';
+import { OnHostSandboxClientProvider } from './on-host-sandbox-provider';
+import type { ActivityFunction, SandboxClientProvider } from './sandbox-provider';
 import { StatefulMCPServerProvider } from './stateful-mcp-provider';
 import {
   OpenAIAgentsTraceActivityInboundInterceptor,
@@ -58,6 +59,28 @@ function sameSources(a: object, b: object): boolean {
   return x !== undefined && y !== undefined && x.length === y.length && x.every((v, i) => v === y[i]);
 }
 
+// Marks the options of an OnHostSandboxClientProvider's Worker, which a plugin on the NativeConnection
+// would otherwise configure as a main Worker.
+const ON_HOST_WORKER_OPTIONS = Symbol('OpenAIAgentsPlugin.onHostWorkerOptions');
+
+// The running Workers of OnHostSandboxClientProviders, which start no on-host Workers of their own.
+const onHostWorkers = new WeakSet<Worker>();
+
+/** An `OnHostSandboxClientProvider` and the Activities its Worker registers. */
+interface OnHostProvider {
+  provider: OnHostSandboxClientProvider;
+  activities: Record<string, ActivityFunction>;
+}
+
+/**
+ * Ends a Worker that has not started polling. There is no public way to stop one. With Core shut down
+ * first, the pollers end at once and run()'s own teardown releases the connection.
+ */
+async function discardUnstarted(worker: Worker, run: (worker: Worker) => Promise<void>): Promise<void> {
+  (worker as unknown as { nativeWorker: { initiateShutdown(): void } }).nativeWorker.initiateShutdown();
+  await run(worker).catch(() => undefined);
+}
+
 /**
  * Options controlling trace interceptor behavior on both the Activity side
  * (directly) and the Workflow side (via header propagation).
@@ -81,9 +104,13 @@ export interface OpenAIAgentsPluginOptions {
    * Sandbox client providers whose Activities will be auto-registered.
    * Reference them from Workflows via `temporalSandboxClient(name)`.
    *
+   * The Worker also runs an extra Worker, on the same connection, for each
+   * `OnHostSandboxClientProvider`: it polls the provider's per-process Task Queue,
+   * starts when the Worker runs and stops with it.
+   *
    * @experimental Sandbox support is experimental and may change without notice.
    */
-  sandboxClientProviders?: SandboxClientProvider[];
+  sandboxClientProviders?: Array<SandboxClientProvider | OnHostSandboxClientProvider>;
   /**
    * Resolves credentials for the hosted tools an Agent declares — a hosted MCP
    * tool's `authorization` and `headers`, a shell or code interpreter tool's
@@ -145,6 +172,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
   // The provider each provider Activity comes from, by Activity name, for the error message.
   private readonly activityProviders: ReadonlyMap<string, string>;
   private readonly tracingApiKey?: TracingApiKeyResolver;
+  private readonly onHostProviders: readonly OnHostProvider[];
 
   constructor(options: OpenAIAgentsPluginOptions) {
     const modelActivities = createModelActivity(options.modelProvider, options.hostedToolCredentials);
@@ -166,6 +194,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
     ];
     const seenNames = new Set<string>();
     const activityProviders = new Map<string, string>();
+    const onHostProviders: OnHostProvider[] = [];
     for (const provider of providers) {
       if (seenNames.has(provider.name)) {
         throw new Error(
@@ -180,6 +209,9 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
       for (const [name, fn] of Object.entries(providerActivities)) {
         activitySources.set(fn, [name, provider]);
         activityProviders.set(name, shownName);
+      }
+      if (provider instanceof OnHostSandboxClientProvider) {
+        onHostProviders.push({ provider, activities: providerActivities });
       }
       allActivities = { ...allActivities, ...providerActivities };
     }
@@ -228,6 +260,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
     });
     this.activityProviders = activityProviders;
     this.tracingApiKey = options.tracingApiKey;
+    this.onHostProviders = onHostProviders;
   }
 
   /**
@@ -239,6 +272,8 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
    * Activities that a plugin applied later replaces are refused by {@link runWorker}.
    */
   override configureWorker(options: WorkerOptions): WorkerOptions {
+    // The Worker of an OnHostSandboxClientProvider gets what it needs from its main Worker.
+    if ((options as { [ON_HOST_WORKER_OPTIONS]?: boolean })[ON_HOST_WORKER_OPTIONS] === true) return options;
     const existing = options.activities as Record<string, unknown> | undefined;
     for (const [name, fn] of Object.entries(this.options.activities as object)) {
       const other = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
@@ -255,26 +290,75 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
   }
 
   /**
-   * Runs the Worker.
+   * Runs the Worker, and with it a Worker for each `OnHostSandboxClientProvider`. When one of them
+   * stops, the others are shut down.
    *
    * @throws TypeError, before the Worker polls, if a plugin applied after this one replaced one of
    * its Activities with a different one. `Worker.create` applies the Worker's plugins in order, then
    * the `NativeConnection`'s.
    */
   override async runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    if (onHostWorkers.has(worker)) return next(worker);
     for (const [name, fn] of Object.entries(this.options.activities as object)) {
       const kept = worker.options.activities.get(name);
       if (kept === undefined || kept === fn || sameSources(kept, fn)) continue;
-      // There is no public way to stop a Worker that has not run yet. With Core shut down first, the
-      // pollers end at once and run()'s own teardown releases the connection.
-      (worker as unknown as { nativeWorker: { initiateShutdown(): void } }).nativeWorker.initiateShutdown();
-      await next(worker).catch(() => undefined);
+      await discardUnstarted(worker, next);
       throw new TypeError(
         `Duplicate registration of Activity '${name}': a plugin applied after OpenAIAgentsPlugin replaced its ` +
           `Activity with this name. ${this.remedy(name)}`
       );
     }
-    return super.runWorker(worker, next);
+    return super.runWorker(worker, (main) => this.runWithOnHostWorkers(main, next));
+  }
+
+  private async runWithOnHostWorkers(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    const { connection } = worker;
+    if (this.onHostProviders.length === 0 || connection === undefined) return next(worker);
+    const { Worker: WorkerClass } = await import('@temporalio/worker');
+    const onHost: Worker[] = [];
+    try {
+      for (const { provider, activities } of this.onHostProviders) {
+        // Its sandbox operations ran on the main Worker before, so they keep its data converter and
+        // Activity interceptors.
+        const options: WorkerOptions = {
+          connection,
+          namespace: worker.options.namespace,
+          taskQueue: provider.taskQueue,
+          activities,
+          dataConverter: worker.options.dataConverter,
+          interceptors: { activity: worker.options.interceptors.activity },
+        };
+        let created: Worker;
+        try {
+          created = await WorkerClass.create(Object.assign(options, { [ON_HOST_WORKER_OPTIONS]: true }));
+        } catch (err) {
+          // Core refuses a second Worker on the queue, such as from another Worker in this process that
+          // uses the provider, or another provider with the same name and Worker name.
+          throw new Error(
+            `Cannot start the Worker of OnHostSandboxClientProvider '${provider.name}' on Task Queue ` +
+              `'${provider.taskQueue}': ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err }
+          );
+        }
+        onHostWorkers.add(created);
+        onHost.push(created);
+      }
+    } catch (err) {
+      await Promise.all([
+        discardUnstarted(worker, next),
+        ...onHost.map((created) => discardUnstarted(created, (w) => w.run())),
+      ]);
+      throw err;
+    }
+    const all = [worker, ...onHost];
+    const stopAll = () => {
+      for (const w of all) if (w.getState() === 'RUNNING') w.shutdown();
+    };
+    const results = await Promise.allSettled(
+      [next(worker), ...onHost.map((w) => w.run())].map((run) => run.finally(stopAll))
+    );
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failed) throw failed.reason;
   }
 
   override configureReplayWorker(options: ReplayWorkerOptions): ReplayWorkerOptions {

@@ -93,12 +93,18 @@ export interface SerializedSandboxSessionState {
   exposedPorts?: Record<string, ExposedPortEndpoint>;
   /** Output of the real client's `serializeSessionState`. */
   providerState: Record<string, unknown>;
+  /**
+   * The Task Queue of the Worker process that holds the session, set by an `OnHostSandboxClientProvider`.
+   * Every operation on the session is sent there.
+   */
+  taskQueue?: string;
 }
 
 /** Workflow-side session state: the serialized handle with a live `Manifest`. */
 export interface TemporalSandboxSessionState extends SandboxSessionState {
   sessionId: string;
   providerState: Record<string, unknown>;
+  taskQueue?: string;
 }
 
 export interface SandboxSessionResult {
@@ -355,12 +361,19 @@ export function decodeManifest(encoded: EncodedManifest, resolvableWorkerEnvVars
   }
 }
 
+export interface SessionEnvelopeOptions {
+  /** Whether a state that doesn't say if its workspace is ready gets `workspaceReady: true`. @default true */
+  defaultWorkspaceReady?: boolean;
+  /** The Task Queue of the Worker process that holds the session. */
+  taskQueue?: string;
+}
+
 /** Builds the transported session handle, with the manifest encoded via {@link encodeManifest}. */
 export function serializeSessionEnvelope(
   sessionId: string,
   state: SandboxSessionState,
   providerState: Record<string, unknown>,
-  defaultWorkspaceReady = true
+  { defaultWorkspaceReady = true, taskQueue }: SessionEnvelopeOptions = {}
 ): SerializedSandboxSessionState {
   return {
     sessionId,
@@ -377,7 +390,13 @@ export function serializeSessionEnvelope(
         : {}),
     ...(state.exposedPorts ? { exposedPorts: state.exposedPorts } : {}),
     providerState,
+    ...(taskQueue !== undefined ? { taskQueue } : {}),
   };
+}
+
+/** Builds the transported handle of a Workflow-side session state, with its Task Queue if it has one. */
+export function serializeWorkflowSessionState(state: TemporalSandboxSessionState): SerializedSandboxSessionState {
+  return serializeSessionEnvelope(state.sessionId, state, state.providerState, { taskQueue: state.taskQueue });
 }
 
 /**
@@ -404,7 +423,7 @@ export function reviveWorkflowSessionState(payload: SerializedSandboxSessionStat
  * own resume path.
  */
 export function toSdkStateRecord(payload: SerializedSandboxSessionState): Record<string, unknown> {
-  const { sessionId: _sessionId, manifest, providerState, ...rest } = payload;
+  const { sessionId: _sessionId, taskQueue: _taskQueue, manifest, providerState, ...rest } = payload;
   return { ...(providerState ?? {}), ...rest, manifest };
 }
 
