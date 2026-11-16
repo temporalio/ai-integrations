@@ -195,8 +195,12 @@ class _ConnectionRecord:
             pass
 
     async def session(self) -> ClientSession:
-        """Return the live session, or raise the connect failure."""
-        return await self._ready
+        """Return the live session, or raise the connect failure.
+
+        The wait is shielded. Cancelling this caller must not cancel the shared
+        connect future, or any other caller waiting on the same connection.
+        """
+        return await asyncio.shield(self._ready)
 
 
 async def get_connection(

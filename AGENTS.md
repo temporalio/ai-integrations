@@ -73,6 +73,7 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - If something doesn't work in the framework itself, because it's unsupported or because of a framework bug, the plugin doesn't have to make it work either. Document the limit in the README. Fix framework bugs upstream, not with a plugin workaround, and raise the dependency floor once the fix ships.
 - Run the framework's own code and hook in through its extension points. Don't copy its objects or depend on their private fields; copies drift from upstream.
 - A behavior change that can alter recorded histories must be gated with a patch, or called out as breaking in the PR with guidance for in-flight runs. This takes precedence over the rules above.
+- Replay is promised only within a major version. Histories from releases of the same major must replay on every later release of that major; across majors there is no promise. A gate that only keeps an older major's runs replaying is removed before the next major ships. Committed replay histories go in a folder per major (`histories/<major>.x/`, `0.x/` below 1.0), and each replay test's `REPLAY_MAJOR` constant names the plugin's current major, the major of its next release, so CI replays only that folder. Older majors' folders stay in the repo.
 
 ## Plugin contract
 

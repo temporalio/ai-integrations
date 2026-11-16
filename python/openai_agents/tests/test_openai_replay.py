@@ -24,37 +24,25 @@ from tests.test_openai import (
     ToolsWorkflow,
 )
 
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 2
+HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
+
 
 @pytest.mark.parametrize(
     "file_name",
     [
-        "agents-as-tools-workflow-history.json",
-        # Recorded on main at 9b6b4c4, which runs copies of the agents: no timer. Without
-        # the openai_agents.run-caller-agents patch, it fails replay.
-        "caller-agent-workflow-history.json",
         # Recorded on this version, with the patch marker: the run gets its own agent back.
         "caller-agent-marker-workflow-history.json",
-        "customer-service-workflow-history.json",
-        "hello-workflow-history.json",
-        "input-guardrail-workflow-history.json",
-        "output-guardrail-workflow-history.json",
-        "research-workflow-history.json",
-        "run-model-provider-workflow-history.json",
-        # Recorded on main at ea04762 with the workflow worker stopped, so
-        # that one activation resolves a stateful MCP call together with
-        # another activity (gather) or with a workflow cancel (cancel).
-        "stateful-mcp-cancel-workflow-history.json",
-        "stateful-mcp-gather-workflow-history.json",
-        "stateful-mcp-gather-wait-workflow-history.json",
         # Recorded on this version, with the patch marker.
         "stateful-mcp-cancel-wait-marker-workflow-history.json",
         "stateful-mcp-gather-wait-marker-workflow-history.json",
         "tools-workflow-callable-class-history.json",
-        "tools-workflow-history.json",
     ],
 )
 async def test_replay(file_name: str) -> None:
-    with (Path(__file__).with_name("histories") / file_name).open("r") as f:
+    with (HISTORIES / file_name).open("r") as f:
         history_json = f.read()
 
     with warnings.catch_warnings(record=True) as recorder:

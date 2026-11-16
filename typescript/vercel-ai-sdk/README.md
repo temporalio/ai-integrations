@@ -76,10 +76,8 @@ model call that downloaded a file returns no `request.body`. An
 `experimental_download` function given to `generateText` runs in the Workflow
 and is told that the model supports every URL.
 
-This change is behind a Workflow patch. An execution that started on an earlier
-version replays as it ran then, so an Activity that its `experimental_download`
-function scheduled still matches its Event History. The new behavior starts
-with the first model call that is not a replay.
+An execution that started on 1.x, in which an `experimental_download` function
+scheduled an Activity for a URL, doesn't replay on this version.
 
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
@@ -173,9 +171,8 @@ fails with `AbortSignal is not defined`, and `stepMs` fails with
 `DOMException is not defined` when its timer fires. Use the Activity
 `startToCloseTimeout` instead.
 
-The cancellation is behind a Workflow patch. An execution that started on an
-earlier version replays as it ran then, when an abort sent no command. The new
-behavior starts with the first model call that is not a replay. A call without
-an `abortSignal` records no patch marker.
+An execution that started on 1.x, in which a signal aborted while a model or
+embedding call ran, doesn't replay on this version: on 1.x the abort sent no
+command.
 
 Development details are in [typescript/README.md](../README.md).
