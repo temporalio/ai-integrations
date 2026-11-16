@@ -33,11 +33,13 @@ HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
 @pytest.mark.parametrize(
     "file_name",
     [
-        # Recorded on this version, with the patch marker: the run gets its own agent back.
-        "caller-agent-marker-workflow-history.json",
-        # Recorded on this version, with the patch marker.
-        "stateful-mcp-cancel-wait-marker-workflow-history.json",
-        "stateful-mcp-gather-wait-marker-workflow-history.json",
+        # The run gets its own agent back, so it starts a timer.
+        "caller-agent-workflow-history.json",
+        # Recorded with the workflow worker stopped, so that one activation
+        # resolves a stateful MCP call together with another activity (gather)
+        # or with a workflow cancel (cancel).
+        "stateful-mcp-cancel-wait-workflow-history.json",
+        "stateful-mcp-gather-wait-workflow-history.json",
         "tools-workflow-callable-class-history.json",
     ],
 )
