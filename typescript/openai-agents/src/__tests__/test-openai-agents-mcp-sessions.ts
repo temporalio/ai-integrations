@@ -212,9 +212,9 @@ const REPLAY_MAJOR = 2;
 
 test('Stateful MCP: recorded histories replay', async (t) => {
   for (const name of [
-    // Recorded with the patch marker: a caller's cancellation of calls to two
-    // servers, one without a schedule-to-start timeout.
-    'stateful-mcp-caller-cancel-marker.json',
+    // A caller's cancellation of calls to two servers, one without a
+    // schedule-to-start timeout.
+    'stateful-mcp-caller-cancel.json',
   ]) {
     const file = path.resolve(__dirname, '../../src/__tests__/histories', `${REPLAY_MAJOR}.x`, name);
     const history = historyFromJSON(JSON.parse(fs.readFileSync(file, 'utf8')));
