@@ -270,10 +270,16 @@ Without heartbeats, a running call cannot receive cancellation. This includes
 interaction streams, which earlier versions heartbeated once per event even
 without a heartbeat timeout.
 
+Heartbeats show that the worker is alive; they don't track stream progress.
+A quiet interaction stream can stay alive until its HTTP timeout or
+`start_to_close_timeout`, instead of failing when no event arrives within
+`heartbeat_timeout`.
+
 Temporal caps `heartbeat_timeout` at `start_to_close_timeout`, including one set
 per model call with `http_options.timeout`, or with the Interactions and Agents
-`timeout` argument, so a shorter one makes beats come sooner. File and file
-search store uploads pass `http_options.timeout` to the HTTP client instead.
+`timeout` argument, so a shorter one makes beats come sooner. `files.upload`,
+`files.download`, `files.register_files`, and file search store uploads pass
+`http_options.timeout` to the HTTP client instead.
 
 The timer runs on the worker's event loop. Blocking the loop can cause heartbeat
 timeouts in every activity sharing it. On Vertex AI, `interactions` and `agents`
@@ -281,10 +287,11 @@ calls refresh credentials on the loop: on the first call, then about once an
 hour. A slow refresh can also fail other running Gemini calls. If that can be
 slow, set a longer `heartbeat_timeout`, or `None`.
 
-**Breaking change when you upgrade or roll back:** earlier versions don't
-heartbeat on a timer. While both versions run, a call that this version
-schedules and an older worker runs fails after 10 seconds without a heartbeat,
-and so does each retry.
+**Breaking change when you upgrade or roll back:**
+[PR #551](https://github.com/temporalio/ai-integrations/pull/551) adds timer
+heartbeats and the 10-second default. A call scheduled with this default and
+run by a worker without timer heartbeats fails after 10 seconds without a
+heartbeat, and so does each retry.
 
 - To upgrade, deploy this version to the workers that run the Gemini activities
   first. If the same workers run workflows too, deploy it with

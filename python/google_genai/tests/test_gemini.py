@@ -2460,8 +2460,9 @@ async def _run_real_activity(
             self.token = "fake-token"
 
     caller = GeminiApiCaller(gemini, credentials=StaticCredentials())
-    fn = next(a for a in caller.activities() if a.__name__ == activity_name)
-    return await (env or ActivityEnvironment()).run(fn, req)
+    activities = {fn.__name__: fn for fn in caller.activities()}
+    assert set(activities) == {name for name, _ in _ALL_ACTIVITIES}
+    return await (env or ActivityEnvironment()).run(activities[activity_name], req)
 
 
 def _heartbeat_counting_env(
