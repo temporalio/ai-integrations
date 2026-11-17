@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -205,7 +206,13 @@ async def test_other_bad_request_keeps_its_type() -> None:
 
 def test_unrecoverable_overflow_fails_the_workflow_not_its_task() -> None:
     config: Any = DeepAgentsPlugin().configure_worker(
-        {"task_queue": "q", "workflow_runner": SandboxedWorkflowRunner()}
+        {
+            "task_queue": "q",
+            "workflow_runner": SandboxedWorkflowRunner(),
+            # A Worker passes its client, which SimplePlugin reads to add the
+            # plugin's interceptor.
+            "client": SimpleNamespace(config=lambda **_: {}),
+        }
     )
     assert ContextOverflowError in config["workflow_failure_exception_types"]
 
