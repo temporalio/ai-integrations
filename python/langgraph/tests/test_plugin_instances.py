@@ -20,6 +20,7 @@ from temporalio import workflow
 from temporalio.client import Client
 from temporalio.langgraph import LangGraphPlugin, entrypoint, graph
 from temporalio.worker import Interceptor, Replayer, Worker
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 
 class State(TypedDict):
@@ -151,15 +152,26 @@ async def test_worker_applies_one_instance_once(
     assert result == {"value": "first"}
 
 
+@pytest.mark.filterwarnings("ignore:The same plugin type")
+@pytest.mark.parametrize(
+    ("on_client", "on_worker"),
+    [(0, 1), (0, 2), (1, 1)],
+    ids=["once-on-worker", "twice-on-worker", "on-client-and-worker"],
+)
+@pytest.mark.parametrize("execute_in", ["activity", "workflow"])
 async def test_worker_built_from_another_workers_interceptors_is_configured(
-    client: Client,
+    client: Client, on_client: int, on_worker: int, execute_in: str
 ) -> None:
     """The active interceptors of a Worker include the plugin's own.
 
-    A Worker that gets them, and lists the instance once, still gets the
-    instance's Activities.
+    A Worker that gets them still applies the plugin's complete configuration,
+    including when the same instance is listed more than once.
     """
-    plugin = graph_plugin("my-graph")
+    g = one_node_graph(first_node)
+    g.nodes["node"].metadata = {"execute_in": execute_in}
+    plugin = LangGraphPlugin(
+        graphs={"my-graph": g}, default_activity_options=_DEFAULT_ACTIVITY_OPTIONS
+    )
     other = Worker(
         client,
         task_queue=f"plugin-instances-{uuid4()}",
@@ -167,16 +179,29 @@ async def test_worker_built_from_another_workers_interceptors_is_configured(
         plugins=[plugin],
     )
 
+    client = client_with(client, [plugin] * on_client)
+    task_queue = f"plugin-instances-{uuid4()}"
     worker = Worker(
         client,
-        task_queue=f"plugin-instances-{uuid4()}",
+        task_queue=task_queue,
         workflows=[NamedGraphWorkflow],
         interceptors=other.config(active_config=True).get("interceptors", []),
-        plugins=[plugin],
+        plugins=[plugin] * on_worker,
     )
 
     config = worker.config(active_config=True)
     assert list(config.get("activities", [])) == plugin.activities
+    assert list(config.get("interceptors", [])) == list(plugin.interceptors or [])
+    runner = config.get("workflow_runner")
+    assert isinstance(runner, SandboxedWorkflowRunner)
+    assert {"langgraph", "langchain_core"} <= runner.restrictions.passthrough_modules
+    async with worker:
+        assert await client.execute_workflow(
+            NamedGraphWorkflow.run,
+            "my-graph",
+            id=f"test-workflow-{uuid4()}",
+            task_queue=task_queue,
+        ) == {"value": "first"}
 
 
 async def test_workers_in_one_process_use_their_own_instance(client: Client) -> None:

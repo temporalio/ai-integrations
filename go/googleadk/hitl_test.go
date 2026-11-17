@@ -2,6 +2,7 @@ package googleadk_test
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,6 +37,8 @@ type hitlResult struct {
 	Paused bool
 	// PendingHint is the hint the paused tool supplied.
 	PendingHint string
+	// PendingID is the call ID of the pending confirmation.
+	PendingID string
 	// ResumedTexts are the model texts produced after the human approves.
 	ResumedTexts []string
 	// ResumedToolResponses are the tool response names seen on the resume pass (the
@@ -57,7 +60,9 @@ type hitlResult struct {
 // Modeling this as a two-pass loop over one shared session (rather than a signal
 // round-trip) keeps it fully deterministic in the test environment while still
 // exercising the real PendingConfirmations / ConfirmationResponse helpers.
-func hitlWorkflow(ctx workflow.Context) (hitlResult, error) {
+//
+// unusedTools adds that many tools the model never calls.
+func hitlWorkflow(ctx workflow.Context, unusedTools int) (hitlResult, error) {
 	danger, err := funcTool("danger", func(tctx agent.Context, _ map[string]any) (map[string]any, error) {
 		// On the first invocation there is no confirmation yet: request one and
 		// return without doing the work. On the resumed invocation ADK supplies a
@@ -75,7 +80,16 @@ func hitlWorkflow(ctx workflow.Context) (hitlResult, error) {
 		return hitlResult{}, err
 	}
 
-	root, err := newHITLRunner(ctx, danger)
+	tools := []tool.Tool{danger}
+	for i := range unusedTools {
+		unused, err := noopTool(fmt.Sprintf("unused_%d", i), "never called")
+		if err != nil {
+			return hitlResult{}, err
+		}
+		tools = append(tools, unused)
+	}
+
+	root, err := newHITLRunner(ctx, tools)
 	if err != nil {
 		return hitlResult{}, err
 	}
@@ -101,6 +115,7 @@ func hitlWorkflow(ctx workflow.Context) (hitlResult, error) {
 	}
 	res.Paused = true
 	res.PendingHint = pending[0].Hint
+	res.PendingID = pending[0].FunctionCallID
 
 	// --- Pass 2: simulate the human approving, then resume. ---
 	resume := googleadk.ConfirmationResponse(googleadk.ConfirmationDecision{
@@ -131,8 +146,8 @@ func hitlWorkflow(ctx workflow.Context) (hitlResult, error) {
 
 // newHITLRunner builds an llmagent + runner sharing one session across the two
 // Run passes so the resume sees the pending confirmation in history.
-func newHITLRunner(_ workflow.Context, danger tool.Tool) (*runner.Runner, error) {
-	root, err := hitlAgent(danger)
+func newHITLRunner(_ workflow.Context, tools []tool.Tool) (*runner.Runner, error) {
+	root, err := hitlAgent(tools)
 	if err != nil {
 		return nil, err
 	}
@@ -144,13 +159,13 @@ func newHITLRunner(_ workflow.Context, danger tool.Tool) (*runner.Runner, error)
 	})
 }
 
-func hitlAgent(danger tool.Tool) (agent.Agent, error) {
+func hitlAgent(tools []tool.Tool) (agent.Agent, error) {
 	return llmagent.New(llmagent.Config{
 		Name:        "assistant",
 		Description: "root assistant",
 		Model:       googleadk.NewModel("fake-model"),
 		Instruction: "be helpful",
-		Tools:       []tool.Tool{danger},
+		Tools:       tools,
 	})
 }
 
@@ -158,7 +173,8 @@ func hitlAgent(danger tool.Tool) (agent.Agent, error) {
 // round-trip: a guarded in-workflow tool pauses the agent via
 // RequestConfirmation, PendingConfirmations surfaces the pause, and a
 // ConfirmationResponse carrying an approval resumes the run so the tool actually
-// executes.
+// executes. An unused tool added to the agent must not change the pending
+// confirmation's call ID, which a client may already have read.
 func TestHITLConfirmationResumesTool(t *testing.T) {
 	hitlToolRan.Store(false)
 
@@ -174,7 +190,7 @@ func TestHITLConfirmationResumesTool(t *testing.T) {
 		},
 	})
 
-	env.ExecuteWorkflow(hitlWorkflow)
+	env.ExecuteWorkflow(hitlWorkflow, 0)
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
@@ -187,6 +203,24 @@ func TestHITLConfirmationResumesTool(t *testing.T) {
 	// The guarded tool did NOT run until approval, then ran exactly once on resume.
 	assert.True(t, hitlToolRan.Load(), "the guarded tool must execute after the human approves")
 	assert.Contains(t, res.ResumedToolResponses, "danger", "the resumed tool response must be present")
+
+	// The same run with one more tool. The test environment uses a fixed run
+	// ID, so both runs draw from the same random stream.
+	env = s.NewTestWorkflowEnvironment()
+	env.RegisterWorkflow(hitlWorkflow)
+	wireActivities(t, env, googleadk.Config{
+		Models: map[string]googleadk.ModelFactory{
+			"fake-model": scriptedModelFactory(
+				googleadk.FunctionCallResponse("call-1", "danger", map[string]any{}),
+				googleadk.TextResponse("done: production data deleted"),
+			),
+		},
+	})
+	env.ExecuteWorkflow(hitlWorkflow, 1)
+	require.NoError(t, env.GetWorkflowError())
+	var withUnused hitlResult
+	require.NoError(t, env.GetWorkflowResult(&withUnused))
+	assert.Equal(t, res.PendingID, withUnused.PendingID, "an unused tool must not change the pending confirmation's call ID")
 }
 
 // ----------------------------------------------------------------------------
