@@ -56,6 +56,8 @@ from temporalio.deepagents.workflow import DeepAgentsWorkflowError
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import (
     ExecuteWorkflowInput,
+    HandleSignalInput,
+    HandleUpdateInput,
     Interceptor,
     WorkflowInboundInterceptor,
     WorkflowInterceptorClassInput,
@@ -513,7 +515,8 @@ class _SyncCallsInterceptor(Interceptor):
 
     The plugin does not wrap a Deep Agent run (``agent.ainvoke`` is LangGraph's
     own call), so this sets up each workflow's event loop when the workflow
-    starts.
+    starts, and when a signal or update handler runs, since one can run before
+    the run method does.
     """
 
     def workflow_interceptor_class(
@@ -528,6 +531,14 @@ class _SyncCallsInbound(WorkflowInboundInterceptor):
         _run_langchain_sync_calls_inline(asyncio.get_running_loop())
         return await super().execute_workflow(input)
 
+    async def handle_signal(self, input: HandleSignalInput) -> None:
+        _run_langchain_sync_calls_inline(asyncio.get_running_loop())
+        await super().handle_signal(input)
+
+    async def handle_update_handler(self, input: HandleUpdateInput) -> Any:
+        _run_langchain_sync_calls_inline(asyncio.get_running_loop())
+        return await super().handle_update_handler(input)
+
 
 def _run_langchain_sync_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
     """Make the workflow event loop run LangChain's thread calls inline.
@@ -536,8 +547,8 @@ def _run_langchain_sync_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
     code with its ``run_in_executor`` helper, which calls
     ``loop.run_in_executor``. The workflow event loop has no threads and raised
     ``NotImplementedError``, so a sync tool never ran. Only the helper's calls
-    for tools, output parsers and LangGraph steps run inline; any other
-    ``run_in_executor`` call, including the helper's calls for caches,
+    for tools, output parsers, runnables and LangGraph steps run inline; any
+    other ``run_in_executor`` call, including the helper's calls for caches,
     retrievers and other I/O, fails as before.
     """
     _run_inline_when_called_by(loop, _called_by_langchain)
@@ -577,14 +588,20 @@ def _run_inline_when_called_by(
 
 
 # The modules whose calls to LangChain's run_in_executor helper run inline:
-# tools, output parsers, and LangGraph's sync nodes and tasks. A sync router's
-# helper call is the coroutine of its own task, so its caller is the event
-# loop's handle in asyncio.events. The helper's other callers, such as caches,
-# retrievers, vector stores and ShellToolMiddleware, do I/O and fail as before.
-_INLINE_LANGCHAIN_CALLERS = (
+# tools, output parsers, RunnableLambda and other runnables with only a sync
+# invoke, and LangGraph's steps. LangGraph runs a sync router's helper call as
+# its own task, so the caller is the event loop's handle in asyncio.events; any
+# helper call started as its own task runs inline too. The helper's other
+# callers, such as caches, retrievers, vector stores and ShellToolMiddleware,
+# do I/O and fail as before.
+_INLINE_LANGCHAIN_CALLER_PACKAGES = (
     "langchain_core.tools.",
     "langchain_core.output_parsers.",
-    "langgraph.",
+)
+_INLINE_LANGCHAIN_CALLER_MODULES = (
+    "langchain_core.runnables.base",
+    "langgraph._internal._runnable",
+    "asyncio.events",
 )
 
 
@@ -597,4 +614,6 @@ def _called_by_langchain(frame: FrameType) -> bool:
         return False
     caller = frame.f_back
     module = caller.f_globals.get("__name__", "") if caller is not None else ""
-    return module == "asyncio.events" or module.startswith(_INLINE_LANGCHAIN_CALLERS)
+    return module in _INLINE_LANGCHAIN_CALLER_MODULES or module.startswith(
+        _INLINE_LANGCHAIN_CALLER_PACKAGES
+    )

@@ -229,16 +229,25 @@ tools, or tools added by middleware.
 Deep Agents' built-in file tools on the default state backend stay in-workflow
 by design.
 
-Sync tools, sync graph nodes and routers, and LangChain output parsers run
-directly in the workflow, not in a separate thread as LangChain runs them
-outside Temporal. This applies to every workflow on a worker with the plugin,
-not only Deep Agent runs. Like other workflow code, they run again on every
-replay, and the Workflow Task waits for them: one that takes more than two
-seconds fails the Workflow Task with a deadlock error. Other sync LangChain
-calls that it would run in a thread, such as a sync-only cache, retriever or
-vector store, or `ShellToolMiddleware`, still fail with `NotImplementedError`;
-run that work in activities. Sync LangChain calls in a signal or update handler
-that runs before the workflow's run method starts fail the same way.
+Sync tools, sync graph nodes and routers, LangChain output parsers, and sync
+`RunnableLambda`s (or other runnables with only a sync `invoke`) run directly in
+the workflow, not in a separate thread as LangChain runs them outside Temporal.
+So does any call to LangChain's `run_in_executor` helper that starts its own
+task, which is how LangGraph runs a sync router. This applies to every workflow
+on a worker with the plugin, not only Deep Agent runs. Like other workflow
+code, they run again on every replay, and the Workflow Task waits for them: one
+that takes more than two seconds fails the Workflow Task with a deadlock error.
+While one runs, LangChain runs async callback handlers on a separate thread, as
+it does outside Temporal, so keep them quick and don't call workflow APIs from
+them. Other sync LangChain calls that it would run in a thread, such as a
+sync-only cache, retriever or vector store, or `ShellToolMiddleware`, still fail
+with `NotImplementedError`; run that work in activities.
+
+**Breaking change:** a run recorded on an earlier version that caught this
+`NotImplementedError` from a sync tool, output parser, runnable, graph node or
+router, and then issued commands, can fail replay on this version with
+`[TMPRL1100]`. Let those runs finish on their original workers first, or keep
+them there with Worker Versioning.
 
 `activity_as_tool` takes every activity option through `activity_options`, an
 `ActivityConfig`: timeouts (`start_to_close_timeout` or

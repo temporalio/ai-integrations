@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from types import FrameType, SimpleNamespace
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Self, TypedDict
 
 import pytest
 
@@ -24,7 +24,8 @@ from temporalio.testing import WorkflowEnvironment
 pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
-from temporalio.common import RetryPolicy  # noqa: E402
+from temporalio.client import WithStartWorkflowOperation  # noqa: E402
+from temporalio.common import RetryPolicy, WorkflowIDConflictPolicy  # noqa: E402
 from temporalio.worker import Replayer, Worker  # noqa: E402
 from temporalio.workflow import ActivityConfig  # noqa: E402
 from tests.helpers.deepagents import (  # noqa: E402
@@ -56,6 +57,7 @@ TEN_SECONDS = ActivityConfig(start_to_close_timeout=timedelta(seconds=10))
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
+from langchain_core.output_parsers import JsonOutputParser  # noqa: E402
 from langchain_core.tools import StructuredTool, tool  # noqa: E402
 from langgraph.prebuilt import InjectedState  # noqa: E402
 from pydantic import BaseModel, ConfigDict, ValidationError  # noqa: E402
@@ -913,6 +915,80 @@ async def test_repeated_tool_calls_with_same_args_both_run(
     assert counts[INVOKE_TOOL] == 2, counts
 
 
+@workflow.defn
+class ParseInHandlerWorkflow:
+    def __init__(self) -> None:
+        self.parsed: Any = None
+
+    # Sent with the start, a signal or update runs before the run method does.
+    # aparse calls LangChain's helper without yielding to the event loop first.
+    @workflow.signal
+    async def parse(self, text: str) -> None:
+        self.parsed = await JsonOutputParser().aparse(text)
+
+    @workflow.update
+    async def parse_now(self, text: str) -> Any:
+        self.parsed = await JsonOutputParser().aparse(text)
+        return self.parsed
+
+    @workflow.run
+    async def run(self) -> Any:
+        await workflow.wait_condition(lambda: self.parsed is not None)
+        return self.parsed
+
+
+@pytest.mark.asyncio
+async def test_handlers_run_sync_langchain_calls_before_the_run_method(
+    env: WorkflowEnvironment,
+) -> None:
+    task_queue = f"da-handler-parse-{uuid.uuid4()}"
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[ParseInHandlerWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        handle = await env.client.start_workflow(
+            ParseInHandlerWorkflow.run,
+            id=f"da-signal-parse-{uuid.uuid4()}",
+            task_queue=task_queue,
+            start_signal="parse",
+            start_signal_args=['{"x": 1}'],
+            execution_timeout=timedelta(seconds=10),
+        )
+        assert await handle.result() == {"x": 1}
+
+        start = WithStartWorkflowOperation(
+            ParseInHandlerWorkflow.run,
+            id=f"da-update-parse-{uuid.uuid4()}",
+            task_queue=task_queue,
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+            execution_timeout=timedelta(seconds=10),
+        )
+        parsed = await env.client.execute_update_with_start_workflow(
+            ParseInHandlerWorkflow.parse_now,
+            '{"y": 2}',
+            start_workflow_operation=start,
+        )
+        assert parsed == {"y": 2}
+
+
+class Count(TypedDict):
+    n: int
+
+
+def count_step(state: Count) -> Count:
+    return {"n": state["n"] + 1}
+
+
+def increment(n: int) -> int:
+    return n + 1
+
+
+def count_route(state: Count) -> str:
+    return "done" if state["n"] > 1 else "again"
+
+
 def run_in_executor_from_other_framework(loop: asyncio.AbstractEventLoop) -> Any:
     return loop.run_in_executor(None, lambda: "other")
 
@@ -933,9 +1009,14 @@ def test_langchain_dispatch_composes_with_other_framework(
     # Another plugin, such as Strands, adds its caller to the same loop.
     from langchain.agents.middleware import ShellToolMiddleware
     from langchain_core.caches import BaseCache
-    from langchain_core.output_parsers import JsonOutputParser
+    from langchain_core.runnables import RunnableLambda
     from langchain_core.runnables import config as langchain_config
     from langchain_core.tools import StructuredTool
+    from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
+        END,
+        START,
+        StateGraph,
+    )
 
     class SyncOnlyCache(BaseCache):
         # Like LangChain's SQLite cache, it has no async methods of its own.
@@ -970,11 +1051,18 @@ def test_langchain_dispatch_composes_with_other_framework(
             loop.run_until_complete(langchain_config.run_in_executor(None, lambda: 42))
             == 42
         )
-        # So do its calls for a tool and for an output parser.
+        # So do its calls for a tool, an output parser and a RunnableLambda.
         tool = StructuredTool.from_function(func=add)
         assert loop.run_until_complete(tool.ainvoke({"a": 1, "b": 2})) == 3
         parsed = loop.run_until_complete(JsonOutputParser().ainvoke('{"x": 1}'))
         assert parsed == {"x": 1}
+        assert loop.run_until_complete(RunnableLambda(increment).ainvoke(1)) == 2
+        # And for a LangGraph graph's sync node and sync router.
+        graph = StateGraph(Count)
+        graph.add_node("step", count_step)
+        graph.add_edge(START, "step")
+        graph.add_conditional_edges("step", count_route, {"again": "step", "done": END})
+        assert loop.run_until_complete(graph.compile().ainvoke({"n": 0})) == {"n": 2}
         # Its calls for I/O, such as a cache or ShellToolMiddleware, still fail.
         with pytest.raises(NotImplementedError):
             loop.run_until_complete(SyncOnlyCache().alookup("prompt", "llm"))
