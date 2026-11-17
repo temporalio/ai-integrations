@@ -22,7 +22,8 @@ references, so neither survives a naive round-trip. This module owns:
 * a workflow-scoped result cache so model / tool results computed before a
   ``continue_as_new`` are reused rather than recomputed after it;
 * the sandbox passthrough module list covering LangChain's transitive
-  eager-import tree.
+  eager-import tree, and the optional provider modules imported before a
+  workflow runs.
 
 LangChain imports are deferred into the functions that need them, so importing
 this module — and constructing the plugin — does not require LangChain to be
@@ -554,6 +555,10 @@ _DEFAULT_PASSTHROUGH: tuple[str, ...] = (
     "langchain",
     "langchain_core",
     "langchain_anthropic",
+    # Optional provider packages: see _OPTIONAL_PROVIDER_MODULES.
+    "langchain_aws",
+    "langchain_fireworks",
+    "langchain_openai",
     "langgraph",
     "deepagents",
     "langsmith",
@@ -581,3 +586,44 @@ def resolve_passthrough_modules(user: Any) -> tuple[str, ...]:
     merged = [*_DEFAULT_PASSTHROUGH, *(user or ())]
     # dict.fromkeys preserves order while de-duplicating.
     return tuple(dict.fromkeys(merged))
+
+
+# deepagents and LangChain load these from Workflow code with
+# ``importlib.import_module`` when the package is installed: deepagents the
+# first two for every agent it builds, LangChain the third for each
+# provider-native structured-output call. The sandbox passes that call through
+# only for a module the process has already imported. Otherwise it runs the
+# module itself, and ``langchain_aws`` then fails where it reads ``os.environ``
+# at import.
+_OPTIONAL_PROVIDER_MODULES: tuple[str, ...] = (
+    "langchain_aws.middleware.prompt_caching",
+    "langchain_fireworks.middleware.prompt_caching",
+    "langchain_openai.chat_models.base",
+)
+
+
+def import_optional_provider_modules() -> None:
+    """Import the optional provider modules that are installed.
+
+    Called outside the sandbox, before a Workflow runs. A package that is not
+    installed, or a release of it without the module, is skipped, as deepagents
+    skips it. Any other failure is a warning, so a broken package does not stop
+    the Worker.
+    """
+    import importlib
+    import warnings
+
+    for name in _OPTIONAL_PROVIDER_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:
+            missing = exc.name if isinstance(exc, ImportError) else None
+            if missing and (name == missing or name.startswith(f"{missing}.")):
+                # Not installed, or a release without this module.
+                continue
+            warnings.warn(
+                f"DeepAgentsPlugin could not import {name} "
+                f"({type(exc).__name__}: {exc}); deepagents or LangChain imports "
+                "it from Workflow code, so repair or remove the package.",
+                stacklevel=2,
+            )
