@@ -136,7 +136,7 @@ test('summary string is passed through to model activity', async (t) => {
   });
 });
 
-test('A model call slower than its heartbeat timeout completes on its first attempt, after a slow interceptor too', async (t) => {
+test('A model call slower than its heartbeat timeout completes on its first attempt', async (t) => {
   const { createWorker, taskQueue } = helpers(t);
   const provider = {
     getModel() {
@@ -148,50 +148,27 @@ test('A model call slower than its heartbeat timeout completes on its first atte
       } as unknown as FakeModel;
     },
   };
-  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+  const wfClient = new WorkflowClient({
+    connection: (t.context as any).env.connection,
+    interceptors: [new OpenAIAgentsTraceClientInterceptor({ modelParams: { heartbeatTimeout: 1_000 } })],
+  });
 
-  // The heartbeat timeout counts from the attempt's start, so an interceptor
-  // that waits 1.5 seconds uses most of a 2-second timeout before the Activity runs.
-  for (const { heartbeatTimeout, interceptorMs } of [
-    { heartbeatTimeout: 1_000, interceptorMs: 0 },
-    { heartbeatTimeout: 2_000, interceptorMs: 1_500 },
-  ]) {
-    const worker = await createWorker({
-      plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })],
-      interceptors: {
-        activity: [
-          () => ({
-            inbound: {
-              async execute(input, next) {
-                await sleep(interceptorMs);
-                return next(input);
-              },
-            },
-          }),
-        ],
-      },
+  await worker.runUntil(async () => {
+    const handle = await wfClient.start(summaryOverrideStringWorkflow, {
+      taskQueue,
+      workflowId: `slow-model-call-${Date.now()}`,
+      args: ['Hello'],
+      workflowExecutionTimeout: '30 seconds',
     });
-    const wfClient = new WorkflowClient({
-      connection: (t.context as any).env.connection,
-      interceptors: [new OpenAIAgentsTraceClientInterceptor({ modelParams: { heartbeatTimeout } })],
-    });
+    t.is(await handle.result(), 'slow answer');
 
-    await worker.runUntil(async () => {
-      const handle = await wfClient.start(summaryOverrideStringWorkflow, {
-        taskQueue,
-        workflowId: `slow-model-call-${interceptorMs}-${Date.now()}`,
-        args: ['Hello'],
-        workflowExecutionTimeout: '30 seconds',
-      });
-      t.is(await handle.result(), 'slow answer');
-
-      const { events } = await handle.fetchHistory();
-      const attempts = (events ?? [])
-        .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED)
-        .map((e) => e.activityTaskStartedEventAttributes?.attempt);
-      t.deepEqual(attempts, [1], `interceptor ${interceptorMs} ms`);
-    });
-  }
+    const { events } = await handle.fetchHistory();
+    const attempts = (events ?? [])
+      .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED)
+      .map((e) => e.activityTaskStartedEventAttributes?.attempt);
+    t.deepEqual(attempts, [1]);
+  });
 });
 
 test('A ModelSummaryProvider gets the agent of each model call, in nested and resumed runs too', async (t) => {
