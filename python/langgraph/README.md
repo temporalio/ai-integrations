@@ -60,6 +60,36 @@ plugin = LangGraphPlugin(
 )
 ```
 
+### One plugin per Worker
+
+Give each Worker one `LangGraphPlugin` with all the graphs, entrypoints and tasks that its Workflows use:
+
+```python
+from datetime import timedelta
+
+from temporalio.langgraph import LangGraphPlugin
+from temporalio.worker import Worker
+
+plugin = LangGraphPlugin(
+    graphs={"my-graph": g},
+    entrypoints={"my_entrypoint": my_entrypoint},
+    tasks=[my_task],
+    activity_options={"my_task": {"execute_in": "activity"}},
+    default_activity_options={"start_to_close_timeout": timedelta(seconds=30)},
+)
+
+worker = Worker(
+    client,
+    task_queue="my-task-queue",
+    workflows=[MyWorkflow],
+    plugins=[plugin],
+)
+```
+
+A Workflow can only use the graphs and entrypoints of one `LangGraphPlugin` instance, so a Worker with a second instance raises `ValueError` when it is created. A Worker also gets the plugins of its Client, and those count: a Worker is refused too when its Client has two instances, or when its Client has one and the Worker has another. The same instance on both is applied once. A `Replayer` with a second instance raises `ValueError` too. Workers in one process can each have their own instance.
+
+**Breaking change:** a Worker or a `Replayer` with two instances used to be created. Its Workflows only found the graphs and entrypoints of the last instance. `graph()` and `entrypoint()` raised `KeyError` for the others, so those Workflow Tasks failed and the runs stayed open. Put the graphs, entrypoints, tasks and `activity_options` of both instances into one `LangGraphPlugin`. Activity names do not change, so open runs continue on the new Worker. If the instances had different `default_activity_options`, set those options on each node or task. If they had different `streaming_topic` or `streaming_batch_interval` values, give each instance its own Worker and task queue. Pass each plugin to its Worker, not to a Client that the Workers share.
+
 ## Checkpointer
 
 If your LangGraph code requires a checkpointer (for example, if you're using interrupts), use `InMemorySaver`.

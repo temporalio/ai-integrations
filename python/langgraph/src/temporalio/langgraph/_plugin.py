@@ -41,7 +41,7 @@ from temporalio.langgraph._task_cache import (
 )
 from temporalio.langgraph._workflow import wrap_workflow
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkflowRunner
+from temporalio.worker import Interceptor, ReplayerConfig, WorkerConfig, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 _ACTIVITY_OPTION_KEYS: frozenset[str] = frozenset(
@@ -205,6 +205,12 @@ class LangGraphPlugin(SimplePlugin):
     and tasks as Temporal Activities, giving your AI agent workflows durable
     execution, automatic retries, and timeouts. It supports both the LangGraph Graph
     API (``StateGraph``) and Functional API (``@entrypoint`` / ``@task``).
+
+    Give a Worker or a Replayer one instance with all its graphs, entrypoints
+    and tasks. A Workflow can only use the graphs and entrypoints of one
+    instance, so a second instance raises ``ValueError`` when the Worker or the
+    Replayer is created. A Worker also gets the plugins of its Client, and
+    applies an instance that is on both once.
 
     Args:
         graphs: Graph API graphs to make available to workflows, keyed by name.
@@ -448,15 +454,14 @@ class LangGraphPlugin(SimplePlugin):
                 )
             return runner
 
+        self._interceptor = LangGraphInterceptor(
+            graphs or {}, entrypoints or {}, streaming_topic=streaming_topic
+        )
         super().__init__(
             "langchain.LangGraphPlugin",
             activities=self.activities,
             workflow_runner=workflow_runner,
-            interceptors=[
-                LangGraphInterceptor(
-                    graphs or {}, entrypoints or {}, streaming_topic=streaming_topic
-                )
-            ],
+            interceptors=[self._interceptor],
         )
 
     def version(self) -> str:
@@ -465,6 +470,56 @@ class LangGraphPlugin(SimplePlugin):
             return importlib.metadata.version("temporalio-langgraph")
         except importlib.metadata.PackageNotFoundError:
             return ""
+
+    def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
+        """See base class. Also refuses a second instance, and applies this one once."""
+        self._refuse_second_instance(
+            config, "Worker", " A Worker also gets the plugins of its Client."
+        )
+        before = list(config.get("activities") or [])
+        config["activities"] = before
+        config = super().configure_worker(config)
+        registered = {id(a) for a in before}
+        config["activities"] = [
+            *before,
+            *(a for a in self.activities if id(a) not in registered),
+        ]
+        interceptors: list[Interceptor] = []
+        own_seen = False
+        for interceptor in config.get("interceptors", []):
+            if interceptor is self._interceptor:
+                if own_seen:
+                    continue
+                own_seen = True
+            interceptors.append(interceptor)
+        config["interceptors"] = interceptors
+        return config
+
+    def configure_replayer(self, config: ReplayerConfig) -> ReplayerConfig:
+        """See base class. Also refuses a second instance on the Replayer."""
+        self._refuse_second_instance(config, "Replayer")
+        return super().configure_replayer(config)
+
+    def _refuse_second_instance(
+        self, config: WorkerConfig | ReplayerConfig, target: str, hint: str = ""
+    ) -> None:
+        """Raise if another instance has configured ``config``.
+
+        Every instance leaves its interceptor in ``config``, so the interceptor
+        of another instance there means that this one is a second instance.
+        """
+        # Written back as a list, because reading a one-shot iterable empties it.
+        interceptors = config["interceptors"] = list(config.get("interceptors") or [])
+        if any(
+            isinstance(i, LangGraphInterceptor) and i is not self._interceptor
+            for i in interceptors
+        ):
+            raise ValueError(
+                f"This {target} has more than one LangGraphPlugin instance. Use "
+                "one instance with all the graphs, entrypoints and tasks: a "
+                "Workflow can only use the graphs and entrypoints of one "
+                f"instance.{hint}"
+            )
 
     def execute(
         self,
