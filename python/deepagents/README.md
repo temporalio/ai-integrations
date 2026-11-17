@@ -12,7 +12,7 @@ the filesystem middleware, human-in-the-loop interrupts, and
 `agent.ainvoke(...)` all keep working. You get crash-durability and resumable
 human-in-the-loop on top. The Limits section lists what does not carry over.
 
-> Release stage: [Pre-release](https://docs.temporal.io/develop/python/integrations/deepagents).
+> Release stage: [Public Preview](https://docs.temporal.io/develop/python/integrations/deepagents).
 
 ## Install
 
