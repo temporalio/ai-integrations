@@ -253,6 +253,19 @@ outside Temporal. To use another model, build the agent with
     item above have finished, stop every earlier Worker before you start this
     version's. If you roll back, keep runs that ran on this version on its
     Workers until they close.
+  - Each model call now starts a new UUID generator, so adding or removing a
+    tool no longer moves the IDs ADK makes for the response, its function
+    calls and confirmations. Every run now gets other IDs than on an earlier
+    version. A run with a pending or answered tool confirmation or long-running
+    tool call gets new IDs when it moves across the upgrade or a rollback. An
+    approval or long-running answer sent with an ID read before the move is
+    dropped without an error. A run whose answered confirmation scheduled a
+    Workflow command fails replay with `[TMPRL1100]`: an approved
+    `ActivityAsTool` tool, an approved or rejected MCP tool, or an approved
+    in-workflow tool that starts a timer, child workflow or Activity. Let those
+    runs finish first, or keep them on the earlier version with Worker
+    Versioning. When an ADK plugin or a `BeforeModelCallbacks` entry supplies
+    the model response, a tool change can still move the IDs.
 - **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
   `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
