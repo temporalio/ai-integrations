@@ -142,7 +142,9 @@ class _ConnectionRecord:
         except BaseException as err:
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
-            _CONNECTIONS.pop(self._server, None)
+            # Only drop our own entry: a newer record may already own the key.
+            if _CONNECTIONS.get(self._server) is self:
+                del _CONNECTIONS[self._server]
             if self._ready.done():
                 raise
             self._ready.set_exception(err)
@@ -179,7 +181,7 @@ class _ConnectionRecord:
         # A call may have acquired the connection between the timer firing and
         # this task running; only evict if it is still idle.
         if self._inflight == 0:
-            await _evict_connection(self._server)
+            await _evict_connection(self._server, self)
 
     async def aclose(self) -> None:
         """Signal the owner task to exit its context manager and wait for it."""
@@ -193,8 +195,12 @@ class _ConnectionRecord:
             pass
 
     async def session(self) -> ClientSession:
-        """Return the live session, or raise the connect failure."""
-        return await self._ready
+        """Return the live session, or raise the connect failure.
+
+        The wait is shielded. Cancelling this caller must not cancel the shared
+        connect future, or any other caller waiting on the same connection.
+        """
+        return await asyncio.shield(self._ready)
 
 
 async def get_connection(
@@ -219,9 +225,21 @@ async def get_connection(
     return session, record
 
 
-async def _evict_connection(server: str) -> None:
-    record = _CONNECTIONS.pop(server, None)
+async def _evict_connection(
+    server: str, expected: _ConnectionRecord | None = None
+) -> None:
+    """Close and uncache the connection for ``server``.
+
+    When ``expected`` is given, only evict if that exact record is still the
+    cached one; a stale caller must not close a newer connection that replaced
+    it.  A record that is no longer cached is still closed.
+    """
+    record = _CONNECTIONS.get(server)
+    if expected is not None and record is not expected:
+        await expected.aclose()
+        return
     if record is not None:
+        del _CONNECTIONS[server]
         await record.aclose()
 
 
@@ -245,11 +263,11 @@ def build_list_tools_activity(
         try:
             return await session.list_tools()
         except McpError as err:
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise _protocol_error(err) from err
         except Exception:
             # The session may be broken; drop it so the next call reconnects.
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise
         finally:
             record.release()
@@ -277,11 +295,11 @@ def build_call_tool_activity(
         try:
             return await session.call_tool(name=req.name, arguments=req.arguments)
         except McpError as err:
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise _protocol_error(err) from err
         except Exception:
             # The session may be broken; drop it so the next call reconnects.
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise
         finally:
             record.release()

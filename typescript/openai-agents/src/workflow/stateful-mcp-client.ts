@@ -12,7 +12,6 @@ import {
   type ActivityOptions,
   CancellationScope,
   isCancellation,
-  patched,
   scheduleActivity,
   workflowInfo,
 } from '@temporalio/workflow';
@@ -56,11 +55,6 @@ export interface StatefulMcpServerOptions extends McpServerHandleOptions {
    */
   cacheToolsList?: boolean;
 }
-
-// Patch marker of runs whose operations without a schedule-to-start timeout
-// follow the session Activity. Runs recorded before it schedule them as
-// earlier versions did, so their histories replay.
-const SESSION_WATCH_PATCH = 'openai-agents-stateful-mcp-session-watch';
 
 const DEDICATED_WORKER_SCHEDULE_FAILURE_MESSAGE =
   'MCP Stateful Server Worker failed to schedule activity. Check that a worker is polling the dedicated task queue for this MCP run.';
@@ -285,10 +279,10 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
    * Not `async`, and the caller awaits the Activity's own promise, so the
    * Workflow resumes in the same order as on earlier versions. The cancellation
    * scope below delivers a caller's cancellation one step later than earlier
-   * versions did, so only runs with the patch marker use it.
+   * versions did.
    */
   private executeOperation<R>(activity: string, args: unknown[]): Promise<R> {
-    if (msOptionalToNumber(this._operationConfig.scheduleToStartTimeout) || !patched(SESSION_WATCH_PATCH)) {
+    if (msOptionalToNumber(this._operationConfig.scheduleToStartTimeout)) {
       return handleWorkerFailure(() => scheduleActivity<R>(activity, args, this._operationConfig));
     }
     // The caller's own cancellation wins over the session's end.

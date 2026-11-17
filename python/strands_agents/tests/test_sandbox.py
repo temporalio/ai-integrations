@@ -17,7 +17,9 @@ import temporalio.testing
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
+from temporalio.converter import DataConverter
 from temporalio.strands_agents import (
     AllowAllWorkerEnvVars,
     SandboxStreamEvent,
@@ -30,6 +32,7 @@ from temporalio.strands_agents import (
 )
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities, get_heartbeat_timeouts
+from tests.mock_model import MockModel
 
 
 class RecordingSandbox(Sandbox):
@@ -608,28 +611,169 @@ def test_sandbox_workflow_context_separates_run_and_chain_identity() -> None:
     assert first.first_execution_run_id == "first-run"
 
 
-@tool(name="sandbox_shell")
-def custom_shell(command: str) -> str:
-    return command
-
-
-def test_sandbox_default_tools_and_override() -> None:
+def test_sandbox_default_tools() -> None:
     default_agent = TemporalAgent(
         model="mock",
         sandbox=TemporalSandbox("recording"),
         start_to_close_timeout=timedelta(seconds=15),
     )
-    assert "sandbox_shell" in default_agent.tool_registry.registry
-    assert "sandbox_file_editor" in default_agent.tool_registry.registry
+    assert set(default_agent.tool_registry.registry) == {
+        "sandbox_shell",
+        "sandbox_read",
+        "sandbox_write",
+        "sandbox_edit",
+    }
+
+
+@pytest.mark.parametrize(
+    "name", ["sandbox_shell", "sandbox_read", "sandbox_write", "sandbox_edit"]
+)
+def test_sandbox_tool_override(name: str) -> None:
+    @tool(name=name)
+    def custom_tool(value: str) -> str:
+        return value
 
     override_agent = TemporalAgent(
         model="mock",
         sandbox=TemporalSandbox("recording"),
-        tools=[custom_shell],
+        tools=[custom_tool],
         start_to_close_timeout=timedelta(seconds=15),
     )
-    assert override_agent.tool_registry.registry["sandbox_shell"] is custom_shell
-    assert "sandbox_file_editor" in override_agent.tool_registry.registry
+    assert override_agent.tool_registry.registry[name] is custom_tool
+    assert set(override_agent.tool_registry.registry) == {
+        "sandbox_shell",
+        "sandbox_read",
+        "sandbox_write",
+        "sandbox_edit",
+    }
+
+
+@workflow.defn
+class SandboxToolsWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        agent = TemporalAgent(
+            model="mock",
+            sandbox=TemporalSandbox(
+                "recording", start_to_close_timeout=timedelta(seconds=15)
+            ),
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        return str(await agent.invoke_async("Write, read, and edit sandbox files."))
+
+
+@pytest.mark.parametrize(
+    "data_converter",
+    [DataConverter.default, pydantic_data_converter],
+    ids=["default", "pydantic"],
+)
+async def test_sandbox_file_tools_run_through_activities(
+    client: Client, data_converter: DataConverter
+) -> None:
+    config = client.config()
+    config["data_converter"] = data_converter
+    client = Client(**config)
+    sandbox = RecordingSandbox()
+    png = b"\x89PNG\r\n\x1a\n\xff\x00"
+    pdf = b"%PDF-1.7\n\xff\x00"
+    sandbox.files.update({"/image.png": png, "/report.pdf": pdf})
+    model_saw: list[dict[str, Any]] = []
+
+    class RecordingModel(MockModel):
+        async def stream(self, messages, *args, **kwargs):  # type: ignore[no-untyped-def, override]
+            model_saw[:] = [
+                block["toolResult"]
+                for message in messages
+                for block in message["content"]
+                if "toolResult" in block
+            ]
+            async for event in super().stream(messages, *args, **kwargs):
+                yield event
+
+    script: list[str | dict[str, Any]] = [
+        {
+            "name": "sandbox_write",
+            "input": {"path": "/notes.txt", "content": "first\ncaf\u00e9\nthird"},
+        },
+        {
+            "name": "sandbox_read",
+            "input": {"path": "/notes.txt", "offset": 2, "limit": 1},
+        },
+        {
+            "name": "sandbox_edit",
+            "input": {
+                "path": "/notes.txt",
+                "old_str": "caf\u00e9",
+                "new_str": "edited",
+            },
+        },
+        {"name": "sandbox_read", "input": {"path": "/notes.txt"}},
+        {"name": "sandbox_read", "input": {"path": "/image.png"}},
+        {"name": "sandbox_read", "input": {"path": "/report.pdf"}},
+        "Done!",
+    ]
+    plugin = StrandsPlugin(
+        models={"mock": lambda: RecordingModel(script)},
+        sandboxes={"recording": lambda _: sandbox},
+    )
+    task_queue = f"test_sandbox_file_tools-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[SandboxToolsWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            SandboxToolsWorkflow.run,
+            id=f"test_sandbox_file_tools-{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert await handle.result() == "Done!\n"
+
+    assert sandbox.files["/notes.txt"] == b"first\nedited\nthird"
+    assert all(result["status"] == "success" for result in model_saw)
+    assert [result["content"] for result in model_saw] == [
+        [{"text": "Wrote 3 lines to /notes.txt."}],
+        [
+            {
+                "text": "     2\tcaf\u00e9\n[Showing lines 2-2 of 3. Use offset/limit to read more.]"
+            }
+        ],
+        [{"text": "Edited /notes.txt."}],
+        [{"text": "     1\tfirst\n     2\tedited\n     3\tthird"}],
+        [{"image": {"format": "png", "source": {"bytes": png}}}],
+        [
+            {
+                "document": {
+                    "format": "pdf",
+                    "name": "report pdf",
+                    "source": {"bytes": pdf},
+                }
+            }
+        ],
+    ]
+    history = await handle.fetch_history()
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "strands-sandbox-write-file",
+        "invoke_model",
+        "strands-sandbox-read-file",
+        "invoke_model",
+        "strands-sandbox-read-file",
+        "strands-sandbox-write-file",
+        "invoke_model",
+        "strands-sandbox-read-file",
+        "invoke_model",
+        "strands-sandbox-read-file",
+        "invoke_model",
+        "strands-sandbox-read-file",
+        "invoke_model",
+    ]
+    await Replayer(workflows=[SandboxToolsWorkflow], plugins=[plugin]).replay_workflow(
+        history
+    )
 
 
 @workflow.defn

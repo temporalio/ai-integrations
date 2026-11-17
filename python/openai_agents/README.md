@@ -244,6 +244,17 @@ The plugin automatically handles several important setup tasks:
 - Registers an activity for invoking model calls with the Temporal worker.
 - Configures OpenAI Agents SDK to run model calls as Temporal activities.
 
+OpenAI's response models can lag behind the live API, so a value that holds a model response can
+fail strict validation when it's decoded. When that happens, the plugin builds the OpenAI models in
+it without validating them, like the OpenAI SDK does with live responses. If the value holds one of
+your own Pydantic models, Pydantic validates it from the decoded JSON, and the result has to encode
+back to the same JSON. If that's not possible, decoding fails with the original validation error.
+Before 2.0.0, you got a plain `dict` instead.
+
+**Important:** if you upgrade from 1.x, Workflow code that read such a value as a `dict` fails, and
+a Signal whose argument can't be decoded is dropped. Keep runs that started on 1.x on that version
+with Worker Versioning, or let them finish first.
+
 ### File 3: Client Execution (`run_hello_world_workflow.py`)
 
 ```python
@@ -676,6 +687,12 @@ Activity and are never shared across workflows.
 `MCPPlugin(clients={"x": ...})` both register Activities under
 `temporalio.mcp.x.*`. Do not register the same MCP server name through
 both plugins on one worker; Temporal rejects the duplicate Activity types.
+
+A factory that returns something other than an `agents.mcp.MCPServer` fails
+the Activity with a non-retryable `ApplicationError` of type
+`MCPServerFactoryTypeError`. A factory that isn't callable makes
+`OpenAIAgentsPlugin(...)` raise `TypeError`, so the Worker doesn't start, even
+when no workflow uses that server.
 
 An optional `factory_argument` can select worker-side configuration such as a
 tenant endpoint:

@@ -1,9 +1,11 @@
 """Initialize Temporal OpenAI Agents overrides."""
 
+import copy
 import dataclasses
 import importlib.metadata
 import json
 import threading
+import types
 import typing
 from collections.abc import (
     AsyncGenerator,
@@ -18,6 +20,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 
 import pydantic
+import pydantic_core
 from agents import ModelProvider, set_trace_provider
 from agents.mcp import MCPServer
 from agents.run import get_default_agent_runner, set_default_agent_runner
@@ -199,7 +202,63 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
                 if field.name in value
             }
         )
+    if _holds_caller_class(type_):
+        # construct_type returns these as decoded JSON.
+        return _validated(type_, value)
     return construct_type(type_=type_, value=value)
+
+
+def _is_union(type_: typing.Any) -> bool:
+    origin = typing.get_origin(type_)
+    return origin is typing.Union or origin is types.UnionType  # pyright: ignore[reportDeprecated]
+
+
+def _is_openai_type(type_: typing.Any) -> bool:
+    """Whether ``construct_type`` builds ``type_``: an openai class, or a union of them."""
+    if typing.get_origin(type_) is typing.Annotated:
+        return _is_openai_type(typing.get_args(type_)[0])
+    if _is_union(type_):
+        args = [arg for arg in typing.get_args(type_) if arg is not type(None)]
+        return bool(args) and all(_is_openai_type(arg) for arg in args)
+    return isinstance(type_, type) and type_.__module__.split(".")[0] == "openai"
+
+
+def _holds_caller_class(type_: typing.Any) -> bool:
+    """Whether ``type_`` is or holds a Pydantic model or dataclass that isn't openai's.
+
+    Reads the schema Pydantic builds, so aliases, forward references and deferred
+    models count.
+    """
+
+    def visit(node: typing.Any) -> bool:
+        if isinstance(node, list):
+            return any(visit(item) for item in node)
+        if not isinstance(node, Mapping):
+            return False
+        if node.get("type") in ("model", "dataclass") and not _is_openai_type(
+            node.get("cls")
+        ):
+            return True
+        return any(visit(item) for item in node.values())
+
+    return not _is_openai_type(type_) and visit(pydantic.TypeAdapter(type_).core_schema)
+
+
+# The converter's encoder, as PydanticJSONPlainPayloadConverter builds it.
+_ENCODER = pydantic_core.SchemaSerializer(
+    pydantic_core.core_schema.any_schema(), config={"ser_json_inf_nan": "constants"}
+)
+
+
+def _validated(type_: typing.Any, raw: typing.Any) -> typing.Any:
+    """Validate ``raw`` as ``type_``; the result must encode back to ``raw``."""
+    # Validators can change their input in place.
+    expected = copy.deepcopy(raw)
+    result = pydantic.TypeAdapter(type_).validate_python(raw)
+    encoded = _ENCODER.to_json(result, by_alias=True, exclude_unset=True)
+    if json.loads(encoded) != expected:
+        raise ValueError("the decoded value does not encode back to the payload")
+    return result
 
 
 # The iterator type pydantic decodes ``Iterable`` fields to. It cannot be
@@ -277,12 +336,15 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
                     json.loads(payload.data), strict=False
                 )
                 return _list_decoded_iterators(value)
-        except pydantic.ValidationError:
+        except pydantic.ValidationError as e:
             if type_hint is None:
                 raise
-            return _list_decoded_iterators(
-                _lenient_construct(type_hint, json.loads(payload.data))
-            )
+            try:
+                value = _lenient_construct(type_hint, json.loads(payload.data))
+            except (ValueError, TypeError):
+                # A value this fallback can't build fails with the strict error.
+                raise e from None
+            return _list_decoded_iterators(value)
 
     def _adapter(self, type_hint: typing.Any) -> pydantic.TypeAdapter[typing.Any]:
         """Return the cached type adapter, as the base class does."""
