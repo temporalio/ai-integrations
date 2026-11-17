@@ -39,6 +39,7 @@ import dataclasses
 import hashlib
 import json
 from typing import TYPE_CHECKING, Any, Literal, cast
+from uuid import UUID
 
 if TYPE_CHECKING:
     from langchain_core.messages import BaseMessage
@@ -483,9 +484,10 @@ def rebuild_runnable_config(data: dict[str, Any]) -> "RunnableConfig":
     config: dict[str, Any] = {"metadata": dict(data.get("metadata", {}))}
     if data.get("tags"):
         config["tags"] = list(data["tags"])
-    for key in ("run_id", "run_name"):
-        if data.get(key) is not None:
-            config[key] = data[key]
+    if data.get("run_name") is not None:
+        config["run_name"] = data["run_name"]
+    if data.get("run_id") is not None:
+        config["run_id"] = UUID(data["run_id"])
     if data.get("recursion_limit") is not None:
         config["recursion_limit"] = data["recursion_limit"]
     if data.get("configurable"):

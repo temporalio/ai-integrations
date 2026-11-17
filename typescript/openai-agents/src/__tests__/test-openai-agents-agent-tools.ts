@@ -65,6 +65,7 @@ test('agent.asTool() runs take the run model, model settings and runner defaults
     t.is(modelActivities.length, 4);
     for (const e of modelActivities) {
       t.is(Number(e.activityTaskScheduledEventAttributes?.startToCloseTimeout?.seconds), 17);
+      t.is(Number(e.activityTaskScheduledEventAttributes?.heartbeatTimeout?.seconds), 10);
       const summary = Buffer.from(e.userMetadata?.summary?.data ?? []).toString('utf-8');
       t.true(summary.includes('runner default'), summary);
     }

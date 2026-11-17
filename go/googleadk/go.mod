@@ -18,6 +18,7 @@ require (
 	go.temporal.io/api v1.63.4
 	go.temporal.io/sdk v1.48.0
 	go.temporal.io/sdk/contrib/workflowstreams v0.1.1
+	golang.org/x/mod v0.41.0
 	google.golang.org/adk/v2 v2.6.0
 	google.golang.org/genai v1.74.0
 	google.golang.org/grpc v1.84.0
@@ -60,7 +61,6 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
