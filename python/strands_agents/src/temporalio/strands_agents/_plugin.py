@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, cast
 from botocore.config import Config as BotocoreConfig
 from strands.models import BedrockModel, Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
-from strands.types.exceptions import ContextWindowOverflowException
+from strands.types.exceptions import (
+    ContextWindowOverflowException,
+    MaxTokensReachedException,
+    StructuredOutputException,
+)
 
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
@@ -155,9 +159,17 @@ class StrandsPlugin(SimplePlugin):
             workflow_runner=_workflow_runner,
             data_converter=_data_converter,
             activities=activities or None,
-            # Strands re-raises this when its conversation manager cannot reduce the
-            # context any further; fail the workflow instead of retrying the task forever.
-            workflow_failure_exception_types=[ContextWindowOverflowException],
+            # Strands raises these in Workflow code from a model answer that is already
+            # in History: ContextWindowOverflowException when its conversation manager
+            # cannot reduce the context any further, MaxTokensReachedException when the
+            # model stopped at its token limit, and StructuredOutputException when the
+            # model gave no valid structured output. A retried Workflow Task would replay
+            # the same answer and raise again, so fail the Workflow instead.
+            workflow_failure_exception_types=[
+                ContextWindowOverflowException,
+                MaxTokensReachedException,
+                StructuredOutputException,
+            ],
             run_context=mcp_plugin.run_context if mcp_plugin else None,
         )
 
