@@ -122,7 +122,7 @@ def reporter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict:
                 if data["fail_api"]:
                     raise subprocess.CalledProcessError(1, args)
                 return json.dumps(data["alerts"][:1]) + "\n" + json.dumps(data["alerts"][1:])
-            if endpoint.endswith("/actions/runs/123/jobs?per_page=100"):
+            if endpoint.endswith("/actions/runs/123/jobs?per_page=30"):
                 return '{"jobs": []}'
             pytest.fail(f"Unexpected API endpoint: {endpoint}")
         if args[:2] == ("issue", "list"):
