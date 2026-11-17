@@ -25,7 +25,6 @@ from datetime import timedelta
 import pydantic
 import pydantic_core
 from agents import ModelProvider, set_trace_provider
-from agents.exceptions import ModelBehaviorError
 from agents.mcp import MCPServer
 from agents.run import get_default_agent_runner, set_default_agent_runner
 from agents.tracing import get_trace_provider
@@ -65,6 +64,7 @@ from temporalio.openai_agents._temporal_worker_env_ref import (
 from temporalio.openai_agents._trace_interceptor import (
     OpenAIAgentsContextPropagationInterceptor,
 )
+from temporalio.openai_agents._workflow_failure import ModelBehaviorErrorInterceptor
 from temporalio.openai_agents.sandbox._on_host_sandbox_client_provider import (
     OnHostSandboxClientProvider,
 )
@@ -671,13 +671,10 @@ class OpenAIAgentsPlugin(SimplePlugin):
         super().__init__(
             name="OpenAIAgentsPlugin",
             data_converter=_data_converter,
-            interceptors=[interceptor],
+            interceptors=[interceptor, ModelBehaviorErrorInterceptor()],
             activities=add_activities,
             workflow_runner=workflow_runner,
-            # ModelBehaviorError, such as a final output that doesn't match the agent's
-            # output_type, comes from a model answer recorded in History. Every replay of
-            # the Workflow Task would raise it again, so it fails the Workflow instead.
-            workflow_failure_exception_types=[AgentsWorkflowError, ModelBehaviorError],
+            workflow_failure_exception_types=[AgentsWorkflowError],
             run_context=lambda: run_context(),
         )
 

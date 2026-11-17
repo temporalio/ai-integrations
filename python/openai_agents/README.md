@@ -397,9 +397,12 @@ When a tool's activity fails, the `AgentsWorkflowError`'s `__cause__` is that to
 The `failure_error_function` of `activity_as_tool()` does not change any of this: it only formats the error returned to the model when the tool's arguments are invalid.
 
 When the model's final output doesn't match the agent's `output_type`, `Runner.run` raises `ModelBehaviorError`, as it does outside Temporal.
-If the Workflow doesn't catch it, the Workflow fails with an `ApplicationError` of type `ModelBehaviorError`.
+`Runner.run` raises the Agents SDK's exceptions to its caller unchanged, so a `UserError` whose cause is a `ModelBehaviorError` stays a `UserError`.
+If a `ModelBehaviorError` escapes the Workflow, or a signal or update handler, the Workflow fails with a retryable `ApplicationError` of type `ModelBehaviorError`.
 It doesn't fail the Workflow Task: the model's answer is in the History, so a retried Workflow Task would get the same answer and fail again.
 To ask the model again, catch the error around the run, or set a Workflow retry policy, which reruns the whole agent run.
+This behavior is gated by the patch `temporalio.openai_agents.model-behavior-error-fails-workflow`, checked when `Runner.run` starts.
+Runs that started an agent run on an earlier release keep failing the Workflow Task, so a Workflow code fix can still recover them.
 
 ### Calling OpenAI Agents Tools inside Temporal Workflows
 
