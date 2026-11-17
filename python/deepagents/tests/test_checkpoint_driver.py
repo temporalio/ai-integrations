@@ -97,6 +97,19 @@ async def _drive(
     pytest.fail("The driver repeated work across 20 rollovers.")
 
 
+async def _snapshot(agent: Any, input: Any = None) -> _ContinueAsNew:
+    if input is None:
+        input = {"messages": [{"role": "user", "content": "Go."}]}
+    with pytest.raises(_ContinueAsNew) as caught:
+        await _checkpoint.run(
+            agent,
+            input,
+            continue_as_new_after=1,
+            state_snapshot=None,
+        )
+    return caught.value
+
+
 @pytest.mark.parametrize("tools", [0, 1, 4, 8])
 @pytest.mark.parametrize("rollover", [False, True])
 @pytest.mark.parametrize("limit_offset", [-1, 0])
@@ -235,21 +248,15 @@ async def test_checkpoint_ordering_survives_worker_clock_skew(
         agents.append(agent)
         return agent
 
-    with pytest.raises(_ContinueAsNew) as caught:
-        await _checkpoint.run(
-            factory(),
-            {"messages": [{"role": "user", "content": "Go."}]},
-            continue_as_new_after=1,
-            state_snapshot=None,
-        )
+    carry = await _snapshot(factory())
     clock = time.time_ns() - 5_000_000_000
     monkeypatch.setattr(checkpoint_id, "_last_v6_timestamp", None)
     monkeypatch.setattr(checkpoint_id, "time", SimpleNamespace(time_ns=lambda: clock))
     result, _ = await _drive(
         factory,
         rollover=True,
-        input=caught.value.input,
-        snapshot=caught.value.snapshot,
+        input=carry.input,
+        snapshot=carry.snapshot,
     )
     assert model._cursor == 3
     assert [message.type for message in result["messages"]] == [
@@ -299,7 +306,11 @@ class ReportMiddleware(AgentMiddleware):
         assert isinstance(state["report"].authors[0], Author)
 
 
-async def test_nested_schema_types_survive_rollover() -> None:
+@pytest.mark.parametrize("strict_msgpack", [False, True])
+async def test_nested_schema_types_survive_rollover(
+    monkeypatch: pytest.MonkeyPatch, strict_msgpack: bool
+) -> None:
+    monkeypatch.setenv("LANGGRAPH_STRICT_MSGPACK", str(strict_msgpack).lower())
     model = FakeModel([_tool_reply(0), _tool_reply(1), "Done."])
 
     def factory() -> Any:
@@ -317,25 +328,29 @@ class ManagedState(TypedDict):
     value: int
 
 
-async def test_managed_channels_do_not_break_serialization() -> None:
-    def model(state: ManagedState) -> dict[str, int]:
-        return {"value": state["value"] + 1}
-
+def _loop_graph(
+    model: Callable[..., Any],
+    *,
+    steps: int = 3,
+    tools: Callable[..., Any] = lambda state: {},
+    tail: Callable[..., Any] | None = None,
+    checkpointer: Any = None,
+) -> Any:
     def route(state: ManagedState) -> str:
-        return "tools" if state["value"] < 3 else END
+        if state["value"] < steps:
+            return "tools"
+        return "tail" if tail is not None else END
 
-    def factory() -> Any:
-        graph = StateGraph(ManagedState)
-        graph.add_node("model", model)
-        graph.add_node("tools", lambda state: {})
-        graph.add_edge(START, "model")
-        graph.add_conditional_edges("model", route)
-        graph.add_edge("tools", "model")
-        return graph.compile(name="test-agent")
-
-    result, carries = await _drive(factory, rollover=True, input={"value": 0})
-    assert result["value"] == 3
-    assert len(carries) == 2
+    graph = StateGraph(ManagedState)
+    graph.add_node("model", model)
+    graph.add_node("tools", tools)
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", route)
+    graph.add_edge("tools", "model")
+    if tail is not None:
+        graph.add_node("tail", tail)
+        graph.add_edge("tail", END)
+    return graph.compile(name="test-agent", checkpointer=checkpointer)
 
 
 class ExtraState(AgentState):
@@ -382,16 +397,10 @@ async def test_input_files_are_not_duplicated_in_rollover_payloads() -> None:
         "configuration": "retained",
     }
     original = copy.deepcopy(input)
-    with pytest.raises(_ContinueAsNew) as caught:
-        await _checkpoint.run(
-            create_deep_agent(name="test-agent", model=model),
-            input,
-            continue_as_new_after=1,
-            state_snapshot=None,
-        )
-    assert caught.value.input == {"configuration": "retained"}
+    carry = await _snapshot(create_deep_agent(name="test-agent", model=model), input)
+    assert carry.input == {"configuration": "retained"}
     converter = _serde.build_data_converter(None)
-    payloads = await converter.encode([caught.value.input, caught.value.snapshot])
+    payloads = await converter.encode([carry.input, carry.snapshot])
     assert sum(len(payload.data) for payload in payloads) < 2 * 1024 * 1024
     assert input == original
 
@@ -427,71 +436,34 @@ async def test_hitl_configuration_fails_before_model_call() -> None:
     assert model._cursor == 0
 
 
-async def test_hitl_resume_uses_callers_saver_after_rollover() -> None:
-    model = FakeModel(
-        [
-            _tool_reply(0),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_file",
-                        "args": {"file_path": "/notes.md"},
-                        "id": "read",
-                    }
-                ],
-            ),
-            _tool_reply(2),
-            "Done.",
-        ]
-    )
-    agents = []
-
-    def factory() -> Any:
-        agent = create_deep_agent(
-            name="test-agent",
-            model=model,
-            checkpointer=InMemorySaver(),
-            interrupt_on={"read_file": True},
-        ).with_config({"configurable": {"thread_id": "approval"}})
-        agents.append(agent)
-        return agent
-
-    result, carries = await _drive(factory, rollover=True)
-    assert carries and result.get("__interrupt__")
-    caller = agents[-1]
-    assert await caller.aget_state({"configurable": {"thread_id": "approval"}})
-    try:
-        result = await _checkpoint.run(
-            caller,
-            Command(resume={"decisions": [{"type": "approve"}]}),
-            continue_as_new_input={},
-            continue_as_new_after=1,
-            state_snapshot=None,
-        )
-    except _ContinueAsNew as continued:
-        result, more_carries = await _drive(
-            factory, rollover=True, input=continued.input, snapshot=continued.snapshot
-        )
-        assert len(more_carries) == 1
-    else:
-        pytest.fail("The resumed invocation did not roll over.")
-    assert result["messages"][-1].content == "Done."
-    assert model._cursor == 4
-
-
-@pytest.mark.parametrize("mode", ["saver", "namespace", "recursion"])
-async def test_invalid_driver_configuration_fails_cleanly(mode: str) -> None:
+@pytest.mark.parametrize(
+    "options, config, input, message",
+    [
+        ({"checkpointer": False}, {}, {}, "InMemorySaver or no checkpointer"),
+        ({}, {"configurable": {"checkpoint_ns": "nested"}}, {}, "root agent graph"),
+        ({}, {"recursion_limit": -1}, {}, "recursion_limit"),
+        ({"checkpointer": InMemorySaver()}, {}, {}, "requires configurable.thread_id"),
+        ({}, {}, Command(resume="yes"), "Command resumes require"),
+    ],
+    ids=[
+        "disabled-saver",
+        "nested-namespace",
+        "recursion",
+        "missing-thread",
+        "resume-input",
+    ],
+)
+async def test_invalid_driver_configuration_fails_before_model_work(
+    options: dict, config: RunnableConfig, input: Any, message: str
+) -> None:
     model = FakeModel(["Unused."])
-    agent = create_deep_agent(
-        name="test-agent", model=model, checkpointer=False if mode == "saver" else None
+    agent = create_deep_agent(name="test-agent", model=model, **options).with_config(
+        config
     )
-    if mode == "namespace":
-        agent = agent.with_config({"configurable": {"checkpoint_ns": "nested"}})
-    elif mode == "recursion":
-        agent = agent.with_config({"recursion_limit": -1})
-    with pytest.raises(DeepAgentsWorkflowError):
-        await _drive(lambda: agent, rollover=False)
+    with pytest.raises(DeepAgentsWorkflowError, match=message):
+        await _checkpoint.run(
+            agent, input, continue_as_new_after=1, state_snapshot=None
+        )
     assert model._cursor == 0
 
 
@@ -500,14 +472,8 @@ async def test_invalid_driver_configuration_fails_cleanly(mode: str) -> None:
 )
 async def test_malformed_snapshot_fails_before_more_model_work(field: str) -> None:
     model = FakeModel([_tool_reply(0), "Done."])
-    with pytest.raises(_ContinueAsNew) as caught:
-        await _checkpoint.run(
-            create_deep_agent(name="test-agent", model=model),
-            {"messages": [{"role": "user", "content": "Go."}]},
-            continue_as_new_after=1,
-            state_snapshot=None,
-        )
-    snapshot = caught.value.snapshot
+    carry = await _snapshot(create_deep_agent(name="test-agent", model=model))
+    snapshot = carry.snapshot
     del snapshot[_checkpoint.SNAPSHOT_KEY][field]
     with pytest.raises(
         DeepAgentsWorkflowError, match="Invalid Deep Agents checkpoint snapshot"
@@ -516,7 +482,7 @@ async def test_malformed_snapshot_fails_before_more_model_work(field: str) -> No
             lambda: create_deep_agent(name="test-agent", model=model),
             rollover=True,
             snapshot=snapshot,
-            input=caught.value.input,
+            input=carry.input,
         )
     assert model._cursor == 1
 
@@ -537,24 +503,13 @@ async def test_agent_programming_errors_keep_their_original_type() -> None:
     assert model._cursor == 0
 
 
-async def _snapshot(model: FakeModel, **config: Any) -> _ContinueAsNew:
-    agent = create_deep_agent(name="test-agent", model=model).with_config(**config)
-    with pytest.raises(_ContinueAsNew) as caught:
-        await _checkpoint.run(
-            agent,
-            {"messages": [{"role": "user", "content": "Go."}]},
-            continue_as_new_after=1,
-            state_snapshot=None,
-        )
-    return caught.value
-
-
 async def test_snapshot_metadata_drops_configuration_secrets() -> None:
     model = FakeModel([_tool_reply(0), "Done."])
     carry = await _snapshot(
-        model,
-        configurable={"tenant_api_key": "configuration-secret"},
-        metadata={"api_key": "metadata-secret"},
+        create_deep_agent(name="test-agent", model=model).with_config(
+            configurable={"tenant_api_key": "configuration-secret"},
+            metadata={"api_key": "metadata-secret"},
+        ),
     )
     saved = carry.snapshot[_checkpoint.SNAPSHOT_KEY]
     assert set(saved["metadata"]) <= {
@@ -577,7 +532,7 @@ async def test_snapshot_metadata_drops_configuration_secrets() -> None:
 @pytest.mark.parametrize("reuse", [False, True])
 async def test_snapshot_rejects_new_input_or_an_existing_thread(reuse: bool) -> None:
     model = FakeModel([_tool_reply(0), "Done."])
-    carry = await _snapshot(model)
+    carry = await _snapshot(create_deep_agent(name="test-agent", model=model))
     agent = create_deep_agent(
         name="test-agent", model=model, checkpointer=InMemorySaver()
     ).with_config({"configurable": {"thread_id": "resume"}})
@@ -605,7 +560,7 @@ async def test_snapshot_rejects_new_input_or_an_existing_thread(reuse: bool) -> 
 
 async def test_snapshots_are_bound_to_a_named_agent() -> None:
     model = FakeModel([_tool_reply(0), "Done."])
-    carry = await _snapshot(model)
+    carry = await _snapshot(create_deep_agent(name="test-agent", model=model))
     with pytest.raises(_checkpoint.CheckpointMismatchError, match="name changed"):
         await _checkpoint.run(
             create_deep_agent(name="writer", model=model),
@@ -625,7 +580,7 @@ async def test_snapshots_are_bound_to_a_named_agent() -> None:
 
 async def test_checkpoint_snapshot_is_rejected_by_legacy_driver() -> None:
     model = FakeModel([_tool_reply(0), "Done."])
-    carry = await _snapshot(model)
+    carry = await _snapshot(create_deep_agent(name="test-agent", model=model))
     from temporalio.deepagents.workflow import _merge_snapshot
 
     agent = create_deep_agent(name="test-agent", model=model)
@@ -686,32 +641,6 @@ async def test_falsy_thread_ids_support_interrupts(thread_id: Any) -> None:
     assert result["messages"][-1].content == "Done."
 
 
-async def test_caller_saver_requires_a_thread_id() -> None:
-    model = FakeModel(["Unused."])
-    with pytest.raises(
-        DeepAgentsWorkflowError, match="requires configurable.thread_id"
-    ):
-        await _drive(
-            lambda: create_deep_agent(
-                name="test-agent", model=model, checkpointer=InMemorySaver()
-            ),
-            rollover=False,
-        )
-    assert model._cursor == 0
-
-
-async def test_command_resume_requires_workflow_input() -> None:
-    model = FakeModel(["Unused."])
-    with pytest.raises(DeepAgentsWorkflowError, match="Command resumes require"):
-        await _checkpoint.run(
-            create_deep_agent(name="test-agent", model=model),
-            Command(resume="yes"),
-            continue_as_new_after=1,
-            state_snapshot=None,
-        )
-    assert model._cursor == 0
-
-
 async def test_serialization_and_deepcopy_errors_fail_before_model_work() -> None:
     class Uncopyable:
         def __deepcopy__(self, memo: Any) -> Any:
@@ -763,13 +692,6 @@ def test_tuple_state_uses_native_msgpack_array_semantics() -> None:
         create_deep_agent(name="test-agent", model=FakeModel(["Unused."]))
     )
     _checkpoint._round_trip(serde, {"tuple": (1, "two", (3,))})
-
-
-async def test_strict_msgpack_preserves_schema_types(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("LANGGRAPH_STRICT_MSGPACK", "true")
-    await test_nested_schema_types_survive_rollover()
 
 
 async def test_breakpoint_rollover_does_not_report_callback_errors() -> None:
@@ -886,17 +808,7 @@ async def test_recursion_budget_includes_nodes_after_the_last_model(
         return {"value": state["value"] + 1}
 
     def factory(saver: Any = None) -> Any:
-        graph = StateGraph(ManagedState)
-        graph.add_node("model", increment)
-        graph.add_node("tools", lambda state: {})
-        graph.add_node("tail", increment)
-        graph.add_edge(START, "model")
-        graph.add_conditional_edges(
-            "model", lambda state: "tools" if state["value"] < 3 else "tail"
-        )
-        graph.add_edge("tools", "model")
-        graph.add_edge("tail", END)
-        return graph.compile(name="test-agent", checkpointer=saver)
+        return _loop_graph(increment, tail=increment, checkpointer=saver)
 
     saver = InMemorySaver()
     native = factory(saver).with_config({"configurable": {"thread_id": "native"}})
@@ -933,15 +845,9 @@ async def test_nested_graph_inherits_the_original_recursion_limit() -> None:
         return {}
 
     def factory() -> Any:
-        graph = StateGraph(ManagedState)
-        graph.add_node("model", increment)
-        graph.add_node("tools", tools)
-        graph.add_edge(START, "model")
-        graph.add_conditional_edges(
-            "model", lambda state: "tools" if state["value"] < 5 else END
+        return _loop_graph(increment, steps=5, tools=tools).with_config(
+            {"recursion_limit": 10}
         )
-        graph.add_edge("tools", "model")
-        return graph.compile(name="test-agent").with_config({"recursion_limit": 10})
 
     expected = await factory().ainvoke({"value": 0})
     result, carries = await _drive(factory, rollover=True, input={"value": 0})
@@ -961,26 +867,15 @@ async def test_handbuilt_graph_preserves_langgraphs_default_limit(
         )
         return {"value": state["value"] + 1}
 
-    graph = StateGraph(ManagedState)
-    graph.add_node("model", model)
-    graph.add_node("tools", lambda state: {})
-    graph.add_edge(START, "model")
-    graph.add_conditional_edges(
-        "model", lambda state: "tools" if state["value"] < 2 else END
-    )
-    graph.add_edge("tools", "model")
-    native = graph.compile()
+    native = _loop_graph(model, steps=2)
     await native.ainvoke(cast(ManagedState, cast(object, {"value": 0})))
-    agent = graph.compile(
-        name="test-agent", checkpointer=InMemorySaver() if caller_saver else None
+    agent = _loop_graph(
+        model, steps=2, checkpointer=InMemorySaver() if caller_saver else None
     )
     if caller_saver:
         agent = agent.with_config({"configurable": {"thread_id": "default-limit"}})
-    with pytest.raises(_ContinueAsNew) as caught:
-        await _checkpoint.run(
-            agent, {"value": 0}, continue_as_new_after=1, state_snapshot=None
-        )
-    saved = caught.value.snapshot[_checkpoint.SNAPSHOT_KEY]
+    carry = await _snapshot(agent, {"value": 0})
+    saved = carry.snapshot[_checkpoint.SNAPSHOT_KEY]
     assert saved["remaining_steps"] == native_limits[0] - (
         saved["metadata"]["step"] + 1
     )
@@ -995,22 +890,15 @@ async def test_managed_remaining_steps_match_native(rollover: bool) -> None:
         return {"value": state["value"] + 1}
 
     def factory() -> Any:
-        graph = StateGraph(ManagedState)
-        graph.add_node("model", model)
-        graph.add_node("tools", lambda state: {})
-        graph.add_edge(START, "model")
-        graph.add_conditional_edges(
-            "model", lambda state: "tools" if state["value"] < 3 else END
-        )
-        graph.add_edge("tools", "model")
-        return graph.compile(name="test-agent").with_config({"recursion_limit": 8})
+        return _loop_graph(model).with_config({"recursion_limit": 8})
 
     expected = await factory().ainvoke({"value": 0})
     native_steps = observed.copy()
     observed.clear()
-    result, _ = await _drive(factory, rollover=rollover, input={"value": 0})
+    result, carries = await _drive(factory, rollover=rollover, input={"value": 0})
     assert result == expected
     assert observed == native_steps
+    assert len(carries) == (2 if rollover else 0)
 
 
 async def test_driver_saver_does_not_retain_intermediate_subagent_histories(

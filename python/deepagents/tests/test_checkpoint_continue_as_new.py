@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from typing import Annotated, Any
 from unittest.mock import patch
 
@@ -150,33 +151,59 @@ async def _histories(
         run_id = continued.new_execution_run_id
 
 
-@pytest.mark.asyncio
+async def _replay(workflow_type: type, histories: list[WorkflowHistory]) -> None:
+    replayer = Replayer(workflows=[workflow_type], plugins=[DeepAgentsPlugin()])
+    for history in histories:
+        await replayer.replay_workflow(history)
+
+
+async def _run(
+    env: WorkflowEnvironment,
+    workflow_type: Any,
+    input: Any = None,
+    *,
+    responses: list[Any] | None = None,
+    provider: Callable[[str], Any] | None = None,
+    replay: bool = True,
+) -> tuple[Any, list[WorkflowHistory]]:
+    """Run with cache eviction and collect and replay every run in the chain."""
+    plugin = DeepAgentsPlugin(
+        model_provider=provider or mock_model_provider(responses or ["Unused."])
+    )
+    client_config = env.client.config()
+    client_config["plugins"] = [plugin]
+    client = Client(**client_config)
+    task_queue = str(uuid.uuid4())
+    async with Worker(
+        client, task_queue=task_queue, workflows=[workflow_type], max_cached_workflows=0
+    ):
+        handle = await client.start_workflow(
+            workflow_type.run,
+            args=[] if input is None else [input],
+            id=task_queue,
+            task_queue=task_queue,
+        )
+        result = await handle.result()
+    histories = await _histories(client, handle.id, handle.first_execution_run_id)
+    if replay:
+        await _replay(workflow_type, histories)
+    return result, histories
+
+
 @pytest.mark.parametrize("todos", [False, True])
 async def test_graph_state_and_lifecycle_cross_multiple_runs(
     env: WorkflowEnvironment, todos: bool
 ) -> None:
-    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(_responses(todos)))
-    client_config = env.client.config()
-    client_config["plugins"] = [plugin]
-    client = Client(**client_config)
-    async with Worker(
-        client,
-        task_queue=f"checkpoint-state-{todos}",
-        workflows=[CheckpointAgentWorkflow],
-        max_cached_workflows=0,
-    ):
-        handle = await client.start_workflow(
-            CheckpointAgentWorkflow.run,
-            {
-                "messages": [{"role": "user", "content": "Research."}],
-                "todos": todos,
-                "limit": 1,
-            },
-            id=f"checkpoint-state-{uuid.uuid4()}",
-            task_queue=f"checkpoint-state-{todos}",
-        )
-        result = await handle.result()
-        histories = await _histories(client, handle.id, handle.first_execution_run_id)
+    result, histories = await _run(
+        env,
+        CheckpointAgentWorkflow,
+        {
+            "messages": [{"role": "user", "content": "Research."}],
+            "todos": todos,
+            "limit": 1,
+        },
+        responses=_responses(todos),
+    )
     assert len(histories) >= 3
     assert result["started"] == result["finished"] == 1
     assert result["model_steps"] == 5
@@ -191,37 +218,21 @@ async def test_graph_state_and_lifecycle_cross_multiple_runs(
         assert result["todos"][0]["status"] == "pending"
     else:
         assert result["todos"] is None
-    replayer = Replayer(
-        workflows=[CheckpointAgentWorkflow], plugins=[DeepAgentsPlugin()]
-    )
-    for history in histories:
-        await replayer.replay_workflow(history)
 
 
-@pytest.mark.asyncio
 async def test_completed_answer_returns_even_past_limit(
     env: WorkflowEnvironment,
 ) -> None:
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-completed",
-        workflows=[CheckpointAgentWorkflow],
-        plugins=[DeepAgentsPlugin(model_provider=mock_model_provider(["Done."]))],
-    ):
-        handle = await env.client.start_workflow(
-            CheckpointAgentWorkflow.run,
-            {"messages": [{"role": "user", "content": "Hello."}], "limit": 1},
-            id=f"checkpoint-completed-{uuid.uuid4()}",
-            task_queue="checkpoint-completed",
-        )
-        result = await handle.result()
-    assert result["model_steps"] == result["started"] == result["finished"] == 1
-    assert (
-        len(await _histories(env.client, handle.id, handle.first_execution_run_id)) == 1
+    result, histories = await _run(
+        env,
+        CheckpointAgentWorkflow,
+        {"messages": [{"role": "user", "content": "Hello."}], "limit": 1},
+        responses=["Done."],
     )
+    assert result["model_steps"] == result["started"] == result["finished"] == 1
+    assert len(histories) == 1
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("suggested", [False, True])
 async def test_checkpoint_driver_follows_server_suggestion(
     env: WorkflowEnvironment, suggested: bool
@@ -229,28 +240,12 @@ async def test_checkpoint_driver_follows_server_suggestion(
     with patch.object(
         workflow.Info, "is_continue_as_new_suggested", return_value=suggested
     ):
-        async with Worker(
-            env.client,
-            task_queue=f"checkpoint-suggestion-{suggested}",
-            workflows=[CheckpointAgentWorkflow],
-            plugins=[
-                DeepAgentsPlugin(model_provider=mock_model_provider(_responses(False)))
-            ],
-        ):
-            handle = await env.client.start_workflow(
-                CheckpointAgentWorkflow.run,
-                {"messages": [{"role": "user", "content": "Research."}]},
-                id=f"checkpoint-suggestion-{uuid.uuid4()}",
-                task_queue=f"checkpoint-suggestion-{suggested}",
-            )
-            result = await handle.result()
-        histories = await _histories(
-            env.client, handle.id, handle.first_execution_run_id
+        result, histories = await _run(
+            env,
+            CheckpointAgentWorkflow,
+            {"messages": [{"role": "user", "content": "Research."}]},
+            responses=_responses(False),
         )
-        for history in histories:
-            await Replayer(
-                workflows=[CheckpointAgentWorkflow], plugins=[DeepAgentsPlugin()]
-            ).replay_workflow(history)
     assert (len(histories) > 1) == suggested
     assert result["model_steps"] == 5
 
@@ -278,34 +273,17 @@ class InterruptedAgentWorkflow:
         }
 
 
-@pytest.mark.asyncio
 async def test_application_interrupt_is_returned_to_caller(
     env: WorkflowEnvironment,
 ) -> None:
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-interrupt",
-        workflows=[InterruptedAgentWorkflow],
-        plugins=[
-            DeepAgentsPlugin(
-                model_provider=mock_model_provider(
-                    [
-                        _call("read_file", {"file_path": "/notes.md"}, "read-1"),
-                    ]
-                )
-            )
-        ],
-    ):
-        handle = await env.client.start_workflow(
-            InterruptedAgentWorkflow.run,
-            {"messages": [{"role": "user", "content": "Read."}]},
-            id=f"checkpoint-interrupt-{uuid.uuid4()}",
-            task_queue="checkpoint-interrupt",
-        )
-        assert await handle.result() == {"interrupted": True, "finished": 0}
-    assert (
-        len(await _histories(env.client, handle.id, handle.first_execution_run_id)) == 1
+    result, histories = await _run(
+        env,
+        InterruptedAgentWorkflow,
+        {"messages": [{"role": "user", "content": "Read."}]},
+        responses=[_call("read_file", {"file_path": "/notes.md"}, "read-1")],
     )
+    assert result == {"interrupted": True, "finished": 0}
+    assert len(histories) == 1
 
 
 @workflow.defn
@@ -324,30 +302,14 @@ class RecursionBudgetWorkflow:
         return "unexpected completion"
 
 
-@pytest.mark.asyncio
 async def test_recursion_budget_survives_rollovers(env: WorkflowEnvironment) -> None:
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-budget",
-        workflows=[RecursionBudgetWorkflow],
-        plugins=[
-            DeepAgentsPlugin(
-                model_provider=mock_model_provider(
-                    [
-                        _call("ls", {"path": "/"}, "loop"),
-                    ]
-                )
-            )
-        ],
-    ):
-        handle = await env.client.start_workflow(
-            RecursionBudgetWorkflow.run,
-            {"messages": [{"role": "user", "content": "Loop."}]},
-            id=f"checkpoint-budget-{uuid.uuid4()}",
-            task_queue="checkpoint-budget",
-        )
-        assert await handle.result() == "limited"
-    histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
+    result, histories = await _run(
+        env,
+        RecursionBudgetWorkflow,
+        {"messages": [{"role": "user", "content": "Loop."}]},
+        responses=[_call("ls", {"path": "/"}, "loop")],
+    )
+    assert result == "limited"
     assert 1 < len(histories) < 8
 
 
@@ -373,7 +335,6 @@ class SubagentCheckpointWorkflow:
         return [[m.type, m.content] for m in result["messages"]]
 
 
-@pytest.mark.asyncio
 async def test_subagent_finishes_before_parent_rollover(
     env: WorkflowEnvironment,
 ) -> None:
@@ -394,19 +355,12 @@ async def test_subagent_finishes_before_parent_rollover(
         provider_calls.append(name)
         return sub(name) if name == "fake:sub" else main(name)
 
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-subagent",
-        workflows=[SubagentCheckpointWorkflow],
-        plugins=[DeepAgentsPlugin(model_provider=provider)],
-    ):
-        handle = await env.client.start_workflow(
-            SubagentCheckpointWorkflow.run,
-            {"messages": [{"role": "user", "content": "Delegate."}]},
-            id=f"checkpoint-subagent-{uuid.uuid4()}",
-            task_queue="checkpoint-subagent",
-        )
-        result = await handle.result()
+    result, histories = await _run(
+        env,
+        SubagentCheckpointWorkflow,
+        {"messages": [{"role": "user", "content": "Delegate."}]},
+        provider=provider,
+    )
     assert provider_calls == ["fake:main", "fake:sub", "fake:sub", "fake:main"]
     assert result == [
         ["human", "Delegate."],
@@ -414,12 +368,7 @@ async def test_subagent_finishes_before_parent_rollover(
         ["tool", "Sub done."],
         ["ai", "Main done."],
     ]
-    histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
     assert len(histories) == 2
-    for history in histories:
-        await Replayer(
-            workflows=[SubagentCheckpointWorkflow], plugins=[DeepAgentsPlugin()]
-        ).replay_workflow(history)
 
 
 class LegacyTodoAgent:
@@ -448,59 +397,25 @@ class LegacyTodoCheckpointWorkflow:
         )
 
 
-@pytest.mark.asyncio
-async def test_pre_checkpoint_histories_use_legacy_driver(
-    env: WorkflowEnvironment,
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_todo_rollover_is_only_used_by_legacy_histories(
+    env: WorkflowEnvironment, legacy: bool
 ) -> None:
     original_patched = workflow.patched
 
     def before_checkpoint_change(patch_id: str) -> bool:
-        if patch_id == "deepagents.checkpoint-continue-as-new":
+        if legacy and patch_id == "deepagents.checkpoint-continue-as-new":
             return False
         return original_patched(patch_id)
 
     with patch.object(workflow, "patched", before_checkpoint_change):
-        async with Worker(
-            env.client,
-            task_queue="checkpoint-legacy",
-            workflows=[LegacyTodoCheckpointWorkflow],
-            plugins=[DeepAgentsPlugin()],
-        ):
-            handle = await env.client.start_workflow(
-                LegacyTodoCheckpointWorkflow.run,
-                {"messages": []},
-                id=f"checkpoint-legacy-{uuid.uuid4()}",
-                task_queue="checkpoint-legacy",
-            )
-            assert (await handle.result())["messages"] == ["step"] * 3
-    histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
-    assert len(histories) == 3
-    for history in histories:
-        await Replayer(
-            workflows=[LegacyTodoCheckpointWorkflow], plugins=[DeepAgentsPlugin()]
-        ).replay_workflow(history)
-
-
-@pytest.mark.asyncio
-async def test_plain_agent_todos_do_not_trigger_rollover(
-    env: WorkflowEnvironment,
-) -> None:
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-plain",
-        workflows=[LegacyTodoCheckpointWorkflow],
-        plugins=[DeepAgentsPlugin()],
-    ):
-        handle = await env.client.start_workflow(
-            LegacyTodoCheckpointWorkflow.run,
-            {"messages": []},
-            id=f"checkpoint-plain-{uuid.uuid4()}",
-            task_queue="checkpoint-plain",
+        result, histories = await _run(
+            env, LegacyTodoCheckpointWorkflow, {"messages": []}, replay=False
         )
-        assert (await handle.result())["messages"] == ["step"]
-    assert (
-        len(await _histories(env.client, handle.id, handle.first_execution_run_id)) == 1
-    )
+    assert result["messages"] == ["step"] * (3 if legacy else 1)
+    assert len(histories) == (3 if legacy else 1)
+    # Replay outside the patch to prove old histories select the legacy driver.
+    await _replay(LegacyTodoCheckpointWorkflow, histories)
 
 
 @workflow.defn
@@ -518,27 +433,16 @@ class StaticBreakpointWorkflow:
         return [[m.type, m.content] for m in result["messages"]]
 
 
-@pytest.mark.asyncio
 async def test_caller_breakpoint_is_not_automatically_resumed(
     env: WorkflowEnvironment,
 ) -> None:
     def no_model_call(name: str) -> Any:
         raise AssertionError(f"Caller breakpoint was bypassed: {name}")
 
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-breakpoint",
-        workflows=[StaticBreakpointWorkflow],
-        plugins=[DeepAgentsPlugin(model_provider=no_model_call)],
-    ):
-        assert await env.client.execute_workflow(
-            StaticBreakpointWorkflow.run,
-            id=f"checkpoint-breakpoint-{uuid.uuid4()}",
-            task_queue="checkpoint-breakpoint",
-        ) == [["human", "Pause."]]
+    result, _ = await _run(env, StaticBreakpointWorkflow, provider=no_model_call)
+    assert result == [["human", "Pause."]]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "snapshot, message",
     [
@@ -589,41 +493,23 @@ class ApprovalAfterRolloverWorkflow:
         return result["messages"][-1].content
 
 
-@pytest.mark.asyncio
 async def test_approval_after_rollover_resumes_and_continues_again(
     env: WorkflowEnvironment,
 ) -> None:
-    plugin = DeepAgentsPlugin(
-        model_provider=mock_model_provider(
-            [
-                _call("ls", {"path": "/"}, "ls-1"),
-                _call("read_file", {"file_path": "/notes.md"}, "read-1"),
-                _call("read_file", {"file_path": "/notes.md"}, "read-2"),
-                _call("ls", {"path": "/"}, "ls-2"),
-                "Approved.",
-            ]
-        )
+    result, histories = await _run(
+        env,
+        ApprovalAfterRolloverWorkflow,
+        {"messages": [{"role": "user", "content": "Read."}]},
+        responses=[
+            _call("ls", {"path": "/"}, "ls-1"),
+            _call("read_file", {"file_path": "/notes.md"}, "read-1"),
+            _call("read_file", {"file_path": "/notes.md"}, "read-2"),
+            _call("ls", {"path": "/"}, "ls-2"),
+            "Approved.",
+        ],
     )
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-approval-resume",
-        workflows=[ApprovalAfterRolloverWorkflow],
-        plugins=[plugin],
-        max_cached_workflows=0,
-    ):
-        handle = await env.client.start_workflow(
-            ApprovalAfterRolloverWorkflow.run,
-            {"messages": [{"role": "user", "content": "Read."}]},
-            id=f"checkpoint-approval-{uuid.uuid4()}",
-            task_queue="checkpoint-approval-resume",
-        )
-        assert await handle.result() == "Approved."
-    histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
+    assert result == "Approved."
     assert len(histories) == 5
-    for history in histories:
-        await Replayer(
-            workflows=[ApprovalAfterRolloverWorkflow], plugins=[DeepAgentsPlugin()]
-        ).replay_workflow(history)
 
 
 @workflow.defn
@@ -653,7 +539,6 @@ class InvalidConfigurationWorkflow:
         )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["signature", "saver", "threshold", "recursion"])
 async def test_driver_errors_fail_workflow_execution(
     env: WorkflowEnvironment, mode: str
@@ -665,25 +550,15 @@ async def test_driver_errors_fail_workflow_execution(
         calls.append(name)
         return looping_provider(name)
 
-    workflow_class = (
-        InvalidSignatureWorkflow
-        if mode == "signature"
-        else InvalidConfigurationWorkflow
-    )
-    async with Worker(
-        env.client,
-        task_queue=f"checkpoint-invalid-{mode}",
-        workflows=[workflow_class],
-        plugins=[DeepAgentsPlugin(model_provider=provider)],
-    ):
-        handle = await env.client.start_workflow(
-            workflow_class.run,
+    with pytest.raises(WorkflowFailureError) as caught:
+        await _run(
+            env,
+            InvalidSignatureWorkflow
+            if mode == "signature"
+            else InvalidConfigurationWorkflow,
             {"mode": mode},
-            id=f"checkpoint-invalid-{mode}-{uuid.uuid4()}",
-            task_queue=f"checkpoint-invalid-{mode}",
+            provider=provider,
         )
-        with pytest.raises(WorkflowFailureError) as caught:
-            await handle.result()
     cause = caught.value.cause
     assert isinstance(cause, ApplicationError)
     assert cause.type == DeepAgentsWorkflowError.TYPE
@@ -745,9 +620,7 @@ async def test_signal_and_update_turns_finish_without_rolling_over(
         assert await handle.result() == 2
     histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
     assert len(histories) == 1
-    await Replayer(
-        workflows=[HandlerAgentWorkflow], plugins=[DeepAgentsPlugin()]
-    ).replay_workflow(histories[0])
+    await _replay(HandlerAgentWorkflow, histories)
 
 
 @workflow.defn
@@ -770,26 +643,11 @@ class TypedInputWorkflow:
 async def test_explicit_workflow_input_retains_its_type_across_rollover(
     env: WorkflowEnvironment,
 ) -> None:
-    plugin = DeepAgentsPlugin(
-        model_provider=mock_model_provider([_call("ls", {"path": "/"}, "ls"), "Done."])
+    result, histories = await _run(
+        env,
+        TypedInputWorkflow,
+        "Go.",
+        responses=[_call("ls", {"path": "/"}, "ls"), "Done."],
     )
-    async with Worker(
-        env.client,
-        task_queue="checkpoint-typed-input",
-        workflows=[TypedInputWorkflow],
-        plugins=[plugin],
-        max_cached_workflows=0,
-    ):
-        handle = await env.client.start_workflow(
-            TypedInputWorkflow.run,
-            "Go.",
-            id=f"checkpoint-typed-input-{uuid.uuid4()}",
-            task_queue="checkpoint-typed-input",
-        )
-        assert await handle.result() == "Done."
-    histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
+    assert result == "Done."
     assert len(histories) == 2
-    for history in histories:
-        await Replayer(
-            workflows=[TypedInputWorkflow], plugins=[DeepAgentsPlugin()]
-        ).replay_workflow(history)
