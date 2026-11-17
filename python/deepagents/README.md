@@ -485,6 +485,12 @@ named ...`, as it does without the plugin. That includes a caller Activity
 with one of these names. A second, different
 dynamic Activity fails with `TypeError: More than one dynamic activity`.
 
+Cancellation escaping `run_deep_agent` closes the Workflow as `CANCELED`.
+Use `temporalio.exceptions.is_cancelled_exception` to recognize cancellation.
+Other Temporal failures remain `DeepAgentsWorkflowError`. Histories recorded
+before the `deepagents.raise-cancellation` patch retain the earlier failure
+and cleanup behavior during replay.
+
 ## Composing with other plugins
 
 This plugin carries no tracing context of its own. For observability, compose it
