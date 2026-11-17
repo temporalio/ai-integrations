@@ -105,11 +105,9 @@ def test_functional_task_closure_raises() -> None:
 
 
 def test_graph_node_main_module_raises() -> None:
-    """The closure fallback doesn't extend to other task_id rejections.
+    """Only closures and local functions get past task_id's rejections.
 
-    A ``__main__`` node function's ``module.qualname`` isn't stable across
-    runs of a script, so it stays rejected as before; only closures and
-    local functions fall back to the activity name.
+    A ``__main__`` node function stays rejected as before.
     """
 
     def node(state: State) -> dict[str, str]:  # pyright: ignore[reportUnusedParameter]

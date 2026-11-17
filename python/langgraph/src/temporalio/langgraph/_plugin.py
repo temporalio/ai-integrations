@@ -65,34 +65,33 @@ def _constant_summary_fn(
 def _task_cache_id(func: Callable, activity_name: str) -> str:
     """Return the continue-as-new cache id for an activity-bound node or task.
 
-    Node factories return closures, and ``task_id`` rejects those: every
-    closure from one factory shares a qualname, so it cannot identify a
-    node. A Graph API node's Temporal identity is its ``<graph>.<node>``
-    activity name regardless of its function, so that name — prefixed to
-    keep it out of the ``module.qualname`` id space — identifies the
-    node's cached results just as well. Only closures and local functions
-    fall back; every other ``task_id`` rejection (``__main__`` functions,
-    callables without a qualname) still propagates. Functions with a
-    stable ``module.qualname`` keep it, so caches written by earlier
-    versions (and the histories carrying them) stay valid.
+    A Functional API task is identified by its ``module.qualname``, which is
+    also its activity name. A Graph API node is identified by its
+    ``<graph>.<node>`` activity name, prefixed to keep it out of the
+    ``module.qualname`` id space, and never by its function: nodes built
+    from one function, bound method or factory share a qualname, so one
+    would get another's cached result. A node function that ``task_id``
+    rejects is refused although its id does not use it (``__main__``
+    functions, callables without a qualname). Closures and local functions
+    are accepted.
 
     Args:
         func: Activity-bound node or task function.
-        activity_name: Activity name whose results are cached when ``func``
-            is a closure or local function.
+        activity_name: Activity name the function is registered under.
 
     Returns:
         The id the continue-as-new result cache keys ``func``'s entries by.
     """
     try:
-        return task_id(func)
+        if task_id(func) == activity_name:
+            return activity_name
     except ValueError:
         qualname = (
             getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or ""
         )
         if "<locals>" not in qualname:
             raise
-        return f"graph-node:{activity_name}"
+    return f"graph-node:{activity_name}"
 
 
 def _merge_activity_opts(
@@ -573,17 +572,22 @@ def graph(
 ) -> StateGraph[Any, Any, Any, Any]:
     """Retrieve a registered graph by name.
 
+    Call it anywhere in Workflow code: in ``__init__``, in ``run``, in a
+    handler, or in a node or task that runs in the Workflow.
+
     Each call returns a shallow copy of the graph with its own nodes, so
     ``compile()`` can add to it and set node defaults without changing the
     registered graph.
 
     Args:
         name: Graph name as registered with LangGraphPlugin.
-        cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed nodes are
-            not re-executed after continue-as-new.
+        cache: Optional task result cache from a cache() call in an earlier
+            run, passed on through continue-as-new. The first call of an
+            Activity node with the same input as a call in that cache gets
+            the cached result instead of running. The cache belongs to the
+            Workflow run, not to this graph: every graph and entrypoint of
+            the run uses it, and a later call without ``cache`` keeps it.
     """
-    set_task_cache(cache or {})
     graphs = _workflow_graphs.get(workflow.info().run_id)
     if graphs is None:
         raise RuntimeError(
@@ -591,6 +595,7 @@ def graph(
         )
     if name not in graphs:
         raise KeyError(f"Graph {name!r} not found. Available graphs: {list(graphs)}")
+    set_task_cache(cache)
     # compile() adds the default error handler's node to its builder, raising
     # if the node is already there, and sets node defaults on the node specs.
     # The registered builder serves every run on the Worker, so copy both. The
@@ -606,13 +611,19 @@ def entrypoint(
 ) -> Pregel[Any, Any, Any, Any]:
     """Retrieve a registered entrypoint by name.
 
+    Call it anywhere in Workflow code: in ``__init__``, in ``run``, in a
+    handler, or in a node or task that runs in the Workflow.
+
     Args:
         name: Entrypoint name as registered with Plugin.
-        cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed tasks are
-            not re-executed after continue-as-new.
+        cache: Optional task result cache from a cache() call in an earlier
+            run, passed on through continue-as-new. The first call of an
+            Activity task with the same arguments as a call in that cache
+            gets the cached result instead of running. The cache belongs to
+            the Workflow run, not to this entrypoint: every graph and
+            entrypoint of the run uses it, and a later call without
+            ``cache`` keeps it.
     """
-    set_task_cache(cache or {})
     entrypoints = _workflow_entrypoints.get(workflow.info().run_id)
     if entrypoints is None:
         raise RuntimeError(
@@ -622,14 +633,19 @@ def entrypoint(
         raise KeyError(
             f"Entrypoint {name!r} not found. Available entrypoints: {list(entrypoints)}"
         )
+    set_task_cache(cache)
     return workflow_entrypoint(entrypoints[name])
 
 
 def cache() -> dict[str, Any] | None:
-    """Return the task result cache as a serializable dict.
+    """Return the Workflow run's task result cache as a serializable dict.
 
-    Returns a dict suitable for passing to entrypoint(name, cache=...) to
-    restore cached task results across continue-as-new boundaries.
-    Returns None if the cache is empty.
+    Pass it to the next run through continue-as-new and give it to
+    graph(name, cache=...) or entrypoint(name, cache=...) there. It holds
+    the latest result of each Activity node or task call of this run, and
+    what earlier runs handed over. Returns None if the cache is empty.
     """
+    if not workflow.in_workflow():
+        # The cache is kept on the Workflow's event loop, so other code has none.
+        return None
     return get_task_cache() or None
