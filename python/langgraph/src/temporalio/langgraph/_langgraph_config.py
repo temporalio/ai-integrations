@@ -69,8 +69,9 @@ def strip_runnable_config(config: RunnableConfig | None) -> RunnableConfig:
     LangGraph injects the active RunnableConfig into user functions as a
     config kwarg. The full object holds non-serializable things (callbacks,
     checkpointer/store/cache handles, pregel send/read callables) that can't
-    cross an activity boundary, so we keep only primitive fields and the
-    serializable subset of configurable.
+    cross an activity boundary, so we keep only primitive fields and
+    LangGraph's own serializable keys of configurable. Every other
+    configurable value is dropped.
     """
     orig = config or {}
     configurable = orig.get("configurable") or {}
