@@ -16,6 +16,7 @@ from typing import Any, Callable
 from langgraph._internal._runnable import RunnableCallable
 from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
+from langgraph.types import CachePolicy, TimeoutPolicy
 
 from temporalio import activity, workflow
 from temporalio.langgraph._activity import (
@@ -107,6 +108,88 @@ def _merge_activity_opts(
     return merged
 
 
+def _refuse_clock_policies(
+    owner: str,
+    timeout: TimeoutPolicy | None,
+    cache_policy: CachePolicy | None,
+    how: str = "set",
+) -> None:
+    """Refuse the LangGraph policies that depend on the system clock.
+
+    A ``run_timeout`` fires on a Workflow timer and a cache policy without a
+    ``ttl`` never expires, so they pass.
+    """
+    if timeout is not None and timeout.idle_timeout is not None:
+        raise ValueError(
+            f"{owner} has a LangGraph idle_timeout {how}. LangGraph times it "
+            f"with the system clock, so the Workflow would not be "
+            f"deterministic. Use run_timeout or Temporal activity options "
+            f"instead, e.g. heartbeat_timeout."
+        )
+    if cache_policy is not None and cache_policy.ttl is not None:
+        raise ValueError(
+            f"{owner} has a LangGraph cache_policy ttl {how}. LangGraph's "
+            f"InMemoryCache expires entries by the system clock, so the "
+            f"Workflow would not be deterministic. Remove the ttl."
+        )
+
+
+def _refuse_unsupported_policies(
+    graphs: dict[str, StateGraph[Any, Any, Any, Any]],
+    entrypoints: dict[str, Pregel[Any, Any, Any, Any]],
+    tasks: list,
+) -> None:
+    """Refuse the LangGraph policies that the plugin can't support.
+
+    A node's or a task's own ``retry_policy`` is refused where the plugin
+    wraps it.
+    """
+    for graph_name, graph in graphs.items():
+        # compile() gives these to every node that sets none of its own. It
+        # runs in the Workflow, after the plugin has looked at the nodes.
+        defaults = graph._node_defaults
+        if defaults.retry_policy:
+            raise ValueError(
+                f"Graph {graph_name} has a LangGraph retry_policy set with "
+                f"set_node_defaults. Use Temporal activity options instead, "
+                f"e.g. pass retry_policy=RetryPolicy(...) via "
+                f"default_activity_options or in each node's metadata dict."
+            )
+        _refuse_clock_policies(
+            f"Graph {graph_name}",
+            defaults.timeout,
+            defaults.cache_policy,
+            how="set with set_node_defaults",
+        )
+        for node_name, node in graph.nodes.items():
+            _refuse_clock_policies(
+                f"Node {graph_name}.{node_name}", node.timeout, node.cache_policy
+            )
+    for task in tasks:
+        _refuse_clock_policies(
+            f"Task {task.func.__name__}", task.timeout, task.cache_policy
+        )
+    for name, program in entrypoints.items():
+        if program.retry_policy:
+            raise ValueError(
+                f"Entrypoint {name} has a LangGraph retry_policy set. Use "
+                f"Temporal activity options instead, e.g. pass "
+                f"retry_policy=RetryPolicy(...) via default_activity_options "
+                f"or activity_options[task_name]."
+            )
+        if program.cache is not None:
+            raise ValueError(
+                f"Entrypoint {name} has a LangGraph cache set. Every Workflow "
+                f"run on the Worker would share it, so one run would get "
+                f"another run's results. Remove it."
+            )
+        # @entrypoint puts its timeout on the node that runs the function.
+        for function_node in program.nodes.values():
+            _refuse_clock_policies(
+                f"Entrypoint {name}", function_node.timeout, program.cache_policy
+            )
+
+
 class LangGraphPlugin(SimplePlugin):
     """LangGraph plugin for Temporal SDK.
 
@@ -163,6 +246,12 @@ class LangGraphPlugin(SimplePlugin):
             non-interactive aggregation, lower toward 10–50ms only if
             you've measured the latency need and accept the history
             cost.
+
+    Raises:
+        ValueError: If a graph, task or entrypoint sets a LangGraph option
+            that the plugin refuses: a ``retry_policy``, an ``idle_timeout``,
+            a cache policy ``ttl``, or a ``cache`` on an entrypoint. The
+            README says what to use instead.
     """
 
     def __init__(
@@ -241,6 +330,8 @@ class LangGraphPlugin(SimplePlugin):
                 *(task.func for task in tasks or []),
             ],
         )
+
+        _refuse_unsupported_policies(graphs or {}, entrypoints or {}, tasks or [])
 
         # Graph API: Wrap graph nodes as Temporal Activities.
         if graphs:

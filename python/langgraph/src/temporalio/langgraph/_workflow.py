@@ -14,6 +14,7 @@ from langgraph._internal._constants import CONFIG_KEY_RUNTIME
 
 from temporalio import workflow
 from temporalio.contrib.workflow_streams._stream import _PUBLISH_SIGNAL
+from temporalio.langgraph._langgraph_config import refuse_idle_timeout
 
 
 def wrap_workflow(
@@ -37,6 +38,8 @@ def wrap_workflow(
     """
 
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        refuse_idle_timeout()
+
         if summary_fn is not None:
             # Always write (clearing when empty) so this node never shows a
             # stale summary left by an earlier workflow-bound node.
