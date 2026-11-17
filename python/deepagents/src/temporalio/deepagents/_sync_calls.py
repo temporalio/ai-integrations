@@ -14,20 +14,25 @@ graph built before the Worker or Replayer keeps it. Workflow code is imported
 again in the sandbox for each run, so its graphs get the stand-in. LangGraph's
 refusal of a timeout on a sync step recognizes both.
 
-Sync graph calls use a separate thread pool. Guard its module-local factory so
-they fail before any node runs, including through methods bound before setup.
+LangChain runs a graph step with several nodes, ``batch`` and
+``RunnableParallel`` on its own thread pool, whose threads run outside the
+Workflow. The plugin swaps that pool's class for one that refuses work in
+Workflow code, so those calls fail the Workflow Task before anything runs on a
+thread. A graph whose steps each run one node never uses the pool.
 """
 
 from __future__ import annotations
 
 import contextvars
 import importlib
+import inspect
 import threading
 from collections.abc import Callable
 from functools import partial
 from typing import Any
 
 from temporalio import workflow
+from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
 
 # The modules whose ``run_in_executor`` runs a tool, an output parser, a
 # runnable with only a sync invoke, or a LangGraph step.
@@ -47,20 +52,28 @@ _MODULES = (
 # the helper and later ones the stand-in, so the plugin wraps the check.
 _TIMEOUT_CHECK = "langgraph.pregel._utils"
 _EXECUTOR_CHECK = "_is_executor_backed_afunc"
-_GRAPH_EXECUTOR = "langgraph.pregel._executor"
+
+_POOL_MESSAGE = (
+    "LangChain tried to run work on its thread pool in a Workflow, for example a "
+    "LangGraph step with several nodes, batch() or RunnableParallel. Those threads "
+    "run outside the Workflow. Use the async form, such as await graph.ainvoke(...), "
+    "or move the call into an Activity."
+)
 
 
-def _get_executor_for_config(config: Any) -> Any:
-    if workflow.in_workflow() or workflow.unsafe.in_sandbox():
-        from temporalio.deepagents.workflow import DeepAgentsWorkflowError
+def _refuse_in_workflows(pool: type) -> type:
+    class WorkflowPool(pool):  # type: ignore[valid-type, misc]
+        refuses_workflow_work = True
 
-        raise DeepAgentsWorkflowError(
-            "LangGraph sync graph calls start threads outside Workflow execution. "
-            "Use await graph.ainvoke(...), graph.astream(...), or an Activity."
-        )
-    from langchain_core.runnables.config import get_executor_for_config
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+            if workflow.in_workflow() or workflow.unsafe.in_sandbox():
+                raise RestrictedWorkflowAccessError(
+                    "langchain_core.runnables.config.ContextThreadPoolExecutor",
+                    override_message=_POOL_MESSAGE,
+                )
+            return super().submit(fn, *args, **kwargs)
 
-    return get_executor_for_config(config)
+    return WorkflowPool
 
 
 async def _run_in_executor(
@@ -92,7 +105,8 @@ _install_lock = threading.Lock()
 
 def run_sync_calls_in_workflows() -> None:
     """Rebind the helper in ``_MODULES`` for both Workers and Replayers."""
-    from langchain_core.runnables.config import get_executor_for_config, run_in_executor
+    from langchain_core.runnables import config
+    from langchain_core.runnables.config import run_in_executor
 
     with _install_lock:
         modules = [importlib.import_module(name) for name in _MODULES]
@@ -104,23 +118,11 @@ def run_sync_calls_in_workflows() -> None:
                     "the Deep Agents plugin requires the helper imported by name "
                     "to run sync tools in the workflow."
                 )
-        executor = importlib.import_module(_GRAPH_EXECUTOR)
-        factory = getattr(executor, "get_executor_for_config", None)
-        if (
-            factory is not get_executor_for_config
-            and factory is not _get_executor_for_config
-        ):
+        factory = inspect.unwrap(config.get_executor_for_config)
+        if "ContextThreadPoolExecutor" not in factory.__code__.co_names:
             raise RuntimeError(
-                f"Unsupported LangGraph executor factory in {_GRAPH_EXECUTOR}; "
-                "the Deep Agents plugin requires get_executor_for_config imported by name."
-            )
-        if (
-            "get_executor_for_config"
-            not in executor.BackgroundExecutor.__init__.__code__.co_names
-        ):
-            raise RuntimeError(
-                f"Unsupported LangGraph BackgroundExecutor in {_GRAPH_EXECUTOR}; "
-                "it no longer uses get_executor_for_config."
+                "Unsupported langchain_core.runnables.config.get_executor_for_config; "
+                "the Deep Agents plugin requires it to build ContextThreadPoolExecutor."
             )
         utils = importlib.import_module(_TIMEOUT_CHECK)
         check = None
@@ -134,7 +136,9 @@ def run_sync_calls_in_workflows() -> None:
                 )
         for module in modules:
             setattr(module, "run_in_executor", _run_in_executor)
-        setattr(executor, "get_executor_for_config", _get_executor_for_config)
+        pool = config.ContextThreadPoolExecutor
+        if not getattr(pool, "refuses_workflow_work", False):
+            setattr(config, "ContextThreadPoolExecutor", _refuse_in_workflows(pool))
         if check is not None and not getattr(check, "recognizes_stand_in", False):
             wrapped = _recognize_stand_in(check, run_in_executor)
             setattr(utils, _EXECUTOR_CHECK, wrapped)

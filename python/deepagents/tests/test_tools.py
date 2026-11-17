@@ -42,7 +42,9 @@ with workflow.unsafe.imports_passed_through():
     )
     from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
     from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
-    from temporalio.deepagents.workflow import DeepAgentsWorkflowError  # noqa: E402
+    from temporalio.worker.workflow_sandbox import (  # noqa: E402
+        RestrictedWorkflowAccessError,
+    )
     from tests.prebound_graph import (  # noqa: E402
         EARLY_GRAPH_STREAM,
         EARLY_GRAPH_VISITS,
@@ -65,7 +67,7 @@ from langchain_core.output_parsers import (  # noqa: E402
     JsonOutputParser,
     StrOutputParser,
 )
-from langchain_core.runnables import RunnableLambda  # noqa: E402
+from langchain_core.runnables import RunnableLambda, RunnableParallel  # noqa: E402
 from langchain_core.tools import BaseTool, StructuredTool, Tool, tool  # noqa: E402
 from langgraph.func import (  # noqa: E402  # pyright: ignore[reportMissingTypeStubs]
     entrypoint,
@@ -1047,26 +1049,32 @@ class SyncLangChainCallsWorkflow:
         results.append(
             [state async for state in graph.astream({}, stream_mode="values")][-1]
         )
+        # A sync graph whose steps each run one node runs in the workflow.
+        results.append(count_graph().invoke({"n": 0}))
         visited.clear()
         EARLY_GRAPH_VISITS.clear()
+        # Calls that would run work on LangChain's thread pool are refused,
+        # also for a graph built before the Worker.
         graph_calls: list[Callable[[], Any]] = [
             lambda: graph.invoke({}),
             lambda: list(graph.stream({})),
             lambda: list(EARLY_GRAPH_STREAM({})),
+            lambda: count_graph().batch([{"n": 0}, {"n": 0}]),
+            lambda: RunnableParallel(a=count_graph(), b=count_graph()).invoke({"n": 0}),
         ]
         rejected: list[bool] = []
         for call in graph_calls:
             try:
                 call()
                 rejected.append(False)
-            except DeepAgentsWorkflowError as err:
+            except RestrictedWorkflowAccessError as err:
                 rejected.append("ainvoke" in str(err))
         try:
             await StructuredTool.from_function(
                 func=graph_calls[0], name="sync_graph", description="Run a graph."
             ).ainvoke({})
             rejected.append(False)
-        except DeepAgentsWorkflowError as err:
+        except RestrictedWorkflowAccessError as err:
             rejected.append("ainvoke" in str(err))
         results.append([rejected, visited, list(EARLY_GRAPH_VISITS)])
         return results
@@ -1107,7 +1115,8 @@ async def test_sync_langchain_calls_run_in_the_workflow(
         "rejected",
         {"left": True, "right": True},
         {"left": True, "right": True},
-        [[True, True, True, True], [], []],
+        {"n": 2},
+        [[True, True, True, True, True, True], [], []],
     ]
 
     # Sync graph calls still work outside Workflows, including in Activities.

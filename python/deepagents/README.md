@@ -245,10 +245,12 @@ call raises `InvalidStateError`. Use an async entrypoint or node and
 `await task(...)` instead.
 
 Call compiled graphs with `await graph.ainvoke(...)` or `graph.astream(...)`.
-Sync graph calls such as `graph.invoke(...)` and `graph.stream(...)`, including
-calls from a sync tool, raise `DeepAgentsWorkflowError` before any node runs.
-LangGraph would otherwise run those nodes on threads outside Workflow execution.
-Move a graph into an activity if it needs the sync APIs.
+A sync call such as `graph.invoke(...)` or `graph.stream(...)`, including one
+from a sync tool, runs in the workflow only while each step runs one node.
+LangChain runs a step with several nodes, `batch(...)` and `RunnableParallel`
+on its own thread pool, outside the workflow, so in a workflow they fail the
+Workflow Task with `RestrictedWorkflowAccessError` before any of that work
+starts. Use the async form, or move the call into an activity.
 
 Like other workflow code, sync calls run again on every replay. Their combined
 work in one Workflow Task can trigger deadlock detection (two seconds by
