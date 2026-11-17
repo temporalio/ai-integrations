@@ -180,7 +180,7 @@ export class TemporalModel implements Model {
   ): ActivityInterfaceFor<ModelActivities> | LocalActivityInterfaceFor<ModelActivities> {
     return options.useLocalActivity
       ? proxyLocalActivities<ModelActivities>(options.activityOptions as LocalActivityOptions)
-      : proxyActivities<ModelActivities>(options.activityOptions);
+      : proxyActivities<ModelActivities>({ heartbeatTimeout: '10s', ...options.activityOptions });
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
@@ -261,6 +261,16 @@ export class TemporalModel implements Model {
     agent: Agent<any, any> | undefined,
     runModelSettings: ModelSettings | undefined
   ): SerializedModelRequest {
+    // Upstream times the call out by aborting `request.signal`, which can't stop the Activity.
+    if (request.modelSettings.timeoutMs !== undefined) {
+      throw ApplicationFailure.create({
+        message:
+          "modelSettings.timeoutMs can't stop a model call that runs as an Activity. Set startToCloseTimeout " +
+          'in activityOptions on the plugin, runner, TemporalModel, or run, instead.',
+        type: 'AgentsWorkflowError',
+        nonRetryable: true,
+      });
+    }
     const wire = toSerializedModelRequest(request);
     const selected = agent?.model || currentModelCall()?.run.model();
     const hasModelSettings = (agent as { hasExplicitModelSettings?(): boolean } | undefined)?.hasExplicitModelSettings;

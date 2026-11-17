@@ -82,14 +82,16 @@ func (m *mcpToolset) Name() string { return m.name }
 // so the toolset and its filter issue them at the same points on every ADK
 // release. They return the list ADK v2.5.0 and earlier keep for the whole
 // agent run, even when the MCP server, the filter or another Tools call, such
-// as one from an InstructionProvider, has changed it since: ADK draws a UUID
-// from the workflow's random stream for each tool it keeps before every model
-// step, so the IDs it generates, such as tool confirmation IDs, stay the same
-// on every release. From the second model step, the proxy tools from that
-// list no longer pack themselves, so ProcessRequest alone decides what the
-// model request declares and dispatches. In the first step ADK packs them
-// before ProcessRequest runs, so that request also declares the tools of the
-// first list.
+// as one from an InstructionProvider, has changed it since. ADK draws a UUID
+// for each tool it keeps before every model step. Each model call starts a new
+// UUID generator, so these draws reach the IDs ADK generates, such as tool
+// confirmation IDs, only in the cases NewContext names, such as a response an
+// ADK plugin or BeforeModelCallbacks entry supplies instead of the model.
+// There, returning the first list keeps those IDs the same on every release.
+// From the second model step, the proxy tools from that list no longer pack
+// themselves, so ProcessRequest alone decides what the model request declares
+// and dispatches. In the first step ADK packs them before ProcessRequest runs,
+// so that request also declares the tools of the first list.
 //
 // One case still keeps different lists on different releases: an agent that
 // reaches the same toolset more than once, for example directly and through
@@ -691,8 +693,9 @@ func (a *Activities) mcpToolset(ctx context.Context, name string) (tool.Toolset,
 	defer a.mcpMu.Unlock()
 	if a.mcpClosed {
 		// Close is terminal: rebuilding here would cache a toolset nothing will
-		// ever close. Non-retryable — the worker is shutting down.
-		return nil, newApplicationError(ErrorTypeMCP, false, nil,
+		// ever close. Retryable, so another worker on the Task Queue can run
+		// the call.
+		return nil, newApplicationError(ErrorTypeMCP, true, nil,
 			"MCP toolsets are closed (Activities.Close was called)")
 	}
 	if ts, ok := a.mcpCache[name]; ok {

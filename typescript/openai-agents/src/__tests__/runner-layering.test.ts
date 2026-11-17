@@ -20,12 +20,13 @@ test('mergeModelOptions: constructor only, no header — header-less Workflow ge
   // A Schedule/UI/CLI-started Workflow has no config header, so the constructor
   // default is the only source layered above DEFAULT.
   const merged = mergeModelOptions(
-    { activityOptions: { startToCloseTimeout: '120s' }, streamingTopic: 'events' },
+    { activityOptions: { startToCloseTimeout: '120s', heartbeatTimeout: 0 }, streamingTopic: 'events' },
     undefined
   );
   t.is(merged.activityOptions.startToCloseTimeout, '120s');
   t.is(merged.streamingTopic, 'events');
   t.is(merged.useLocalActivity, false);
+  t.is(merged.activityOptions.heartbeatTimeout, 0);
 });
 
 test('mergeModelOptions: both present — client overrides matching field, non-overlapping constructor fields survive', (t) => {
@@ -65,8 +66,9 @@ test('mergeModelOptions: a defined falsy field in the header overrides a truthy 
 });
 
 test('mergeModelOptions: a defined 0 in the header overrides a lower layer', (t) => {
-  const merged = mergeModelOptions({ streamingBatchInterval: 100 }, { streamingBatchInterval: 0 });
+  const merged = mergeModelOptions({ streamingBatchInterval: 100 }, { streamingBatchInterval: 0, activityOptions: { heartbeatTimeout: 0 } });
   t.is(merged.streamingBatchInterval, 0);
+  t.is(merged.activityOptions.heartbeatTimeout, 0);
 });
 
 test('mergeModelOptions: Workflow-authored summaryProvider passes through', (t) => {

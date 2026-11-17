@@ -68,6 +68,12 @@ test('Streaming: external subscriber and in-workflow result see the same events'
     t.is(received[0]!.type, 'output_text_delta');
     t.is(received[0]!.delta, 'Hello streamed world');
     t.is(received[received.length - 1]!.type, 'response_done');
+
+    const { events: history } = await handle.fetchHistory();
+    const heartbeatTimeouts = (history ?? [])
+      .filter((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'invokeModelStreamActivity')
+      .map((e) => Number(e.activityTaskScheduledEventAttributes?.heartbeatTimeout?.seconds));
+    t.deepEqual(heartbeatTimeouts, [10]);
   });
 });
 

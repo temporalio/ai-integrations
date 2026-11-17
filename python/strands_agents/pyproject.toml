@@ -8,7 +8,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]   # committed copy of the repository's root LICENSE
 classifiers = [
-  "Development Status :: 4 - Beta",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
+  "Development Status :: 5 - Production/Stable",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -45,6 +45,8 @@ module-name = "temporalio.strands_agents"
 dev = [
   "botocore-stubs>=1.34.0,<2",
   "strands-agents-tools>=0.5.2",
+  # Security floor for the HTML dependencies of strands-agents-tools.
+  "soupsieve>=4,<5",
   "pyright>=1.1.414,<2",
   "basedpyright>=1.40.2,<2",
   "mypy>=1.20.2,<2",
@@ -61,6 +63,10 @@ dev = [
   "mcp-types>=2,<3",
   "temporalio-mcp>=0.4.0,<0.5",
 ]
+
+[tool.uv.dependency-groups]
+# SoupSieve is development-only; keep the published plugin's Python 3.11 floor.
+dev = { requires-python = ">=3.11.5" }
 
 [tool.uv]
 default-groups = ["dev"]

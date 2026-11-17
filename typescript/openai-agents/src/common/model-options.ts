@@ -16,7 +16,7 @@ export interface ModelSummaryProvider {
 
 /** Model execution settings; scheduling uses the SDK's own ActivityOptions. */
 export interface TemporalModelOptions {
-  /** Temporal SDK scheduling options, merged per field with inherited defaults. */
+  /** Temporal SDK scheduling options, merged per field. Regular Activities default to a 10-second heartbeat timeout. */
   activityOptions?: ActivityOptions;
   /** Use local Activities instead of regular Activities. @default false */
   useLocalActivity?: boolean;

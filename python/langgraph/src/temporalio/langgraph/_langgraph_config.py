@@ -24,6 +24,34 @@ from langgraph.pregel._algo import LazyAtomicCounter
 from langgraph.runtime import ExecutionInfo, Runtime
 from pydantic import BaseModel
 
+from temporalio.exceptions import ApplicationError
+
+# What Runtime.heartbeat is outside an attempt that has an idle timeout.
+_NO_OP_HEARTBEAT = Runtime().heartbeat
+
+
+def refuse_idle_timeout() -> None:
+    """Fail the node or task that LangGraph runs under an idle timeout.
+
+    The plugin refuses the idle timeouts it can see when it is built. A
+    ``Send`` sets one while the graph runs. LangGraph gives an attempt with an
+    idle timeout a ``Runtime`` whose heartbeat resets the timer.
+
+    Raises:
+        ApplicationError: Non-retryable, if an idle timeout covers the attempt.
+    """
+    config = var_child_runnable_config.get() or {}
+    runtime = (config.get("configurable") or {}).get(CONFIG_KEY_RUNTIME)
+    if getattr(runtime, "heartbeat", _NO_OP_HEARTBEAT) is not _NO_OP_HEARTBEAT:
+        node = (config.get("metadata") or {}).get("langgraph_node")
+        raise ApplicationError(
+            f"Node {node!r} runs under a LangGraph idle_timeout, which a Send "
+            "can set. LangGraph times it with the system clock, so the "
+            "Workflow would not be deterministic. Use run_timeout or Temporal "
+            "activity options instead, e.g. heartbeat_timeout.",
+            non_retryable=True,
+        )
+
 
 def is_context_schema(schema: type[Any]) -> bool:
     """Return whether a context class can be restored after payload conversion."""
@@ -41,8 +69,9 @@ def strip_runnable_config(config: RunnableConfig | None) -> RunnableConfig:
     LangGraph injects the active RunnableConfig into user functions as a
     config kwarg. The full object holds non-serializable things (callbacks,
     checkpointer/store/cache handles, pregel send/read callables) that can't
-    cross an activity boundary, so we keep only primitive fields and the
-    serializable subset of configurable.
+    cross an activity boundary, so we keep only primitive fields and
+    LangGraph's own serializable keys of configurable. Every other
+    configurable value is dropped.
     """
     orig = config or {}
     configurable = orig.get("configurable") or {}

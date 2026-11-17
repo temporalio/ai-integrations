@@ -53,6 +53,7 @@ def _native_tool() -> McpTool:
     )
 
 
+@BaseToolset.register
 class _NativeToolset:
     def __init__(self) -> None:
         self.closed = False

@@ -563,8 +563,9 @@ def temporal_sandbox_client(
         Use with caution in production environments.
 
     This returns a ``BaseSandboxClient`` that dispatches all sandbox operations
-    as Temporal activities, targeting the ``SandboxClientProvider`` registered
-    on the worker with the matching ``name``.
+    as Temporal activities, targeting the ``SandboxClientProvider`` or
+    ``OnHostSandboxClientProvider`` registered on the worker with the matching
+    ``name``.
 
     Example::
 
@@ -576,7 +577,7 @@ def temporal_sandbox_client(
         )
 
     Args:
-        name: The name of the ``SandboxClientProvider`` registered on the
+        name: The name of the sandbox client provider registered on the
             worker.  Must match exactly.
         config: Optional activity configuration for controlling timeouts,
             retries, etc.  Defaults to a 5-minute ``start_to_close_timeout``.

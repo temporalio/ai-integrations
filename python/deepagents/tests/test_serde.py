@@ -7,6 +7,9 @@ chat messages. These tests pin the load side of that seam: every message class
 payload shape already sitting in recorded histories (legacy
 ``langchain.schema.messages.*`` ids) keeps loading, and no call relies on — or
 warns about — ``load``'s default ``allowed_objects``.
+
+The transcript ``run_deep_agent`` carries across continue-as-new goes through
+the same ``load``, so its load side is pinned here too.
 """
 
 from __future__ import annotations
@@ -198,6 +201,44 @@ def test_message_list_round_trip_preserves_subtypes() -> None:
         revived = _serde.load_messages(_serde.dump_messages(messages))
     assert [type(m) for m in revived] == [type(m) for m in messages]
     assert not _allowed_objects_warnings(caught)
+
+
+def test_carried_messages_round_trip_preserves_subtypes() -> None:
+    """``load_carried_messages`` revives a carried transcript, warning-clean."""
+    messages = [_instantiate(cls) for cls in _MESSAGE_CLASSES]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        revived = _serde.load_carried_messages(_serde.dump_carried_messages(messages))
+    assert [type(m) for m in revived] == [type(m) for m in messages]
+    assert not _allowed_objects_warnings(caught)
+
+
+def test_carried_message_cannot_revive_a_class_outside_the_allowlist() -> None:
+    """A carried message cannot revive a class that ``"core"`` leaves out.
+
+    A caller can pass its own snapshot, and a message in it can nest any
+    serialized object. LangChain's ``"all"`` allowlist accepts a chat model
+    and ``"core"`` does not.
+    """
+    carried = {
+        "lc": 1,
+        "type": "constructor",
+        "id": ["langchain", "schema", "messages", "HumanMessage"],
+        "kwargs": {
+            "content": "find the docs",
+            "type": "human",
+            "additional_kwargs": {
+                "model": {
+                    "lc": 1,
+                    "type": "constructor",
+                    "id": ["langchain", "chat_models", "openai", "ChatOpenAI"],
+                    "kwargs": {"model": "gpt-4o"},
+                }
+            },
+        },
+    }
+    with pytest.raises(ValueError, match="not allowed"):
+        _serde.load_carried_messages([carried])
 
 
 @pytest.mark.parametrize("name", sorted(_RECORDED_PAYLOADS))

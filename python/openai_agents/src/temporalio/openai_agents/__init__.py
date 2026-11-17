@@ -20,6 +20,10 @@ from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     temporal_worker_env_ref,
 )
+from temporalio.openai_agents.sandbox._on_host_sandbox_client_provider import (
+    SANDBOX_LOST_ERROR_TYPE,
+    OnHostSandboxClientProvider,
+)
 from temporalio.openai_agents.sandbox._sandbox_client_provider import (
     SandboxClientProvider,
 )
@@ -34,8 +38,10 @@ __all__ = [
     "AgentsWorkflowError",
     "AllowAllWorkerEnvVars",
     "ModelSummaryProvider",
+    "OnHostSandboxClientProvider",
     "OpenAIAgentsPlugin",
     "OpenAIPayloadConverter",
+    "SANDBOX_LOST_ERROR_TYPE",
     "SandboxClientProvider",
     "TemporalAgent",
     "TemporalModel",

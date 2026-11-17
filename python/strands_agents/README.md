@@ -1,6 +1,6 @@
 # Strands Agents
 
-> Release stage: [Public Preview](https://docs.temporal.io/develop/python/integrations/strands-agents).
+> Release stage: [Generally Available](https://docs.temporal.io/develop/python/integrations/strands-agents).
 
 This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) allows you to run [Strands Agents](https://strandsagents.com/) inside Temporal Workflows, routing model invocations, tool calls, and MCP tool calls through Temporal Activities for durable execution, Temporal-managed retries, and timeouts.
 
@@ -123,6 +123,8 @@ A worker model that keeps the conversation server-side, such as `OpenAIResponses
 Stateful model calls run as their own activities, `strands_invoke_stateful_model` and `strands_invoke_stateful_model_streaming`. While you roll out this version, a worker running an earlier version does not register them, so it fails such a call (`NotFoundError`) and Temporal retries it until an upgraded worker takes it. Upgrade every worker on the task queue before a `retry_policy` with a low `maximum_attempts` runs out, or route upgraded workflows to upgraded workers with Worker Versioning.
 
 A run that continues as new starts with no messages when its model is stateful, so it needs the model state it carries. If that run's workers do not have this version, or its config activity runs on a worker that does not, it treats the model as stateless, ignores the carried response id and starts the model's conversation over. Keep such runs on upgraded workers, and do not roll workers back to an earlier version while they continue as new.
+
+A model call that fails with a context window overflow raises `ContextWindowOverflowException` in the workflow, so Strands reduces the conversation and calls the model again, as it does natively. Releases before 1.0 let the overflow reach the workflow as an `ActivityError`, and later builds of `main` gated the change with a patch marker, which this version no longer reads. So a run that hit an overflow before you deploy this version fails to replay on it with `[TMPRL1100]`, and a run that hits one on this version fails to replay on an earlier version. Let those runs finish on their original workers before you upgrade, or keep them there with Worker Versioning, and do not roll workers back to an earlier version while runs that hit an overflow on this version are open.
 
 ## Retries
 

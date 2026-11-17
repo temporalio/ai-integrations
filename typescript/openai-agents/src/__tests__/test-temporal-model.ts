@@ -116,6 +116,7 @@ test('concurrent runs sharing a TemporalModel retain their own Activity options 
     t.deepEqual(await handle.result(), ['done', 'done']);
     const events = scheduled(await handle.fetchHistory());
     t.true(events.every((e) => input(e).modelName === ''));
+    t.true(events.every((e) => Number(e.activityTaskScheduledEventAttributes?.heartbeatTimeout?.seconds) === 10));
     t.deepEqual(
       events.map((e) => input(e).request.modelSettings),
       [{}, {}]
