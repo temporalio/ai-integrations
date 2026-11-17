@@ -539,7 +539,9 @@ func (e *a2aHTTPStatusError) Error() string { return "unexpected HTTP status: " 
 // graph.
 //
 // Later 1.x releases may refuse more agent shapes that send from Workflow
-// code, so a tree that passes today may be refused after an upgrade.
+// code, so a tree that passes today may be refused in new runs after an
+// upgrade. A new check will not change how Histories recorded on earlier 1.x
+// releases replay.
 func NewRunnerPlugin(root agent.Agent) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: "googleadk",

@@ -754,8 +754,9 @@ an upgrade would newly pass through ungated.
     Workflow Task exits too, and the run stays open until you terminate it. A
     graph fan-out can fail the run with a node panic instead. Fan out with
     `agenttool` tools called in one model response, or use a sequential agent
-    (`sequentialagent`). A later 1.x release may refuse these shapes with an
-    error when the run starts.
+    (`sequentialagent`). A later 1.x release may refuse these shapes in new
+    runs, with an error when the run starts. It will not change how Histories
+    recorded on earlier 1.x releases replay.
   - Single-turn sub-agents (`llmagent.ModeSingleTurn`) called in the same model
     response as another tool or sub-agent: every Workflow Task fails with
     `trying to block on coroutine which is already blocked`. Pass
@@ -804,8 +805,9 @@ an upgrade would newly pass through ungated.
   outside replay, the first time an HTTP request carries its context. It only
   warns: the request still goes out.
   Later 1.x releases may refuse more agent shapes that send from Workflow
-  code, so a tree that passes both checks today may be refused after an
-  upgrade.
+  code, so a tree that passes both checks today may be refused in new runs
+  after an upgrade. A new check will not change how Histories recorded on
+  earlier 1.x releases replay.
 
   An open run that made such a model call on an earlier version cannot
   continue on this one: on its next Workflow Task, `runner.Run` returns the
