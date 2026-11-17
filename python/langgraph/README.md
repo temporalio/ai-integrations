@@ -73,6 +73,12 @@ class MyWorkflow:
         ...
 ```
 
+Functional API entrypoints registered with `@entrypoint(checkpointer=InMemorySaver())` receive a fresh in-memory saver for each Workflow execution instance. Repeated `entrypoint(name)` lookups, invocations and interrupt resumes within that instance share its checkpoints. Other Workflows, replay after eviction, and a new run after continue-as-new start with an empty saver; replay reconstructs its contents from History. Initialize a new run from Workflow input, including any values carried across continue-as-new.
+
+The registered saver supplies its serializer (`serde`). Its existing checkpoints are not imported. Only the standard `InMemorySaver` class is supported: custom checkpointers and subclasses raise `ValueError` when the plugin is constructed, because the plugin cannot safely reproduce their configuration and resources for each Workflow instance.
+
+**Breaking change:** entrypoint checkpoints are no longer shared across Workflow instances, and custom entrypoint checkpointers are refused. Let runs that relied on that state or those checkpointers finish before upgrading, or use Worker Versioning.
+
 ## Execution Location
 
 Every node (Graph API) and task (Functional API) must be labeled with `execute_in`, set to either `"activity"` or `"workflow"`. This is required per node/task; it cannot be set in `default_activity_options`.

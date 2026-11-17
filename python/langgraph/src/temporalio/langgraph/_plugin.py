@@ -22,6 +22,10 @@ from temporalio.langgraph._activity import (
     wrap_activity,
     wrap_execute_activity,
 )
+from temporalio.langgraph._entrypoint import (
+    validate_entrypoint_checkpointers,
+    workflow_entrypoint,
+)
 from temporalio.langgraph._interceptor import (
     LangGraphInterceptor,
     _workflow_entrypoints,
@@ -215,6 +219,7 @@ class LangGraphPlugin(SimplePlugin):
         self._streaming_topic = streaming_topic
         self._streaming_batch_interval = streaming_batch_interval
         self._context_schemas: dict[str, type[Any]] = {}
+        validate_entrypoint_checkpointers(entrypoints or {})
         schemas: list[type[Any] | None] = [
             *(graph.context_schema for graph in (graphs or {}).values()),
             *(program.context_schema for program in (entrypoints or {}).values()),
@@ -461,7 +466,7 @@ def entrypoint(
         raise KeyError(
             f"Entrypoint {name!r} not found. Available entrypoints: {list(entrypoints)}"
         )
-    return entrypoints[name]
+    return workflow_entrypoint(entrypoints[name])
 
 
 def cache() -> dict[str, Any] | None:
