@@ -711,6 +711,11 @@ worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
 
+In workflow code, `TemporalModel` doesn't use LangChain's LLM cache, even one you
+set with `set_llm_cache(...)`. A cache hit there would skip the model Activity,
+and the run would then fail to replay. The model your `model_provider` returns
+still uses the cache inside the Activity.
+
 Each plugin instance registers five Activities: `deepagents.invoke_model`,
 `deepagents.invoke_model_streaming`, `deepagents.invoke_tool`,
 `deepagents.backend_op` and `deepagents.get_model_profile`. Use one

@@ -24,7 +24,7 @@ pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 
 from temporalio import workflow  # noqa: E402
-from temporalio.worker import Worker  # noqa: E402
+from temporalio.worker import Replayer, Worker  # noqa: E402
 from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 
 # Resolve framework symbols through the imported module to avoid confusing
@@ -32,6 +32,8 @@ from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 with workflow.unsafe.imports_passed_through():
+    from langchain_core.caches import InMemoryCache
+    from langchain_core.globals import set_llm_cache
     from langchain_core.messages import AIMessage
 
     from temporalio.deepagents import DeepAgentsPlugin, tool_as_activity
@@ -100,6 +102,36 @@ async def test_deep_agent_runs_via_plugin(env: WorkflowEnvironment) -> None:
     counts = await count_scheduled_activities(handle)
     # The model call was made durable as an activity, with no user wiring.
     assert counts[INVOKE_MODEL] >= 1, counts
+
+
+@pytest.mark.asyncio
+async def test_global_llm_cache_is_not_used_in_workflow(
+    env: WorkflowEnvironment,
+) -> None:
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(["The answer is 42."]),
+    )
+    set_llm_cache(InMemoryCache())
+    try:
+        async with Worker(
+            env.client,
+            task_queue="da-llm-cache",
+            workflows=[DeepAgentWorkflow],
+            plugins=[plugin],
+        ):
+            handle = await env.client.start_workflow(
+                DeepAgentWorkflow.run,
+                "What is the meaning of life?",
+                id=f"da-llm-cache-{uuid.uuid4()}",
+                task_queue="da-llm-cache",
+            )
+            assert "42" in await handle.result()
+        # A cache hit in workflow code would skip the model activity here.
+        await Replayer(workflows=[DeepAgentWorkflow], plugins=[plugin]).replay_workflow(
+            await handle.fetch_history()
+        )
+    finally:
+        set_llm_cache(None)
 
 
 @pytest.mark.asyncio
