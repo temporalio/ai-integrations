@@ -151,8 +151,9 @@ class StreamingTestProvider implements ProviderV4 {
   }
 }
 
-test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {
+test('Streaming text, reasoning, finish and response metadata survive activity execution and workflow replay', async (t) => {
   const providerMetadata = { test: { source: 'delta' } };
+  const reasoningMetadata = { test: { signature: 'signed' } };
   const finishMetadata = { test: { cachedTokens: 7 } };
   const responseMetadata = { id: 'response-1', modelId: 'test-model', timestamp: new Date('2026-01-01T00:00:00Z') };
   const provider = new StreamingTestProvider([
@@ -161,6 +162,10 @@ test('Streaming text, finish and response metadata survive activity execution an
     { type: 'text-start', id: 'provider-part' },
     { type: 'text-delta', id: 'provider-part', delta: 'hello', providerMetadata },
     { type: 'text-end', id: 'provider-part' },
+    { type: 'reasoning-start', id: 'provider-reasoning' },
+    { type: 'reasoning-delta', id: 'provider-reasoning', delta: 'thinking' },
+    { type: 'reasoning-delta', id: 'provider-reasoning', delta: '', providerMetadata: reasoningMetadata },
+    { type: 'reasoning-end', id: 'provider-reasoning' },
     { type: 'finish', finishReason: createFinishReason('stop'), usage: createUsage(), providerMetadata: finishMetadata },
   ]);
   const { createWorker, executeWorkflow } = helpers(t);
@@ -177,6 +182,9 @@ test('Streaming text, finish and response metadata survive activity execution an
       { type: 'text-start', id: 'part-0', providerMetadata },
       { type: 'text-delta', id: 'part-0', delta: 'hello' },
       { type: 'text-end', id: 'part-0' },
+      { type: 'reasoning-start', id: 'part-1', providerMetadata: reasoningMetadata },
+      { type: 'reasoning-delta', id: 'part-1', delta: 'thinking' },
+      { type: 'reasoning-end', id: 'part-1' },
       {
         type: 'finish',
         providerMetadata: finishMetadata,

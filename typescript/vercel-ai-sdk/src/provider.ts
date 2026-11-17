@@ -206,7 +206,7 @@ export class TemporalLanguageModel implements LanguageModelV4 {
             controller.enqueue({ type: 'text-delta', id, delta: item.text });
             controller.enqueue({ type: 'text-end', id });
           } else if (item.type === 'reasoning') {
-            controller.enqueue({ type: 'reasoning-start', id });
+            controller.enqueue({ type: 'reasoning-start', id, providerMetadata: item.providerMetadata });
             controller.enqueue({ type: 'reasoning-delta', id, delta: item.text });
             controller.enqueue({ type: 'reasoning-end', id });
           } else {
