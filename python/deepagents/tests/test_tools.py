@@ -43,6 +43,11 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
     from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
     from temporalio.deepagents.workflow import DeepAgentsWorkflowError  # noqa: E402
+    from tests.prebound_graph import (  # noqa: E402
+        EARLY_GRAPH_STREAM,
+        EARLY_GRAPH_VISITS,
+        fanout_graph,
+    )
 
 INVOKE_TOOL = "deepagents.invoke_tool"
 # Dedicated queue for tool activities, so tests can prove task-queue routing.
@@ -1004,34 +1009,6 @@ def count_graph() -> Any:
 COUNT_GRAPH = count_graph()
 
 
-class Fanout(TypedDict, total=False):
-    left: bool
-    right: bool
-
-
-def fanout_graph(visited: list[str]) -> Any:
-    def left(state: Fanout) -> Fanout:
-        visited.append("left")
-        return {**state, "left": workflow.in_workflow()}
-
-    def right(state: Fanout) -> Fanout:
-        visited.append("right")
-        return {**state, "right": workflow.in_workflow()}
-
-    graph = StateGraph(Fanout)
-    graph.add_node("a", left)
-    graph.add_node("b", right)
-    for node in ("a", "b"):
-        graph.add_edge(START, node)
-        graph.add_edge(node, END)
-    return graph.compile()
-
-
-# Bound during collection, before the Worker installs the executor guard.
-EARLY_GRAPH_VISITS: list[str] = []
-EARLY_GRAPH_STREAM = fanout_graph(EARLY_GRAPH_VISITS).stream
-
-
 @workflow.defn
 class SyncLangChainCallsWorkflow:
     @workflow.run
@@ -1071,10 +1048,6 @@ class SyncLangChainCallsWorkflow:
             [state async for state in graph.astream({}, stream_mode="values")][-1]
         )
         visited.clear()
-        # Get the host's pre-bound method, rather than the sandbox's fresh copy.
-        with workflow.unsafe.imports_passed_through():
-            from tests.test_tools import EARLY_GRAPH_STREAM, EARLY_GRAPH_VISITS
-
         EARLY_GRAPH_VISITS.clear()
         graph_calls: list[Callable[[], Any]] = [
             lambda: graph.invoke({}),
