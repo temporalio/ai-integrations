@@ -39,7 +39,7 @@ import {
   type RunAsyncToolRequest,
   type ToolProcessLlmRequest,
 } from '@google/adk';
-import { ApplicationFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure } from '@temporalio/common';
 import { type ActivityOptions, inWorkflowContext, isCancellation, log, proxyActivities } from '@temporalio/workflow';
 
 import { underAbortSignal } from './abort';
@@ -533,7 +533,7 @@ class TemporalLoadMcpResourceTool extends BaseTool {
       }
     } catch (err) {
       if (isCancellation(err)) throw err;
-      warn(`Failed to list MCP resources: ${String(err)}`);
+      warn(`Failed to list MCP resources: ${describeFailure(err)}`);
     }
 
     const lastContent = llmRequest.contents.at(-1);
@@ -556,7 +556,7 @@ class TemporalLoadMcpResourceTool extends BaseTool {
         }
       } catch (err) {
         if (isCancellation(err)) throw err;
-        warn(`Failed to read MCP resource '${resourceName}': ${String(err)}`);
+        warn(`Failed to read MCP resource '${resourceName}': ${describeFailure(err)}`);
       }
     }
   }
@@ -586,6 +586,11 @@ function warn(message: string): void {
   } else {
     console.warn(message);
   }
+}
+
+/** `String(err)`, plus the Activity's own error: an `ActivityFailure` says only "Activity task failed". */
+function describeFailure(err: unknown): string {
+  return err instanceof ActivityFailure && err.cause ? `${String(err)}: ${String(err.cause)}` : String(err);
 }
 
 /** Mirrors ADK's `appendInstructions` (`models/llm_request.ts`), which the `common` surface does not export. */

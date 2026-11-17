@@ -7,12 +7,14 @@
 import { readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { mock } from 'node:test';
 
 import test, { type ExecutionContext } from 'ava';
 import { BaseToolset, MCPToolset, type BaseTool, type MCPConnectionParams, type ReadonlyContext } from '@google/adk';
 import { Context as ActivityContext } from '@temporalio/activity';
 import { ApplicationFailure, CancelledFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
+import { Runtime } from '@temporalio/worker';
 
 import { createMCPActivities } from '../activities';
 import { GoogleAdkPlugin } from '../index';
@@ -343,11 +345,19 @@ test.serial('a failing server gives up on the default bound, is skipped, and is 
   // The fixture sets no `maximumAttempts`, so this is the default the resource
   // Activities apply. Without it the Activity would retry forever on a
   // status-less MCP error and the turn below would never return.
+  const logged = mock.method(Runtime.instance().logger, 'log');
+  t.teardown(() => logged.mock.restore());
   const text = await withWorker(env, { taskQueue, plugins: [makePlugin()] }, () =>
     env.client.workflow.execute(mcpLoadResourceAgentFailing, { taskQueue, workflowId })
   );
   // The turn completed: neither the listing nor the read failed it.
   t.is(text, 'resource=missing; listed=none');
+  // Each skip is logged with the Activity's own error, not just "Activity task failed".
+  const skips = logged.mock.calls
+    .map((call) => String(call.arguments[1]))
+    .filter((message) => message.startsWith('Failed to'));
+  t.is(skips.length, 3, skips.join('\n'));
+  for (const message of skips) t.true(message.endsWith(': MCP server unavailable.'), message);
   const { events } = await env.client.workflow.getHandle(workflowId).fetchHistory();
   // Once per model call, because a rejected listing is not the memoized one.
   t.is(countScheduledActivities(events ?? [], 'brokenServer-listResources'), 2);

@@ -16,6 +16,7 @@ import {
   MCPSessionManager,
   MCPToolset,
   isBaseToolset,
+  version as adkVersion,
   type BaseLlm,
   type BaseToolset,
   type Context as AdkToolContext,
@@ -35,6 +36,7 @@ import {
   MCP_ERROR_FAILURE_TYPE,
   MCP_RESOURCES_UNSUPPORTED_FAILURE_TYPE,
   MCP_TOOL_NOT_FOUND_FAILURE_TYPE,
+  MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE,
   MODEL_ERROR_FAILURE_TYPE,
   STREAM_ERROR_FAILURE_TYPE,
 } from './error-types';
@@ -204,19 +206,25 @@ function resourceCapable(toolset: BaseToolset, name: string): ResourceCapableToo
   );
 }
 
-// Every `MCPConnectionParams` tag in the supported ADK range. ADK 2.3 adds
-// `SseConnectionParams`; earlier releases leave it to their own session manager.
+const [adkMajor = 0, adkMinor = 0] = adkVersion.split('.').map(Number);
+
+// The `MCPConnectionParams` tags the installed ADK connects. ADK 2.3 adds
+// `SseConnectionParams`; earlier releases return an unconnected session for it.
+// The peer range stops at ADK 2.4, so a new tag comes with a change to that range.
 const MCP_CONNECTION_PARAMS_TYPES: ReadonlySet<unknown> = new Set([
   'StdioConnectionParams',
-  'SseConnectionParams',
   'StreamableHTTPConnectionParams',
+  ...(adkMajor > 2 || (adkMajor === 2 && adkMinor >= 3) ? ['SseConnectionParams'] : []),
 ]);
 
-// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `Promise`.
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `Promise`,
+// with its `type` tag when it has one.
 function describeValue(value: unknown): string {
   if (value === null) return 'null';
   if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
-  return (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+  const kind = (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+  const tag = (value as { type?: unknown }).type;
+  return typeof tag === 'string' ? `${kind} with type '${tag}'` : kind;
 }
 
 function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<MCPToolsetFactory> {
@@ -227,9 +235,11 @@ function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<
   ) {
     return produced;
   }
+  // An async factory's rejection would otherwise go unhandled and stop the Worker process.
+  if (produced instanceof Promise) produced.catch(() => undefined);
   throw ApplicationFailure.nonRetryable(
     `MCP toolset factory '${name}' returned ${describeValue(produced)}, not a BaseToolset or MCPConnectionParams.`,
-    'MCPToolsetFactoryTypeError'
+    MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE
   );
 }
 

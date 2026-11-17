@@ -241,11 +241,14 @@ operation rather than reusing one. Holding a session open across operations is
 the factory's job — see `MCPToolsetFactory`.
 
 A factory must return a `BaseToolset` or `MCPConnectionParams` with type
-`StdioConnectionParams`, `StreamableHTTPConnectionParams` or, with ADK 2.3,
-`SseConnectionParams`. Other results now
-fail the Activity without retries with type `MCPToolsetFactoryTypeError`. Fix
-these factories before upgrading; the next attempt of an in-flight Activity
-also runs this check.
+`StdioConnectionParams`, `StreamableHTTPConnectionParams` or, from ADK 2.3,
+`SseConnectionParams`. Other results now fail the Activity without retries with
+`MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE` (`GoogleAdkMCPToolsetFactoryTypeError`,
+exported from `@temporalio/google-adk/workflow`). A factory whose toolset isn't
+ready yet should throw rather than return `undefined`: exceptions are still
+retried. A factory that isn't a function makes `new GoogleAdkPlugin(...)` throw
+a `TypeError`, so the Worker doesn't start. Fix these factories before
+upgrading; the next attempt of an in-flight Activity also runs this check.
 
 Gate the toolset's tools behind human approval with
 `requireConfirmation` — see [Durable human-in-the-loop](#durable-human-in-the-loop).

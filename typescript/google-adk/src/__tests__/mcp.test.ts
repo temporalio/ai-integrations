@@ -3,14 +3,20 @@ import os from 'node:os';
 import path from 'node:path';
 
 import test from 'ava';
-import { MCPToolset, type BaseToolset, type Context, type MCPConnectionParams } from '@google/adk';
+import {
+  MCPToolset,
+  version as adkVersion,
+  type BaseToolset,
+  type Context,
+  type MCPConnectionParams,
+} from '@google/adk';
 import type { FunctionDeclaration } from '@google/genai';
 import { ApplicationFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
 
 import { createMCPActivities } from '../activities';
 import { GoogleAdkPlugin, type MCPToolsetFactory } from '../index';
-import { TemporalMCPToolset } from '../workflow';
+import { MCP_ERROR_FAILURE_TYPE, MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE, TemporalMCPToolset } from '../workflow';
 import { mockMCPToolset } from '../testing';
 import {
   echoDef,
@@ -87,7 +93,7 @@ for (const operation of ['listTools', 'callTool', 'listResources', 'readResource
       [null, 'null'],
       [42, 'number'],
       [{}, 'Object'],
-      [{ type: 'UnknownConnectionParams' }, 'Object'],
+      [{ type: 'StreamableHttpConnectionParams' }, "Object with type 'StreamableHttpConnectionParams'"],
       // What an async factory returns.
       [Promise.resolve({ type: 'StdioConnectionParams' }), 'Promise'],
     ];
@@ -105,23 +111,51 @@ for (const operation of ['listTools', 'callTool', 'listResources', 'readResource
         { instanceOf: ApplicationFailure }
       );
       t.true(err!.nonRetryable);
-      t.is(err!.type, 'MCPToolsetFactoryTypeError');
+      t.is(err!.type, MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE);
       t.is(
         err!.message,
         `MCP toolset factory 'testServer' returned ${kind}, not a BaseToolset or MCPConnectionParams.`
       );
     }
+
+    // A rejecting async factory fails the same way, without leaving the rejection
+    // unhandled: that would stop the process, and fail this file.
+    const rejecting = createMCPActivities({
+      testServer: (async () => {
+        throw new Error('factory failed');
+      }) as unknown as MCPToolsetFactory,
+    });
+    const rejected = await t.throwsAsync(
+      new MockActivityEnvironment().run(rejecting[`testServer-${operation}`] as (args: unknown) => Promise<unknown>, {
+        toolName: 'echo',
+        args: {},
+        name: 'file:///test',
+      }),
+      { instanceOf: ApplicationFailure }
+    );
+    t.is(rejected!.type, MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE);
   });
 
-  test(`${operation} passes SSE connection params to ADK`, async (t) => {
-    // ADK fails these itself: 2.3 cannot fetch port 9, and earlier releases never connect.
-    const sse = { type: 'SseConnectionParams', url: 'http://127.0.0.1:9/sse' } as unknown as MCPConnectionParams;
-    const activities = createMCPActivities({ testServer: () => sse });
-    const activity = activities[`testServer-${operation}`] as (args: unknown) => Promise<unknown>;
-    const err = await t.throwsAsync(
-      new MockActivityEnvironment().run(activity, { toolName: 'echo', args: {}, name: 'file:///test' })
-    );
-    t.not((err as ApplicationFailure).type, 'MCPToolsetFactoryTypeError');
+  test(`${operation} passes connection params the installed ADK supports to ADK`, async (t) => {
+    // ADK fails each one itself: the command doesn't exist and nothing listens on port 9.
+    const allParams = [
+      { type: 'StdioConnectionParams', serverParams: { command: path.join(os.tmpdir(), uid('no-such-mcp-server')) } },
+      { type: 'StreamableHTTPConnectionParams', url: 'http://127.0.0.1:9/mcp' },
+      { type: 'SseConnectionParams', url: 'http://127.0.0.1:9/sse' },
+    ];
+    // ADK 2.3 adds the SSE transport; earlier releases never connect it.
+    const [major = 0, minor = 0] = adkVersion.split('.').map(Number);
+    const sseSupported = major > 2 || (major === 2 && minor >= 3);
+    for (const params of allParams) {
+      const activities = createMCPActivities({ testServer: () => params as unknown as MCPConnectionParams });
+      const activity = activities[`testServer-${operation}`] as (args: unknown) => Promise<unknown>;
+      const err = await t.throwsAsync(
+        new MockActivityEnvironment().run(activity, { toolName: 'echo', args: {}, name: 'file:///test' }),
+        { instanceOf: ApplicationFailure }
+      );
+      const refused = params.type === 'SseConnectionParams' && !sseSupported;
+      t.is(err!.type, refused ? MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE : MCP_ERROR_FAILURE_TYPE, params.type);
+    }
   });
 
   test(`${operation} keeps MCP factory exceptions retryable`, async (t) => {
