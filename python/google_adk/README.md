@@ -203,7 +203,7 @@ worker = Worker(
 
 `TemporalMcpToolSet` also accepts an optional `factory_argument`. It is sent to the toolset activities and passed to the registered `toolset_factory` when the `McpToolset` is created.
 
-Both MCP providers require factory results with callable `get_tools()` and `close()` methods. An invalid result now fails the Activity without retries with type `MCPToolsetFactoryTypeError`. Fix these factories before upgrading; the next attempt of an in-flight Activity also runs this check.
+Both MCP providers require the toolset factory to return an ADK `BaseToolset`, such as `McpToolset`. Any other result now fails the Activity without retries with type `MCPToolsetFactoryTypeError`. Fix these factories before upgrading; the next attempt of an in-flight Activity also runs this check.
 
 **Do not pass secrets, credentials, or API keys through `factory_argument`.** It is an activity argument, so it is recorded in workflow history and, without a payload codec, visible in the web UI. Resolve credentials worker-side inside the toolset factory instead.
 

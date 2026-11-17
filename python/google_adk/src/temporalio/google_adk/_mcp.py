@@ -194,20 +194,12 @@ def _check_toolset_factory(name: str, toolset_factory: object) -> None:
         )
 
 
-async def _validate_toolset(name: str, toolset: McpToolset) -> McpToolset:
-    if callable(getattr(toolset, "get_tools", None)) and callable(
-        getattr(toolset, "close", None)
-    ):
+def _validate_toolset(name: str, toolset: McpToolset) -> McpToolset:
+    if isinstance(toolset, BaseToolset):
         return toolset
-    if callable(getattr(toolset, "close", None)):
-        try:
-            await toolset.close()
-        except Exception:
-            # Cleanup must not hide the invalid factory result.
-            pass
-    raise ApplicationError(
-        f"MCP toolset factory {name!r} returned {_type_name(toolset)}, not a "
-        "toolset with callable get_tools() and close() methods",
+    raise ApplicationError(  # type: ignore[reportUnreachable]
+        f"MCP toolset factory {name!r} returned {_type_name(toolset)}, "
+        "not a BaseToolset",
         type="MCPToolsetFactoryTypeError",
         non_retryable=True,
     )
@@ -258,7 +250,7 @@ class TemporalMcpToolSetProvider:
             # Build a fresh toolset per call, honoring this call's
             # ``factory_argument``, and always close it so no MCP session
             # (or stdio subprocess) leaks. See issue #1663.
-            toolset = await _validate_toolset(
+            toolset = _validate_toolset(
                 self._name, self._toolset_factory(args.factory_argument)
             )
             try:
@@ -288,7 +280,7 @@ class TemporalMcpToolSetProvider:
         async def call_tool(
             args: _CallToolArguments,
         ) -> _CallToolResult:
-            toolset = await _validate_toolset(
+            toolset = _validate_toolset(
                 self._name, self._toolset_factory(args.factory_argument)
             )
             try:
@@ -1077,7 +1069,7 @@ class TemporalStatefulMcpToolSetProvider:
                 # read-back. Check again, and register before the next await.
                 if server_id in self._toolsets:
                     raise _already_running_failure()
-                toolset = await _validate_toolset(
+                toolset = _validate_toolset(
                     self._name,
                     self._toolset_factory(args.factory_argument if args else None),
                 )

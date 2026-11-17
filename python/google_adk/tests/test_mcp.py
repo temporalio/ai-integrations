@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from google.adk.events import EventActions
+from google.adk.tools.base_toolset import BaseToolset
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
 from google.adk.tools.mcp_tool.mcp_tool import McpTool
@@ -66,6 +67,7 @@ class _FakeTool:
         return {"echo": args}
 
 
+@BaseToolset.register
 class _FakeToolset:
     """Stands in for ``google.adk.tools.mcp_tool.McpToolset``.
 
@@ -117,18 +119,15 @@ def _call_tool_args(factory_argument: Any = None) -> _CallToolArguments:
 
 @pytest.mark.parametrize("operation", ["list", "call"])
 async def test_invalid_factory_result_is_non_retryable(operation: str) -> None:
-    closed: list[bool] = []
-
-    async def close() -> None:
-        closed.append(True)
-        raise RuntimeError("close failed")
-
+    fake = _FakeToolset()
     invalid_results = [
         (None, "builtins.NoneType"),
         (object(), "builtins.object"),
-        (SimpleNamespace(get_tools=1), "types.SimpleNamespace"),
-        (SimpleNamespace(get_tools=_FakeToolset().get_tools), "types.SimpleNamespace"),
-        (SimpleNamespace(close=close), "types.SimpleNamespace"),
+        # Has the toolset methods, but isn't a BaseToolset.
+        (
+            SimpleNamespace(get_tools=fake.get_tools, close=fake.close),
+            "types.SimpleNamespace",
+        ),
     ]
     for result, kind in invalid_results:
         # Passed in place of the factory, the value fails when the Worker is built.
@@ -154,10 +153,8 @@ async def test_invalid_factory_result_is_non_retryable(operation: str) -> None:
         assert err.value.type == "MCPToolsetFactoryTypeError"
         assert err.value.non_retryable
         assert err.value.message == (
-            f"MCP toolset factory 'invalid' returned {kind}, not a toolset with "
-            "callable get_tools() and close() methods"
+            f"MCP toolset factory 'invalid' returned {kind}, not a BaseToolset"
         )
-    assert closed == [True]
 
 
 async def test_call_tool_creates_and_closes_fresh_toolset_each_call():

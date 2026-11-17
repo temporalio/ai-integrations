@@ -36,6 +36,7 @@ from types import FrameType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from google.adk.tools.base_toolset import BaseToolset
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.tool_context import ToolContext
@@ -107,6 +108,7 @@ class _FakeTool:
         return {"echo": args}
 
 
+@BaseToolset.register
 class _FakeToolset:
     """In-memory stand-in for ``google.adk.tools.mcp_tool.McpToolset``."""
 
