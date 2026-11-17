@@ -178,15 +178,24 @@ func (e errStubGeminiAPI) RoundTrip(req *http.Request) (*http.Response, error) {
 // returns HTTP 400, or HTTP 200 with no candidates, which is how the Gemini API
 // answers a blocked prompt. It verifies the plugin classifies the genai APIError
 // and ADK's "empty response" as non-retryable, and the workflow fails fast (the
-// model Activity is attempted exactly once, not retried).
+// model Activity is attempted exactly once, not retried). From ADK 2.8.0, a
+// reply with no candidates is a response, not an error, so the run ends after
+// one attempt, with the block reason as an error event.
 func TestGeminiModelErrorIsNonRetryable(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		stub errStubGeminiAPI
+		name         string
+		stub         errStubGeminiAPI
+		noCandidates bool
+		wantErrors   []string
 	}{
 		{name: "http 400", stub: errStubGeminiAPI{status: http.StatusBadRequest, body: `{"error":{"code":400,"message":"invalid argument","status":"INVALID_ARGUMENT"}}`}},
-		{name: "blocked prompt", stub: errStubGeminiAPI{status: http.StatusOK, body: `{"promptFeedback":{"blockReason":"SAFETY"}}`}},
-		{name: "empty reply", stub: errStubGeminiAPI{status: http.StatusOK, body: `{"usageMetadata":{"promptTokenCount":3}}`}},
+		{
+			name:         "blocked prompt",
+			stub:         errStubGeminiAPI{status: http.StatusOK, body: `{"promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"blocked for safety"}}`},
+			noCandidates: true,
+			wantErrors:   []string{"blocked for safety"},
+		},
+		{name: "empty reply", stub: errStubGeminiAPI{status: http.StatusOK, body: `{"usageMetadata":{"promptTokenCount":3}}`}, noCandidates: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			geminiFactory := func(ctx context.Context, name string) (model.LLM, error) {
@@ -207,11 +216,19 @@ func TestGeminiModelErrorIsNonRetryable(t *testing.T) {
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
+			// Nothing is retried: exactly one model Activity attempt.
+			assert.Equal(t, 1, counter.get(googleadk.InvokeModelActivityName))
+			if tc.noCandidates && googleadk.ADKAtLeast(t, "v2.8.0") {
+				// google/adk-go#2068
+				require.NoError(t, env.GetWorkflowError())
+				var res runResult
+				require.NoError(t, env.GetWorkflowResult(&res))
+				assert.Equal(t, tc.wantErrors, res.Errors)
+				return
+			}
 			err := env.GetWorkflowError()
 			require.Error(t, err)
 			assert.True(t, googleadk.IsNonRetryable(err), "the model error must be non-retryable; got %v", err)
-			// A non-retryable error is not retried: exactly one model Activity attempt.
-			assert.Equal(t, 1, counter.get(googleadk.InvokeModelActivityName))
 		})
 	}
 }
