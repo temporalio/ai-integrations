@@ -7,9 +7,11 @@ import {
   type SandboxClient,
   type SandboxRunConfig,
   type SandboxSessionLike,
+  type SandboxSessionState,
 } from '@openai/agents-core/sandbox';
-import { ApplicationFailure, condition, defineQuery, defineSignal, setHandler } from '@temporalio/workflow';
+import { ApplicationFailure, condition, continueAsNew, defineQuery, defineSignal, setHandler } from '@temporalio/workflow';
 import { TemporalOpenAIRunner, workerEnvValue, temporalSandboxClient } from '../../workflow';
+import { serializeSessionEnvelope, type TemporalSandboxSessionState } from '../../common/sandbox-activity-types';
 
 class TestSandboxCapability extends Capability {
   readonly type = 'test_sandbox';
@@ -173,6 +175,10 @@ function addEnvironmentReference(value: unknown): void {
 class EchoSandboxCapability extends Capability {
   readonly type = 'echo_sandbox';
 
+  constructor(private readonly onSession?: (state: SandboxSessionState) => void) {
+    super();
+  }
+
   override tools(): Tool<any>[] {
     const runCommand = (name: string, needsApproval: boolean): FunctionTool =>
       ({
@@ -188,6 +194,7 @@ class EchoSandboxCapability extends Capability {
         strict: true,
         invoke: async (_ctx: RunContext<any>, input: string): Promise<string> => {
           if (!this._session) throw new Error('echo_sandbox capability is not bound to a session');
+          this.onSession?.(this._session.state);
           return this._session.execCommand!(JSON.parse(input));
         },
         needsApproval: async () => needsApproval,
@@ -255,6 +262,95 @@ export async function sandboxApprovalSequenceWorkflow(variables: string[], waitF
     result = await runner.run(agent, result.state, { runConfig: runConfig(variable) });
   }
   return result.newItems
+    .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
+    .join('\n');
+}
+
+/**
+ * A sandbox agent runs `run_now` and pauses for approval of `run_approved`. `pause` returns the paused state's string.
+ * Otherwise approves and resumes from `result.state` (`live`), from `RunState.fromString` (`runState`), or
+ * from that with the session's state as `runConfig.sandbox.sessionState` (`sessionState`). Given `pausedState`,
+ * resumes that instead of running first. Returns each command's output.
+ */
+export async function sandboxRootResumeWorkflow(
+  resume: 'pause' | 'live' | 'runState' | 'sessionState',
+  pausedState?: string
+): Promise<string> {
+  let sessionState: SandboxSessionState | undefined;
+  const agent = new SandboxAgent({
+    name: 'sandbox-root',
+    model: 'gpt-4o-mini',
+    capabilities: [new EchoSandboxCapability((state) => (sessionState = state))],
+  });
+  const client = temporalSandboxClient('lifecycle');
+  const runner = new TemporalOpenAIRunner();
+  const paused = pausedState ? undefined : await runner.run(agent, 'run', { runConfig: { sandbox: { client } } });
+  if (resume === 'pause') return paused!.state.toString();
+  const state =
+    resume === 'live' ? paused!.state : await RunState.fromString(agent, pausedState ?? paused!.state.toString());
+  for (const interruption of state.getInterruptions()) state.approve(interruption);
+  const resumed = await runner.run(agent, state, {
+    runConfig: { sandbox: { client, ...(resume === 'sessionState' ? { sessionState } : {}) } },
+  });
+  return resumed.newItems
+    .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
+    .join('\n');
+}
+
+/**
+ * Without `saved`, a sandbox agent with its manifest at `root` runs `run_now`, pauses for approval of `run_approved`,
+ * and returns its session's serialized state. Given `saved`, a new run resumes that state as
+ * `runConfig.sandbox.sessionState` and returns each command's output.
+ */
+export async function sandboxSavedSessionResumeWorkflow(root: string, saved?: string): Promise<string> {
+  const captured: { session?: TemporalSandboxSessionState } = {};
+  const agent = new SandboxAgent({
+    name: 'sandbox-root',
+    model: 'gpt-4o-mini',
+    defaultManifest: new Manifest({ root }),
+    capabilities: [new EchoSandboxCapability((state) => (captured.session = state as TemporalSandboxSessionState))],
+  });
+  const client = temporalSandboxClient('lifecycle');
+  const runner = new TemporalOpenAIRunner();
+  if (saved === undefined) {
+    await runner.run(agent, 'run', { runConfig: { sandbox: { client } } });
+    const session = captured.session!;
+    return JSON.stringify(serializeSessionEnvelope(session.sessionId, session, session.providerState));
+  }
+  const sessionState = await client.deserializeSessionState(JSON.parse(saved));
+  const resumed = await runner.run(agent, 'run', { runConfig: { sandbox: { client, sessionState } } });
+  return resumed.newItems
+    .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
+    .join('\n');
+}
+
+/**
+ * A plain agent asks a nested `SandboxAgent` through `asTool()`, which runs `run_now` and pauses for
+ * approval of `run_approved`. Returns the paused state's string or, with `continueWithState`,
+ * continues as new with it. Given `pausedState`, approves and resumes that instead, and returns each
+ * tool's output.
+ */
+export async function sandboxNestedRootResumeWorkflow(
+  pausedState?: string,
+  continueWithState = false
+): Promise<string> {
+  const nested = new SandboxAgent({
+    name: 'nested-sandbox',
+    model: 'gpt-4o-mini',
+    capabilities: [new EchoSandboxCapability()],
+  });
+  const lead = new Agent({ name: 'lead', model: 'gpt-4o-mini', tools: [nested.asTool({ toolName: 'ask_sandbox' })] });
+  const runConfig = { sandbox: { client: temporalSandboxClient('lifecycle') } };
+  const runner = new TemporalOpenAIRunner();
+  if (pausedState === undefined) {
+    const paused = (await runner.run(lead, 'run', { runConfig })).state.toString();
+    if (continueWithState) await continueAsNew<typeof sandboxNestedRootResumeWorkflow>(paused);
+    return paused;
+  }
+  const state = await RunState.fromString(lead, pausedState);
+  for (const interruption of state.getInterruptions()) state.approve(interruption);
+  const resumed = await runner.run(lead, state, { runConfig });
+  return resumed.newItems
     .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
     .join('\n');
 }

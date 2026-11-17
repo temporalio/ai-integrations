@@ -617,7 +617,7 @@ Adding a resolver to a Workflow that has open runs, including moving one off the
 
 An OpenAI Agents SDK `SandboxAgent` runs commands, edits files, and keeps a workspace inside a sandbox. This plugin dispatches each of those operations as an Activity.
 
-The Docker and Unix-local backends run the sandbox on the Worker's own machine, where other Workers can't reach it, so they're supported for local development only, with a single Worker. For production, use a hosted backend, such as E2B, Modal or Daytona from `@openai/agents-extensions`.
+The Docker and Unix-local backends run the sandbox on the Worker's own machine, where other Workers can't reach it, so they're supported for local development only, with a single Worker. For production, use a hosted backend, such as E2B or Daytona from `@openai/agents-extensions`.
 
 A process started by `exec` outlives the Worker holding the session only if the backend can reconnect it after `resume`; Docker and Unix-local can't.
 

@@ -11,13 +11,16 @@ import {
 import type {
   SandboxClient,
   SandboxClientOptions,
+  SandboxClientResumeOptions,
   SandboxSession,
   SandboxSessionState,
 } from '@openai/agents-core/sandbox';
-import { SandboxError, SandboxMountError, isEnvValueReference } from '@openai/agents-core/sandbox';
+import { Manifest, SandboxError, SandboxMountError, isEnvValueReference } from '@openai/agents-core/sandbox';
 import {
+  captureLiveMountCredentialAuthorityIfAbsent,
   deserializeHostPathGrantRedactionMetadata,
   isStringRecord,
+  liveMountEnvironmentAuthorityMatches,
   rebindPersistedMountCredentials,
   rehydratePersistedEnvironmentForRuntime,
   sanitizeEnvironmentForPersistence,
@@ -30,6 +33,7 @@ import {
   SANDBOX_CLIENT_DELETE_SUFFIX,
   SANDBOX_CLIENT_RESUME_SUFFIX,
   SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX,
+  SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX,
   SANDBOX_EDITOR_CREATE_FILE_SUFFIX,
   SANDBOX_EDITOR_DELETE_FILE_SUFFIX,
   SANDBOX_EDITOR_UPDATE_FILE_SUFFIX,
@@ -87,19 +91,19 @@ const workerEnvVarStorage = new AsyncLocalStorage<readonly string[]>();
 registerWorkerEnvVarContext(() => workerEnvVarStorage.getStore());
 
 /**
- * Temporal retries every Activity exception by default, so only a
- * SandboxError the agents library has classified as terminal
- * (`retryable === false`) is turned into a non-retryable ApplicationFailure.
+ * Temporal retries every Activity exception by default, so a SandboxError the agents library has
+ * classified as terminal (`retryable === false`) is turned into a non-retryable ApplicationFailure. So
+ * is any other UserError, such as a backend's refusal to resume, which a retry won't change.
  */
 function translateSandboxErrors(fn: ActivityFunction): ActivityFunction {
   return async (...args: unknown[]) => {
     try {
       return await fn(...args);
     } catch (err: unknown) {
-      if (err instanceof SandboxError && err.retryable === false) {
+      if (err instanceof UserError && (!(err instanceof SandboxError) || err.retryable === false)) {
         throw ApplicationFailure.create({
           message: err.message,
-          type: err.code,
+          type: err instanceof SandboxError ? err.code : err.name,
           nonRetryable: true,
           cause: err,
         });
@@ -221,7 +225,12 @@ export class SandboxClientProvider {
   ): Promise<SandboxSessionState> {
     const trusted = decodeManifest(trustedManifest ?? payload.manifest, this._resolvableWorkerEnvVars);
     const saved = trustedManifest ? withTrustedManifest(payload, trustedManifest) : payload;
-    const state = rebindPersistedMountCredentials(await this.rehydrateState(saved), trusted);
+    // Rebound onto the backend's own object, as upstream's `resumeSandboxSession` does: Cloudflare refuses
+    // to resume one its `deserializeSessionState` returned, and a copy would get past that.
+    const state = await this.rehydrateState(saved);
+    const rebound = rebindPersistedMountCredentials(state, trusted);
+    state.manifest = rebound.manifest;
+    for (const key of Object.keys(state)) if (!(key in rebound)) delete state[key];
     const grants = new Map(trusted.extraPathGrants.map((grant) => [grant.path, grant]));
     const { extraPathGrants } = state.manifest;
     for (const [index, grant] of extraPathGrants.entries()) extraPathGrants[index] = grants.get(grant.path) ?? grant;
@@ -233,7 +242,8 @@ export class SandboxClientProvider {
 
   private async session(
     payload: SerializedSandboxSessionState,
-    trustedManifest?: EncodedManifest
+    trustedManifest?: EncodedManifest,
+    options?: SandboxClientResumeOptions
   ): Promise<SandboxSession> {
     const existing = this._sessions.get(payload.sessionId);
     if (existing) return existing;
@@ -251,9 +261,7 @@ export class SandboxClientProvider {
     }
     const resume = this.client.resume.bind(this.client);
     const resumePromise = (async (): Promise<SandboxSession> => {
-      const session = await resume(await this.resumableState(payload, trustedManifest));
-      this._sessions.set(payload.sessionId, session);
-      return session;
+      return this.track(payload.sessionId, await resume(await this.resumableState(payload, trustedManifest), options));
     })();
     this._resuming.set(payload.sessionId, resumePromise);
     try {
@@ -261,6 +269,16 @@ export class SandboxClientProvider {
     } finally {
       this._resuming.delete(payload.sessionId);
     }
+  }
+
+  /**
+   * Caches a session the Worker created or resumed, and records its live mount authority, as upstream's
+   * runner does for a session it owns, so the reuse check compares the trusted manifest with it.
+   */
+  private track(sessionId: string, session: SandboxSession): SandboxSession {
+    captureLiveMountCredentialAuthorityIfAbsent(session.state.manifest, session.state.environment);
+    this._sessions.set(sessionId, session);
+    return session;
   }
 
   private async providerState(state: SandboxSessionState): Promise<Record<string, unknown>> {
@@ -313,8 +331,7 @@ export class SandboxClientProvider {
         // idempotency key, so a retry after the backend session is created but
         // before this result is recorded leaks that first session.
         const sessionId = randomUUID();
-        this._sessions.set(sessionId, session);
-        return this.sessionResult(sessionId, session);
+        return this.sessionResult(sessionId, this.track(sessionId, session));
       },
 
       [`${n}${SANDBOX_CLIENT_RESUME_SUFFIX}`]: async (
@@ -325,8 +342,7 @@ export class SandboxClientProvider {
           archiveLimits: input.archiveLimits,
           clientOptions: input.clientOptions,
         });
-        this._sessions.set(input.state.sessionId, session);
-        return this.sessionResult(input.state.sessionId, session);
+        return this.sessionResult(input.state.sessionId, this.track(input.state.sessionId, session));
       },
 
       [`${n}${SANDBOX_CLIENT_DELETE_SUFFIX}`]: async (input: SandboxSessionStateInput): Promise<void> => {
@@ -353,7 +369,7 @@ export class SandboxClientProvider {
       ): Promise<boolean> => {
         let state: SandboxSessionState;
         try {
-          ({ state } = await this.session(input.state, input.trustedManifest));
+          ({ state } = await this.session(input.state, input.trustedManifest, { clientOptions: input.clientOptions }));
         } catch (err) {
           // On a cache miss, upstream refuses to resume some sessions, such as one with an in-container mount.
           if (err instanceof SandboxMountError && err.code === 'mount_config_invalid') return false;
@@ -373,21 +389,17 @@ export class SandboxClientProvider {
           return false;
         }
         if (this.client.canReusePreservedOwnedSession) {
-          let reusable: boolean;
-          try {
-            reusable = await this.client.canReusePreservedOwnedSession(state, {
-              clientOptions: input.clientOptions,
-              revalidateManifestEntries: input.revalidateManifestEntries,
-              trustedManifest,
-            });
-          } catch (err) {
-            // Upstream fails the run here. A SandboxError says whether a retry helps; any other UserError won't.
-            if (err instanceof UserError && !(err instanceof SandboxError)) {
-              throw ApplicationFailure.create({ message: err.message, type: err.name, nonRetryable: true, cause: err });
-            }
-            throw err;
-          }
+          const reusable = await this.client.canReusePreservedOwnedSession(state, {
+            clientOptions: input.clientOptions,
+            revalidateManifestEntries: input.revalidateManifestEntries,
+            trustedManifest,
+          });
           if (!reusable) return false;
+        } else if (trustedManifest) {
+          // For a backend with no check of its own, upstream refuses a change to the credentials that mounts
+          // take from the environment.
+          const environment = await trustedManifest.resolveEnvironment();
+          if (!liveMountEnvironmentAuthorityMatches(state.manifest, trustedManifest, environment)) return false;
         }
         // Upstream refuses to resume a live session without a trusted manifest, so there is nothing to refresh.
         if (!trustedManifest) return true;
@@ -409,6 +421,9 @@ export class SandboxClientProvider {
         state.environment = environment;
         return true;
       },
+
+      [`${n}${SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX}`]: async (clientOptions?: Record<string, unknown>) =>
+        this.client.resolveTrustedManifestForResume?.(new Manifest(), clientOptions).root ?? '/workspace',
 
       [`${n}${SANDBOX_SESSION_START_SUFFIX}`]: async (input: SandboxLifecycleInput): Promise<void> => {
         const session = await this.session(input.state);

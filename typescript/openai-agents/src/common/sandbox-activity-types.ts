@@ -28,6 +28,7 @@ export const SANDBOX_CLIENT_RESUME_SUFFIX = '-sandbox-client-resume';
 export const SANDBOX_CLIENT_DELETE_SUFFIX = '-sandbox-client-delete';
 export const SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX = '-sandbox-client-serialize-session-state';
 export const SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX = '-sandbox-client-can-reuse-preserved-owned-session';
+export const SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX = '-sandbox-client-workspace-root';
 export const SANDBOX_SESSION_START_SUFFIX = '-sandbox-session-start';
 export const SANDBOX_SESSION_RUNNING_SUFFIX = '-sandbox-session-running';
 export const SANDBOX_SESSION_STOP_SUFFIX = '-sandbox-session-stop';

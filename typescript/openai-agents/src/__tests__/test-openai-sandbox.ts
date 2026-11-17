@@ -3,14 +3,19 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { setTracingDisabled, withTrace } from '@openai/agents-core';
 import { UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';
-import { WorkflowClient } from '@temporalio/client';
+import { WorkflowClient, type WorkflowHandle } from '@temporalio/client';
 import { Worker } from '@temporalio/worker';
 import { helpers } from '@temporalio/test-helpers';
 import { OpenAIAgentsPlugin, OpenAIAgentsTraceClientInterceptor, SandboxClientProvider } from '..';
 import { installAgentSdkCollector } from './helpers/openai-agents-spans';
 import { makeTestFunction } from './helpers/test-fn';
 import { FakeModelProvider, handoffResponse, textResponse, toolCallResponse } from './stubs/openai-agents';
-import { FakeSandboxClient, FakeSandboxSession, LifecycleSandboxClient } from './stubs/sandbox-fakes';
+import {
+  FakeSandboxClient,
+  FakeSandboxSession,
+  LifecycleSandboxClient,
+  RootMovingSandboxClient,
+} from './stubs/sandbox-fakes';
 import {
   approvalPausedQuery,
   approvalResumeSignal,
@@ -24,8 +29,11 @@ import {
   sandboxExecWorkflow,
   sandboxManifestResumeWorkflow,
   sandboxNestedApprovalWorkflow,
+  sandboxNestedRootResumeWorkflow,
   sandboxNoModelWorkflow,
   sandboxResumeEnvironmentWorkflow,
+  sandboxRootResumeWorkflow,
+  sandboxSavedSessionResumeWorkflow,
   sandboxValidationWorkflow,
   sandboxWorkerEnvWorkflow,
 } from './workflows/openai-sandbox';
@@ -320,6 +328,112 @@ test.serial('An approval resume on a Worker that lost the live sandbox resumes i
     delete process.env[APPROVAL_VAR];
   }
 });
+
+async function workspaceRootActivities(handle: WorkflowHandle): Promise<number> {
+  const { events } = await handle.fetchHistory();
+  return (events ?? []).filter(
+    (event) =>
+      event.activityTaskScheduledEventAttributes?.activityType?.name === 'lifecycle-sandbox-client-workspace-root'
+  ).length;
+}
+
+function rootMovingWorker(
+  createWorker: ReturnType<typeof helpers>['createWorker'],
+  backend: RootMovingSandboxClient,
+  responses = [
+    toolCallResponse('run_now', { cmd: 'first' }),
+    toolCallResponse('run_approved', { cmd: 'second' }),
+    textResponse('Done.'),
+  ]
+) {
+  return createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider(responses),
+        sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
+      }),
+    ],
+  });
+}
+
+for (const resume of ['live', 'runState', 'sessionState'] as const) {
+  test(`An approval resume (${resume}) reuses a sandbox whose backend moved its root`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const backend = new RootMovingSandboxClient();
+    const worker = await rootMovingWorker(createWorker, backend);
+    const handle = await startWorkflow(sandboxRootResumeWorkflow, { args: [resume] });
+    t.is(await worker.runUntil(handle.result()), '#1 ran first with KEY=\n#1 ran first,second with KEY=');
+    t.is(await workspaceRootActivities(handle), 0, 'the Workflow knows the root from creating the sandbox');
+    t.deepEqual(backend.liveSandboxes(), []);
+  });
+}
+
+test('An approval resume in another Workflow asks the Worker once where the backend moved the root', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const backend = new RootMovingSandboxClient();
+  const worker = await rootMovingWorker(createWorker, backend);
+  const [paused, resumed] = await worker.runUntil(async () => {
+    const paused = await startWorkflow(sandboxRootResumeWorkflow, { args: ['pause'] });
+    const resumed = await startWorkflow(sandboxRootResumeWorkflow, { args: ['runState', await paused.result()] });
+    t.is(await resumed.result(), '#1 ran first with KEY=\n#1 ran first,second with KEY=');
+    return [paused, resumed];
+  });
+  t.is(await workspaceRootActivities(paused), 0);
+  t.is(await workspaceRootActivities(resumed), 1);
+  t.deepEqual(
+    backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+    ['create#1', 'resume#1', 'delete#1']
+  );
+});
+
+for (const root of ['/workspace', '/custom']) {
+  test(`A run in another Workflow resumes a saved sessionState with the manifest root at ${root}`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const backend = new RootMovingSandboxClient();
+    const worker = await rootMovingWorker(createWorker, backend, [
+      toolCallResponse('run_now', { cmd: 'first' }),
+      toolCallResponse('run_approved', { cmd: 'second' }),
+      toolCallResponse('run_now', { cmd: 'second' }),
+      textResponse('Done.'),
+    ]);
+    const resumed = await worker.runUntil(async () => {
+      const saved = await (await startWorkflow(sandboxSavedSessionResumeWorkflow, { args: [root] })).result();
+      const resumed = await startWorkflow(sandboxSavedSessionResumeWorkflow, { args: [root, saved] });
+      t.is(await resumed.result(), '#1 ran first,second with KEY=');
+      return resumed;
+    });
+    t.is(await workspaceRootActivities(resumed), 1);
+    t.deepEqual(
+      backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+      ['create#1', 'resume#1', 'delete#1']
+    );
+  });
+}
+
+for (const continued of [false, true]) {
+  const how = continued ? 'after continueAsNew' : 'in another Workflow';
+  test(`A nested asTool() approval resumed ${how} reuses a sandbox whose backend moved its root`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const backend = new RootMovingSandboxClient();
+    const worker = await rootMovingWorker(createWorker, backend, [
+      toolCallResponse('ask_sandbox', { input: 'run' }),
+      toolCallResponse('run_now', { cmd: 'first' }),
+      toolCallResponse('run_approved', { cmd: 'second' }),
+      textResponse('nested done'),
+      textResponse('Done.'),
+    ]);
+    const output = await worker.runUntil(async () => {
+      if (continued) return (await startWorkflow(sandboxNestedRootResumeWorkflow, { args: [undefined, true] })).result();
+      const paused = await startWorkflow(sandboxNestedRootResumeWorkflow, { args: [] });
+      return (await startWorkflow(sandboxNestedRootResumeWorkflow, { args: [await paused.result()] })).result();
+    });
+    t.is(output, 'nested done');
+    t.deepEqual(
+      backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+      ['create#1', 'resume#1', 'delete#1']
+    );
+  });
+}
 
 test("A SandboxAgent that names no model keeps its capabilities' providerData, such as compaction", async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);

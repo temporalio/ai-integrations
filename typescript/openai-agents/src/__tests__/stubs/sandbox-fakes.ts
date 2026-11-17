@@ -1,6 +1,7 @@
 import type { ToolOutputImage } from '@openai/agents-core';
 import {
   Manifest,
+  cloneManifest,
   isEnvValueReference,
   serializeEnvValueReference,
   type ExecCommandArgs,
@@ -289,5 +290,20 @@ export class LifecycleSandboxClient implements SandboxClient {
         return `#${state.sandboxId} ran ${commands.join(',')} with KEY=${state.environment?.KEY ?? ''}`;
       },
     };
+  }
+}
+
+/** Like Daytona and Vercel, moves the default `/workspace` root on create and in a resume's trusted manifest. */
+export class RootMovingSandboxClient extends LifecycleSandboxClient {
+  override async create(args?: SandboxClientCreateArgs | Manifest): Promise<SandboxSession> {
+    const manifest = (args instanceof Manifest ? args : args?.manifest) ?? new Manifest();
+    return super.create(this.resolveTrustedManifestForResume(cloneManifest(manifest)));
+  }
+
+  resolveTrustedManifestForResume(manifest: Manifest): Manifest {
+    if (manifest.root !== '/workspace') return manifest;
+    const moved = cloneManifest(manifest);
+    (moved as { root: string }).root = '/home/lifecycle/workspace';
+    return moved;
   }
 }

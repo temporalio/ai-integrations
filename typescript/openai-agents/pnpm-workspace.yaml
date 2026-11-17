@@ -12,5 +12,6 @@ minimumReleaseAgeExclude:
 
   # agents-core 0.22.0 lets sandbox clients prepare manifest environments
   # (openai/openai-agents-js#2085). agents-openai pins the same core version.
+  # Remove both lines once 0.22.0 passes the cooldown on 2026-11-27.
   - '@openai/agents-core@0.22.0'
   - '@openai/agents-openai@0.22.0'

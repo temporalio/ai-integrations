@@ -8,7 +8,7 @@ import type {
   SandboxSessionLike,
   SandboxSessionSerializationOptions,
 } from '@openai/agents-core/sandbox';
-import { Manifest } from '@openai/agents-core/sandbox';
+import { Manifest, cloneManifest } from '@openai/agents-core/sandbox';
 import { ApplicationFailure, type ActivityOptions } from '@temporalio/common';
 import { scheduleActivity } from '@temporalio/workflow';
 import {
@@ -17,6 +17,7 @@ import {
   SANDBOX_CLIENT_DELETE_SUFFIX,
   SANDBOX_CLIENT_RESUME_SUFFIX,
   SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX,
+  SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX,
   decodeManifest,
   encodeManifest,
   reviveWorkflowSessionState,
@@ -28,6 +29,7 @@ import {
   type TemporalSandboxSessionState,
 } from '../common/sandbox-activity-types';
 import { TemporalSandboxSession } from './sandbox-session';
+import { getCurrentPluginConfig, workspaceRoots } from './plugin-config-store';
 import { maybeTemporalSpan } from './span-helpers';
 
 /**
@@ -77,7 +79,25 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
       ],
       this._config
     );
-    return this.wrapSession(result);
+    const session = this.wrapSession(result);
+    if (!manifest || manifest.root === '/workspace') workspaceRoots()[this._name] = session.state.manifest.root;
+    return session;
+  }
+
+  /**
+   * Gives the trusted manifest the root the Worker's backend uses for `/workspace`, so resuming works on
+   * backends that move it, such as Daytona and Vercel.
+   */
+  resolveTrustedManifestForResume(manifest: Manifest): Manifest {
+    const root = getCurrentPluginConfig()?.workspaceRoots?.[this._name];
+    if (manifest.root !== '/workspace' || root === undefined) return manifest;
+    return Object.assign(cloneManifest(manifest), { root });
+  }
+
+  /** Before a resume, asks the Worker where its backend puts `/workspace`, unless this Workflow run already knows it. */
+  async _fetchWorkspaceRoot(clientOptions?: SandboxClientOptions): Promise<void> {
+    const name = `${this._name}${SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX}`;
+    workspaceRoots()[this._name] ??= await scheduleActivity<string>(name, [clientOptions], this._config);
   }
 
   async resume(
