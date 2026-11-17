@@ -314,6 +314,8 @@ See `ModelActivityOptions` for the public field list. `summary` can be a string 
 
 The model Activities get a 10-second `heartbeatTimeout` by default. They heartbeat every half timeout, starting half the timeout into the call, so a call that ends sooner sends no heartbeat. Set `heartbeatTimeout` in `modelParams` or the runner's `defaultModelParams` to change it, or set it to `0` to turn heartbeats off. Local Activities don't heartbeat.
 
+The heartbeat timeout counts from the start of the attempt, and the Worker encodes each heartbeat with your payload codecs before sending it. So the first heartbeat arrives after the Worker's startup work for the attempt (interceptors and payload decoding), plus half the timeout, plus the encoding time. Startup and encoding together must comfortably fit in the other half: under 5 seconds with the default. If they can take longer, such as with a codec that calls a remote key service, raise `heartbeatTimeout` to more than twice that time, or set it to `0`. Otherwise a healthy model call longer than half the timeout fails with a heartbeat timeout on every attempt.
+
 ## Tools
 
 Inline function tools, hosted tools, Activity-backed tools, Nexus operation tools, nested agent tools, and MCP tools can all be used from a Temporal-backed agent. Any tool that does I/O must run outside the Workflow sandbox, usually through an Activity or Nexus Operation.
