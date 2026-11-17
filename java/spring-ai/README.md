@@ -47,6 +47,27 @@ definitions and execute only in the workflow. Retry, per-model Activity options,
 response metadata, and media-size guards retain their behavior. Optional vector-store,
 embedding, and MCP modules are detected through Spring auto-configuration.
 
+## Structured output
+
+`entity(...)` and `responseEntity(...)` convert the model's answer in workflow code,
+after the model Activity has completed. When the answer doesn't match the target
+type, Spring AI's `BeanOutputConverter` throws a Jackson
+`tools.jackson.core.JacksonException`. If the workflow doesn't handle it, the
+workflow task fails and is retried, but the model's answer is already in the
+history, so every retry fails the same way and the workflow stays running.
+
+Catch the exception around the call, for example to ask the model again or return
+a fallback, or make it fail the workflow so a workflow retry policy can start
+another run:
+
+```java
+WorkflowImplementationOptions options =
+    WorkflowImplementationOptions.newBuilder()
+        .setFailWorkflowExceptionTypes(JacksonException.class)
+        .build();
+worker.registerWorkflowImplementationTypes(options, MyWorkflowImpl.class);
+```
+
 ## Provider retries
 
 For OpenAI chat Activities, native OpenAI HTTP errors retain their status, error
