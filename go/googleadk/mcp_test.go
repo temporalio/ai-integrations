@@ -527,16 +527,18 @@ func catalogChangeWorkflow(ctx workflow.Context, filterDrops, instructionLists b
 // still packed themselves, a tool the server dropped would stay declared and
 // a call to it would run CallMcpTool there, but not with ADK v2.6.0.
 //
-// It also proves a change in the list does not change the IDs ADK generates:
-// the turn draws the same number of UUIDs in every case, on every ADK
-// release. ADK draws a UUID for each tool it kept from Tools before every
-// model step:
+// It also proves the turn draws the same number of UUIDs in every case, on
+// every ADK release. ADK draws a UUID for each tool it kept from Tools before
+// every model step:
 // v2.5.0 and earlier keep the first list of the agent run, and v2.6.0 keeps
-// what each step's Tools call returns. If those calls returned the current
-// list, or the list of a later Tools call before the first ProcessRequest,
-// such as an InstructionProvider's, a dropped tool would shift the IDs drawn
-// after it, tool confirmation IDs included, on v2.6.0 only, and Histories
-// would not replay across releases.
+// what each step's Tools call returns. Each model call starts a new UUID
+// generator, so these draws reach the IDs ADK generates only in the cases
+// NewContext names, such as a response an ADK plugin or BeforeModelCallbacks
+// entry supplies instead of the model. There, if those calls returned the
+// current list, or the list of a later Tools call before the first
+// ProcessRequest, such as an InstructionProvider's, a dropped tool would shift
+// the IDs drawn after it, tool confirmation IDs included, on v2.6.0 only, and
+// Histories would not replay across releases.
 func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 	t.Run("not called", func(t *testing.T) {
 		var hide atomic.Bool

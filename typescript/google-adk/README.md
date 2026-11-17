@@ -1,6 +1,6 @@
 # @temporalio/google-adk
 
-Release stage: Public Preview.
+Release stage: Generally Available.
 
 Run [Google Agent Development Kit](https://github.com/google/adk-js) (`@google/adk`)
 agents as durable [Temporal](https://temporal.io) Workflows.
@@ -239,6 +239,22 @@ authenticated session — does not carry from one MCP operation to the next: the
 connection params above and ADK's `MCPToolset` both open a new session per
 operation rather than reusing one. Holding a session open across operations is
 the factory's job — see `MCPToolsetFactory`.
+
+A factory must be synchronous and return a `BaseToolset` or `MCPConnectionParams`
+with type `StdioConnectionParams`, `StreamableHTTPConnectionParams` or, from ADK
+2.3, `SseConnectionParams`. Other results, including the `Promise` of an async
+factory, now fail the Activity without retries with
+`MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE` (`GoogleAdkMCPToolsetFactoryTypeError`,
+exported from `@temporalio/google-adk/workflow`). A factory whose toolset isn't
+ready yet should throw rather than return `undefined`: exceptions are still
+retried. A factory that isn't a function makes `new GoogleAdkPlugin(...)` throw
+a `TypeError`, so the Worker doesn't start. Fix these factories before
+upgrading; the next attempt of an in-flight Activity also runs this check.
+
+On ADK 2.3, an SSE server that refuses the connection leaves its transport
+reconnecting in the background, one per failed attempt
+([modelcontextprotocol/typescript-sdk#3193](https://github.com/modelcontextprotocol/typescript-sdk/issues/3193)).
+Prefer `StreamableHTTPConnectionParams` where the server supports it.
 
 Gate the toolset's tools behind human approval with
 `requireConfirmation` — see [Durable human-in-the-loop](#durable-human-in-the-loop).
@@ -650,7 +666,6 @@ const model = new TemporalModel('gemini-2.5-flash', {
   streamingBatchInterval: '100 milliseconds',
   activity: {
     startToCloseTimeout: '5 minutes',
-    heartbeatTimeout: '30 seconds',
   },
 });
 
@@ -831,12 +846,14 @@ Cautions:
   for model requests and honors `retry-after` where available.
 - `heartbeatTimeout` defaults to 10 seconds for the model and MCP Activities. It
   detects a dead worker, not a stalled call: they heartbeat on a timer at half that
-  timeout — a hung call included — and a streaming model call also heartbeats per
-  chunk. A cancel reaches a running call only through a heartbeat. In Temporal
-  Cloud each heartbeat that reaches the service is an Action: with the default, at
-  most one every 8 seconds of a running call. Set `heartbeatTimeout: 0` to turn the
-  timer off. The bound on a stalled call is `startToCloseTimeout`, one minute by
-  default.
+  timeout — a hung call included — and only on that timer, streaming or not, so a
+  call shorter than half the timeout sends none. A cancel reaches a running call
+  only through a heartbeat, so not before half the timeout: a shorter call runs to
+  the end. In Temporal Cloud each heartbeat that reaches the service is an Action:
+  with the default, at most one every 8 seconds of a running call. Set
+  `heartbeatTimeout: 0` to turn heartbeats off; then a cancel never reaches a
+  running call. The bound on a stalled call is `startToCloseTimeout`, one minute
+  by default.
 - Streaming topic delivery is at-least-once. The deterministic Workflow value is
   the Activity result, not the stream side channel.
 - ADK's own log lines from inside a Workflow (ADK 2.1 and later: an `[ADK]`

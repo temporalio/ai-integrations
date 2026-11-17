@@ -15,7 +15,7 @@ import { inWorkflowContext } from '@temporalio/workflow';
 import { refuseTracingApiKey } from '../common/headers';
 import { ActivityBackedModelProvider } from './activity-backed-model';
 import { type AgentToolRecord, checkAgentToolOptions, getAgentToolRecord, isUnrecordedAgentTool } from './agent-tools';
-import { validateTemporalSandboxClient } from './sandbox-client';
+import { TemporalSandboxClient, validateTemporalSandboxClient } from './sandbox-client';
 
 /**
  * Checks an agent graph before a run, without changing it: the agents reached through handoffs and
@@ -189,7 +189,13 @@ export function installRunnerCheck(): void {
       sandbox,
       `${where} ${options?.sandbox !== undefined ? 'runOptions.sandbox' : 'runConfig.sandbox'}`
     );
-    return state.original.call(this, agent, input, { ...options, sandbox: Object.freeze({ ...sandbox }) });
+    const frozen = Object.freeze({ ...sandbox });
+    // A run that resumes a sandbox, top-level or nested, first learns where the backend puts `/workspace`.
+    const resumes = frozen.sessionState !== undefined || (input instanceof RunState && !!input._sandbox);
+    if (resumes && frozen.client instanceof TemporalSandboxClient) {
+      await frozen.client._fetchWorkspaceRoot(frozen.options);
+    }
+    return state.original.call(this, agent, input, { ...options, sandbox: frozen });
   }
   Object.defineProperty(Runner.prototype, runnerCheckState, { value: state });
   Runner.prototype.run = run as typeof Runner.prototype.run;

@@ -2,8 +2,6 @@
  * Workflow-safe API for the Google ADK Temporal plugin — importable from
  * Workflow code running in the V8 sandbox.
  *
- * @experimental The Google ADK plugin is an experimental feature; APIs may change without notice.
- *
  * @module
  */
 
@@ -49,6 +47,7 @@ export {
   MCP_ERROR_FAILURE_TYPE,
   MCP_RESOURCES_UNSUPPORTED_FAILURE_TYPE,
   MCP_TOOL_NOT_FOUND_FAILURE_TYPE,
+  MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE,
   MODEL_ERROR_FAILURE_TYPE,
   NODE_REPORTED_FAILURE_TYPE,
   NODE_SCHEMA_VALIDATION_FAILURE_TYPE,

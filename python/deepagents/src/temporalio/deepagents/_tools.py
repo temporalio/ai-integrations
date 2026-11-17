@@ -14,9 +14,9 @@ the user three explicit ways to move that work to an activity:
 * :class:`TemporalBackend` — wrap a real-I/O backend so each file/exec op runs
   as an activity.
 
-The choice is always explicit: an unwrapped non-builtin tool runs in-workflow,
-and the plugin warns at construction so that is a conscious decision, never a
-silent one.
+An unwrapped non-builtin tool runs in-workflow. The plugin warns about one
+passed in the ``tools=`` keyword of ``create_deep_agent``; it does not check
+``tools`` passed by position or a sub-agent's tools.
 
 Registries here live in a ``temporalio``-namespaced (sandbox-passthrough) module
 and are process-local. Tools must be registered at startup in every activity
@@ -37,6 +37,7 @@ import uuid as _uuid
 import warnings
 import weakref
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import is_dataclass
 from datetime import timedelta
 from types import SimpleNamespace
@@ -78,6 +79,14 @@ _BACKEND_REGISTRY_LOCK = threading.Lock()
 # set by the plugin. Not per-workflow state: fixed for the worker's lifetime, and
 # this module is sandbox-passthrough so the workflow sees the configured value.
 _tool_defaults: dict[str, Any] = {}
+
+# The public arun entry point receives the model's call id and RunnableConfig;
+# StructuredTool's coroutine receives only the validated tool arguments.
+_tool_call_context: ContextVar[tuple[str | None, dict[str, Any]] | None] = ContextVar(
+    "_temporal_deepagents_tool_call", default=None
+)
+
+_TOOL_CONTEXT_PATCH = "deepagents.wrapped-tool-call-context"
 
 
 def set_tool_defaults(options: Any) -> None:
@@ -499,10 +508,16 @@ def tool_as_activity(
     invoked in-workflow, dispatches ``deepagents.invoke_tool`` instead of running
     the tool body inline.
 
-    Call this at module import or worker startup on every process that can
-    execute tool activities. Registration inside a workflow alone does not
-    make the tool available in another worker process.
+    Call this at the top level of the module that defines the tool, on every
+    process that can execute tool activities, and import that module in the
+    workflow file under ``workflow.unsafe.imports_passed_through()``. A tool
+    defined in code the workflow sandbox loads (the workflow file, a module it
+    imports without that guard, or the body of ``run``) is registered as the
+    sandbox's copy, and the activity then runs that copy under the sandbox's
+    restrictions. Registration inside a workflow alone does not make the tool
+    available in another worker process.
     """
+    from langchain_core.runnables.config import ensure_config
     from langchain_core.tools import BaseTool, StructuredTool
 
     base_tool: BaseTool
@@ -522,11 +537,25 @@ def tool_as_activity(
     async def _run(**kwargs: Any) -> Any:
         from temporalio.deepagents.workflow import call_tool
 
-        tool_call_id = kwargs.pop("__tool_call_id__", None) or workflow.uuid4().hex
+        modern = workflow.patched(_TOOL_CONTEXT_PATCH)
+        if modern and base_tool.return_direct:
+            from temporalio.deepagents.workflow import DeepAgentsWorkflowError
+
+            raise DeepAgentsWorkflowError(
+                "tool_as_activity does not support return_direct=True. "
+                "Return from the Workflow explicitly after calling the tool."
+            )
+        context = _tool_call_context.get() if modern else None
+        call_id, config = context if context is not None else (None, {})
+        fallback_id = kwargs.pop("__tool_call_id__", None)
+        tool_call_id = (
+            call_id if call_id is not None else fallback_id or workflow.uuid4().hex
+        )
         activity_input = _activity.ToolActivityInput(
             tool_name=tool_name,
             tool_call_id=tool_call_id,
             args=kwargs,
+            config=config,
         )
         output = await call_tool(
             activity_input,
@@ -534,19 +563,37 @@ def tool_as_activity(
             **opts,
         )
         message = _serde.load_object(output.message)
-        # Return CONTENT, not the pre-built ToolMessage: the activity cannot
-        # know the model's real tool_call_id, so a ToolMessage assembled there
-        # carries a generated id that a real provider rejects as an unpaired
-        # tool_result. Given plain content, the tool node stamps the model's
-        # own id — exactly as it does for unwrapped tools.
         from langchain_core.messages import ToolMessage
 
-        if isinstance(message, ToolMessage):
+        if isinstance(message, ToolMessage) and call_id is None:
+            # Native calls with bare arguments return content, while calls
+            # carrying a model's tool-call id return the complete ToolMessage.
             return message.content
         return message
 
+    class ActivityTool(StructuredTool):
+        """A native StructuredTool whose validated coroutine dispatches an Activity."""
+
+        async def arun(
+            self, tool_input: str | dict[str, Any], *args: Any, **kwargs: Any
+        ) -> Any:
+            """Retain the native validation and callback path around dispatch."""
+            config = ensure_config(kwargs.get("config"))
+            if kwargs.get("run_id") is not None:
+                config["run_id"] = kwargs["run_id"]
+            token = _tool_call_context.set(
+                (
+                    kwargs.get("tool_call_id"),
+                    _serde.strip_runnable_config(config),
+                )
+            )
+            try:
+                return await super().arun(tool_input, *args, **kwargs)
+            finally:
+                _tool_call_context.reset(token)
+
     _ROUTED_TOOL_NAMES.add(tool_name)
-    return StructuredTool(
+    return ActivityTool(
         name=tool_name,
         description=base_tool.description,
         args_schema=base_tool.args_schema,  # type: ignore[arg-type]

@@ -510,37 +510,38 @@ async def test_graph_continue_as_new_cached_factory_nodes(client: Client):
 
 
 @dataclass
-class LegacyKeyInput:
+class NodeKeyInput:
     value: int
     cache: dict[str, Any] | None = None
     phase: int = 1
 
 
 @workflow.defn
-class LegacyKeyWorkflow:
+class NodeKeyWorkflow:
     """Runs the one-node graph, continuing-as-new once with the cache."""
 
     @workflow.run
-    async def run(self, input_data: LegacyKeyInput) -> dict[str, Any]:
-        app = graph("cached-legacy-id", cache=input_data.cache).compile()
+    async def run(self, input_data: NodeKeyInput) -> dict[str, Any]:
+        app = graph("cached-node-id", cache=input_data.cache).compile()
         state = await app.ainvoke({"value": input_data.value})
 
         if input_data.phase < 2:
             workflow.continue_as_new(
-                LegacyKeyInput(value=input_data.value, cache=cache(), phase=2)
+                NodeKeyInput(value=input_data.value, cache=cache(), phase=2)
             )
 
         return {"state": state, "cache": cache()}
 
 
-async def test_graph_continue_as_new_cached_module_qualname_key(client: Client):
-    """A module-level node keeps its pre-change ``module.qualname`` cache id.
+async def test_graph_continue_as_new_cached_node_key(client: Client):
+    """A Graph API node's cache entries are keyed by its activity name.
 
-    The entry is seeded exactly as an earlier version would have written
-    it — ``cache_key`` over the function's ``module.qualname``, its args,
-    and its context — so a node whose cache was populated before this
-    change is still honoured after continue-as-new. The seeded result (41)
-    differs from a real execution (20 * 2) so a cache miss is observable.
+    The seeded key is written out, so a change to the node's id, to the
+    arguments that go into the key or to the hash fails here: a run that
+    carries a cache through continue-as-new needs the same keys to replay.
+    The function's ``module.qualname``, which keyed a module-level node's
+    entries before, is not read any more. The seeded results (41 and 13)
+    differ from a real execution (20 * 2) so a cache miss is observable.
     """
     _reset()
     metadata = {
@@ -552,20 +553,25 @@ async def test_graph_continue_as_new_cached_module_qualname_key(client: Client):
     g.add_edge(START, "double")
 
     initial = {"value": 20}
-    legacy_id = f"{double.__module__}.{double.__qualname__}"
-    seeded = {cache_key(legacy_id, (initial,), {}, None): {"value": 41}}
+    key = "ec9773a01c5b8f9ceaf0ee9d1d1f93ed"
+    assert key == cache_key("graph-node:cached-node-id.double", (initial,), {}, None)
+    qualname_id = f"{double.__module__}.{double.__qualname__}"
+    seeded = {
+        key: {"value": 41},
+        cache_key(qualname_id, (initial,), {}, None): {"value": 13},
+    }
 
-    task_queue = f"graph-cached-legacy-id-{uuid4()}"
+    task_queue = f"graph-cached-node-id-{uuid4()}"
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[LegacyKeyWorkflow],
-        plugins=[LangGraphPlugin(graphs={"cached-legacy-id": g})],
+        workflows=[NodeKeyWorkflow],
+        plugins=[LangGraphPlugin(graphs={"cached-node-id": g})],
     ):
         result = await client.execute_workflow(
-            LegacyKeyWorkflow.run,
-            LegacyKeyInput(value=20, cache=seeded),
-            id=f"graph-cached-legacy-id-{uuid4()}",
+            NodeKeyWorkflow.run,
+            NodeKeyInput(value=20, cache=seeded),
+            id=f"graph-cached-node-id-{uuid4()}",
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=20),
         )

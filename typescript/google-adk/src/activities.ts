@@ -16,6 +16,7 @@ import {
   MCPSessionManager,
   MCPToolset,
   isBaseToolset,
+  version as adkVersion,
   type BaseLlm,
   type BaseToolset,
   type Context as AdkToolContext,
@@ -35,6 +36,7 @@ import {
   MCP_ERROR_FAILURE_TYPE,
   MCP_RESOURCES_UNSUPPORTED_FAILURE_TYPE,
   MCP_TOOL_NOT_FOUND_FAILURE_TYPE,
+  MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE,
   MODEL_ERROR_FAILURE_TYPE,
   STREAM_ERROR_FAILURE_TYPE,
 } from './error-types';
@@ -131,8 +133,6 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
         const model = resolveModel(args.model);
         const request = fromWireRequest(args.request);
         for await (const response of model.generateContentAsync(request, true, abortSignal)) {
-          // Heartbeat per chunk so a slow stream isn't mistaken for a stuck worker.
-          ActivityContext.current().heartbeat();
           events.publish(response);
           responses.push(response);
         }
@@ -170,6 +170,10 @@ export function createMCPActivities(
 ): Record<string, (args: never) => Promise<unknown>> {
   const activities: Record<string, (args: never) => Promise<unknown>> = {};
   for (const [name, factory] of Object.entries(toolsets)) {
+    // Fail when the Worker is built, not in every MCP Activity.
+    if (typeof factory !== 'function') {
+      throw new TypeError(`MCP toolset factory '${name}' is ${describeValue(factory)}, not a function.`);
+    }
     Object.assign(activities, withSources(mcpActivitiesForName(name, factory), [factory]));
   }
   return activities;
@@ -200,6 +204,51 @@ function resourceCapable(toolset: BaseToolset, name: string): ResourceCapableToo
   );
 }
 
+const [adkMajor = 0, adkMinor = 0] = adkVersion.split('.').map(Number);
+
+// The `MCPConnectionParams` tags the installed ADK connects. ADK 2.3 adds
+// `SseConnectionParams`; earlier releases return an unconnected session for it.
+// The peer range stops at ADK 2.4, so a new tag comes with a change to that range.
+const MCP_CONNECTION_PARAMS_TYPES: ReadonlySet<unknown> = new Set([
+  'StdioConnectionParams',
+  'StreamableHTTPConnectionParams',
+  ...(adkMajor > 2 || (adkMajor === 2 && adkMinor >= 3) ? ['SseConnectionParams'] : []),
+]);
+
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `Promise`,
+// with its `type` tag when it has one.
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
+  const kind = (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+  const tag = (value as { type?: unknown }).type;
+  return typeof tag === 'string' ? `${kind} with type '${tag}'` : kind;
+}
+
+function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<MCPToolsetFactory> {
+  const produced = factory();
+  if (
+    isBaseToolset(produced) ||
+    (produced != null && typeof produced === 'object' && MCP_CONNECTION_PARAMS_TYPES.has(produced.type))
+  ) {
+    return produced;
+  }
+  // An async factory's rejection would otherwise go unhandled and stop the Worker process.
+  if (produced instanceof Promise) produced.catch(() => undefined);
+  // Only an ADK before 2.3 gets here with an SSE tag.
+  if ((produced as { type?: unknown } | null | undefined)?.type === 'SseConnectionParams') {
+    throw ApplicationFailure.nonRetryable(
+      `MCP toolset factory '${name}' returned SseConnectionParams, which needs ADK 2.3 or later; ` +
+        `this Worker has ADK ${adkVersion}.`,
+      MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE
+    );
+  }
+  throw ApplicationFailure.nonRetryable(
+    `MCP toolset factory '${name}' returned ${describeValue(produced)}, not a BaseToolset or MCPConnectionParams.`,
+    MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE
+  );
+}
+
 function mcpActivitiesForName(
   name: string,
   factory: MCPToolsetFactory
@@ -210,7 +259,7 @@ function mcpActivitiesForName(
       const stopHeartbeat = startAdaptiveHeartbeat();
       let owned: MCPToolset | undefined;
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         const toolset = isBaseToolset(produced) ? produced : (owned = new MCPToolset(produced));
         const tools = await toolset.getTools();
         // `_getDeclaration` is underscore-prefixed by ADK convention but is a
@@ -234,7 +283,7 @@ function mcpActivitiesForName(
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         if (!isBaseToolset(produced)) {
           return await withOneSession(new MCPSessionManager(produced), (session) =>
             session.callTool({ name: args.toolName, arguments: args.args }, undefined, { signal: abortSignal })
@@ -264,7 +313,7 @@ function mcpActivitiesForName(
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         if (!isBaseToolset(produced)) {
           return await withOneSession(new MCPSessionManager(produced), (session) =>
             listResourceNames(session, abortSignal)
@@ -288,7 +337,7 @@ function mcpActivitiesForName(
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         if (!isBaseToolset(produced)) {
           return await withOneSession(new MCPSessionManager(produced), (session) =>
             readResourceByName(session, args.name, abortSignal)
@@ -431,6 +480,9 @@ function disableSdkRetries(request: LlmRequest): void {
  * Starts an auto-heartbeat at ~half the Activity's `heartbeatTimeout` so a slow
  * (thinking-mode) model call is not mistaken for a stuck worker. Returns a stop
  * function; a no-op when no heartbeat timeout is configured.
+ *
+ * These are the plugin's only heartbeats. The first goes out half the timeout
+ * into the call, so a shorter call sends none and costs no Temporal Cloud Action.
  */
 function startAdaptiveHeartbeat(): () => void {
   const heartbeatTimeoutMs = ActivityContext.current().info.heartbeatTimeoutMs;

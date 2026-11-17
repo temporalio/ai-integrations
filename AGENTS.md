@@ -122,6 +122,14 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   Spring Boot major series. Run `resolveAndLockAll --write-locks --refresh-dependencies`
   first; subsequent test and build commands reuse a separate ignored latest lock.
   Ordinary CI and releases default to `-PdependencyMode=locked` and committed locks.
+- Shared Java CI resolves dependencies before offline lint, tests and packaging.
+  `scripts/ci/resolve_java_dependencies.py` allows three fresh Gradle invocations,
+  waiting 10 then 30 seconds only after transient dependency-download errors;
+  authentication, missing artifacts, TLS, integrity and lock failures remain terminal.
+  `resolveDependencies` preserves committed locks; latest mode uses `resolveAndLockAll`.
+  External Gradle caches are keyed by OS, architecture, plugin, Java, Boot, dependency
+  mode and build/lock inputs, with fallback only within the same matrix variant.
+  Successful default-branch jobs save caches; latest runs use a fresh snapshot key.
 
 ## TypeScript conventions
 
@@ -239,6 +247,24 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   the `global.json` SDK plus its runtime, fails if `dotnet --version` leaves the SDK channel, and
   runs `make test TEST_FRAMEWORK=net<runtime>`. A plain `make test` runs every listed runtime, so a
   machine needs their runtimes installed next to the SDK.
+
+## Pull requests
+
+PRs are squash-merged, so the PR title becomes the commit subject and a line in the plugin's
+release notes. Start each title with the plugin it changes:
+
+```
+[python/openai_agents] breaking: remove the gates that kept 1.x runs replaying
+[python/mcp] say that `timedelta(0)` also turns heartbeats off
+```
+
+- The tag is the plugin's folder path, as written in its release tags: `python/openai_agents`,
+  `typescript/vercel-ai-sdk`, `go/googleadk`.
+- A PR that changes up to three plugins lists them all:
+  `[python/strands_agents, python/deepagents]`. One that changes more than three has no tag, and
+  one that changes no plugin uses `[repo]`.
+- Write the text after the tag in lowercase, and don't repeat the plugin's name. Start with
+  `breaking:` when the change is breaking. Other PRs get no type word.
 
 ## CI
 

@@ -90,8 +90,11 @@ func classifyToolError(errType, name string, err error) error {
 
 // ActivityToolOptions configures ActivityAsTool.
 type ActivityToolOptions struct {
-	// Name is the tool name the model sees. Defaults to the activity's
-	// registered name (or its Go function name when unregistered).
+	// Name is the tool name the model sees, and the Activity type the tool
+	// schedules: register the activity under this name. When empty, the tool
+	// is named after the activity's Go function and passes that name to
+	// workflow.ExecuteActivity, which maps it to the name the function is
+	// registered under on the same worker.
 	Name string
 	// Description is the tool description the model sees.
 	Description string

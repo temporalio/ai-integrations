@@ -939,6 +939,13 @@ class StatefulMCPServerProvider:
             DeprecationWarning,
             stacklevel=2,
         )
+        # Fail when the Worker is built, not in every session Activity.
+        if not callable(server_factory):
+            kind = type(server_factory)  # type: ignore[reportUnreachable]
+            raise TypeError(
+                f"MCP server factory {name!r} is "
+                f"{kind.__module__}.{kind.__qualname__}, not callable"
+            )
         self._server_factory = server_factory
         self._server_name = name
         self._name = name + "-stateful"

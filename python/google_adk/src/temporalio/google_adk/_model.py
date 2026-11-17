@@ -16,6 +16,7 @@ import temporalio.workflow
 from temporalio import activity, workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
+from temporalio.google_adk._heartbeat_decorator import auto_heartbeater
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.workflow import ActivityConfig
 
@@ -152,6 +153,7 @@ class TemporalLlmRequest(LlmRequest):
 
 
 @activity.defn
+@auto_heartbeater
 async def invoke_model(llm_request: TemporalLlmRequest) -> list[LlmResponse]:
     """Activity that invokes an LLM model.
 
@@ -188,6 +190,7 @@ class StreamingInvokeInput:
 
 
 @activity.defn
+@auto_heartbeater
 async def invoke_model_streaming(
     input: StreamingInvokeInput,
 ) -> list[LlmResponse]:
@@ -229,7 +232,6 @@ async def invoke_model_streaming(
             async for response in llm.generate_content_async(
                 llm_request=llm_request, stream=True
             ):
-                activity.heartbeat()
                 responses.append(response)
                 events.publish(response)
     except BaseException:
@@ -305,6 +307,19 @@ class TemporalModel(BaseLlm):
                 name with a class prefix, such as ``gemini:gemini-2.5-flash``,
                 reaches the model as ``gemini-2.5-flash``.
             activity_config: Configuration options for the activity execution.
+                ``heartbeat_timeout`` defaults to 10 seconds. The model
+                activities heartbeat on a timer at half of it, so a cancel
+                reaches a running model call, and a lost worker is noticed,
+                within about this long. In Temporal Cloud each heartbeat that
+                reaches the service is an Action: with the default, at most
+                one every 8 seconds of a running call, and none for a call
+                shorter than 5 seconds. Set ``heartbeat_timeout`` to ``None``
+                to turn heartbeats off. The timer runs on the worker's event
+                loop, so a model that blocks the loop for longer than the
+                timeout fails the call with a heartbeat timeout. Workers on
+                an earlier version of this plugin don't heartbeat this way,
+                so a model call they run fails after 10 seconds without a
+                heartbeat. The README says how to upgrade and roll back.
             summary_fn: Optional callable that receives the LlmRequest and
                 returns a summary string (or None) for the activity. Must be
                 deterministic as it is called during workflow execution. If
@@ -352,7 +367,8 @@ class TemporalModel(BaseLlm):
         self._streaming_topic = streaming_topic
         self._streaming_batch_interval = streaming_batch_interval
         self._activity_config = ActivityConfig(
-            start_to_close_timeout=timedelta(seconds=60)
+            start_to_close_timeout=timedelta(seconds=60),
+            heartbeat_timeout=timedelta(seconds=10),
         )
         if activity_config is not None:
             if summary_fn is not None and activity_config.get("summary") is not None:

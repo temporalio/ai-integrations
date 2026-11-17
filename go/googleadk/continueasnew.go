@@ -17,8 +17,9 @@ import (
 //
 // Only session-scoped state is captured. App- and user-scoped state (the "app:"
 // and "user:" key prefixes), which the session service manages across sessions
-// rather than within one, is not carried; persist that in a durable session
-// service if you need it. Event state deltas are likewise filtered to session
+// rather than within one, is not carried; to keep a value, pass it in your own
+// continue-as-new input and add it to State under its prefixed key before
+// ImportSession. Event state deltas are likewise filtered to session
 // scope in the snapshot's copies — the live session's events are not modified —
 // so re-appending them on import cannot resurrect app-, user-, or temp-scoped
 // state. Every value in State and every event must be JSON-serializable.
