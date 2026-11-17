@@ -328,18 +328,22 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 // ToolFilter excludes while its confirmation is pending does not run when the
 // human approves: ADK resumes the call from the toolset's current Tools list,
 // which the filter governs at that point, not when the tools were listed. The
+// model gets the answer ADK gives, without Temporal, for a call to a tool the
+// agent does not have; its text differs between ADK releases. The
 // resume keeps the paused run's invocation ID, and with ReuseMessage also its
 // *genai.Content. With RetryResume, a failed resume already listed and
 // filtered before the filter changed, and the retry passes the same message.
 // With ReuseIterator under a sequential root, ADK runs the kept iterator again
 // with the same RunConfig.
 func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
-	wantNotFound := "not found"
-	if googleadk.ADKAtLeast(t, "v2.8.0") {
-		// ADK 2.8.0 answers an unknown tool call the way adk-python does
-		// (google/adk-go#2316).
-		wantNotFound = "no tool with that name is available"
-	}
+	native, err := runNatively(t, nativeAssistant(t, googleadk.NewFakeModel(
+		googleadk.FunctionCallResponse("call-1", "guarded", map[string]any{"target": "prod"}),
+		googleadk.TextResponse("done"),
+	)), "run the guarded tool")
+	require.NoError(t, err)
+	notFound, _ := native.ToolResponsePayloads["guarded"]["error"].(string)
+	require.NotEmpty(t, notFound, "ADK's answer for a tool the agent does not have")
+
 	for _, tc := range []mcpHitlCase{
 		{},
 		{ReuseMessage: true},
@@ -364,7 +368,7 @@ func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
 
 			require.True(t, res.Paused, "agent must pause on a pending confirmation")
 			assert.EqualValues(t, 0, mcpGuardedRuns.Load(), "an excluded tool must not run after approval")
-			assert.Contains(t, res.ResumedGuardedError, wantNotFound,
+			assert.Equal(t, notFound, res.ResumedGuardedError,
 				"ADK must not find the excluded tool when it resumes the call")
 			assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName),
 				"only the pending pass reaches the worker")

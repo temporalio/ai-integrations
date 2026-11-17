@@ -7,10 +7,11 @@ package googleadk
 // response's text into the partial-accumulated aggregate duplicated the
 // message and dropped the function calls (the tool was never invoked
 // in-workflow). A non-partial response must therefore REPLACE
-// partial-accumulated content, while metadata keeps folding — Gemini's
-// terminal response omits fields (e.g. ModelVersion) that earlier chunks
-// carried — and a stream carrying several non-partial responses must keep
-// every part, mirroring how ADK's flow fully processes each non-partial event.
+// partial-accumulated content, while metadata keeps folding: Gemini's
+// terminal response omits fields that earlier chunks carried, ModelVersion
+// among them before ADK v2.8.0. A stream carrying several non-partial
+// responses must keep every part, mirroring how ADK's flow fully processes
+// each non-partial event.
 
 import (
 	"io"
@@ -70,9 +71,11 @@ func nonPartial(parts ...*genai.Part) *model.LLMResponse {
 // TestAggregateResponsesGeminiTerminalAuthoritative drives the real gemini
 // model over a stubbed SSE transport and proves the aggregate handed back into
 // the workflow carries the message exactly once, keeps the function-call part
-// (so the tool actually runs in-workflow), and preserves metadata — including
-// ModelVersion, which the terminal response omits before ADK 2.8.0 — from
-// earlier chunks.
+// (so the tool actually runs in-workflow), and carries the metadata of the
+// chunks, ModelVersion included. Before ADK v2.8.0 the terminal response omits
+// ModelVersion, and it comes from the earlier chunks;
+// TestAggregateResponsesTerminalReplaceKeepsMetadata covers that case on every
+// ADK release.
 func TestAggregateResponsesGeminiTerminalAuthoritative(t *testing.T) {
 	llm, err := gemini.NewModel(t.Context(), "gemini-2.5-flash", &genai.ClientConfig{
 		APIKey:     "stub-key",
@@ -94,8 +97,8 @@ func TestAggregateResponsesGeminiTerminalAuthoritative(t *testing.T) {
 
 	// Pin the iterator shape the fix is built on: every raw chunk is yielded as
 	// a Partial, then the model's own aggregate arrives LAST as a non-partial
-	// response already carrying all the parts. Before ADK 2.8.0 it has no
-	// ModelVersion (google/adk-go#2070).
+	// response already carrying all the parts. It carries the stream's
+	// ModelVersion from ADK v2.8.0, and none before.
 	require.Len(t, responses, 3)
 	assert.True(t, responses[0].Partial)
 	assert.Equal(t, "Checking weather. ", concatText(responses[0].Content))
@@ -126,6 +129,26 @@ func TestAggregateResponsesGeminiTerminalAuthoritative(t *testing.T) {
 	assert.EqualValues(t, 10, agg.UsageMetadata.TotalTokenCount)
 	assert.Equal(t, "gemini-2.5-flash", agg.ModelVersion,
 		"ModelVersion from earlier chunks must survive the terminal replace")
+}
+
+// TestAggregateResponsesTerminalReplaceKeepsMetadata proves a terminal response
+// that omits metadata an earlier chunk carried, as the gemini model's terminal
+// aggregate omits ModelVersion before ADK v2.8.0, replaces the content but not
+// that metadata, and that metadata it does carry wins.
+func TestAggregateResponsesTerminalReplaceKeepsMetadata(t *testing.T) {
+	first := partialText("Checking weather. ")
+	first.ModelVersion = "gemini-2.5-flash"
+	first.UsageMetadata = &genai.GenerateContentResponseUsageMetadata{TotalTokenCount: 4}
+	final := nonPartial(&genai.Part{Text: "Checking weather. "})
+	final.UsageMetadata = &genai.GenerateContentResponseUsageMetadata{TotalTokenCount: 10}
+
+	agg := aggregateResponses(nil, first)
+	agg = aggregateResponses(agg, final)
+
+	assert.Equal(t, "Checking weather. ", concatText(agg.Content))
+	assert.Equal(t, "gemini-2.5-flash", agg.ModelVersion, "the terminal response omits ModelVersion")
+	require.NotNil(t, agg.UsageMetadata)
+	assert.EqualValues(t, 10, agg.UsageMetadata.TotalTokenCount, "the terminal response carries UsageMetadata")
 }
 
 // TestAggregateResponsesTerminalReplaceCopies proves the authoritative-replace

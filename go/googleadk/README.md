@@ -46,6 +46,14 @@ The minimum supported ADK version is v2.6.0. This package requires Go 1.26.10+
 so the latest-dependency checks can also run ADK v2.7.0. The replay-safe telemetry
 gate composes `workflow.IsReadOnly`.
 
+ADK's agent loop runs in your Workflow, so an ADK release can change what a
+History replays into. Treat an ADK upgrade as a Workflow code change: let open
+runs finish first, or keep them on their Workers with Worker Versioning. ADK
+v2.8.0 is such a release. For example, a History in which a remote A2A call
+failed, or in which the model called a tool that was not available, does not
+replay the same way on ADK v2.8.0 as on v2.6.0 to v2.7.1, in either direction
+(see **Remote A2A agents** and **MCP, statelessly** below).
+
 ## Samples
 
 Runnable end-to-end samples live in
@@ -233,8 +241,12 @@ outside Temporal. To use another model, build the agent with
   - From the second model step of an agent run, a toolset in the agent's
     `Toolsets` declares only the tools the server lists, and `ToolFilter`
     allows, for that step. A model call to an MCP tool it no longer declares
-    gets ADK's tool-not-found error: no `CallMcpTool` Activity and no before-
-    or after-tool callbacks run, but on-tool-error callbacks do. In the first
+    gets ADK's tool-not-found error, and no `CallMcpTool` Activity runs. With
+    ADK v2.6.0 to v2.7.1, no before- or after-tool callbacks run for it, but
+    on-tool-error callbacks do. From ADK v2.8.0, before-tool callbacks run
+    first and can answer the call: an answer goes through the after-tool
+    callbacks, and without one the on-tool-error callbacks run. The error text
+    the model gets differs between those releases too. In the first
     step, such a call still runs `CallMcpTool`; for a tool the server no longer
     lists, it fails with a non-retryable `McpError`.
   - From the second model step, your own `Tools` calls on such a toolset, for
@@ -286,13 +298,15 @@ outside Temporal. To use another model, build the agent with
     such as call interceptors that add credentials, set
     `Config.A2AClientFactory` to `googleadk.NewA2AClientFactory(opts...)`, which
     keeps those clients. Any other `a2aclient.Factory` uses its own HTTP
-    clients: a2a-go's defaults stop every call at 3 minutes and report an HTTP
-    error status only as text, which the plugin retries.
+    clients: a2a-go's defaults stop every call at 3 minutes, and whether an HTTP
+    error status is retried then depends on how a2a-go reports it, not on the
+    status. A `503` with a plain-text body, for example, is retried over
+    JSON-RPC. Over REST it is retried with a2a-go v2.6.0, and not from a2a-go
+    v2.7.0, which ADK v2.8.0 requires.
   - A zero `StartToCloseTimeout` falls back to one minute, and with no
     `RetryPolicy` Temporal retries without limit. A call that fails with an HTTP
     status follows the rule under **Typed failures**. An A2A error the remote
-    agent answers with is not retried. Before ADK 2.8.0, ADK turns it into an
-    error event; from 2.8.0, the run returns it as an error. A send
+    agent answers with is not retried. A send
     that times out or fails on the network is retried, which sends the message
     again and starts another remote task, so set a `StartToCloseTimeout` longer
     than the remote agent takes to answer. The same happens when the Worker
@@ -307,6 +321,17 @@ outside Temporal. To use another model, build the agent with
     limit. If the stream fails after its first events, the workflow gets those
     events and the error, without a retry, and ADK cancels the unfinished task
     as it does without Temporal.
+  - When a call fails for good, ADK ends it as it does without Temporal, which
+    depends on the ADK release. ADK v2.6.0 to v2.7.1 turn the error into an
+    event with an `ErrorMessage`: `runner.Run` returns no error, a sequential
+    agent goes on to its next agent, and a loop agent to its next iteration.
+    From ADK v2.8.0 the remote agent returns the error, so `runner.Run`
+    returns it and the run ends there. On every release, an `agenttool` around
+    the remote agent hands the error to the model as a failed tool call
+    instead. A History in which a remote call failed does not replay across
+    that change: it fails with `[TMPRL1100]` or the run ends another way, and
+    where neither happens, the events and the IDs that ADK generates after the
+    failure differ.
   - A cancellation gets a single 5-second attempt, and still goes out after the
     workflow is cancelled. Cancelling the workflow while a send is in flight
     does not cancel the remote task: the send's result is dropped, and ADK
@@ -335,12 +360,14 @@ outside Temporal. To use another model, build the agent with
   errors have. A custom `model.LLM` can expose its status the same way.
   A streamed call whose chunks could not all be published fails with
   `googleadk.StreamError` (see [Streaming](#streaming)).
-  Before ADK 2.8.0, a non-streamed Gemini reply with no candidates, which is how
-  Gemini answers a blocked prompt, fails at once as a non-retryable
-  `googleadk.ModelError`, like a permanent `4xx`: ADK returns it as
-  `empty response`, with no status. With `WithStreaming`, and from ADK 2.8.0
-  without it too, ADK returns the block as a response with an `ErrorCode`
-  instead. Other errors without a status are retried.
+  With ADK v2.6.0 to v2.7.1, a non-streamed Gemini reply with no candidates,
+  which is how Gemini answers a blocked prompt, fails at once as a
+  non-retryable `googleadk.ModelError`, like a permanent `4xx`: ADK returns it
+  as `empty response`, with no status. With `WithStreaming`, and from ADK
+  v2.8.0 without it too, ADK returns the block as a response with an
+  `ErrorCode` instead: the model call succeeds, and `runner.Run` yields that
+  event and returns no error. The ADK release of the Worker that runs
+  `InvokeModel` decides which. Other errors without a status are retried.
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.
