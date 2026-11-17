@@ -11,7 +11,8 @@ stores and ``ShellToolMiddleware``, do I/O and fail as before.
 
 LangGraph stores the helper in each sync step when it builds a graph, so a
 graph built before the Worker or Replayer keeps it. Workflow code is imported
-again in the sandbox for each run, so its graphs get the stand-in.
+again in the sandbox for each run, so its graphs get the stand-in. LangGraph's
+refusal of a timeout on a sync step recognizes both.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import contextvars
 import importlib
 import threading
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 from temporalio import workflow
@@ -38,8 +40,10 @@ _MODULES = (
 )
 
 # From LangGraph 1.2.0, this module compares a sync step's function with the
-# helper, to refuse a timeout on that step, so it needs the stand-in too.
+# helper, to refuse a timeout on that step. Steps built before the swap hold
+# the helper and later ones the stand-in, so the plugin wraps the check.
 _TIMEOUT_CHECK = "langgraph.pregel._utils"
+_EXECUTOR_CHECK = "_is_executor_backed_afunc"
 
 
 async def _run_in_executor(
@@ -54,6 +58,16 @@ async def _run_in_executor(
         return contextvars.copy_context().run(func, *args, **kwargs)
     except StopIteration as exc:
         raise RuntimeError from exc
+
+
+def _recognize_stand_in(check: Callable[..., Any], helper: Any) -> Any:
+    def is_executor_backed(afunc: Any) -> bool:
+        if isinstance(afunc, partial) and afunc.func is _run_in_executor:
+            afunc = partial(helper, *afunc.args, **afunc.keywords)
+        return bool(check(afunc))
+
+    is_executor_backed.recognizes_stand_in = True  # type: ignore[attr-defined]
+    return is_executor_backed
 
 
 _install_lock = threading.Lock()
@@ -75,11 +89,18 @@ def run_sync_calls_in_workflows() -> None:
                     "the Deep Agents plugin requires the helper imported by name "
                     "to run sync tools in the workflow."
                 )
-        check = importlib.import_module(_TIMEOUT_CHECK)
-        if getattr(check, "run_in_executor", None) in (
-            run_in_executor,
-            _run_in_executor,
-        ):
-            modules.append(check)
+        utils = importlib.import_module(_TIMEOUT_CHECK)
+        check = None
+        if getattr(utils, "run_in_executor", None) is run_in_executor:
+            check = getattr(utils, _EXECUTOR_CHECK, None)
+            if not callable(check):
+                raise RuntimeError(
+                    f"Unsupported LangGraph timeout check in {_TIMEOUT_CHECK}; "
+                    "the Deep Agents plugin requires its "
+                    f"{_EXECUTOR_CHECK} to keep refusing timeouts on sync steps."
+                )
         for module in modules:
             setattr(module, "run_in_executor", _run_in_executor)
+        if check is not None and not getattr(check, "recognizes_stand_in", False):
+            wrapped = _recognize_stand_in(check, run_in_executor)
+            setattr(utils, _EXECUTOR_CHECK, wrapped)

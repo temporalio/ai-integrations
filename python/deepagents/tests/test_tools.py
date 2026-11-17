@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -1073,9 +1074,21 @@ async def test_sync_langchain_calls_run_in_the_workflow(
     tool_thread = await StructuredTool.from_function(func=thread_id).ainvoke({})
     assert tool_thread != threading.get_ident()
 
-    # LangGraph still refuses a timeout on a sync node.
-    graph = StateGraph(Count)
-    graph.add_node("step", count_step, timeout=1.0)
-    graph.add_edge(START, "step")
-    with pytest.raises(ValueError, match="is sync"):
-        graph.compile()
+    # LangGraph still refuses a timeout on a sync node, whether the node was
+    # added before the plugin swapped LangChain's helper or after.
+    from langchain_core.runnables.config import run_in_executor
+
+    early = StateGraph(Count)
+    with pytest.MonkeyPatch.context() as before_swap:
+        before_swap.setattr(
+            importlib.import_module("langgraph._internal._runnable"),
+            "run_in_executor",
+            run_in_executor,
+        )
+        early.add_node("step", count_step, timeout=1.0)
+    late = StateGraph(Count)
+    late.add_node("step", count_step, timeout=1.0)
+    for graph in (early, late):
+        graph.add_edge(START, "step")
+        with pytest.raises(ValueError, match="is sync"):
+            graph.compile()
