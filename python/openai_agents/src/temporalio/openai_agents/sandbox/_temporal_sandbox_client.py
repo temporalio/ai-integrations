@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 from typing import Any
 
@@ -26,6 +27,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
 )
 from temporalio.openai_agents.sandbox._temporal_sandbox_session import (
     TemporalSandboxSession,
+    _sent_trusted_manifest,
     _session_activity_config,
 )
 from temporalio.workflow import ActivityConfig
@@ -52,19 +54,27 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
             sandbox backend is targeted.
         config: Optional activity configuration for controlling timeouts,
             retries, etc.  Defaults to a 5-minute ``start_to_close_timeout``.
+        backend_id: The client's ``backend_id``. Defaults to ``name``. See
+            :func:`temporalio.openai_agents.workflow.temporal_sandbox_client`.
     """
 
     def __init__(
         self,
         name: str,
         config: ActivityConfig | None = None,
+        *,
+        backend_id: str | None = None,
     ) -> None:
         """Initialize the client."""
         self._name = name
         self._config: ActivityConfig = config or ActivityConfig(
             start_to_close_timeout=timedelta(minutes=5),
         )
-        self.backend_id = name
+        self.backend_id = backend_id or name
+        # The manifest with mount credentials of each session this client
+        # returned, for the delete Activity: OpenAI's SDK passes delete() a
+        # wrapper of the session.
+        self._trusted_manifests: dict[uuid.UUID, Manifest] = {}
 
     async def create(
         self,
@@ -87,53 +97,55 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
             result_type=SessionResult,
             **self._config,
         )
-        return self._wrap_session(
-            TemporalSandboxSession(
-                name=self._name,
-                config=self._config,
-                state=result.state,
-                supports_pty_flag=result.supports_pty,
-            ),
-            # Real instrumentation runs in the activity in the real client session.
-            instrumentation=None,
-        )
+        return self._new_session(result, manifest)
 
     async def resume(self, state: SandboxSessionState) -> SandboxSession:
         """Resume an existing sandbox session via activity."""
         _reject_host_path_grants(state.manifest)
+        # Serializing the state drops the mount credentials the Runner rebound
+        # into it, so only then does its manifest carry them to the Worker. A
+        # state with nothing rebound sends none.
+        trusted_manifest = state.manifest if state.mount_authority_rebound else None
         result: SessionResult = await workflow.execute_activity(
             f"{self._name}-sandbox_client_resume",
-            arg=ResumeSessionArgs(
-                state=state,
-                # Serializing the state drops the mount credentials the Runner
-                # rebound into it, so only then does its manifest carry them to
-                # the Worker. A state with nothing rebound sends none.
-                trusted_manifest=state.manifest
-                if state.mount_authority_rebound
-                else None,
-            ),
+            arg=ResumeSessionArgs(state=state, trusted_manifest=trusted_manifest),
             result_type=SessionResult,
             **_session_activity_config(self._config, state),
         )
+        return self._new_session(result, trusted_manifest)
+
+    async def delete(self, session: TemporalSandboxSession) -> TemporalSandboxSession:  # type: ignore[override]
+        """Delete a sandbox session via activity."""
+        state = session.state
+        await workflow.execute_activity(
+            f"{self._name}-sandbox_client_delete",
+            arg=StopArgs(
+                state=state,
+                trusted_manifest=_sent_trusted_manifest(
+                    state, self._trusted_manifests.get(state.session_id)
+                ),
+            ),
+            **_session_activity_config(self._config, state),
+        )
+        self._trusted_manifests.pop(state.session_id, None)
+        return session
+
+    def _new_session(
+        self, result: SessionResult, trusted_manifest: Manifest | None
+    ) -> SandboxSession:
+        if trusted_manifest is not None:
+            self._trusted_manifests[result.state.session_id] = trusted_manifest
         return self._wrap_session(
             TemporalSandboxSession(
                 name=self._name,
                 config=self._config,
                 state=result.state,
                 supports_pty_flag=result.supports_pty,
+                trusted_manifest=trusted_manifest,
             ),
             # Real instrumentation runs in the activity in the real client session.
             instrumentation=None,
         )
-
-    async def delete(self, session: TemporalSandboxSession) -> TemporalSandboxSession:  # type: ignore[override]
-        """Delete a sandbox session via activity."""
-        await workflow.execute_activity(
-            f"{self._name}-sandbox_client_delete",
-            arg=StopArgs(state=session.state),
-            **_session_activity_config(self._config, session.state),
-        )
-        return session
 
     def deserialize_session_state(self, payload: dict[str, Any]) -> SandboxSessionState:
         """Deserialize a session state from a dict."""

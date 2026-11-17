@@ -24,7 +24,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ResumeSessionArgs,
     SessionResult,
     StopArgs,
-    _HasState,
+    _SessionOperationArgs,
 )
 
 SANDBOX_LOST_ERROR_TYPE = "SandboxLost"
@@ -101,7 +101,8 @@ class OnHostSandboxClientProvider(_SandboxProviderBase):
         # the extra Worker beside it.
         return self._task_queue_for(activity.info().task_queue)
 
-    async def _session(self, args: _HasState) -> SandboxSession:
+    async def _session(self, args: _SessionOperationArgs) -> SandboxSession:
+        # Only resume rebuilds a session, so this ignores args.trusted_manifest.
         session = self._sessions.get(str(args.state.session_id))
         if session is not None:
             return session

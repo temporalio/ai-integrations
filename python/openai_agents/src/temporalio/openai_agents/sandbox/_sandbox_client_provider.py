@@ -40,7 +40,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     StartArgs,
     StopArgs,
     WriteArgs,
-    _HasState,
+    _SessionOperationArgs,
 )
 from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ExecResult as ExecResultModel,
@@ -112,7 +112,7 @@ class _SandboxProviderBase(abc.ABC):
         return self._name
 
     @abc.abstractmethod
-    async def _session(self, args: _HasState) -> SandboxSession:
+    async def _session(self, args: _SessionOperationArgs) -> SandboxSession:
         """Return the live session the arguments' state names."""
         ...
 
@@ -338,10 +338,14 @@ class SandboxClientProvider(_SandboxProviderBase):
             )
         super().__init__(name, client)
 
-    async def _session(self, args: _HasState) -> SandboxSession:
+    async def _session(self, args: _SessionOperationArgs) -> SandboxSession:
         key = str(args.state.session_id)
         if key not in self._sessions:
-            self._sessions[key] = await self._client.resume(args.state)
+            # Another Worker may have created the session, so rebuild it with
+            # the mount credentials the Workflow sent.
+            self._sessions[key] = await self._client.resume(
+                _with_trusted_mounts(args.state, args.trusted_manifest)
+            )
         return self._sessions[key]
 
     def _own_activities(

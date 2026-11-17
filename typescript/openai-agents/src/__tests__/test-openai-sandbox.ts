@@ -971,3 +971,16 @@ test.serial('With an on-host provider, a Worker refuses another plugin on its Na
     })
   );
 });
+
+test.serial('With an on-host provider, a Worker refuses the plugin on both its NativeConnection and itself', async (t) => {
+  const { createWorker } = helpers(t);
+  const plugin = new OpenAIAgentsPlugin({
+    modelProvider: new FakeModelProvider([]),
+    sandboxClientProviders: [new OnHostSandboxClientProvider('lifecycle', new LifecycleSandboxClient())],
+  });
+  const connection = await NativeConnection.connect({ address: t.context.env.address, plugins: [plugin] });
+  t.teardown(() => connection.close());
+
+  const err = await t.throwsAsync(createWorker({ connection, plugins: [plugin] }), { instanceOf: TypeError });
+  t.regex(err!.message, /Register it on the Worker \(Worker\.create plugins\) only/);
+});
