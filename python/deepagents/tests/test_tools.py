@@ -7,13 +7,15 @@ expected activity.
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Self, TypedDict
 
 import pytest
 
@@ -49,8 +51,24 @@ TEN_SECONDS = ActivityConfig(start_to_close_timeout=timedelta(seconds=10))
 # the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
+from langchain.agents.middleware import ShellToolMiddleware  # noqa: E402
+from langchain_core.caches import BaseCache  # noqa: E402
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
-from langchain_core.tools import StructuredTool, tool  # noqa: E402
+from langchain_core.output_parsers import (  # noqa: E402
+    JsonOutputParser,
+    StrOutputParser,
+)
+from langchain_core.runnables import RunnableLambda  # noqa: E402
+from langchain_core.tools import BaseTool, StructuredTool, Tool, tool  # noqa: E402
+from langgraph.func import (  # noqa: E402  # pyright: ignore[reportMissingTypeStubs]
+    entrypoint,
+    task,
+)
+from langgraph.graph import (  # noqa: E402  # pyright: ignore[reportMissingTypeStubs]
+    END,
+    START,
+    StateGraph,
+)
 from langgraph.prebuilt import InjectedState  # noqa: E402
 from pydantic import BaseModel, ConfigDict, ValidationError  # noqa: E402
 
@@ -905,3 +923,159 @@ async def test_repeated_tool_calls_with_same_args_both_run(
 
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_TOOL] == 2, counts
+
+
+class Count(TypedDict):
+    n: int
+
+
+def count_step(state: Count) -> Count:
+    return {"n": state["n"] + 1}
+
+
+def increment(n: int) -> int:
+    return n + 1
+
+
+def count_route(state: Count) -> str:
+    return "done" if state["n"] > 1 else "again"
+
+
+class SyncOnlyCache(BaseCache):
+    # Like LangChain's SQLite cache, it has no async methods of its own.
+    def lookup(self, prompt: str, llm_string: str) -> Any:
+        return None
+
+    def update(self, prompt: str, llm_string: str, return_val: Any) -> None:
+        pass
+
+    def clear(self, **kwargs: Any) -> None:
+        pass
+
+
+def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
+
+
+def shout(word: str) -> str:
+    return word.upper()
+
+
+def thread_id() -> int:
+    """Return the current thread's id."""
+    return threading.get_ident()
+
+
+class Double(BaseTool):
+    name: str = "double"
+    description: str = "Double a number."
+
+    def _run(self, n: int) -> int:
+        return 2 * n
+
+
+async def words() -> AsyncIterator[str]:
+    yield "a"
+    yield "b"
+
+
+@task
+def triple(n: int) -> int:
+    return 3 * n
+
+
+@entrypoint()
+async def triple_flow(n: int) -> int:
+    return await triple(n)
+
+
+def count_graph() -> Any:
+    graph = StateGraph(Count)
+    graph.add_node("step", count_step)
+    graph.add_edge(START, "step")
+    graph.add_conditional_edges("step", count_route, {"again": "step", "done": END})
+    return graph.compile()
+
+
+# Built when the module is imported, as many graphs are.
+COUNT_GRAPH = count_graph()
+
+
+@workflow.defn
+class SyncLangChainCallsWorkflow:
+    @workflow.run
+    async def run(self, workspace: str) -> list[Any]:
+        # Tools, output parsers, a RunnableLambda, a graph's sync node and
+        # sync router, and a sync task run in the workflow.
+        results: list[Any] = [
+            await StructuredTool.from_function(func=add).ainvoke({"a": 1, "b": 2}),
+            await Tool.from_function(shout, "shout", "Shout a word.").ainvoke("hi"),
+            await Double().ainvoke({"n": 2}),
+            await JsonOutputParser().ainvoke('{"x": 1}'),
+            [chunk async for chunk in StrOutputParser().atransform(words())],
+            await RunnableLambda(increment).ainvoke(1),
+            await count_graph().ainvoke({"n": 0}),
+            await COUNT_GRAPH.ainvoke({"n": 0}),
+            await triple_flow.ainvoke(2),
+        ]
+        # LangChain's calls for I/O, such as a cache or ShellToolMiddleware,
+        # still fail, and so do other callers.
+        shell = ShellToolMiddleware(workspace_root=workspace)
+        calls: list[Callable[[], Any]] = [
+            lambda: SyncOnlyCache().alookup("prompt", "llm"),
+            lambda: shell.abefore_agent({"messages": []}, None),  # type: ignore[arg-type]
+            lambda: asyncio.to_thread(lambda: "unrelated"),
+        ]
+        for call in calls:
+            try:
+                await call()
+                results.append("ran")
+            except NotImplementedError:
+                results.append("rejected")
+        return results
+
+
+@pytest.mark.asyncio
+async def test_sync_langchain_calls_run_in_the_workflow(
+    env: WorkflowEnvironment, tmp_path: Any
+) -> None:
+    task_queue = f"da-sync-calls-{uuid.uuid4()}"
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[SyncLangChainCallsWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        result = await env.client.execute_workflow(
+            SyncLangChainCallsWorkflow.run,
+            str(tmp_path),
+            id=f"da-sync-calls-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=10),
+        )
+    assert result == [
+        3,
+        "HI",
+        4,
+        {"x": 1},
+        ["a", "b"],
+        2,
+        {"n": 2},
+        {"n": 2},
+        6,
+        "rejected",
+        "rejected",
+        "rejected",
+    ]
+
+    # Outside a workflow, LangChain still runs a sync tool on a thread.
+    tool_thread = await StructuredTool.from_function(func=thread_id).ainvoke({})
+    assert tool_thread != threading.get_ident()
+
+    # LangGraph still refuses a timeout on a sync node.
+    graph = StateGraph(Count)
+    graph.add_node("step", count_step, timeout=1.0)
+    graph.add_edge(START, "step")
+    with pytest.raises(ValueError, match="is sync"):
+        graph.compile()
