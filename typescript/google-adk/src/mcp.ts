@@ -64,6 +64,13 @@ import { activityOptionsFrom, withDefaultHeartbeatTimeout } from './model';
  * therefore be a single long-lived instance the factory returns each time, and closing
  * it stays the factory author's job. Supplying {@link MCPConnectionParams} instead
  * hands that lifecycle to the plugin.
+ *
+ * The factory must be synchronous. It must return a {@link BaseToolset} or
+ * {@link MCPConnectionParams} with type `StdioConnectionParams`,
+ * `StreamableHTTPConnectionParams` or, from ADK 2.3, `SseConnectionParams`. Anything
+ * else, including the `Promise` of an async factory, fails the Activity without retries
+ * with `MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE`. A factory whose toolset isn't ready yet
+ * should throw instead: exceptions are retried.
  */
 export type MCPToolsetFactory = () => BaseToolset | MCPConnectionParams;
 

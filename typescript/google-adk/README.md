@@ -240,15 +240,21 @@ connection params above and ADK's `MCPToolset` both open a new session per
 operation rather than reusing one. Holding a session open across operations is
 the factory's job — see `MCPToolsetFactory`.
 
-A factory must return a `BaseToolset` or `MCPConnectionParams` with type
-`StdioConnectionParams`, `StreamableHTTPConnectionParams` or, from ADK 2.3,
-`SseConnectionParams`. Other results now fail the Activity without retries with
+A factory must be synchronous and return a `BaseToolset` or `MCPConnectionParams`
+with type `StdioConnectionParams`, `StreamableHTTPConnectionParams` or, from ADK
+2.3, `SseConnectionParams`. Other results, including the `Promise` of an async
+factory, now fail the Activity without retries with
 `MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE` (`GoogleAdkMCPToolsetFactoryTypeError`,
 exported from `@temporalio/google-adk/workflow`). A factory whose toolset isn't
 ready yet should throw rather than return `undefined`: exceptions are still
 retried. A factory that isn't a function makes `new GoogleAdkPlugin(...)` throw
 a `TypeError`, so the Worker doesn't start. Fix these factories before
 upgrading; the next attempt of an in-flight Activity also runs this check.
+
+On ADK 2.3, an SSE server that refuses the connection leaves its transport
+reconnecting in the background, one per failed attempt
+([modelcontextprotocol/typescript-sdk#3193](https://github.com/modelcontextprotocol/typescript-sdk/issues/3193)).
+Prefer `StreamableHTTPConnectionParams` where the server supports it.
 
 Gate the toolset's tools behind human approval with
 `requireConfirmation` — see [Durable human-in-the-loop](#durable-human-in-the-loop).

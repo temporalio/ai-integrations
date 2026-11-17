@@ -237,6 +237,14 @@ function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<
   }
   // An async factory's rejection would otherwise go unhandled and stop the Worker process.
   if (produced instanceof Promise) produced.catch(() => undefined);
+  // Only an ADK before 2.3 gets here with an SSE tag.
+  if ((produced as { type?: unknown } | null | undefined)?.type === 'SseConnectionParams') {
+    throw ApplicationFailure.nonRetryable(
+      `MCP toolset factory '${name}' returned SseConnectionParams, which needs ADK 2.3 or later; ` +
+        `this Worker has ADK ${adkVersion}.`,
+      MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE
+    );
+  }
   throw ApplicationFailure.nonRetryable(
     `MCP toolset factory '${name}' returned ${describeValue(produced)}, not a BaseToolset or MCPConnectionParams.`,
     MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE

@@ -353,11 +353,12 @@ test.serial('a failing server gives up on the default bound, is skipped, and is 
   // The turn completed: neither the listing nor the read failed it.
   t.is(text, 'resource=missing; listed=none');
   // Each skip is logged with the Activity's own error, not just "Activity task failed".
-  const skips = logged.mock.calls
-    .map((call) => String(call.arguments[1]))
-    .filter((message) => message.startsWith('Failed to'));
-  t.is(skips.length, 3, skips.join('\n'));
-  for (const message of skips) t.true(message.endsWith(': MCP server unavailable.'), message);
+  // At least once each: a retried Workflow Task may log again.
+  const messages = logged.mock.calls.map((call) => String(call.arguments[1]));
+  const listSkips = messages.filter((message) => message.startsWith('Failed to list MCP resources: '));
+  const readSkips = messages.filter((message) => message.startsWith("Failed to read MCP resource '"));
+  t.true(listSkips.length > 0 && readSkips.length > 0, messages.join('\n'));
+  for (const message of [...listSkips, ...readSkips]) t.true(message.endsWith(': MCP server unavailable.'), message);
   const { events } = await env.client.workflow.getHandle(workflowId).fetchHistory();
   // Once per model call, because a rejected listing is not the memoized one.
   t.is(countScheduledActivities(events ?? [], 'brokenServer-listResources'), 2);

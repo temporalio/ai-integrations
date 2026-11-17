@@ -155,6 +155,13 @@ for (const operation of ['listTools', 'callTool', 'listResources', 'readResource
       );
       const refused = params.type === 'SseConnectionParams' && !sseSupported;
       t.is(err!.type, refused ? MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE : MCP_ERROR_FAILURE_TYPE, params.type);
+      if (refused) {
+        t.is(
+          err!.message,
+          `MCP toolset factory 'testServer' returned SseConnectionParams, which needs ADK 2.3 or later; ` +
+            `this Worker has ADK ${adkVersion}.`
+        );
+      }
     }
   });
 
