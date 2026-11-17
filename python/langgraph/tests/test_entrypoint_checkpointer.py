@@ -158,6 +158,56 @@ async def test_continue_as_new_starts_with_a_fresh_saver(client: Client) -> None
     await replayer.replay_workflow(await handle.fetch_history())
 
 
+@workflow.defn
+class AttachedSaverWorkflow:
+    @workflow.run
+    async def run(self, value: str) -> list[str]:
+        config: RunnableConfig = {"configurable": {"thread_id": "conversation"}}
+        app = entrypoint("memory")
+        app.checkpointer = InMemorySaver()
+        await app.ainvoke(value, config)
+        await workflow.sleep(0.001)
+        return cast(list[str], await entrypoint("memory").ainvoke("done", config))
+
+
+@pytest.mark.parametrize("evict", [False, True], ids=["cached", "evicted"])
+async def test_saver_attached_in_workflow_survives_repeated_lookups(
+    client: Client, evict: bool
+) -> None:
+    @lg_entrypoint()
+    async def remember(value: str, previous: list[str] | None = None) -> list[str]:
+        return [*(previous or []), value]
+
+    plugin = LangGraphPlugin(entrypoints={"memory": remember})
+    task_queue = f"checkpoint-attached-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[AttachedSaverWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0 if evict else 1000,
+    ):
+        handles = [
+            await client.start_workflow(
+                AttachedSaverWorkflow.run,
+                value,
+                id=f"checkpoint-attached-{uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            for value in ("alice", "bob")
+        ]
+        assert [await handle.result() for handle in handles] == [
+            ["alice", "done"],
+            ["bob", "done"],
+        ]
+
+    replayer = Replayer(workflows=[AttachedSaverWorkflow], plugins=[plugin])
+    for handle in handles:
+        await replayer.replay_workflow(await handle.fetch_history())
+    assert remember.checkpointer is None
+
+
 class CountingSerializer(JsonPlusSerializer):
     def __init__(self) -> None:
         super().__init__()

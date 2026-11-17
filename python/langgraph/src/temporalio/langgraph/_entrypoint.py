@@ -45,17 +45,15 @@ def workflow_entrypoint(program: Program) -> Program:
     Aliases of a program or saver keep sharing it within the same instance.
     """
     saver = program.checkpointer
-    if not isinstance(saver, InMemorySaver):
-        return program
     loop = asyncio.get_running_loop()
     scoped: _WorkflowEntrypoints | None = getattr(loop, _WORKFLOW_ENTRYPOINTS, None)
     if scoped is None:
         scoped = _WorkflowEntrypoints()
         setattr(loop, _WORKFLOW_ENTRYPOINTS, scoped)
     if id(program) not in scoped.programs:
-        if id(saver) not in scoped.savers:
-            scoped.savers[id(saver)] = InMemorySaver(serde=saver.serde)
-        scoped.programs[id(program)] = program.copy(
-            update={"checkpointer": scoped.savers[id(saver)]}
-        )
+        if isinstance(saver, InMemorySaver):
+            if id(saver) not in scoped.savers:
+                scoped.savers[id(saver)] = InMemorySaver(serde=saver.serde)
+            saver = scoped.savers[id(saver)]
+        scoped.programs[id(program)] = program.copy(update={"checkpointer": saver})
     return scoped.programs[id(program)]

@@ -200,10 +200,17 @@ outside Temporal. To use another model, build the agent with
   remote tools (full declarations, including parameters) via `ListMcpTools` and
   executes calls via `CallMcpTool`. The live, stateful `mcptoolset.New(...)` runs
   worker-side, never in the workflow. Your `MCPFactory` runs at most once per
-  toolset name — the toolset is cached and shared across calls — and the plugin
-  closes any cached toolset that implements `Close() error` at worker stop
-  automatically; with manual wiring, call `Activities.Close` yourself after
-  `worker.Run` returns. A tool's own error, such as an MCP `isError` result,
+  toolset name: the toolset is cached and shared across calls. The plugin
+  closes any cached toolset that implements `Close() error`, as ADK's
+  `mcptoolset` does, after the worker has stopped; with manual wiring, call
+  `Activities.Close` yourself once `Stop` has returned, or once `worker.Run`
+  has returned after its interrupt channel stopped the worker. An MCP
+  Activity that reaches an `Activities` value after `Close` fails with a
+  retryable `googleadk.McpError`, so Temporal retries it and another worker on
+  the Task Queue can run it. Set `worker.Options.WorkerStopTimeout` to let MCP
+  calls in flight finish before the worker stops and the toolsets close;
+  without it the worker cancels them.
+  A tool's own error, such as an MCP `isError` result,
   reaches the model once, as it does without Temporal; `CallMcpTool` succeeds
   and is not retried. The plugin counts an error as the tool's own when it
   wraps no other error and is not an `ApplicationError`. ADK's MCP tools wrap
@@ -284,7 +291,8 @@ outside Temporal. To use another model, build the agent with
   - A zero `StartToCloseTimeout` falls back to one minute, and with no
     `RetryPolicy` Temporal retries without limit. A call that fails with an HTTP
     status follows the rule under **Typed failures**. An A2A error the remote
-    agent answers with is not retried; ADK turns it into an error event. A send
+    agent answers with is not retried. Before ADK 2.8.0, ADK turns it into an
+    error event; from 2.8.0, the run returns it as an error. A send
     that times out or fails on the network is retried, which sends the message
     again and starts another remote task, so set a `StartToCloseTimeout` longer
     than the remote agent takes to answer. The same happens when the Worker
@@ -327,10 +335,11 @@ outside Temporal. To use another model, build the agent with
   errors have. A custom `model.LLM` can expose its status the same way.
   A streamed call whose chunks could not all be published fails with
   `googleadk.StreamError` (see [Streaming](#streaming)).
-  A non-streamed Gemini reply with no candidates, which is how Gemini answers a
-  blocked prompt, fails at once as a non-retryable `googleadk.ModelError`, like
-  a permanent `4xx`: ADK returns it as `empty response`, with no status. With
-  `WithStreaming`, ADK returns the block as a response with an `ErrorCode`
+  Before ADK 2.8.0, a non-streamed Gemini reply with no candidates, which is how
+  Gemini answers a blocked prompt, fails at once as a non-retryable
+  `googleadk.ModelError`, like a permanent `4xx`: ADK returns it as
+  `empty response`, with no status. With `WithStreaming`, and from ADK 2.8.0
+  without it too, ADK returns the block as a response with an `ErrorCode`
   instead. Other errors without a status are retried.
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
