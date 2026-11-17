@@ -338,15 +338,15 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
-			require.NoError(t, env.GetWorkflowError())
-			var res runResult
-			require.NoError(t, env.GetWorkflowResult(&res))
 			assert.Equal(t, 1, counter.get(googleadk.ResolveA2AAgentCardActivityName), "card resolution must not be retried")
 			if tc.cardFails {
 				assert.Zero(t, counter.get(googleadk.SendA2AMessageActivityName), "a rejected card must not reach SendA2AMessage")
 			} else {
 				assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
 			}
+			require.NoError(t, env.GetWorkflowError())
+			var res runResult
+			require.NoError(t, env.GetWorkflowResult(&res))
 			if tc.wantError != "" {
 				requireRemoteCallError(t, res, returned, tc.wantError)
 			} else {
@@ -641,10 +641,11 @@ func TestRemoteSubAgentStreaming(t *testing.T) {
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
+			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName))
+			assert.Equal(t, tc.wantCancel, counter.get(googleadk.CancelA2ATaskActivityName), "ADK cancels a task the run leaves unfinished")
 			require.NoError(t, env.GetWorkflowError())
 			var res runResult
 			require.NoError(t, env.GetWorkflowResult(&res))
-			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName))
 			assert.Equal(t, tc.wantTexts, res.Texts)
 			if tc.wantError != "" {
 				requireRemoteCallError(t, res, returned, tc.wantError)
@@ -652,7 +653,6 @@ func TestRemoteSubAgentStreaming(t *testing.T) {
 				assert.Empty(t, res.Errors)
 				assert.Nil(t, res.RunError)
 			}
-			assert.Equal(t, tc.wantCancel, counter.get(googleadk.CancelA2ATaskActivityName), "ADK cancels a task the run leaves unfinished")
 		})
 	}
 }

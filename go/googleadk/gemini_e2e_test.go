@@ -188,13 +188,15 @@ func TestGeminiModelErrorIsNonRetryable(t *testing.T) {
 		stub errStubGeminiAPI
 		// wantCodes are the error codes of the run's events when ADK returns
 		// the reply as a response.
-		wantCodes []string
+		wantCodes  []string
+		wantErrors []string
 	}{
 		{name: "http 400", stub: errStubGeminiAPI{status: http.StatusBadRequest, body: `{"error":{"code":400,"message":"invalid argument","status":"INVALID_ARGUMENT"}}`}},
 		{
-			name:      "blocked prompt",
-			stub:      errStubGeminiAPI{status: http.StatusOK, body: `{"promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"blocked for safety"}}`},
-			wantCodes: []string{"SAFETY"},
+			name:       "blocked prompt",
+			stub:       errStubGeminiAPI{status: http.StatusOK, body: `{"promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"blocked for safety"}}`},
+			wantCodes:  []string{"SAFETY"},
+			wantErrors: []string{"blocked for safety"},
 		},
 		{name: "empty reply", stub: errStubGeminiAPI{status: http.StatusOK, body: `{"usageMetadata":{"promptTokenCount":3}}`}},
 	} {
@@ -230,6 +232,7 @@ func TestGeminiModelErrorIsNonRetryable(t *testing.T) {
 				require.NoError(t, env.GetWorkflowResult(&res))
 				assert.Equal(t, native, res, "the run must end as it does without Temporal")
 				assert.Equal(t, tc.wantCodes, res.ErrorCodes)
+				assert.Equal(t, tc.wantErrors, res.Errors)
 			}
 			// Neither an error nor a response is retried: exactly one model
 			// Activity attempt.

@@ -109,8 +109,12 @@ func TestAggregateResponsesGeminiTerminalAuthoritative(t *testing.T) {
 	assert.False(t, responses[2].Partial)
 	require.NotNil(t, responses[2].Content)
 	require.Len(t, responses[2].Content.Parts, 2)
-	assert.Contains(t, []string{"", "gemini-2.5-flash"}, responses[2].ModelVersion,
-		"gemini's terminal aggregate carries the stream's ModelVersion or none")
+	if ADKAtLeast(t, "v2.8.0") {
+		assert.Equal(t, "gemini-2.5-flash", responses[2].ModelVersion)
+	} else {
+		assert.Empty(t, responses[2].ModelVersion,
+			"gemini's terminal aggregate omits ModelVersion; folding metadata must keep it alive")
+	}
 
 	// The aggregate: message once, function call kept, metadata preserved.
 	require.NotNil(t, agg)

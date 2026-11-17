@@ -202,16 +202,18 @@ func (a *Activities) Register(r worker.Registry) {
 }
 
 // Close closes every cached MCP toolset that implements `Close() error`,
-// joining any failures. Call it after the worker stops (defer acts.Close()) so
-// long-lived MCP sessions — and, for CommandTransport, their server
-// subprocesses — shut down with the worker. It is idempotent and terminal:
-// once closed, MCP Activities on this value fail (non-retryably) rather than
-// silently rebuilding toolsets nothing would ever close. The default worker
-// stop does not wait for in-flight Activities, so set a nonzero
-// worker.Options.WorkerStopTimeout when using closable toolsets to let them
-// drain before Close runs. Toolsets without a Close method (including ADK v2's
-// mcptoolset at the pinned version) cannot be closed and end with the worker
-// process.
+// joining any failures, so long-lived MCP sessions and, for CommandTransport,
+// their server subprocesses shut down with the worker. Call it after the
+// worker has stopped. NewPlugin does that. With NewActivities and Register you
+// call it yourself: once Stop has returned, or once worker.Run has returned
+// after its interrupt channel stopped the worker. It is idempotent and
+// terminal: once closed, MCP Activities on this value fail with a retryable
+// McpError rather than silently rebuilding toolsets nothing would ever close,
+// and Temporal retries them, so another worker on the Task Queue can run them.
+// The default worker stop does not wait for in-flight Activities, so set a
+// nonzero worker.Options.WorkerStopTimeout when using closable toolsets to let
+// them drain before Close runs. Toolsets without a Close method cannot be
+// closed and end with the worker process. ADK's mcptoolset has one.
 func (a *Activities) Close() error {
 	a.mcpMu.Lock()
 	defer a.mcpMu.Unlock()

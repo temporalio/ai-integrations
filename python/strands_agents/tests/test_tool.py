@@ -8,10 +8,7 @@ from uuid import uuid4
 
 import pytest
 from strands import tool
-from strands_tools import (  # pyright: ignore[reportMissingTypeStubs]
-    calculator,
-    file_read,
-)
+from strands_tools import calculator  # pyright: ignore[reportMissingTypeStubs]
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
@@ -31,16 +28,7 @@ def letter_counter(word: str, letter: str) -> int:
 
 @activity.defn(name="read_file")
 async def read_file_activity(path: str) -> str:
-    result = file_read.file_read(
-        {
-            "toolUseId": "read_file",
-            "name": "file_read",
-            "input": {"path": path, "mode": "view"},
-        }
-    )
-    text = result["content"][0].get("text")
-    assert text is not None
-    return text
+    return Path(path).read_text()
 
 
 @activity.defn(name="track_parcel")
