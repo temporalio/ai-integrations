@@ -650,7 +650,6 @@ const model = new TemporalModel('gemini-2.5-flash', {
   streamingBatchInterval: '100 milliseconds',
   activity: {
     startToCloseTimeout: '5 minutes',
-    heartbeatTimeout: '30 seconds',
   },
 });
 
@@ -833,10 +832,12 @@ Cautions:
   detects a dead worker, not a stalled call: they heartbeat on a timer at half that
   timeout — a hung call included — and only on that timer, streaming or not, so a
   call shorter than half the timeout sends none. A cancel reaches a running call
-  only through a heartbeat. In Temporal Cloud each heartbeat that reaches the
-  service is an Action: with the default, at most one every 8 seconds of a running
-  call. Set `heartbeatTimeout: 0` to turn heartbeats off. The bound on a stalled
-  call is `startToCloseTimeout`, one minute by default.
+  only through a heartbeat, so not before half the timeout: a shorter call runs to
+  the end. In Temporal Cloud each heartbeat that reaches the service is an Action:
+  with the default, at most one every 8 seconds of a running call. Set
+  `heartbeatTimeout: 0` to turn heartbeats off; then a cancel never reaches a
+  running call. The bound on a stalled call is `startToCloseTimeout`, one minute
+  by default.
 - Streaming topic delivery is at-least-once. The deterministic Workflow value is
   the Activity result, not the stream side channel.
 - ADK's own log lines from inside a Workflow (ADK 2.1 and later: an `[ADK]`
