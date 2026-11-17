@@ -463,8 +463,18 @@ def test_sync_tool_dispatch_composes_with_other_framework(strands_first: bool):
             _run_inline_when_called_by(loop, called_by)
 
         run_sync_tool = _strands_tool_module["run_sync_tool"]
+
+        async def offload_in_tool() -> int:
+            # An async tool's own asyncio.to_thread call.
+            return await asyncio.to_thread(lambda: 42)
+
         with _agent_loop_step():
             assert loop.run_until_complete(run_sync_tool(lambda: 42)) == 42
+            # In an agent loop step, any other caller still fails.
+            with pytest.raises(NotImplementedError):
+                loop.run_until_complete(offload_in_tool())
+            with pytest.raises(NotImplementedError):
+                loop.run_in_executor(None, lambda: "unrelated")
         other = run_in_executor_from_other_framework(loop)
         assert loop.run_until_complete(other) == "other"
         # Strands' call outside an agent loop step, and any other caller, fail.
