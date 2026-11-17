@@ -535,8 +535,10 @@ def _run_langchain_sync_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
     LangChain runs a sync tool, graph node, router or output parser from async
     code with its ``run_in_executor`` helper, which calls
     ``loop.run_in_executor``. The workflow event loop has no threads and raised
-    ``NotImplementedError``, so a sync tool never ran. Only calls from that
-    helper run inline; any other ``run_in_executor`` call fails as before.
+    ``NotImplementedError``, so a sync tool never ran. Only the helper's calls
+    for tools, output parsers and LangGraph steps run inline; any other
+    ``run_in_executor`` call, including the helper's calls for caches,
+    retrievers and other I/O, fails as before.
     """
     _run_inline_when_called_by(loop, _called_by_langchain)
 
@@ -574,9 +576,25 @@ def _run_inline_when_called_by(
         callers.append(is_caller)
 
 
+# The modules whose calls to LangChain's run_in_executor helper run inline:
+# tools, output parsers, and LangGraph's sync nodes and tasks. A sync router's
+# helper call is the coroutine of its own task, so its caller is the event
+# loop's handle in asyncio.events. The helper's other callers, such as caches,
+# retrievers, vector stores and ShellToolMiddleware, do I/O and fail as before.
+_INLINE_LANGCHAIN_CALLERS = (
+    "langchain_core.tools.",
+    "langchain_core.output_parsers.",
+    "langgraph.",
+)
+
+
 def _called_by_langchain(frame: FrameType) -> bool:
-    """Whether the caller is ``langchain_core.runnables.config.run_in_executor``."""
-    return (
+    """Whether LangChain's ``run_in_executor`` helper runs a tool, parser or graph step."""
+    if not (
         frame.f_code.co_name == "run_in_executor"
         and frame.f_globals.get("__name__") == "langchain_core.runnables.config"
-    )
+    ):
+        return False
+    caller = frame.f_back
+    module = caller.f_globals.get("__name__", "") if caller is not None else ""
+    return module == "asyncio.events" or module.startswith(_INLINE_LANGCHAIN_CALLERS)

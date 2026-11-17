@@ -224,10 +224,21 @@ search_tool = tool_as_activity(
 Pass both to `create_temporal_deep_agent(..., tools=[weather_tool,
 search_tool])`. An unwrapped tool, sync or async, runs in-workflow, so it has to
 be deterministic. The plugin warns about an unwrapped tool passed in the
-`tools=` keyword. It does not check `tools` passed by position or a sub-agent's
-tools.
+`tools=` keyword. It does not check `tools` passed by position, a sub-agent's
+tools, or tools added by middleware.
 Deep Agents' built-in file tools on the default state backend stay in-workflow
 by design.
+
+Sync tools, sync graph nodes and routers, and LangChain output parsers run
+directly in the workflow, not in a separate thread as LangChain runs them
+outside Temporal. This applies to every workflow on a worker with the plugin,
+not only Deep Agent runs. Like other workflow code, they run again on every
+replay, and the Workflow Task waits for them: one that takes more than two
+seconds fails the Workflow Task with a deadlock error. Other sync LangChain
+calls that it would run in a thread, such as a sync-only cache, retriever or
+vector store, or `ShellToolMiddleware`, still fail with `NotImplementedError`;
+run that work in activities. Sync LangChain calls in a signal or update handler
+that runs before the workflow's run method starts fail the same way.
 
 `activity_as_tool` takes every activity option through `activity_options`, an
 `ActivityConfig`: timeouts (`start_to_close_timeout` or

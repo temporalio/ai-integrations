@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from types import FrameType, SimpleNamespace
 from typing import Annotated, Any, Self
 
@@ -920,12 +921,36 @@ def called_by_other_framework(frame: FrameType) -> bool:
     return frame.f_code is run_in_executor_from_other_framework.__code__
 
 
+async def run_in_executor(executor: Any, func: Callable[[], Any]) -> Any:
+    """Named like LangChain's helper, but in another module."""
+    return await asyncio.get_running_loop().run_in_executor(executor, func)
+
+
 @pytest.mark.parametrize("langchain_first", [True, False])
 def test_langchain_dispatch_composes_with_other_framework(
-    langchain_first: bool,
+    langchain_first: bool, tmp_path: Path
 ) -> None:
     # Another plugin, such as Strands, adds its caller to the same loop.
-    from langchain_core.runnables.config import run_in_executor
+    from langchain.agents.middleware import ShellToolMiddleware
+    from langchain_core.caches import BaseCache
+    from langchain_core.output_parsers import JsonOutputParser
+    from langchain_core.runnables import config as langchain_config
+    from langchain_core.tools import StructuredTool
+
+    class SyncOnlyCache(BaseCache):
+        # Like LangChain's SQLite cache, it has no async methods of its own.
+        def lookup(self, prompt: str, llm_string: str) -> Any:
+            return None
+
+        def update(self, prompt: str, llm_string: str, return_val: Any) -> None:
+            pass
+
+        def clear(self, **kwargs: Any) -> None:
+            pass
+
+    def add(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
 
     loop = asyncio.new_event_loop()
     try:
@@ -941,7 +966,24 @@ def test_langchain_dispatch_composes_with_other_framework(
         other = run_in_executor_from_other_framework(loop)
         assert loop.run_until_complete(other) == "other"
         # LangChain's helper still runs inline after the other framework's call.
-        assert loop.run_until_complete(run_in_executor(None, lambda: 42)) == 42
+        assert (
+            loop.run_until_complete(langchain_config.run_in_executor(None, lambda: 42))
+            == 42
+        )
+        # So do its calls for a tool and for an output parser.
+        tool = StructuredTool.from_function(func=add)
+        assert loop.run_until_complete(tool.ainvoke({"a": 1, "b": 2})) == 3
+        parsed = loop.run_until_complete(JsonOutputParser().ainvoke('{"x": 1}'))
+        assert parsed == {"x": 1}
+        # Its calls for I/O, such as a cache or ShellToolMiddleware, still fail.
+        with pytest.raises(NotImplementedError):
+            loop.run_until_complete(SyncOnlyCache().alookup("prompt", "llm"))
+        shell = ShellToolMiddleware(workspace_root=tmp_path)
+        with pytest.raises(NotImplementedError):
+            loop.run_until_complete(shell.abefore_agent({"messages": []}, None))  # type: ignore[arg-type]
+        # So do other callers, even one named like the helper.
+        with pytest.raises(NotImplementedError):
+            loop.run_until_complete(run_in_executor(None, lambda: "named"))
         with pytest.raises(NotImplementedError):
             loop.run_in_executor(None, lambda: "unrelated")
     finally:
