@@ -4,9 +4,11 @@ import (
 	"context"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 
 	"go.temporal.io/googleadk"
@@ -44,6 +46,15 @@ type declarer interface {
 	Declaration() *genai.FunctionDeclaration
 }
 
+func toolInputSchema(t *testing.T, tl tool.Tool) *jsonschema.Schema {
+	t.Helper()
+	d, ok := tl.(declarer)
+	require.True(t, ok)
+	schema, ok := d.Declaration().ParametersJsonSchema.(*jsonschema.Schema)
+	require.True(t, ok, "Activity tool must declare a JSON schema")
+	return schema
+}
+
 // TestActivityAsToolSchemaExcludesJSONDashFields proves the inferred parameter
 // schema follows encoding/json semantics: fields tagged json:"-" are never
 // advertised to the model (the default data converter can never deliver them
@@ -56,11 +67,7 @@ func TestActivityAsToolSchemaExcludesJSONDashFields(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	d, ok := tl.(declarer)
-	require.True(t, ok, "activity tool must expose Declaration()")
-	require.NotNil(t, d.Declaration())
-	require.NotNil(t, d.Declaration().Parameters)
-	props := d.Declaration().Parameters.Properties
+	props := toolInputSchema(t, tl).Properties
 
 	// Naming behavior that must not regress.
 	assert.Contains(t, props, "query", "json-renamed field advertised under its json name")

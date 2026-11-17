@@ -111,9 +111,5 @@ func TestActivityAsToolAcceptsPointerArgs(t *testing.T) {
 	tl, err := googleadk.ActivityAsTool(fn, googleadk.ActivityToolOptions{Name: "pointer-args"})
 	require.NoError(t, err)
 
-	d, ok := tl.(declarer)
-	require.True(t, ok, "activity tool must expose Declaration()")
-	require.NotNil(t, d.Declaration())
-	require.NotNil(t, d.Declaration().Parameters)
-	require.Contains(t, d.Declaration().Parameters.Properties, "city")
+	require.Contains(t, toolInputSchema(t, tl).Properties, "city")
 }

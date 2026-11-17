@@ -345,6 +345,20 @@ outside Temporal. To use another model, build the agent with
 > goroutines. Anything that isn't belongs in an `ActivityAsTool` (or an MCP tool),
 > where it runs worker-side under Temporal's retry/timeout policy.
 
+## Activity tool argument schemas
+
+`ActivityAsTool` infers arguments with the same JSON schema library as ADK's
+`functiontool`: embedded fields are flattened, maps are objects, and
+`time.Time` is a string. Fields are required unless tagged `omitempty` or
+`omitzero`. Set `ActivityToolOptions.InputSchema` for a custom JSON encoding;
+the schema must describe what your Activity's data converter accepts. An
+unsupported inferred type or unresolved schema reference returns an error
+when the tool is built.
+
+Declarations now use `ParametersJsonSchema` instead of `Parameters`. Update
+code that reads those declarations. Let in-flight runs finish before upgrading,
+or keep them on the earlier Workers with Worker Versioning.
+
 ## Heartbeats
 
 The plugin's own Activities heartbeat while they run: `InvokeModel`,

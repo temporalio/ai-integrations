@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/google/jsonschema-go/jsonschema"
+
 	"go.temporal.io/sdk/workflow"
 
 	"google.golang.org/genai"
@@ -95,6 +97,10 @@ type ActivityToolOptions struct {
 	Name string
 	// Description is the tool description the model sees.
 	Description string
+	// InputSchema overrides the inferred argument schema, as in ADK's
+	// functiontool.Config. Use it for types with a custom JSON encoding.
+	// It must describe the arguments the Activity's data converter accepts.
+	InputSchema *jsonschema.Schema
 	// ActivityOptions overrides the per-call Activity options for this tool. A
 	// zero StartToCloseTimeout falls back to the default one-minute tool timeout.
 	ActivityOptions workflow.ActivityOptions
@@ -114,7 +120,8 @@ type activityTool struct {
 // ActivityAsTool wraps an existing Temporal activity function as an ADK tool, so
 // agents can call code the user already runs as durable activities without
 // re-declaring it. The activity must be func(context.Context, TArgs) (TResults,
-// error) (or just error); the tool's parameter schema is inferred from TArgs.
+// error) (or just error); the parameter schema is inferred from TArgs with
+// ADK's JSON schema library, unless InputSchema overrides it.
 // Register the same activity on the worker as usual — the tool dispatches it as
 // a Temporal Activity when the agent calls it.
 func ActivityAsTool(activityFn any, opts ActivityToolOptions) (tool.Tool, error) {
@@ -156,14 +163,26 @@ func ActivityAsTool(activityFn any, opts ActivityToolOptions) (tool.Tool, error)
 	if argsType.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("googleadk: ActivityAsTool args type must be a struct, got %s", argsType.Kind())
 	}
+	inputSchema := opts.InputSchema
+	if inputSchema == nil {
+		var err error
+		inputSchema, err = jsonschema.ForType(argsType, nil)
+		if err != nil {
+			return nil, fmt.Errorf("googleadk: infer ActivityAsTool argument schema: %w", err)
+		}
+	}
+	resolved, err := inputSchema.Resolve(nil)
+	if err != nil {
+		return nil, fmt.Errorf("googleadk: resolve ActivityAsTool argument schema: %w", err)
+	}
 	return &activityTool{
 		activityName:    name,
 		description:     opts.Description,
 		activityOptions: opts.ActivityOptions,
 		decl: &genai.FunctionDeclaration{
-			Name:        name,
-			Description: opts.Description,
-			Parameters:  schemaFromStruct(argsType),
+			Name:                 name,
+			Description:          opts.Description,
+			ParametersJsonSchema: resolved.Schema(),
 		},
 	}, nil
 }
@@ -205,62 +224,6 @@ func activityFuncName(v reflect.Value) string {
 		full = full[i+1:]
 	}
 	return strings.TrimSuffix(full, "-fm")
-}
-
-// schemaFromStruct builds a genai object schema from a Go struct, honoring json
-// tags for field names and exclusion (json:"-"). It is intentionally shallow —
-// enough for the model to produce well-formed arguments — and recurses into
-// nested structs and slices.
-func schemaFromStruct(t reflect.Type) *genai.Schema {
-	s := &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{}}
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-		name := f.Name
-		if tag := f.Tag.Get("json"); tag != "" {
-			// A json tag of exactly "-" excludes the field from JSON entirely
-			// (encoding/json semantics), so the data converter can never deliver
-			// it to the activity — do not advertise it to the model. The check
-			// runs on the raw tag, before comma-splitting, because json:"-,"
-			// means a field literally named "-".
-			if tag == "-" {
-				continue
-			}
-			if comma := strings.Index(tag, ","); comma >= 0 {
-				tag = tag[:comma]
-			}
-			if tag != "" {
-				name = tag
-			}
-		}
-		s.Properties[name] = schemaFromType(f.Type)
-	}
-	return s
-}
-
-func schemaFromType(t reflect.Type) *genai.Schema {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	switch t.Kind() {
-	case reflect.String:
-		return &genai.Schema{Type: genai.TypeString}
-	case reflect.Bool:
-		return &genai.Schema{Type: genai.TypeBoolean}
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return &genai.Schema{Type: genai.TypeInteger}
-	case reflect.Float32, reflect.Float64:
-		return &genai.Schema{Type: genai.TypeNumber}
-	case reflect.Slice, reflect.Array:
-		return &genai.Schema{Type: genai.TypeArray, Items: schemaFromType(t.Elem())}
-	case reflect.Struct:
-		return schemaFromStruct(t)
-	default:
-		return &genai.Schema{Type: genai.TypeString}
-	}
 }
 
 // toResultMap normalizes an activity result into the map[string]any shape ADK
