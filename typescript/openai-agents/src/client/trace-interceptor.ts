@@ -38,6 +38,7 @@ export class OpenAIAgentsTraceClientInterceptor implements WorkflowClientInterce
     this.configHeader = {
       addTemporalSpans: options?.addTemporalSpans,
       useOtelInstrumentation: options?.useOtelInstrumentation,
+      modelParams: options?.modelParams === undefined ? undefined : { ...options.modelParams },
       activityOptions: options?.activityOptions === undefined ? undefined : { ...options.activityOptions },
       useLocalActivity: options?.useLocalActivity,
       streamingTopic: options?.streamingTopic,

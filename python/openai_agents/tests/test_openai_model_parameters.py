@@ -18,6 +18,7 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.openai_agents import (
     AgentsWorkflowError,
+    ModelActivityParameters,
     ModelSummaryProvider,
     OpenAIAgentsPlugin,
     TemporalAgent,
@@ -326,13 +327,6 @@ class ValidateModelConfigWorkflow:
                 assert match in str(e)
             else:
                 raise AssertionError("Expected invalid configuration to fail")
-        for model in (None, "gpt-5"):
-            try:
-                await Runner.run(Agent(name="Native", model=model), "Hello")
-            except ValueError as e:
-                assert "TemporalAgent" in str(e)
-            else:
-                raise AssertionError("Expected explicit model API validation")
         streaming_cases: list[tuple[dict[str, Any], str]] = [
             ({}, "streaming_topic"),
             (
@@ -499,3 +493,100 @@ async def test_streaming_model_configuration(client: Client, kind: str, seconds:
     assert len(attrs) == 1
     assert attrs[0].activity_type.name == "invoke_model_activity_streaming"
     assert attrs[0].start_to_close_timeout.seconds == seconds
+
+
+@pytest.mark.parametrize("factory", [OpenAIAgentsPlugin, AgentEnvironment])
+def test_deprecated_constructor_arguments(
+    factory: type[OpenAIAgentsPlugin] | type[AgentEnvironment],
+):
+    with pytest.warns(DeprecationWarning, match="ModelActivityParameters"):
+        params = ModelActivityParameters()
+    with pytest.warns(DeprecationWarning, match="model_params"):
+        factory(params)
+    cases: list[dict[str, Any]] = [
+        {"activity_config": ActivityConfig()},
+        {"use_local_activity": False},
+        {"streaming_topic": "events"},
+        {"streaming_batch_interval": timedelta(0)},
+        {"summary_provider": SummaryProvider()},
+    ]
+    for options in cases:
+        with pytest.warns(DeprecationWarning, match="model_params"):
+            with pytest.raises(ValueError, match="Cannot combine model_params"):
+                factory(params, **options)
+
+
+@workflow.defn
+class DeprecatedModelConfigWorkflow:
+    @workflow.run
+    async def run(self, regular_override: bool = False) -> str:
+        agent = Agent(name="Legacy", model="gpt-4o")
+        await Runner.run(agent, "Hello")
+        await Runner.run(
+            agent,
+            "Hello",
+            run_config=RunConfig(
+                model=TemporalModel(
+                    use_local_activity=False if regular_override else None,
+                    activity_config=ActivityConfig(
+                        start_to_close_timeout=timedelta(minutes=20)
+                    ),
+                )
+            ),
+        )
+        return "done"
+
+
+@pytest.mark.parametrize(
+    ("local", "regular_override"), [(False, False), (True, False), (True, True)]
+)
+async def test_deprecated_configuration_with_new_run_overrides(
+    client: Client, local: bool, regular_override: bool
+):
+    params = ModelActivityParameters(
+        start_to_close_timeout=timedelta(minutes=5),
+        heartbeat_timeout=None,
+        summary_override=SummaryProvider(),
+        use_local_activity=local,
+    )
+    async with AgentEnvironment(
+        params, model=TestModel(lambda: ResponseBuilders.output_message("done"))
+    ) as env:
+        configured_client = env.applied_on_client(client)
+        async with new_worker(
+            configured_client, DeprecatedModelConfigWorkflow
+        ) as worker:
+            handle = await configured_client.start_workflow(
+                DeprecatedModelConfigWorkflow.run,
+                regular_override,
+                id=str(uuid.uuid4()),
+                task_queue=worker.task_queue,
+            )
+            assert await handle.result() == "done"
+            history = await handle.fetch_history()
+        await Replayer(
+            workflows=[DeprecatedModelConfigWorkflow],
+            plugins=[env.openai_agents_plugin],
+        ).replay_workflow(history)
+    if local and not regular_override:
+        assert not scheduled(history)
+        assert (
+            sum(
+                event.marker_recorded_event_attributes.marker_name
+                == "core_local_activity"
+                for event in history.events
+            )
+            == 2
+        )
+    else:
+        attrs = scheduled(history)
+        count = 1 if local else 2
+        assert [item.start_to_close_timeout.seconds for item in attrs] == (
+            [1200] if local else [300, 1200]
+        )
+        assert [item.heartbeat_timeout.seconds for item in attrs] == [0] * count
+        assert [
+            event.user_metadata.summary.data
+            for event in history.events
+            if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+        ] == [b'"Calling Legacy"'] * count

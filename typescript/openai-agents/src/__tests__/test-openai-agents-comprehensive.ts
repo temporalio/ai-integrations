@@ -775,7 +775,9 @@ test('Retryable model error eventually succeeds', async (t) => {
     const modelProvider = new RetryableThenSuccessModelProvider(2, 'recovered', 429);
     const plugin = new OpenAIAgentsPlugin({
       modelProvider,
-      activityOptions: { retry: { maximumAttempts: 5, initialInterval: '50ms', backoffCoefficient: 1.5 } },
+      modelParams: {
+        retry: { maximumAttempts: 5, initialInterval: '50ms', backoffCoefficient: 1.5 },
+      },
     });
     const worker = await Worker.create({
       connection: env.nativeConnection,

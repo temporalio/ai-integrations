@@ -8,6 +8,7 @@ import json
 import threading
 import types
 import typing
+import warnings
 from collections.abc import (
     AsyncGenerator,
     Awaitable,
@@ -52,7 +53,9 @@ from temporalio.openai_agents._invoke_model_activity import ModelActivity
 from temporalio.openai_agents._model_options import (
     ModelSummaryProvider,
     _ModelOptions,
+    resolve_model_options,
 )
+from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._openai_runner import (
     TemporalOpenAIRunner,
 )
@@ -77,6 +80,8 @@ from temporalio.workflow import ActivityConfig
 if typing.TYPE_CHECKING:
     from temporalio.openai_agents import (
         SandboxClientProvider,
+        StatefulMCPServerProvider,
+        StatelessMCPServerProvider,
     )
     from temporalio.openai_agents._otel_trace_processor import (
         OTelTracingProcessorAdapter,
@@ -448,8 +453,11 @@ class OpenAIAgentsPlugin(SimplePlugin):
 
     def __init__(
         self,
-        activity_config: ActivityConfig | None = None,
+        model_params: ModelActivityParameters | None = None,
         model_provider: ModelProvider | None = None,
+        mcp_server_providers: Sequence[
+            "StatelessMCPServerProvider | StatefulMCPServerProvider"
+        ] = (),
         sandbox_clients: Sequence[
             "SandboxClientProvider | OnHostSandboxClientProvider"
         ] = (),
@@ -458,6 +466,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         use_otel_instrumentation: bool = False,
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
         *,
+        activity_config: ActivityConfig | None = None,
         use_local_activity: bool | None = None,
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta | None = None,
@@ -468,17 +477,22 @@ class OpenAIAgentsPlugin(SimplePlugin):
         """Initialize the OpenAI agents plugin.
 
         Args:
-            activity_config: Per-field defaults for model Activities. Supplied
-                dictionaries are copied; explicit None values override defaults.
-            use_local_activity: Use local model Activities by default. Explicit
-                Activity options unsupported by local Activities are refused.
+            model_params: Deprecated configuration for model Activities. Use
+                activity_config and separate execution options instead.
+            activity_config: Per-field Activity defaults; explicit None clears an
+                inherited field. Cannot be combined with model_params.
+            use_local_activity: Use local model Activities by default.
             streaming_topic: Default Workflow Stream topic (experimental).
-            streaming_batch_interval: Default stream publishing interval; 100 ms
-                if omitted (experimental).
-            summary_provider: Deterministic dynamic summary provider. Cannot be
-                combined with a static activity_config summary.
+            streaming_batch_interval: Default publishing interval (experimental).
+            summary_provider: Deterministic dynamic Activity summary provider.
             model_provider: Optional model provider for custom model implementations.
                 Useful for testing or custom model integrations.
+            mcp_server_providers: Legacy MCP server providers to register with the
+                worker. Deprecated; use ``mcp_servers`` for new MCP v2
+                integrations. A provider's server with a callable
+                ``tool_filter``, a ``require_approval`` policy that can ask for
+                approval, a ``tool_meta_resolver``, or a tool guardrail is
+                rejected in every MCP operation; a static filter is applied.
             mcp_servers: Named OpenAI MCP server factories to register on the worker.
                 Each factory may declare at most one positional parameter, which
                 receives the workflow's ``factory_argument`` (``None`` when the
@@ -523,18 +537,29 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 Use with caution in production environments.
 
         """
-        model_options = _ModelOptions(
-            activity_config=activity_config or ActivityConfig(),
+        model_options = resolve_model_options(
+            model_params,
+            activity_config=activity_config,
             use_local_activity=use_local_activity,
             streaming_topic=streaming_topic,
             streaming_batch_interval=streaming_batch_interval,
             summary_provider=summary_provider,
+            custom_provider=model_provider is not None,
         )
 
         self._use_otel_instrumentation = use_otel_instrumentation
+        if mcp_server_providers:
+            warnings.warn(
+                "mcp_server_providers is deprecated; use mcp_servers with "
+                "workflow.temporal_mcp_server() instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         mcp_activities = None
         if mcp_servers:
-            # Keep optional MCP dependencies lazy until a server is configured.
+            # The shared Activity layer requires MCP v2, but the legacy OpenAI
+            # provider path remains importable with MCP v1.
             try:
                 from temporalio.mcp._activities import _MCPActivities
                 from temporalio.openai_agents._mcp_backend import (
@@ -579,6 +604,14 @@ class OpenAIAgentsPlugin(SimplePlugin):
 
             if mcp_activities:
                 new_activities.extend(mcp_activities.activities)
+
+            server_names = [server.name for server in mcp_server_providers]
+            if len(server_names) != len(set(server_names)):
+                raise ValueError(
+                    "More than one mcp server registered with the same name. Please provide unique names."
+                )
+            for mcp_server in mcp_server_providers:
+                new_activities.extend(mcp_server._get_activities())
 
             sandbox_names = [sc.name for sc in sandbox_clients]
             if len(sandbox_names) != len(set(sandbox_names)):

@@ -253,6 +253,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
           new OpenAIAgentsTraceClientInterceptor({
             addTemporalSpans: interceptorOpts?.addTemporalSpans,
             useOtelInstrumentation: interceptorOpts?.useOtelInstrumentation,
+            modelParams: options.modelParams,
             activityOptions: options.activityOptions,
             useLocalActivity: options.useLocalActivity,
             streamingTopic: options.streamingTopic,

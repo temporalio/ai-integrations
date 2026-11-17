@@ -1,0 +1,86 @@
+import type { Agent, AgentInputItem } from '@openai/agents-core';
+import type { Duration } from '@temporalio/common';
+import type { ActivityOptions } from '@temporalio/workflow';
+
+export interface ModelSummaryProvider {
+  /**
+   * Generate a human-readable summary for the model Activity shown in the Temporal UI.
+   * Runs inside the Workflow sandbox, so it must be deterministic and perform no non-deterministic I/O.
+   */
+  provide(
+    agent: Agent<any, any> | undefined,
+    instructions: string | undefined,
+    input: string | AgentInputItem[]
+  ): string;
+}
+
+/** @deprecated Use ActivityOptions in activityOptions and separate TemporalModelOptions execution settings. */
+export interface ModelActivityOptions extends Omit<ActivityOptions, 'summary'> {
+  /** Use local Activities instead of regular Activities. @default false */
+  useLocalActivity?: boolean;
+  /**
+   * Maximum time between heartbeats. The model Activities heartbeat at half this timeout, so they
+   * hear a cancel, and a lost Worker is noticed, within about this long. Set it to `0` to turn
+   * heartbeats off. Local Activities don't heartbeat, so they ignore it.
+   *
+   * The first heartbeat comes half this timeout after the Activity starts, and goes through your
+   * payload codecs. The Worker's startup work for the attempt (interceptors and payload decoding)
+   * and the heartbeat's encoding must together comfortably fit in the other half (under 5 seconds
+   * with the default). If they can take longer, set this to more than twice that time, or to `0`;
+   * otherwise model calls longer than half this timeout fail with a heartbeat timeout on every
+   * attempt.
+   * @default '10s'
+   */
+  heartbeatTimeout?: Duration;
+  /** Activity summary shown in the Temporal UI. String for static text, ModelSummaryProvider for dynamic. */
+  summary?: string | ModelSummaryProvider;
+  /**
+   * Topic that the streaming model Activity publishes raw model stream events to
+   * for live external consumption. Required when running with `{ stream: true }`;
+   * `run()` throws before scheduling any Activity if it is unset. The Workflow must
+   * host a `WorkflowStream` (from `@temporalio/workflow-streams/workflow`) to receive
+   * the publishes.
+   *
+   * @experimental Streaming support is experimental and may change without notice.
+   */
+  streamingTopic?: string;
+  /**
+   * Batch flush interval for the stream publisher used by the streaming Activity.
+   *
+   * @experimental Streaming support is experimental and may change without notice.
+   */
+  streamingBatchInterval?: Duration;
+}
+
+/**
+ * Plugin-side model Activity options propagated to Workflows via the
+ * `__openai_agents_config` header. The function form of `summary`
+ * is excluded because functions cannot survive JSON serialization.
+ */
+/** @deprecated Use SerializableModelOptions instead. */
+export type SerializableModelActivityOptions = Omit<ModelActivityOptions, 'summary'> & {
+  /** Static summary string used as a tracing summary override. */
+  summary?: string;
+};
+
+export const DEFAULT_MODEL_ACTIVITY_OPTIONS: SerializableModelActivityOptions = {
+  startToCloseTimeout: '60s',
+  heartbeatTimeout: '10s',
+  useLocalActivity: false,
+};
+
+export const STREAMING_TOPIC_NOT_CONFIGURED = {
+  type: 'StreamingTopicNotConfigured',
+  message:
+    "Streaming requires a streamingTopic. Set it via the plugin's modelParams on the client, " +
+    "or via the runner's defaultModelParams (new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic } })). " +
+    'Host a WorkflowStream in your Workflow to use run(agent, input, { stream: true }).',
+} as const;
+
+export const STREAMING_LOCAL_ACTIVITY_UNSUPPORTED = {
+  type: 'StreamingLocalActivityUnsupported',
+  message:
+    'Streaming is incompatible with useLocalActivity. Local Activities cannot heartbeat, so a ' +
+    'long-running streaming model call cannot extend past its startToCloseTimeout. ' +
+    'Set useLocalActivity: false (the default) for streaming runs.',
+} as const;

@@ -53,7 +53,7 @@ for (const [title, stopOnFirstTool, stream, expectCancelled, maxTurns] of [
       },
     };
     const worker = await createWorker({
-      plugins: [new OpenAIAgentsPlugin({ modelProvider: provider, streamingTopic: 'events' })],
+      plugins: [new OpenAIAgentsPlugin({ modelProvider: provider, modelParams: { streamingTopic: 'events' } })],
     });
 
     await worker.runUntil(async () => {
@@ -90,7 +90,7 @@ for (const stream of [false, true]) {
       plugins: [
         new OpenAIAgentsPlugin({
           modelProvider: toolCallModelProvider('holdTool', {}),
-          streamingTopic: 'events',
+          modelParams: { streamingTopic: 'events' },
         }),
       ],
       activities: {

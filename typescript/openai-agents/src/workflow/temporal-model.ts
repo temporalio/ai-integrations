@@ -22,6 +22,8 @@ import {
 import { ApplicationFailure } from '@temporalio/common';
 import {
   mergeModelOptions,
+  activityOptionsForModel,
+  LOCAL_MODEL_ACTIVITY_OPTIONS,
   STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
   STREAMING_TOPIC_NOT_CONFIGURED,
   type TemporalModelOptions,
@@ -111,16 +113,7 @@ function validateOptions(options: ResolvedModelOptions, streaming: boolean): voi
     throw ApplicationFailure.create({ ...STREAMING_LOCAL_ACTIVITY_UNSUPPORTED, nonRetryable: true });
   }
   if (options.useLocalActivity) {
-    const supported = new Set([
-      'summary',
-      'startToCloseTimeout',
-      'scheduleToCloseTimeout',
-      'scheduleToStartTimeout',
-      'retry',
-      'cancellationType',
-      'eventGroups',
-    ]);
-    const unsupported = Object.keys(options.activityOptions).filter((key) => !supported.has(key));
+    const unsupported = Object.keys(activityOptionsForModel(options)).filter((key) => !LOCAL_MODEL_ACTIVITY_OPTIONS.has(key));
     if (unsupported.length > 0) {
       throw ApplicationFailure.create({
         message: `Local model Activities do not support options: ${unsupported.sort().join(', ')}`,
@@ -178,9 +171,10 @@ export class TemporalModel implements Model {
   private createActivities(
     options: ResolvedModelOptions
   ): ActivityInterfaceFor<ModelActivities> | LocalActivityInterfaceFor<ModelActivities> {
+    const activityOptions = activityOptionsForModel(options);
     return options.useLocalActivity
-      ? proxyLocalActivities<ModelActivities>(options.activityOptions as LocalActivityOptions)
-      : proxyActivities<ModelActivities>({ heartbeatTimeout: '10s', ...options.activityOptions });
+      ? proxyLocalActivities<ModelActivities>(activityOptions as LocalActivityOptions)
+      : proxyActivities<ModelActivities>({ heartbeatTimeout: '10s', ...activityOptions });
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {

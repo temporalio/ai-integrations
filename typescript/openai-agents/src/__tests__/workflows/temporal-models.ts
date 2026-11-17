@@ -1,7 +1,31 @@
 import { Agent, RunState, tool } from '@openai/agents-core';
-import { ApplicationFailure, sleep } from '@temporalio/workflow';
+import { ApplicationFailure, continueAsNew, executeChild, sleep, workflowInfo } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalModel, TemporalOpenAIRunner, type TemporalModelOptions } from '../../workflow';
+
+export async function temporalLegacyOptionsWorkflow(kind: 'mixed' | 'local' | 'local-regular' | 'boundaries'): Promise<string> {
+  if (kind === 'boundaries') {
+    await executeChild(temporalLegacyOptionsWorkflow, { args: ['mixed'] });
+    return continueAsNew<typeof temporalLegacyOptionsWorkflow>('mixed');
+  }
+  const runner = new TemporalOpenAIRunner({
+    defaultModelParams: {
+      startToCloseTimeout: '2m',
+      scheduleToCloseTimeout: '15m',
+      summary: { provide: (agent) => `legacy:${agent?.name}` },
+      ...(kind.startsWith('local') ? { useLocalActivity: true, heartbeatTimeout: '2s', taskQueue: 'ignored' } : {}),
+    },
+  });
+  const agent = new Agent({ name: 'Legacy', model: 'gpt-4o' });
+  await runner.run(agent, 'Hello');
+  return (await runner.run(agent, 'Hello', {
+    ...(kind === 'local-regular' ? { useLocalActivity: false } : {}),
+    activityOptions: {
+      startToCloseTimeout: '33s', summary: 'run',
+      ...(kind === 'local-regular' ? { taskQueue: workflowInfo().taskQueue } : {}),
+    },
+  })).finalOutput ?? '';
+}
 
 export async function temporalModelConfigurationWorkflow(): Promise<boolean> {
   const options: TemporalModelOptions = {

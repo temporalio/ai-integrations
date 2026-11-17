@@ -22,10 +22,11 @@ import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox
 import { ApplicationFailure } from '@temporalio/common';
 import { CancellationScope } from '@temporalio/workflow';
 import {
-  mergeModelOptions,
+  mergeRunnerModelOptions,
   type TemporalModelOptions,
   type ResolvedModelOptions,
 } from '../common/model-options';
+import type { ModelActivityOptions } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
 import { refuseTracingApiKey } from '../common/headers';
 import { ActivityBackedModelProvider, type TemporalModel } from './temporal-model';
@@ -100,7 +101,12 @@ export interface TemporalRunOptions<TContext = undefined> extends TemporalModelO
 }
 
 /** Workflow-authored defaults; fields supplied by the Client override them. */
-export type TemporalOpenAIRunnerOptions = TemporalModelOptions;
+export interface TemporalOpenAIRunnerOptions extends TemporalModelOptions {
+  /** @deprecated Use activityOptions and separate execution options instead. */
+  defaultModelParams?: ModelActivityOptions;
+}
+
+export { layerModelParams } from '../common/model-options';
 
 /** Whether a `SandboxAgent` is reachable from `agent` through its handoff graph. */
 function hasSandboxAgent(agent: Agent<any, any>, seen: Set<Agent<any, any>> = new Set()): boolean {
@@ -145,7 +151,7 @@ export class TemporalOpenAIRunner {
   constructor(options?: TemporalOpenAIRunnerOptions) {
     ensureTracingProcessorRegistered();
     const fromHeader = getCurrentPluginConfig();
-    this.modelOptions = mergeModelOptions(options, fromHeader);
+    this.modelOptions = mergeRunnerModelOptions(options, fromHeader);
   }
 
   /**

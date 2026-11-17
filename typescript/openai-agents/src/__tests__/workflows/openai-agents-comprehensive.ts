@@ -542,7 +542,7 @@ export async function toolFailureWorkflow(prompt: string, stream = false): Promi
   });
 
   new WorkflowStream();
-  const runner = new TemporalOpenAIRunner({ streamingTopic: 'events' });
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
   if (!stream) return (await runner.run(agent, prompt, { maxTurns: 3 })).finalOutput ?? '';
   const result = await runner.run(agent, prompt, { stream: true, maxTurns: 3 });
   for await (const _event of result);

@@ -2,6 +2,7 @@ import abc
 import asyncio
 import contextlib
 import copy
+import dataclasses
 import email.utils
 import functools
 import importlib.metadata
@@ -13,6 +14,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from types import FrameType
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -30,6 +32,7 @@ import pytest
 import typing_extensions
 from agents import (
     Agent,
+    AgentBase,
     AgentOutputSchemaBase,
     CodeInterpreterTool,
     FileSearchTool,
@@ -57,6 +60,8 @@ from agents import (
     Runner,
     SQLiteSession,
     Tool,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrailData,
     TResponseInputItem,
     Usage,
     function_tool,
@@ -66,6 +71,7 @@ from agents import (
     set_default_openai_api,
     set_default_openai_client,
     set_default_openai_key,
+    tool_input_guardrail,
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -76,6 +82,7 @@ from agents.items import (
     ToolCallOutputItem,
     TResponseStreamEvent,
 )
+from agents.mcp import MCPServer
 from agents.models import _openai_shared, get_default_model_settings
 from agents.sandbox.capabilities.tools import SandboxApplyPatchTool
 from agents.tool import CustomTool
@@ -107,14 +114,22 @@ from pydantic import ConfigDict, Field, TypeAdapter
 import temporalio.openai_agents as openai_agents
 from temporalio import activity, nexus, workflow
 from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType
 from temporalio.client import (
     Client,
+    DescribeWorkflowInput,
+    Interceptor,
+    OutboundInterceptor,
     WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
 )
 from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.converter import (
+    DefaultFailureConverterWithEncodedAttributes,
+    PayloadCodec,
+)
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
@@ -123,10 +138,12 @@ from temporalio.exceptions import (
     TemporalError,
 )
 from temporalio.openai_agents import (
+    ModelActivityParameters,
     ModelSummaryProvider,
     OpenAIPayloadConverter,
-    TemporalAgent,
-    TemporalModel,
+    StatefulMCPServerProvider,
+    StatelessMCPServerProvider,
+    _mcp,
 )
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
@@ -138,6 +155,9 @@ from temporalio.openai_agents._invoke_model_activity import (
 from temporalio.openai_agents._openai_runner import (
     _coerce_run_config,
 )
+from temporalio.openai_agents._temporal_model import (
+    TemporalModel,
+)
 from temporalio.openai_agents._temporal_worker_env_ref import (
     _WorkerEnvRefResolver,
 )
@@ -147,7 +167,7 @@ from temporalio.openai_agents.testing import (
     TestModel,
     TestModelProvider,
 )
-from temporalio.service import RPCError
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 from temporalio.workflow import ActivityConfig
@@ -178,7 +198,7 @@ def test_tool_call_response_builder_keeps_default_ids():
 class HelloWorldAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = TemporalAgent[None](
+        agent = Agent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
         )
@@ -190,7 +210,7 @@ class HelloWorldAgent:
 class CallerAgentWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = TemporalAgent[None](
+        agent = Agent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
         )
@@ -204,7 +224,9 @@ class CallerAgentWorkflow:
 async def test_hello_world_agent(client: Client):
     async with AgentEnvironment(
         model=hello_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -371,7 +393,7 @@ def nexus_weather_mock_model():
 class ToolsWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="Tools Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -411,7 +433,7 @@ class ToolsWorkflow:
 class NexusToolsWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="Nexus Tools Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -518,7 +540,7 @@ class NexusToolCancelWorkflow:
         elif case == "tool_bug":
             tools.append(function_tool(self.bug, failure_error_function=None))
         if case in ("nested", "nested_tool_fails"):
-            inner = TemporalAgent[str](
+            inner = Agent[str](
                 name="Inner", instructions="You are a helpful agent.", tools=tools
             )
             tools = [
@@ -529,7 +551,7 @@ class NexusToolCancelWorkflow:
                 )
             ]
         elif case == "spawned":
-            inner = TemporalAgent[str](
+            inner = Agent[str](
                 name="Inner", instructions="You are a helpful agent.", tools=tools
             )
 
@@ -543,7 +565,7 @@ class NexusToolCancelWorkflow:
                 return task.result().final_output
 
             tools = [function_tool(spawn)]
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="Nexus Tool Cancel Workflow",
             instructions="You are a helpful agent.",
             tools=tools,
@@ -576,7 +598,9 @@ class FixedNexusToolCancelWorkflow(NexusToolCancelWorkflow):
 async def test_tool_workflow(client: Client):
     async with AgentEnvironment(
         model=weather_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1294,7 +1318,9 @@ def weather_failure_mock_model():
 async def test_tool_failure_workflow(client: Client):
     async with AgentEnvironment(
         model=weather_failure_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1326,7 +1352,9 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
 
     async with AgentEnvironment(
         model=nexus_weather_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -1452,7 +1480,9 @@ async def test_nexus_tool_cancel_workflow(
         responses.insert(0, ResponseBuilders.tool_call("{}", "spawn"))
     async with AgentEnvironment(
         model=TestModel.returning_responses(responses),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -1679,7 +1709,7 @@ class ResearchWorkflow:
 async def test_research_workflow(client: Client):
     async with AgentEnvironment(
         model=research_mock_model(),
-        activity_config=ActivityConfig(
+        model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=120),
             schedule_to_close_timeout=timedelta(seconds=120),
         ),
@@ -1730,25 +1760,25 @@ async def test_research_workflow(client: Client):
 
 
 def orchestrator_agent() -> Agent:
-    spanish_agent = TemporalAgent[None](
+    spanish_agent = Agent[None](
         name="spanish_agent",
         instructions="You translate the user's message to Spanish",
         handoff_description="An english to spanish translator",
     )
 
-    french_agent = TemporalAgent[None](
+    french_agent = Agent[None](
         name="french_agent",
         instructions="You translate the user's message to French",
         handoff_description="An english to french translator",
     )
 
-    italian_agent = TemporalAgent[None](
+    italian_agent = Agent[None](
         name="italian_agent",
         instructions="You translate the user's message to Italian",
         handoff_description="An english to italian translator",
     )
 
-    orchestrator_agent = TemporalAgent[None](
+    orchestrator_agent = Agent[None](
         name="orchestrator_agent",
         instructions=(
             "You are a translation agent. You use the tools given to you to translate."
@@ -1774,7 +1804,7 @@ def orchestrator_agent() -> Agent:
 
 
 def synthesizer_agent() -> Agent:
-    return TemporalAgent(
+    return Agent(
         name="synthesizer_agent",
         instructions="You inspect translations, correct them if needed, and produce a final concatenated response.",
     )
@@ -1824,7 +1854,9 @@ def agent_as_tools_mock_model():
 async def test_agents_as_tools_workflow(client: Client):
     async with AgentEnvironment(
         model=agent_as_tools_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1939,7 +1971,7 @@ def init_agents() -> Agent[AirlineAgentContext]:
     Initialize the agents for the airline customer service workflow.
     :return: triage agent
     """
-    faq_agent = TemporalAgent[AirlineAgentContext](
+    faq_agent = Agent[AirlineAgentContext](
         name="FAQ Agent",
         handoff_description="A helpful agent that can answer questions about the airline.",
         instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
@@ -1952,7 +1984,7 @@ def init_agents() -> Agent[AirlineAgentContext]:
         tools=[faq_lookup_tool],
     )
 
-    seat_booking_agent = TemporalAgent[AirlineAgentContext](
+    seat_booking_agent = Agent[AirlineAgentContext](
         name="Seat Booking Agent",
         handoff_description="A helpful agent that can update a seat on a flight.",
         instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
@@ -1966,7 +1998,7 @@ def init_agents() -> Agent[AirlineAgentContext]:
         tools=[update_seat],
     )
 
-    triage_agent = TemporalAgent[AirlineAgentContext](
+    triage_agent = Agent[AirlineAgentContext](
         name="Triage Agent",
         handoff_description="A triage agent that can delegate a customer's request to the appropriate agent.",
         instructions=(
@@ -2092,7 +2124,9 @@ class CustomerServiceWorkflow:
 async def test_customer_service_workflow(client: Client):
     async with AgentEnvironment(
         model=customer_service_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2242,7 +2276,7 @@ class CarriedItemsWorkflow:
                 for part in item["content"]
             ]
             result = await Runner.run(
-                TemporalAgent(name="Assistant", instructions="Answer."),
+                Agent(name="Assistant", instructions="Answer."),
                 input_items + [{"content": "Next", "role": "user"}],
             )
         except Exception as e:
@@ -2524,7 +2558,7 @@ class CarriedCustomToolChatWorkflow:
         async def echo(ctx: ToolContext[Any], input: str) -> str:  # type: ignore[reportUnusedParameter]
             return input
 
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="custom-tool-agent",
             instructions="Use the echo tool.",
             tools=[
@@ -2648,7 +2682,7 @@ class MathHomeworkOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-guardrail_agent: Agent = TemporalAgent(
+guardrail_agent: Agent = Agent(
     name="Guardrail check",
     instructions="Check if the user is asking you to do their math homework.",
     output_type=MathHomeworkOutput,
@@ -2677,7 +2711,7 @@ async def math_guardrail(
 class InputGuardrailWorkflow:
     @workflow.run
     async def run(self, messages: list[str]) -> list[str]:
-        agent = TemporalAgent(
+        agent = Agent(
             name="Customer support agent",
             instructions="You are a customer support agent. You help customers with their questions.",
             input_guardrails=[math_guardrail],
@@ -2715,7 +2749,9 @@ class InputGuardrailWorkflow:
 async def test_input_guardrail(client: Client):
     async with AgentEnvironment(
         model=InputGuardrailModel(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2778,7 +2814,7 @@ async def sensitive_data_check(
     )
 
 
-output_guardrail_agent = TemporalAgent(
+output_guardrail_agent = Agent(
     name="Assistant",
     instructions="You are a helpful assistant.",
     output_type=MessageOutput,
@@ -2803,7 +2839,9 @@ class OutputGuardrailWorkflow:
 async def test_output_guardrail(client: Client):
     async with AgentEnvironment(
         model=output_guardrail_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2864,7 +2902,7 @@ class WorkflowToolWorkflow:
 
     @workflow.run
     async def run(self) -> dict[str, list[str]]:
-        agent: Agent = TemporalAgent(
+        agent: Agent = Agent(
             name="Assistant",
             instructions="You are a helpful assistant.",
             model="gpt-4o",
@@ -2907,7 +2945,9 @@ class WorkflowToolWorkflow:
 async def test_workflow_method_tools(client: Client):
     async with AgentEnvironment(
         model=workflow_tool_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2976,8 +3016,8 @@ async def assert_status_retry_behavior(
 
     async with AgentEnvironment(
         model=TestModel(lambda: status_error(status)),
-        activity_config=ActivityConfig(
-            retry_policy=retry_policy or RetryPolicy(maximum_attempts=2)
+        model_params=ModelActivityParameters(
+            retry_policy=retry_policy or RetryPolicy(maximum_attempts=2),
         ),
     ) as env:
         client = env.applied_on_client(client)
@@ -3236,7 +3276,7 @@ async def test_chat_completions_model(
 
         async with AgentEnvironment(
             model_provider=model_provider,
-            activity_config=ActivityConfig(
+            model_params=ModelActivityParameters(
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=1),
             ),
@@ -3295,7 +3335,7 @@ class WaitModel(Model):
 class AlternateModelAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = TemporalAgent[None](
+        agent = Agent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
             model="test_model",
@@ -3313,7 +3353,9 @@ class CheckModelNameProvider(ModelProvider):
 async def test_alternative_model(client: Client):
     async with AgentEnvironment(
         model_provider=CheckModelNameProvider(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -3336,18 +3378,18 @@ async def test_alternative_model(client: Client):
     ("params", "expected"),
     [
         (
-            ActivityConfig(heartbeat_timeout=timedelta(seconds=0.5)),
+            ModelActivityParameters(heartbeat_timeout=timedelta(seconds=0.5)),
             timedelta(seconds=0.5),
         ),
-        (ActivityConfig(), timedelta(seconds=10)),
-        (ActivityConfig(heartbeat_timeout=None), None),
+        (ModelActivityParameters(), timedelta(seconds=10)),
+        (ModelActivityParameters(heartbeat_timeout=None), None),
     ],
     ids=["set", "default", "off"],
 )
 async def test_heartbeat(
     client: Client,
     env: WorkflowEnvironment,
-    params: ActivityConfig,
+    params: ModelActivityParameters,
     expected: timedelta | None,
 ):
     if env.supports_time_skipping:
@@ -3355,7 +3397,7 @@ async def test_heartbeat(
 
     async with AgentEnvironment(
         model=WaitModel(),
-        activity_config=params,
+        model_params=params,
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -3383,7 +3425,7 @@ async def test_heartbeat(
 class SessionWorkflow:
     @workflow.run
     async def run(self) -> None:
-        agent: Agent = TemporalAgent(
+        agent: Agent = Agent(
             name="Assistant",
             instructions="You are a helpful assistant.",
         )
@@ -3439,7 +3481,7 @@ class RunModelProviderWorkflow:
             if provider == "custom"
             else MultiProvider(openai_use_responses=False)
         )
-        agent = TemporalAgent[None](
+        agent = Agent[None](
             name="Assistant", instructions="You are a helpful assistant."
         )
         result = await Runner.run(
@@ -3493,7 +3535,7 @@ async def test_run_model_provider_refused(client: Client, provider: str):
 class LiteLlmAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = TemporalAgent[None](
+        agent = Agent[None](
             name="Assistant",
             instructions="You only respond in haikus.",
             model="fake/test-model",
@@ -3568,7 +3610,9 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
 
     async with AgentEnvironment(
         model_provider=LitellmProvider(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -3615,7 +3659,7 @@ def file_search_tool_mock_model():
 class FileSearchToolWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="File Search Workflow",
             instructions="You are a librarian. You should use your tools to source all your information.",
             tools=[
@@ -3639,7 +3683,9 @@ class FileSearchToolWorkflow:
 
 async def test_file_search_tool(client: Client):
     async with AgentEnvironment(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30)
+        ),
         model=file_search_tool_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -3682,7 +3728,7 @@ def image_generation_mock_model():
 class ImageGenerationWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="Image Generation Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -3704,7 +3750,9 @@ class ImageGenerationWorkflow:
 
 async def test_image_generation_tool(client: Client):
     async with AgentEnvironment(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30)
+        ),
         model=image_generation_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -3748,7 +3796,7 @@ def code_interpreter_mock_model():
 class CodeInterpreterWorkflow:
     @workflow.run
     async def run(self, question: str) -> str:
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="Code Interpreter Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -3773,7 +3821,9 @@ class CodeInterpreterWorkflow:
 async def test_code_interpreter_tool(client: Client):
     async with AgentEnvironment(
         model=code_interpreter_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=60)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=60),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -3838,7 +3888,7 @@ class HostedMCPWorkflow:
             requested_approval = True
             return MCPToolApprovalFunctionResult(approve=True)
 
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="Hosted MCP Workflow",
             instructions="You are a helpful agent.",
             tools=[
@@ -3864,7 +3914,9 @@ class HostedMCPWorkflow:
 
 async def test_hosted_mcp_tool(client: Client):
     async with AgentEnvironment(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
         model=hosted_mcp_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -3914,7 +3966,7 @@ class CustomToolWorkflow:
             captured.append(input)
             return input
 
-        agent = TemporalAgent[str](
+        agent = Agent[str](
             name="custom-tool-agent",
             instructions="Use the echo tool.",
             tools=[
@@ -3979,12 +4031,12 @@ def multiple_models_mock_model():
 class MultipleModelWorkflow:
     @workflow.run
     async def run(self, use_run_config: bool):
-        underling = TemporalAgent[None](
+        underling = Agent[None](
             name="Underling",
             instructions="You do all the work you are told.",
         )
 
-        starting_agent = TemporalAgent[None](
+        starting_agent = Agent[None](
             name="Lazy Assistant",
             model="gpt-4o-mini",
             instructions="You delegate all your work to another agent.",
@@ -4001,7 +4053,9 @@ class MultipleModelWorkflow:
 async def test_multiple_models(client: Client):
     provider = AssertDifferentModelProvider(multiple_models_mock_model())
     async with AgentEnvironment(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
         model_provider=provider,
     ) as env:
         client = env.applied_on_client(client)
@@ -4023,7 +4077,9 @@ async def test_multiple_models(client: Client):
 async def test_run_config_models(client: Client):
     provider = AssertDifferentModelProvider(multiple_models_mock_model())
     async with AgentEnvironment(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
         model_provider=provider,
     ) as env:
         client = env.applied_on_client(client)
@@ -4051,12 +4107,12 @@ class DictRunConfigWorkflow:
 
     @workflow.run
     async def run(self) -> str:
-        underling = TemporalAgent[None](
+        underling = Agent[None](
             name="Underling",
             instructions="You do all the work you are told.",
         )
 
-        starting_agent = TemporalAgent[None](
+        starting_agent = Agent[None](
             name="Lazy Assistant",
             model="gpt-4o-mini",
             instructions="You delegate all your work to another agent.",
@@ -4078,7 +4134,9 @@ async def test_dict_run_config_models(client: Client):
     # RunConfig(model="gpt-4o") in test_run_config_models above.
     provider = AssertDifferentModelProvider(multiple_models_mock_model())
     async with AgentEnvironment(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
         model_provider=provider,
     ) as env:
         client = env.applied_on_client(client)
@@ -4130,8 +4188,10 @@ async def test_summary_provider(client: Client):
             return "My summary"
 
     async with AgentEnvironment(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
-        summary_provider=SummaryProvider(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+            summary_override=SummaryProvider(),
+        ),
         model=hello_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
@@ -4161,7 +4221,7 @@ class OutputType(pydantic.BaseModel):
 class OutputTypeWorkflow:
     @workflow.run
     async def run(self) -> OutputType:
-        agent: Agent = TemporalAgent(
+        agent: Agent = Agent(
             name="Assistant",
             instructions="You are a helpful assistant, adhere to the json schema output",
             output_type=OutputType,
@@ -4186,7 +4246,9 @@ def output_type_mock_model():
 async def test_output_type(client: Client):
     async with AgentEnvironment(
         model=output_type_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=120)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -4202,6 +4264,301 @@ async def test_output_type(client: Client):
             result = await workflow_handle.result()
             assert isinstance(result, OutputType)
             assert result.answer == "My answer"
+
+
+@workflow.defn
+class McpServerWorkflow:
+    @workflow.run
+    async def run(
+        self,
+        caching: bool,
+        factory_argument: Any | None,
+        require_approval: Literal["always"] | None,
+    ) -> str:
+        from agents.mcp import MCPServer  # type: ignore[reportUnusedImport]
+
+        server: MCPServer = openai_agents.workflow.stateless_mcp_server(
+            "HelloServer",
+            cache_tools_list=caching,
+            factory_argument=factory_argument,
+            require_approval=require_approval,
+        )
+        agent = Agent[str](
+            name="MCP ServerWorkflow",
+            instructions="Use the tools to assist the customer.",
+            mcp_servers=[server],
+        )
+        result = await Runner.run(
+            starting_agent=agent, input="Say hello to Tom and Tim."
+        )
+        if result.interruptions:
+            return f"Approval needed: {result.interruptions[0].tool_name}"
+        return result.final_output
+
+
+@workflow.defn
+class McpServerStatefulWorkflow:
+    @workflow.run
+    async def run(
+        self,
+        timeout: timedelta | None,
+        factory_argument: Any | None,
+        require_approval: Literal["always"] | None,
+    ) -> str:
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer",
+            config=ActivityConfig(
+                schedule_to_start_timeout=timeout,
+                start_to_close_timeout=timedelta(seconds=30),
+            ),
+            factory_argument=factory_argument,
+            require_approval=require_approval,
+        ) as server:
+            agent = Agent[str](
+                name="MCP ServerWorkflow",
+                instructions="Use the tools to assist the customer.",
+                mcp_servers=[server],
+            )
+            result = await Runner.run(
+                starting_agent=agent, input="Say hello to Tom and Tim."
+            )
+            if result.interruptions:
+                return f"Approval needed: {result.interruptions[0].tool_name}"
+            return result.final_output
+
+
+def tracking_mcp_mock_model():
+    return TestModel.returning_responses(
+        [
+            ResponseBuilders.tool_call(
+                arguments='{"name":"Tom"}',
+                name="Say-Hello",
+                call_id="call-say-hello-tom",
+                item_id="item-say-hello-tom",
+            ),
+            ResponseBuilders.tool_call(
+                arguments='{"name":"Tim"}',
+                name="Say-Hello",
+                call_id="call-say-hello-tim",
+                item_id="item-say-hello-tim",
+            ),
+            ResponseBuilders.output_message("Hi Tom and Tim!"),
+        ]
+    )
+
+
+def get_tracking_server(
+    name: str, require_approval: Any = None, cleanup_error: bool = False
+):
+    from agents.mcp import MCPServer  # type: ignore
+    from mcp import GetPromptResult, ListPromptsResult  # type: ignore
+    from mcp import Tool as MCPTool  # type: ignore
+    from mcp.types import CallToolResult, TextContent  # type: ignore
+
+    class TrackingMCPServer(MCPServer):
+        calls: list[str]
+
+        def __init__(self, name: str):
+            self._name = name
+            self.calls = []
+            super().__init__(require_approval=require_approval)
+
+        async def connect(self):
+            self.calls.append("connect")
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+        async def cleanup(self):
+            self.calls.append("cleanup")
+            # SDK servers tolerate cleanup() before connect(); raise here so a
+            # cleanup() call on a rejected server is detectable.
+            if "connect" not in self.calls:
+                raise AttributeError("cleanup() before connect()")
+            if cleanup_error:
+                raise RuntimeError("cleanup failed")
+
+        async def list_tools(
+            self,
+            run_context: RunContextWrapper[Any] | None = None,
+            agent: AgentBase | None = None,
+        ) -> list[MCPTool]:
+            self.calls.append("list_tools")
+            return [
+                MCPTool.model_validate(
+                    {
+                        "name": "Say-Hello",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                            },
+                            "required": ["name"],
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                        },
+                    }
+                )
+            ]
+
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: dict[str, Any] | None,
+            meta: dict[str, Any] | None = None,
+        ) -> CallToolResult:
+            self.calls.append("call_tool")
+            name = (arguments or {}).get("name") or "John Doe"
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Hello {name}")]
+            )
+
+        async def list_prompts(self) -> ListPromptsResult:
+            raise NotImplementedError()
+
+        async def get_prompt(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> GetPromptResult:
+            raise NotImplementedError()
+
+    return TrackingMCPServer(name)
+
+
+def test_legacy_mcp_apis_are_deprecated():
+    with pytest.warns(DeprecationWarning, match="StatelessMCPServerProvider"):
+        stateless_provider = StatelessMCPServerProvider(
+            "deprecated-stateless",
+            lambda: cast(MCPServer, cast(object, None)),
+        )
+    with pytest.warns(DeprecationWarning, match="StatefulMCPServerProvider"):
+        StatefulMCPServerProvider(
+            "deprecated-stateful",
+            lambda _argument: cast(MCPServer, cast(object, None)),
+        )
+    with pytest.warns(DeprecationWarning, match="stateless_mcp_server"):
+        openai_agents.workflow.stateless_mcp_server("deprecated-stateless")
+    with pytest.warns(DeprecationWarning, match="stateful_mcp_server"):
+        openai_agents.workflow.stateful_mcp_server("deprecated-stateful")
+    with pytest.warns(DeprecationWarning, match="mcp_server_providers"):
+        openai_agents.OpenAIAgentsPlugin(mcp_server_providers=[stateless_provider])
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "stateful",
+        "stateless",
+        "stateless-cached",
+        "stateful-approval",
+        "stateless-approval",
+        "stateful-cleanup-error",
+    ],
+)
+async def test_mcp_server(client: Client, mode: str):
+    stateful = mode.startswith("stateful")
+    caching = mode == "stateless-cached"
+    require_approval = "always" if mode.endswith("-approval") else None
+    cleanup_error = mode.endswith("-cleanup-error")
+
+    from agents.mcp import MCPServer  # type: ignore
+
+    from temporalio.openai_agents import (
+        StatefulMCPServerProvider,
+        StatelessMCPServerProvider,
+    )
+
+    tracking_server = get_tracking_server(
+        name="HelloServer", cleanup_error=cleanup_error
+    )
+    server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
+        StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
+        if stateful
+        else StatelessMCPServerProvider("HelloServer", lambda _: tracking_server)
+    )
+
+    async with AgentEnvironment(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
+        model=tracking_mcp_mock_model(),
+        mcp_server_providers=[server],
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client, McpServerStatefulWorkflow, McpServerWorkflow
+        ) as worker:
+            if stateful:
+                result = await client.execute_workflow(
+                    McpServerStatefulWorkflow.run,
+                    args=[timedelta(seconds=30), None, require_approval],
+                    id=f"mcp-server-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+            else:
+                result = await client.execute_workflow(
+                    McpServerWorkflow.run,
+                    args=[caching, None, require_approval],
+                    id=f"mcp-server-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+    print(tracking_server.calls)
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        # The session's heartbeat task stops, even when cleanup() fails.
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
+        ]
+    if require_approval:
+        assert result == "Approval needed: Say-Hello"
+        assert "call_tool" not in tracking_server.calls
+        return
+    assert result == "Hi Tom and Tim!"
+    if stateful:
+        assert tracking_server.calls == [
+            "connect",
+            "list_tools",
+            "call_tool",
+            "list_tools",
+            "call_tool",
+            "list_tools",
+            "cleanup",
+        ]
+    else:
+        if caching:
+            assert tracking_server.calls == [
+                "connect",
+                "list_tools",
+                "cleanup",
+                "connect",
+                "call_tool",
+                "cleanup",
+                "connect",
+                "call_tool",
+                "cleanup",
+            ]
+        else:
+            assert tracking_server.calls == [
+                "connect",
+                "list_tools",
+                "cleanup",
+                "connect",
+                "call_tool",
+                "cleanup",
+                "connect",
+                "list_tools",
+                "cleanup",
+                "connect",
+                "call_tool",
+                "cleanup",
+                "connect",
+                "list_tools",
+                "cleanup",
+            ]
 
 
 async def test_auto_heartbeater_interval_heartbeats_without_timeout():
@@ -4229,15 +4586,1219 @@ async def test_auto_heartbeater_interval_heartbeats_without_timeout():
     assert not heartbeats
 
 
+@pytest.mark.parametrize("stateful", [True, False])
+async def test_mcp_server_factory_argument(client: Client, stateful: bool):
+    def factory(args: Any | None) -> MCPServer:
+        print("Invoking factory: ", args)
+        if args is not None:
+            assert args is not None
+            assert cast(dict[str, str], args).get("user") == "blah"
+
+        return get_tracking_server("HelloServer")
+
+    server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
+        StatefulMCPServerProvider("HelloServer", factory)
+        if stateful
+        else StatelessMCPServerProvider("HelloServer", factory)
+    )
+
+    async with AgentEnvironment(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
+        model=tracking_mcp_mock_model(),
+        mcp_server_providers=[server],
+    ) as env:
+        client = env.applied_on_client(client)
+
+        headers = {"user": "blah"}
+        async with new_worker(
+            client, McpServerStatefulWorkflow, McpServerWorkflow
+        ) as worker:
+            if stateful:
+                await client.execute_workflow(
+                    McpServerStatefulWorkflow.run,
+                    args=[timedelta(seconds=30), headers, None],
+                    id=f"mcp-server-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+            else:
+                await client.execute_workflow(
+                    McpServerWorkflow.run,
+                    args=[False, headers, None],
+                    id=f"mcp-server-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+
+
+@tool_input_guardrail
+def reject_tool_input(_data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    return ToolGuardrailFunctionOutput.reject_content("blocked")
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "require_approval",
+        "instance_evaluator",
+        "tool_filter",
+        "tool_meta_resolver",
+        "tool_input_guardrails",
+    ],
+)
+@pytest.mark.parametrize("stateful", [True, False])
+async def test_mcp_server_factory_settings_are_rejected(
+    client: Client, stateful: bool, setting: str
+):
+    if setting == "require_approval":
+        tracking_server = get_tracking_server("HelloServer", require_approval="always")
+    elif setting == "instance_evaluator":
+        # The default policy, but an evaluator that always asks.
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server._get_needs_approval_for_tool = (  # type: ignore[method-assign]
+            lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
+        )
+    elif setting == "tool_meta_resolver":
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_meta_resolver = lambda context: {"tenant": "t-1"}  # type: ignore[attr-defined]
+    elif setting == "tool_input_guardrails":
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_input_guardrails = [reject_tool_input]  # type: ignore[attr-defined]
+    else:
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_filter = lambda context, tool: True  # type: ignore[attr-defined]
+    server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
+        StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
+        if stateful
+        else StatelessMCPServerProvider("HelloServer", lambda _: tracking_server)
+    )
+
+    async with AgentEnvironment(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
+        model=tracking_mcp_mock_model(),
+        mcp_server_providers=[server],
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client, McpServerStatefulWorkflow, McpServerWorkflow
+        ) as worker:
+            with pytest.raises(WorkflowFailureError) as err:
+                if stateful:
+                    # Without a schedule-to-start timeout, the error must
+                    # still reach the workflow before its execution timeout.
+                    await client.execute_workflow(
+                        McpServerStatefulWorkflow.run,
+                        args=[None, None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+                else:
+                    await client.execute_workflow(
+                        McpServerWorkflow.run,
+                        args=[False, None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+    assert isinstance(err.value.cause, ActivityError)
+    assert isinstance(err.value.cause.cause, ApplicationError)
+    assert err.value.cause.cause.non_retryable
+    message = err.value.cause.cause.message
+    if setting == "tool_meta_resolver":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets tool_meta_resolver" in message
+        assert f"on the server {route}() gives the workflow" in message
+    elif setting == "tool_input_guardrails":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets tool_input_guardrails" in message
+        assert f"on the server {route}() gives the workflow" in message
+    elif setting != "tool_filter":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets require_approval" in message
+        assert f"{route}(require_approval=...)" in message
+    else:
+        assert "'HelloServer' sets a callable tool_filter" in message
+        assert "create_static_tool_filter" in message
+        assert "temporal_mcp_server(tool_filter=...)" in message
+    # The rejected server is never connected, cleaned up or called.
+    assert tracking_server.calls == []
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
+        ]
+
+
+async def test_stateful_mcp_server_no_worker(client: Client):
+    server = StatefulMCPServerProvider(
+        "Filesystem-Server",
+        lambda _: get_tracking_server("Filesystem-Server"),
+    )
+
+    async with AgentEnvironment(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
+        model=tracking_mcp_mock_model(),
+        mcp_server_providers=[server],
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client,
+            McpServerStatefulWorkflow,
+        ) as worker:
+            workflow_handle = await client.start_workflow(
+                McpServerStatefulWorkflow.run,
+                args=[timedelta(seconds=1), None, None],
+                id=f"mcp-server-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowFailureError) as err:
+                await workflow_handle.result()
+            assert isinstance(err.value.cause, ApplicationError)
+            assert (
+                err.value.cause.message
+                == "MCP Stateful Server Worker failed to schedule activity."
+            )
+
+
+@workflow.defn
+class McpServerStatefulRetriedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+
+    @workflow.run
+    async def run(
+        self,
+        session_start_to_close: timedelta,
+        schedule_to_start: timedelta,
+        session_heartbeat_timeout: timedelta | None = None,
+    ) -> list[str]:
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=10),
+            schedule_to_start_timeout=schedule_to_start,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer",
+            config=config,
+            server_session_config=ActivityConfig(
+                start_to_close_timeout=session_start_to_close,
+                heartbeat_timeout=session_heartbeat_timeout,
+            ),
+        ) as server:
+            self._listed = [tool.name for tool in await server.list_tools()]
+            await workflow.wait_condition(lambda: self._resume)
+            try:
+                return [tool.name for tool in await server.list_tools()]
+            except ApplicationError:
+                # Leaving the block raises the session activity's failure.
+                pass
+        return []
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+def _assert_session_refused(err: WorkflowFailureError) -> None:
+    # What leaves the block is the type the docstrings name.
+    assert isinstance(err.cause, ApplicationError)
+    assert err.cause.type == "DedicatedWorkerFailure"
+    # Refused by the retried session activity, not only by an operation timing
+    # out.
+    cause: BaseException | None = err.cause
+    while cause is not None and not (
+        isinstance(cause, ApplicationError) and cause.non_retryable
+    ):
+        cause = cause.__cause__
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "DedicatedWorkerFailure"
+
+
+async def _session_failed(handle: WorkflowHandle[Any, Any]) -> bool:
+    sessions: set[int] = set()
+    async for event in handle.fetch_history_events():
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            name = event.activity_task_scheduled_event_attributes.activity_type.name
+            if name.endswith("-server-session"):
+                sessions.add(event.event_id)
+        elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED:
+            failed = event.activity_task_failed_event_attributes
+            if failed.scheduled_event_id in sessions:
+                return True
+    return False
+
+
+def _encoding_in(name: str) -> bool:
+    frame: FrameType | None = sys._getframe()
+    while frame and frame.f_code.co_name != name:
+        frame = frame.f_back
+    return frame is not None
+
+
+class _DelayMayBeOpenCodec(PayloadCodec):
+    """Delays the worker's "may be open" heartbeats, and longer its activity failures.
+
+    A "may be open" heartbeat sent before the attempt clears it then finishes
+    encoding after the clearing one, but before the attempt's failure.
+    """
+
+    def __init__(self) -> None:
+        self.heartbeat_delays = 0
+        self.failure_delays = 0
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async"):
+            if any(_mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads):
+                self.heartbeat_delays += 1
+                await asyncio.sleep(1.5)
+        elif _encoding_in("_handle_start_activity_task") and _encoding_in(
+            "encode_failure"
+        ):
+            self.failure_delays += 1
+            await asyncio.sleep(3)
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "worker_replaced",
+        "session_timed_out",
+        "first_connect_fails",
+        "first_connect_fails_delayed_heartbeats",
+        "first_connect_fails_close_wait_ends_delayed_heartbeats",
+        "shutdown_before_connect_delayed_heartbeats",
+        "shutdown_before_connect_ignored",
+        "short_heartbeat_timeout",
+    ],
+)
+async def test_stateful_mcp_server_session_retried(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
+    first_connect_fails = case.startswith("first_connect_fails")
+    shutdown_before_connect = case.startswith("shutdown_before_connect")
+    delayed_heartbeats = case.endswith("delayed_heartbeats")
+    codec = _DelayMayBeOpenCodec()
+    if "close_wait_ends" in case:
+        # The attempt stops waiting for a heartbeat still being encoded before
+        # it finishes, and the failure is encoded after it would.
+        monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 0.5)
+    if delayed_heartbeats:
+        monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
+        # Each heartbeat takes longer to encode than the interval, so one is
+        # always being encoded when the first connect fails or is cancelled.
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter,
+            payload_codec=codec,
+            failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+        )
+        client = Client(**config)
+    factory_calls = 0
+    connecting = False
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        server = get_tracking_server("HelloServer")
+        if shutdown_before_connect and factory_calls == 1:
+
+            async def hang_connect() -> None:
+                nonlocal connecting
+                connecting = True
+                try:
+                    # Until the worker's shutdown cancels it.
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    if case != "shutdown_before_connect_ignored":
+                        raise
+                    # A connect() that ignores the cancellation and connects.
+
+            server.connect = hang_connect  # type: ignore[method-assign]
+        if first_connect_fails and factory_calls == 1:
+
+            async def fail_connect() -> None:
+                if delayed_heartbeats:
+                    await asyncio.sleep(2.5)
+                raise RuntimeError("first connect failed")
+
+            server.connect = fail_connect  # type: ignore[method-assign]
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+
+        async def expect_refused(handle: WorkflowHandle[Any, Any]) -> None:
+            # The fix fails the retried session activity; without it, a retry
+            # calls the factory again.
+            async def refused_or_retried() -> None:
+                assert await _session_failed(handle) or factory_calls > 1
+
+            await assert_eventually(refused_or_retried, timeout=timedelta(seconds=40))
+            await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            # A new server would open a new MCP session without the old one's
+            # state.
+            assert factory_calls == 1
+            _assert_session_refused(err.value)
+
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[
+                    timedelta(seconds=5)
+                    if case == "session_timed_out"
+                    else timedelta(hours=1),
+                    # Long enough for the retry of an attempt that never connected.
+                    timedelta(
+                        seconds=30
+                        if first_connect_fails or shutdown_before_connect
+                        else 5
+                    ),
+                    timedelta(seconds=4) if case == "short_heartbeat_timeout" else None,
+                ],
+                id=f"mcp-server-retried-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=80),
+            )
+            if shutdown_before_connect:
+
+                async def connect_started() -> None:
+                    assert connecting
+
+                # The first worker shuts down while its first connect() runs.
+                await assert_eventually(connect_started, timeout=timedelta(seconds=30))
+            else:
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+            if first_connect_fails:
+                # No session was opened, so the retry connects again.
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                if delayed_heartbeats:
+                    # The SDK functions the codec looks for still exist.
+                    assert codec.heartbeat_delays and codec.failure_delays
+                return
+            if case == "session_timed_out":
+                await expect_refused(handle)
+                return
+            if case == "short_heartbeat_timeout":
+                # The session heartbeats within its 4-second heartbeat timeout,
+                # so it is not retried.
+                await asyncio.sleep(10)
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 1
+                return
+
+        # The first worker shut down gracefully, as in a deployment, and
+        # Temporal retries the session activity on the next one.
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            if shutdown_before_connect:
+                # No session was opened, so the retry connects again.
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                if delayed_heartbeats:
+                    # The SDK functions the codec looks for still exist.
+                    assert codec.heartbeat_delays and codec.failure_delays
+                return
+            await expect_refused(handle)
+
+
+@workflow.defn
+class McpServerStatefulCancelledAfterRefusalWorkflow:
+    """Waits in a block whose session gets refused, recovering as the README says."""
+
+    @workflow.run
+    async def run(self) -> str:
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(seconds=6)
+                ),
+            ) as server:
+                await server.list_tools()
+                await workflow.wait_condition(lambda: False)
+        except ApplicationError as err:
+            if err.type != "DedicatedWorkerFailure":
+                raise
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer"
+            ) as server:
+                await server.list_tools()
+        return "recovered"
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_cancelled_after_refusal(client: Client):
+    # The session times out on a live worker and its retry is refused while the
+    # block waits. Cancelling the workflow then cancels the run: the block's
+    # DedicatedWorkerFailure doesn't replace the cancellation, so the
+    # README's recovery code doesn't swallow it.
+    factory_calls = 0
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        return get_tracking_server("HelloServer")
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, McpServerStatefulCancelledAfterRefusalWorkflow
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulCancelledAfterRefusalWorkflow.run,
+                id=f"mcp-server-cancelled-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+
+            async def refused() -> None:
+                assert await _session_failed(handle)
+
+            await assert_eventually(refused, timeout=timedelta(seconds=30))
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as err:
+                await asyncio.wait_for(handle.result(), timeout=20)
+
+    assert isinstance(err.value.cause, CancelledError)
+    assert factory_calls == 1
+
+
+class _DenyDescribe(Interceptor):
+    def __init__(self, status: RPCStatusCode = RPCStatusCode.PERMISSION_DENIED) -> None:
+        super().__init__()
+        self._status = status
+
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _DenyDescribeOutbound(next, self._status)
+
+
+class _DenyDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, status: RPCStatusCode) -> None:
+        super().__init__(next)
+        self._status = status
+
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        raise RPCError("Request refused.", self._status, b"")
+
+
+class _StallDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _StallDescribeOutbound(next)
+
+
+class _StallDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        await asyncio.Event().wait()
+
+
+class _OtherAttemptDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _OtherAttemptDescribeOutbound(next)
+
+
+class _OtherAttemptDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        # As if a later attempt of the session activity had replaced this one.
+        description = await super().describe_workflow(input)
+        for pending in description.raw_description.pending_activities:
+            pending.attempt += 1
+        return description
+
+
+class _StallReadBackCodec(PayloadCodec):
+    """Never finishes decoding the details the session activity reads back."""
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_read_back"):
+            await asyncio.Event().wait()
+        return list(payloads)
+
+
+class _StallMayBeOpenCodec(PayloadCodec):
+    """Never finishes encoding "may be open" heartbeats after the first ``passed``."""
+
+    def __init__(self, passed: int = 0) -> None:
+        self.passed = passed
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async") and any(
+            _mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads
+        ):
+            if self.passed:
+                self.passed -= 1
+            else:
+                await asyncio.Event().wait()
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "refused",
+        "not_found",
+        "describe_stalls",
+        "decode_stalls",
+        "encode_stalls",
+        "other_attempt",
+    ],
+)
+async def test_stateful_mcp_server_without_describe_permission(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
+    # The worker's client may not describe the workflow: the session activity
+    # fails at once with an error that says so, and the run fails with it. A
+    # describe or decoding that never ends fails the attempt at the deadline,
+    # and so does a heartbeat whose encoding never ends.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 1.0)
+    servers: list[Any] = []
+
+    def factory(_: Any) -> MCPServer:
+        server = get_tracking_server("HelloServer")
+        servers.append(server)
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        config = client.config()
+        codec = {
+            "decode_stalls": _StallReadBackCodec,
+            "encode_stalls": _StallMayBeOpenCodec,
+        }.get(case)
+        if codec:
+            config["data_converter"] = dataclasses.replace(
+                client.data_converter, payload_codec=codec()
+            )
+        else:
+            interceptor = {
+                "refused": _DenyDescribe(),
+                "not_found": _DenyDescribe(RPCStatusCode.NOT_FOUND),
+                "describe_stalls": _StallDescribe(),
+                "other_attempt": _OtherAttemptDescribe(),
+            }[case]
+            config["interceptors"] = [*config["interceptors"], interceptor]
+        worker_client = env.applied_on_client(Client(**config))
+        client = env.applied_on_client(client)
+        async with new_worker(
+            worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[timedelta(hours=1), timedelta(seconds=5), None],
+                id=f"mcp-server-describe-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            if case not in ("refused", "not_found"):
+                failures: list[str] = []
+
+                async def attempt_failed() -> None:
+                    description = await handle.describe()
+                    failures[:] = [
+                        pending.last_failure.message
+                        for pending in description.raw_description.pending_activities
+                        if pending.activity_type.name.endswith("-server-session")
+                        and pending.last_failure.message
+                    ]
+                    assert failures
+
+                # The attempt fails (at the 2-second deadline when stalled) and
+                # is retried.
+                await assert_eventually(attempt_failed, timeout=timedelta(seconds=20))
+                await handle.terminate()
+                assert servers == []
+                assert failures == [
+                    "This stateful MCP server session activity attempt is no "
+                    "longer the current one."
+                    if case == "other_attempt"
+                    else "The server did not show the stateful MCP server session "
+                    "activity's first heartbeat within 2 seconds."
+                ]
+                return
+            with pytest.raises(WorkflowFailureError) as err:
+                await asyncio.wait_for(handle.result(), timeout=20)
+
+    # The session activity failed before it built a server.
+    assert servers == []
+    _assert_session_refused(err.value)
+    messages: list[str] = []
+    cause: BaseException | None = err.value
+    while cause is not None:
+        messages.append(str(cause))
+        cause = cause.__cause__
+    if case == "not_found":
+        assert any("could not describe this workflow run" in m for m in messages)
+        assert not any("permission" in m for m in messages), messages
+    else:
+        assert any("permission to describe" in m for m in messages), messages
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_worker_shutdown_while_closing(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    # The first "may be open" heartbeat reaches the server, the later ones hang
+    # in encoding, and the read-back hangs, so the attempt fails at its deadline
+    # and then waits in close() for those heartbeats. A worker shutdown during
+    # that wait must still let the attempt end, with the clear as its last
+    # heartbeat details.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 60.0)
+    monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 0.5)
+    closing = asyncio.Event()
+    close = _mcp._SessionHeartbeats.close
+
+    async def close_and_flag(self: _mcp._SessionHeartbeats) -> None:
+        # close() does not await before its wait, so once this is set, the
+        # attempt waits there.
+        closing.set()
+        await close(self)
+
+    monkeypatch.setattr(_mcp._SessionHeartbeats, "close", close_and_flag)
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter, payload_codec=_StallMayBeOpenCodec(passed=1)
+        )
+        config["interceptors"] = [*config["interceptors"], _StallDescribe()]
+        worker_client = env.applied_on_client(Client(**config))
+        client = env.applied_on_client(client)
+        async with new_worker(
+            worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[timedelta(hours=1), timedelta(seconds=5), None],
+                id=f"mcp-server-shutdown-closing-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            await asyncio.wait_for(closing.wait(), timeout=20)
+            await asyncio.wait_for(worker.shutdown(), timeout=20)
+
+        # The attempt's failure carried the clear over the first heartbeat, so
+        # its retry may connect.
+        async def retried() -> Any:
+            description = await handle.describe()
+            sessions = [
+                pending
+                for pending in description.raw_description.pending_activities
+                if pending.activity_type.name.endswith("-server-session")
+            ]
+            assert sessions and sessions[0].attempt == 2
+            return sessions[0]
+
+        session = await assert_eventually(retried, timeout=timedelta(seconds=20))
+        assert not session.heartbeat_details.payloads
+        await handle.terminate()
+
+
+@dataclass
+class _SessionEndedInput:
+    case: str
+    session_task_queue: str
+
+
+@workflow.defn
+class McpServerStatefulSessionEndedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+        self._failure: list[str] = []
+
+    @workflow.run
+    async def run(self, input: _SessionEndedInput) -> list[str]:
+        # No schedule-to-start timeout: only the session's end stops an
+        # operation waiting on the session's task queue.
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if input.case == "schedule_to_close":
+            # The timeout ends the operation, so it keeps its commands.
+            config["schedule_to_close_timeout"] = timedelta(seconds=3)
+        if input.case.startswith("next_block") or input.case.endswith(
+            "wait_cancellation"
+        ):
+            config["cancellation_type"] = (
+                workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
+        if input.case.endswith("abandon"):
+            config["cancellation_type"] = workflow.ActivityCancellationType.ABANDON
+        server_session_config = ActivityConfig(
+            start_to_close_timeout=timedelta(hours=1),
+            task_queue=input.session_task_queue,
+        )
+        if input.case == "numeric_session_id":
+            server_session_config["activity_id"] = "100"
+        if input.case == "operation_waiting_after_cancel":
+            # Work after a caught cancellation still gets the session's failure.
+            try:
+                await workflow.wait_condition(lambda: False)
+            except asyncio.CancelledError:
+                pass
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-1"
+        out: list[str] = []
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                config=config,
+                server_session_config=server_session_config,
+            ) as server:
+                if input.case == "numeric_session_id":
+                    # The first operations get default IDs below the session's.
+                    tools = [tool.name for tool in await server.list_tools()]
+                    await server.call_tool("Say-Hello", {"name": "First"})
+                    return tools
+                if input.case == "operation_cancelled":
+                    # Cancelled while queued, before the session's worker polls.
+                    call = asyncio.create_task(
+                        server.call_tool("Say-Hello", {"name": "Cancelled"})
+                    )
+                    await workflow.sleep(1)
+                    call.cancel()
+                    try:
+                        await call
+                    except ActivityError as err:
+                        out.append(type(err.cause).__name__)
+                    return out + [tool.name for tool in await server.list_tools()]
+                self._listed = [tool.name for tool in await server.list_tools()]
+                await workflow.wait_condition(lambda: self._resume)
+                if input.case.startswith("next_block"):
+                    await server.call_tool("Say-Hello", {"name": "Old"})
+                else:
+                    try:
+                        await server.list_tools()
+                    except ApplicationError as err:
+                        # The block's exit replaces this error, so keep its causes.
+                        cause: BaseException | None = err
+                        while cause is not None:
+                            self._failure.append(str(cause))
+                            cause = cause.__cause__
+                        raise
+        except (ApplicationError, ActivityError):
+            if not input.case.startswith("next_block"):
+                raise
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-2"
+        # A later block with the same name uses the same task queue.
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer", config=config, server_session_config=server_session_config
+        ) as server:
+            return [tool.name for tool in await server.list_tools()]
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.query
+    def failure(self) -> list[str]:
+        return self._failure
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "operation_waiting",
+        "operation_waiting_abandon",
+        "operation_waiting_wait_cancellation",
+        "operation_waiting_after_cancel",
+        "operation_after_refusal",
+        "next_block",
+        "next_block_custom_ids",
+        "operation_cancelled",
+        "schedule_to_close",
+        "numeric_session_id",
+    ],
+)
+async def test_stateful_mcp_server_operations_after_session_ended(
+    client: Client, case: str
+):
+    servers: list[Any] = []
+    call_cancelled = asyncio.Event()
+
+    def factory(_: Any) -> MCPServer:
+        server = get_tracking_server("HelloServer")
+        if case == "operation_cancelled":
+            connect = server.connect
+
+            async def slow_connect() -> None:
+                # The session's worker polls only after the call is cancelled.
+                await call_cancelled.wait()
+                await connect()
+
+            server.connect = slow_connect  # type: ignore[method-assign]
+        servers.append(server)
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+        host_task_queue = f"{task_queue}-host"
+
+        def operations() -> list[str]:
+            return [
+                event.activity_task_scheduled_event_attributes.activity_type.name
+                for event in events
+                if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+                and "-server-session"
+                not in (
+                    event.activity_task_scheduled_event_attributes.activity_type.name
+                )
+            ]
+
+        async with new_worker(
+            client, McpServerStatefulSessionEndedWorkflow, task_queue=task_queue
+        ):
+            async with new_worker(client, task_queue=host_task_queue):
+                handle = await client.start_workflow(
+                    McpServerStatefulSessionEndedWorkflow.run,
+                    _SessionEndedInput(case, host_task_queue),
+                    id=f"mcp-server-session-ended-{uuid.uuid4()}",
+                    task_queue=task_queue,
+                    execution_timeout=timedelta(seconds=80),
+                )
+                if case == "operation_waiting_after_cancel":
+                    await handle.cancel()
+                if case == "operation_cancelled":
+
+                    async def cancelled() -> None:
+                        history = [e async for e in handle.fetch_history_events()]
+                        assert any(
+                            e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCELED
+                            for e in history
+                        )
+
+                    try:
+                        await assert_eventually(
+                            cancelled, timeout=timedelta(seconds=20)
+                        )
+                    finally:
+                        call_cancelled.set()
+                    assert await handle.result() == ["CancelledError", "Say-Hello"]
+                    # The cancelled call never ran once the session's worker polled.
+                    assert "call_tool" not in servers[0].calls
+                    return
+                if case == "numeric_session_id":
+                    assert await handle.result() == ["Say-Hello"]
+                    assert "call_tool" in servers[0].calls
+                    return
+                assert await handle.execute_update(
+                    McpServerStatefulSessionEndedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+            # The session's host shut down gracefully after the session opened.
+
+            if case.startswith(("operation_waiting", "next_block")):
+                await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
+
+                # Wait until the operation waits beside the retried session.
+                async def operation_pending() -> None:
+                    description = await handle.describe()
+                    assert len(description.raw_description.pending_activities) >= 2
+
+                await assert_eventually(
+                    operation_pending,
+                    timeout=timedelta(seconds=20),
+                    interval=timedelta(milliseconds=100),
+                )
+
+            # The retried session activity is refused on the next host.
+            async with new_worker(client, task_queue=host_task_queue):
+                if case in ("operation_after_refusal", "schedule_to_close"):
+
+                    async def session_failed() -> None:
+                        assert await _session_failed(handle)
+
+                    await assert_eventually(
+                        session_failed, timeout=timedelta(seconds=30)
+                    )
+                    await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
+                result: list[str] | None = None
+                failure: WorkflowFailureError | None = None
+                try:
+                    result = await asyncio.wait_for(handle.result(), timeout=30)
+                except WorkflowFailureError as e:
+                    failure = e
+                causes: list[str] = []
+                if case.startswith("operation_waiting"):
+                    causes = await handle.query(
+                        McpServerStatefulSessionEndedWorkflow.failure
+                    )
+
+    events = [event async for event in handle.fetch_history_events()]
+    if case.startswith("next_block"):
+        # The second block's server got its own session; the first block's call
+        # did not run against it.
+        assert result == ["Say-Hello"]
+        assert len(servers) == 2
+        assert "call_tool" not in servers[1].calls
+        return
+    assert len(servers) == 1
+    assert failure
+    _assert_session_refused(failure)
+    if case.startswith("operation_waiting"):
+        # The operation's own error names the session's refusal as its cause,
+        # in every cancellation mode.
+        assert any("An earlier attempt" in cause for cause in causes), causes
+    # The waiting operation was cancelled (ABANDON and WAIT_CANCELLATION_COMPLETED
+    # request no cancel); none was scheduled after the session ended. An
+    # operation with a schedule-to-close timeout is scheduled as before the fix,
+    # and that timeout ends it.
+    assert operations() == ["HelloServer-stateful-list-tools"] * (
+        2 if case.startswith(("operation_waiting", "schedule_to_close")) else 1
+    )
+    assert any(
+        event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED
+        for event in events
+    ) == (case in ("operation_waiting", "operation_waiting_after_cancel"))
+
+
+@workflow.defn
+class McpServerStatefulOneTaskWorkflow:
+    """A block whose session's end reaches the workflow with another event."""
+
+    def __init__(self) -> None:
+        self._listed = False
+        self._resume = False
+
+    @workflow.run
+    async def run(self, input: _SessionEndedInput) -> str:
+        # No schedule-to-start timeout: the waiting operation follows the session.
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                config=config,
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(hours=1),
+                    task_queue=input.session_task_queue,
+                ),
+            ) as server:
+                await server.list_tools()
+                self._listed = True
+                if input.case == "timer_first":
+                    await workflow.sleep(10)
+                else:
+                    await workflow.wait_condition(lambda: self._resume)
+                    if input.case == "cancel_with_refusal":
+                        await server.list_tools()
+        except ApplicationError as err:
+            # The README's recovery.
+            if err.type != "DedicatedWorkerFailure":
+                raise
+            return "recovered"
+        return "completed"
+
+    @workflow.query
+    def listed(self) -> bool:
+        return self._listed
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case", ["timer_first", "cancel_with_refusal", "signal_with_refusal"]
+)
+async def test_stateful_mcp_server_session_end_with_other_events(
+    client: Client, case: str
+):
+    # The workflow worker is stopped until the session's refusal and other
+    # events, the block's last timer, a workflow cancel, or a Signal that ends
+    # the block and a workflow cancel, are all in history, so that one workflow
+    # task brings them.
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+        host_task_queue = f"{task_queue}-host"
+
+        def workflow_worker() -> Any:
+            return new_worker(
+                client,
+                McpServerStatefulOneTaskWorkflow,
+                task_queue=task_queue,
+                max_cached_workflows=0,
+            )
+
+        async with workflow_worker():
+            async with new_worker(client, task_queue=host_task_queue):
+                handle = await client.start_workflow(
+                    McpServerStatefulOneTaskWorkflow.run,
+                    _SessionEndedInput(case, host_task_queue),
+                    id=f"mcp-server-one-task-{uuid.uuid4()}",
+                    task_queue=task_queue,
+                    execution_timeout=timedelta(seconds=80),
+                )
+
+                async def listed() -> None:
+                    assert await handle.query(McpServerStatefulOneTaskWorkflow.listed)
+
+                await assert_eventually(listed, timeout=timedelta(seconds=20))
+            # The session's host shut down gracefully, so its retry waits.
+            if case == "cancel_with_refusal":
+                await handle.signal(McpServerStatefulOneTaskWorkflow.resume)
+
+                async def operation_pending() -> None:
+                    description = await handle.describe()
+                    assert len(description.raw_description.pending_activities) >= 2
+
+                await assert_eventually(
+                    operation_pending, timeout=timedelta(seconds=20)
+                )
+
+        if case == "signal_with_refusal":
+            await handle.signal(McpServerStatefulOneTaskWorkflow.resume)
+        if case == "timer_first":
+
+            async def timer_fired() -> None:
+                events = [e async for e in handle.fetch_history_events()]
+                assert any(
+                    e.event_type == EventType.EVENT_TYPE_TIMER_FIRED for e in events
+                )
+
+            await assert_eventually(timer_fired, timeout=timedelta(seconds=30))
+        # The next host refuses the retried session.
+        async with new_worker(client, task_queue=host_task_queue):
+
+            async def session_failed() -> None:
+                assert await _session_failed(handle)
+
+            await assert_eventually(session_failed, timeout=timedelta(seconds=30))
+            if case != "timer_first":
+                await handle.cancel()
+            async with workflow_worker():
+                if case == "timer_first":
+                    # The block raises the documented error, so the recovery runs.
+                    assert await handle.result() == "recovered"
+                else:
+                    # The workflow's cancellation wins over the session's end.
+                    with pytest.raises(WorkflowFailureError) as err:
+                        await handle.result()
+                    assert isinstance(err.value.cause, CancelledError)
+
+
+@workflow.defn
+class McpServerStatefulEmptyBlockWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
+            pass
+
+
+async def test_stateful_mcp_server_empty_block(client: Client):
+    # The session activity never started, so leaving the block raises the bare
+    # CancelledError that earlier versions raise (#391), not a
+    # DedicatedWorkerFailure for a session that ended.
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, McpServerStatefulEmptyBlockWorkflow) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulEmptyBlockWorkflow.run,
+                id=f"mcp-server-empty-block-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            assert isinstance(err.value.cause, CancelledError)
+
+
 def test_sandbox_apply_patch_tool_round_trips_through_activity_input():
     class FakeSandboxSession:
         pass
 
     tool = SandboxApplyPatchTool(session=FakeSandboxSession())  # type: ignore[arg-type]
 
-    stub = TemporalModel(
-        model_name="gpt-5",
-    )
+    stub = TemporalModel("gpt-5")
 
     activity_input, _summary = stub._build_activity_input(
         system_instructions=None,
@@ -4273,9 +5834,7 @@ def test_custom_tool_with_defer_loading_round_trips_through_activity_input():
         defer_loading=True,
     )
 
-    stub_model = TemporalModel(
-        model_name="gpt-5",
-    )
+    stub_model = TemporalModel("gpt-5")
 
     activity_input, _summary = stub_model._build_activity_input(
         system_instructions=None,
@@ -4301,8 +5860,10 @@ def test_custom_tool_with_defer_loading_round_trips_through_activity_input():
 async def test_local_hello_world_agent(client: Client):
     async with AgentEnvironment(
         model=hello_mock_model(),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
-        use_local_activity=True,
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            use_local_activity=True,
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -4326,7 +5887,9 @@ async def test_split_workers(client: Client):
     new_config = client.config()
 
     workflow_plugin = openai_agents.OpenAIAgentsPlugin(
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30)
+        ),
         model_provider=TestModelProvider(hello_mock_model()),
         register_activities=False,
     )
@@ -4338,7 +5901,7 @@ async def test_split_workers(client: Client):
         workflow_client, HelloWorldAgent, no_remote_activities=True
     ) as worker:
         activity_plugin = openai_agents.OpenAIAgentsPlugin(
-            activity_config=ActivityConfig(
+            model_params=ModelActivityParameters(
                 start_to_close_timeout=timedelta(seconds=30)
             ),
             model_provider=TestModelProvider(hello_mock_model()),
@@ -4372,13 +5935,13 @@ def multiple_handoffs_mock_model():
 class MultipleHandoffsWorkflow:
     @workflow.run
     async def run(self, task: str) -> str:
-        planner = TemporalAgent[None](
+        planner = Agent[None](
             name="Planner",
             instructions="You analyze requirements and create detailed plans.",
             handoff_description="An agent that creates detailed plans and strategies",
         )
 
-        writer = TemporalAgent[None](
+        writer = Agent[None](
             name="Writer",
             instructions="You write documents and reports based on provided information.",
             handoff_description="An agent that writes professional documents and reports",
@@ -4389,7 +5952,7 @@ class MultipleHandoffsWorkflow:
             handoff(agent=a) for a in specialists
         ]
 
-        triage = TemporalAgent[None](
+        triage = Agent[None](
             name="Triage",
             instructions="Hand off to Planner when requested.",
             handoffs=handoffs_list,
@@ -4403,7 +5966,9 @@ async def test_multiple_handoffs_workflow(client: Client):
     model = multiple_handoffs_mock_model()
     async with AgentEnvironment(
         model=model,
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -4503,7 +6068,7 @@ class ImplicitSettingsAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
         # Names no model, so the agent carries the SDK's implicit default settings.
-        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
+        agent = Agent(name="Assistant", instructions="Reply briefly.")
         return (await Runner.run(agent, input=prompt)).final_output
 
 
@@ -4511,7 +6076,7 @@ class ImplicitSettingsAgent:
 class ExplicitSettingsAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        agent = TemporalAgent(
+        agent = Agent(
             name="Assistant",
             instructions="Reply briefly.",
             model_settings=ModelSettings(temperature=0.2, verbosity="high"),
@@ -4522,7 +6087,9 @@ class ExplicitSettingsAgent:
 async def _run_with_model(client: Client, model: Model, workflow_type: type) -> None:
     async with AgentEnvironment(
         model_provider=FixedModelProvider(model),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(client, workflow_type) as worker:
@@ -4569,39 +6136,6 @@ async def test_implicit_model_settings_kept_for_an_unnamed_provider_model(
     assert model.settings == [get_default_model_settings()]
 
 
-@workflow.defn
-class RunUnnamedModelAgent:
-    @workflow.run
-    async def run(self, prompt: str) -> str:
-        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
-        for settings in (None, ModelSettings(temperature=0.2)):
-            await Runner.run(
-                agent,
-                input=prompt,
-                run_config=RunConfig(model=TemporalModel(), model_settings=settings),
-            )
-        return "done"
-
-
-@pytest.mark.parametrize("default_model", ["gpt-5", "gpt-4o"])
-async def test_unnamed_model_override_preserves_upstream_settings(
-    client: Client, monkeypatch: pytest.MonkeyPatch, default_model: str
-):
-    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", default_model)
-    native_model = RecordingNamedModel("gpt-5")
-    for settings in (None, ModelSettings(temperature=0.2)):
-        await Runner.run(
-            Agent(name="Native"),
-            input="Hello",
-            run_config=RunConfig(model=native_model, model_settings=settings),
-        )
-    assert native_model.settings == [ModelSettings(), ModelSettings(temperature=0.2)]
-
-    model = RecordingNamedModel("gpt-5")
-    await _run_with_model(client, model, RunUnnamedModelAgent)
-    assert model.settings == native_model.settings
-
-
 async def test_explicit_model_settings_reach_the_provider_model_unchanged(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ):
@@ -4617,7 +6151,7 @@ class RunModelAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
         # Names no model, but the run does.
-        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
+        agent = Agent(name="Assistant", instructions="Reply briefly.")
         result = await Runner.run(
             agent, input=prompt, run_config=RunConfig(model="gpt-5.4-pro")
         )
@@ -4637,7 +6171,7 @@ class RunOverrideSettingsAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
         # Names no model, but the run sets a reasoning effort explicitly.
-        agent = TemporalAgent(name="Assistant", instructions="Reply briefly.")
+        agent = Agent(name="Assistant", instructions="Reply briefly.")
         result = await Runner.run(
             agent,
             input=prompt,
@@ -4693,7 +6227,9 @@ async def test_alignment_uses_the_workflow_workers_defaults(
     model = RecordingNamedModel("gpt-oss-120b")
     async with AgentEnvironment(
         model_provider=DifferentDefaultModelProvider(model),
-        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
     ) as env:
         env_client = env.applied_on_client(client)
         async with new_worker(env_client, ImplicitSettingsAgent) as worker:
@@ -4733,3 +6269,36 @@ def test_plugin_reports_package_version() -> None:
     assert openai_agents.OpenAIAgentsPlugin().version() == importlib.metadata.version(
         "temporalio-openai-agents"
     )
+
+
+@workflow.defn
+class RunUnnamedModelAgent:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent(name="Assistant", instructions="Reply briefly.")
+        for settings in (None, ModelSettings(temperature=0.2)):
+            await Runner.run(
+                agent,
+                input=prompt,
+                run_config=RunConfig(model=TemporalModel(), model_settings=settings),
+            )
+        return "done"
+
+
+@pytest.mark.parametrize("default_model", ["gpt-5", "gpt-4o"])
+async def test_unnamed_model_override_preserves_upstream_settings(
+    client: Client, monkeypatch: pytest.MonkeyPatch, default_model: str
+):
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", default_model)
+    native_model = RecordingNamedModel("gpt-5")
+    for settings in (None, ModelSettings(temperature=0.2)):
+        await Runner.run(
+            Agent(name="Native"),
+            input="Hello",
+            run_config=RunConfig(model=native_model, model_settings=settings),
+        )
+    assert native_model.settings == [ModelSettings(), ModelSettings(temperature=0.2)]
+
+    model = RecordingNamedModel("gpt-5")
+    await _run_with_model(client, model, RunUnnamedModelAgent)
+    assert model.settings == native_model.settings

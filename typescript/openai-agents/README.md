@@ -364,11 +364,22 @@ A local call forwards supported scheduling options, including
 `scheduleToStartTimeout`. Model instances follow the upstream Model-object
 settings defaults; string models keep the SDK's model-name defaults.
 
-These APIs are part of the next major release (2.x). Changing the effective
-Activity options of an open Workflow, especially switching between local and
-regular Activities, can change its recorded commands. Finish earlier-version
-runs on their existing Worker Deployment version or keep that deployment
-available while routing new runs to the new version.
+`ModelActivityOptions`, `SerializableModelActivityOptions`, the plugin and Client
+interceptor's `modelParams`, and the runner's `defaultModelParams` remain supported
+and are deprecated. Existing configuration headers continue to work, including
+through child Workflows and continue-as-new. Migrate scheduling fields to
+`activityOptions`, move `useLocalActivity`, `streamingTopic`, and
+`streamingBatchInterval` alongside it, and replace an object-valued `summary` with
+`summaryProvider` in Workflow code. Static summaries use `activityOptions.summary`.
+When both spellings occur in one layer, defined new fields take precedence per
+field; Client settings still override runner defaults. Deprecated local
+configuration retains its handling of ignored regular-only options; newly
+supplied `activityOptions` receive strict validation.
+
+Existing 2.x histories continue to replay. Changing effective Activity options,
+especially switching between local and regular Activities, can change recorded
+commands. Gate those changes with `patched()` or keep open runs on their existing
+Worker Deployment version while routing new runs to the new version.
 
 The model Activities get a 10-second `heartbeatTimeout` by default. They heartbeat every half timeout, starting half the timeout into the call, so a call that ends sooner sends no heartbeat. Set `activityOptions.heartbeatTimeout` on the plugin, runner, model, or run to change it, or set it to `0` to turn heartbeats off. Local Activities don't heartbeat.
 

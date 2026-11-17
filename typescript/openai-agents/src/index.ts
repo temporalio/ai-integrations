@@ -28,3 +28,5 @@ export type { TracingApiKeyContext, TracingApiKeyResolver } from './worker/trace
 
 export { OpenAIAgentsTraceClientInterceptor } from './client/trace-interceptor';
 export type { OpenAIAgentsTraceClientInterceptorOptions } from './client/trace-interceptor';
+
+export type { ModelActivityOptions, SerializableModelActivityOptions } from './common/model-activity-options';

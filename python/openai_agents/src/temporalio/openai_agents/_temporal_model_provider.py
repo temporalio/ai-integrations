@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import warnings
 from collections.abc import Awaitable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -58,8 +59,11 @@ def validate_agent(agent: Agent[Any]) -> None:
     if not isinstance(agent, TemporalAgent) and not isinstance(
         agent.model, TemporalModel
     ):
-        raise ValueError(
-            "Use TemporalAgent for string or implicit models, or Agent(model=TemporalModel(...))."
+        warnings.warn(
+            "Using Agent with a string or implicit model is deprecated; use TemporalAgent "
+            "or Agent(model=TemporalModel(...)) instead",
+            DeprecationWarning,
+            stacklevel=3,
         )
 
 
@@ -105,8 +109,7 @@ class _CaptureAgentFilter:
         """Record ``data.agent`` and return the wrapped filter's result unchanged.
 
         Raises:
-            ValueError: If the agent could call a provider inside the Workflow,
-                or uses an implicit/string model without TemporalAgent on a new run.
+            ValueError: If the agent could call a provider inside the Workflow.
         """
         validate_agent(data.agent)
         effective_model_options(data.agent).config(streaming=self.streaming)

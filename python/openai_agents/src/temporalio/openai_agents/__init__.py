@@ -7,9 +7,14 @@ This module provides compatibility between the
 # Swap the openai item types' Iterable fields for lists before any class that holds them is built.
 from temporalio.openai_agents import _openai_types  # noqa: F401  # isort: skip  # pyright: ignore[reportUnusedImport]
 from temporalio.openai_agents._errors import AgentsWorkflowError
+from temporalio.openai_agents._mcp import (
+    StatefulMCPServerProvider,
+    StatelessMCPServerProvider,
+)
 from temporalio.openai_agents._model_options import (
     ModelSummaryProvider,
 )
+from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_agent import TemporalAgent
 from temporalio.openai_agents._temporal_model import TemporalModel
 from temporalio.openai_agents._temporal_openai_agents import (
@@ -37,12 +42,15 @@ from . import testing, workflow
 __all__ = [
     "AgentsWorkflowError",
     "AllowAllWorkerEnvVars",
+    "ModelActivityParameters",
     "ModelSummaryProvider",
     "OnHostSandboxClientProvider",
     "OpenAIAgentsPlugin",
     "OpenAIPayloadConverter",
     "SANDBOX_LOST_ERROR_TYPE",
     "SandboxClientProvider",
+    "StatefulMCPServerProvider",
+    "StatelessMCPServerProvider",
     "TemporalAgent",
     "TemporalModel",
     "TemporalWorkerEnvValue",

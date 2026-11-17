@@ -1,18 +1,13 @@
-import type { Agent, AgentInputItem } from '@openai/agents-core';
 import type { Duration } from '@temporalio/common';
 import type { ActivityOptions } from '@temporalio/workflow';
+import {
+  DEFAULT_MODEL_ACTIVITY_OPTIONS,
+  type ModelActivityOptions,
+  type SerializableModelActivityOptions,
+  type ModelSummaryProvider,
+} from './model-activity-options';
 
-export interface ModelSummaryProvider {
-  /**
-   * Generate a human-readable summary for the model Activity shown in the Temporal UI.
-   * Runs inside the Workflow sandbox, so it must be deterministic and perform no non-deterministic I/O.
-   */
-  provide(
-    agent: Agent<any, any> | undefined,
-    instructions: string | undefined,
-    input: string | AgentInputItem[]
-  ): string;
-}
+export type { ModelSummaryProvider };
 
 /** Model execution settings; scheduling uses the SDK's own ActivityOptions. */
 export interface TemporalModelOptions {
@@ -45,9 +40,24 @@ export interface TemporalModelOptions {
  * `__openai_agents_config` header. summaryProvider is Workflow-authored because
  * functions cannot survive JSON serialization.
  */
-export type SerializableModelOptions = Omit<TemporalModelOptions, 'summaryProvider'>;
+export type SerializableModelOptions = Omit<TemporalModelOptions, 'summaryProvider'> & {
+  /** @deprecated Use activityOptions and separate execution options instead. */
+  modelParams?: SerializableModelActivityOptions;
+};
+
+/** Workflow defaults, including the deprecated configuration spelling. */
+export interface RunnerModelOptions extends TemporalModelOptions {
+  /** @deprecated Use activityOptions and separate execution options instead. */
+  defaultModelParams?: ModelActivityOptions;
+}
 
 export type ResolvedModelOptions = TemporalModelOptions & { activityOptions: ActivityOptions };
+
+// Workflow-only provenance: deprecated local settings ignore regular-only fields.
+// Keep the fields until the call chooses its execution mode, so switching back to
+// regular Activities retains the caller's explicit heartbeat and task queue.
+const legacyActivityFields = Symbol('legacyActivityFields');
+type ModelOptionsLayer = TemporalModelOptions & { [legacyActivityFields]?: ReadonlySet<string> };
 
 export const DEFAULT_MODEL_OPTIONS: ResolvedModelOptions = {
   activityOptions: { startToCloseTimeout: '60s' },
@@ -56,7 +66,8 @@ export const DEFAULT_MODEL_OPTIONS: ResolvedModelOptions = {
 
 /** Merge SDK scheduling options per field and keep execution settings separate. */
 export function mergeModelOptions(...layers: (Readonly<TemporalModelOptions> | undefined)[]): ResolvedModelOptions {
-  const result: ResolvedModelOptions = { activityOptions: {} };
+  const legacyFields = new Set<string>();
+  const result: ResolvedModelOptions & ModelOptionsLayer = { activityOptions: {}, [legacyActivityFields]: legacyFields };
   for (const layer of [DEFAULT_MODEL_OPTIONS, ...layers]) {
     if (layer === undefined) continue;
     // A higher-layer static or dynamic summary replaces the inherited summary choice.
@@ -68,7 +79,10 @@ export function mergeModelOptions(...layers: (Readonly<TemporalModelOptions> | u
       if (key !== 'activityOptions' && value !== undefined) Object.assign(result, { [key]: value });
     }
     for (const [key, value] of Object.entries(layer.activityOptions ?? {})) {
-      if (value !== undefined) Object.assign(result.activityOptions, { [key]: value });
+      if (value === undefined) continue;
+      Object.assign(result.activityOptions, { [key]: value });
+      if ((layer as ModelOptionsLayer)[legacyActivityFields]?.has(key)) legacyFields.add(key);
+      else legacyFields.delete(key);
     }
   }
   return result;
@@ -88,3 +102,65 @@ export const STREAMING_LOCAL_ACTIVITY_UNSUPPORTED = {
     'long-running streaming model call cannot extend past its startToCloseTimeout. ' +
     'Set useLocalActivity: false (the default) for streaming runs.',
 } as const;
+
+
+/** Convert legacy flat settings without adding defaults to a partial layer. */
+export function modelOptionsFromLegacy(options: ModelActivityOptions | undefined): ModelOptionsLayer | undefined {
+  if (options === undefined) return undefined;
+  const { useLocalActivity, streamingTopic, streamingBatchInterval, summary, ...activityOptions } = options;
+  return {
+    activityOptions: { ...activityOptions, ...(typeof summary === 'string' ? { summary } : {}) },
+    useLocalActivity,
+    streamingTopic,
+    streamingBatchInterval,
+    ...(typeof summary === 'object' && summary !== null ? { summaryProvider: summary } : {}),
+    [legacyActivityFields]: new Set(Object.keys(activityOptions)),
+  };
+}
+
+export const LOCAL_MODEL_ACTIVITY_OPTIONS = new Set([
+  'summary',
+  'startToCloseTimeout',
+  'scheduleToCloseTimeout',
+  'scheduleToStartTimeout',
+  'retry',
+  'cancellationType',
+  'eventGroups',
+]);
+
+/** Layer deprecated and new spellings without changing Client precedence. */
+export function mergeRunnerModelOptions(
+  options: RunnerModelOptions | undefined,
+  header: SerializableModelOptions | undefined
+): ResolvedModelOptions {
+  return mergeModelOptions(
+    modelOptionsFromLegacy(options?.defaultModelParams),
+    options,
+    modelOptionsFromLegacy(header?.modelParams),
+    header
+  );
+}
+
+/** Apply legacy local handling only after model and run overrides are resolved. */
+export function activityOptionsForModel(options: ResolvedModelOptions): ActivityOptions {
+  const result = { ...options.activityOptions };
+  if (!options.useLocalActivity) return result;
+  for (const key of (options as ModelOptionsLayer)[legacyActivityFields] ?? []) {
+    if (!LOCAL_MODEL_ACTIVITY_OPTIONS.has(key)) delete result[key as keyof ActivityOptions];
+  }
+  return result;
+}
+
+/** @deprecated Use activityOptions and separate execution options with mergeModelOptions. */
+export function layerModelParams(
+  defaults: ModelActivityOptions | undefined,
+  header: SerializableModelActivityOptions | undefined
+): ModelActivityOptions {
+  const result: ModelActivityOptions = { ...DEFAULT_MODEL_ACTIVITY_OPTIONS };
+  for (const layer of [defaults, header]) {
+    for (const [key, value] of Object.entries(layer ?? {})) {
+      if (value !== undefined) Object.assign(result, { [key]: value });
+    }
+  }
+  return result;
+}

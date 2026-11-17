@@ -10,6 +10,7 @@ import sys
 import types
 import typing
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
 from typing import Any
 
@@ -60,6 +61,7 @@ from temporalio.workflow import (
 
 if typing.TYPE_CHECKING:
     from agents.mcp import MCPServer
+    from agents.mcp.server import RequireApprovalSetting
 
 
 def _parse_tool_arguments(schema: FuncSchema, input: str | None) -> BaseModel:
@@ -583,6 +585,130 @@ def temporal_sandbox_client(
             retries, etc.  Defaults to a 5-minute ``start_to_close_timeout``.
     """
     return TemporalSandboxClient(name=name, config=config)
+
+
+def stateless_mcp_server(
+    name: str,
+    config: ActivityConfig | None = None,
+    cache_tools_list: bool = False,
+    factory_argument: Any | None = None,
+    require_approval: "RequireApprovalSetting" = None,
+) -> "MCPServer":
+    """A stateless MCP server implementation for Temporal workflows.
+
+    .. deprecated:: 1.0.0
+        Use :py:func:`temporal_mcp_server` instead.
+
+    This uses a TemporalMCPServer of the same name registered with the OpenAIAgents plugin to implement
+    durable MCP operations statelessly.
+
+    This approach is suitable for simple use cases where connection overhead is acceptable
+    and you don't need to maintain state between operations. It should be preferred to stateful when possible due to its
+    superior durability guarantees.
+
+    .. warning::
+        Do not pass secrets, credentials, or API keys through ``factory_argument``. It is an
+        activity argument, so it is recorded in workflow history and, without a payload codec,
+        visible in the web UI. Resolve credentials worker-side inside the server factory
+        instead.
+
+    Args:
+        name: A string name for the server. Should match that provided in the plugin.
+        config: Optional activity configuration for MCP operation activities.
+               Defaults to 1-minute start-to-close timeout.
+        cache_tools_list: If true, the list of tools will be cached for the duration of the server
+        factory_argument: Optional argument to be provided to the factory when producing an MCPServer.
+               Must not contain secrets.
+        require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
+               same values as ``MCPServerStdio(require_approval=...)``. Set it here: on the
+               factory's server, any policy other than ``"never"``, ``False``, or only ``"never"``
+               entries is rejected, callables included. A callable policy runs in the workflow and
+               must be deterministic.
+    """
+    import warnings
+
+    warnings.warn(
+        "stateless_mcp_server() is deprecated; use temporal_mcp_server() instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from temporalio.openai_agents._mcp import (
+        _StatelessMCPServerReference,
+    )
+
+    return _StatelessMCPServerReference(
+        name,
+        config,
+        cache_tools_list,
+        factory_argument,
+        require_approval=require_approval,
+    )
+
+
+def stateful_mcp_server(
+    name: str,
+    config: ActivityConfig | None = None,
+    server_session_config: ActivityConfig | None = None,
+    factory_argument: Any | None = None,
+    require_approval: "RequireApprovalSetting" = None,
+) -> AbstractAsyncContextManager["MCPServer"]:
+    """A stateful MCP server implementation for Temporal workflows.
+
+    .. deprecated:: 1.0.0
+        Use :py:func:`temporal_mcp_server` instead.
+
+    This wraps an MCP server to maintain a persistent connection throughout
+    the workflow execution. It creates a dedicated worker that stays connected to
+    the MCP server and processes operations on a dedicated task queue.
+
+    This approach is more efficient for workflows that make multiple MCP calls,
+    as it avoids connection overhead, but requires more resources to maintain
+    the persistent connection and worker.
+
+    The caller will have to handle cases where the dedicated worker fails, as Temporal is
+    unable to seamlessly recreate any lost state in that case.
+
+    .. warning::
+        Do not pass secrets, credentials, or API keys through ``factory_argument``. It is an
+        activity argument, so it is recorded in workflow history and, without a payload codec,
+        visible in the web UI. Resolve credentials worker-side inside the server factory
+        instead.
+
+    Args:
+        name: A string name for the server. Should match that provided in the plugin.
+        config: Optional activity configuration for MCP operation activities.
+               Defaults to 1-minute start-to-close and 30-second schedule-to-start timeouts.
+        server_session_config: Optional activity configuration for the connection activity.
+                       Defaults to 1-hour start-to-close timeout. That timeout is the longest the
+                       block can stay open: the activity then times out, and its retry fails with
+                       ``DedicatedWorkerFailure``. Raise it for long blocks, such as ones that wait
+                       for a person, and set a ``heartbeat_timeout`` to notice a lost worker sooner.
+        factory_argument: Optional argument to be provided to the factory when producing an MCPServer.
+               Must not contain secrets.
+        require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
+               same values as ``MCPServerStdio(require_approval=...)``. Set it here: on the
+               factory's server, any policy other than ``"never"``, ``False``, or only ``"never"``
+               entries is rejected, callables included. A callable policy runs in the workflow and
+               must be deterministic.
+    """
+    import warnings
+
+    warnings.warn(
+        "stateful_mcp_server() is deprecated; use temporal_mcp_server() instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from temporalio.openai_agents._mcp import (
+        _StatefulMCPServerReference,
+    )
+
+    return _StatefulMCPServerReference(
+        name,
+        config,
+        server_session_config,
+        factory_argument,
+        require_approval=require_approval,
+    )
 
 
 def temporal_mcp_server(

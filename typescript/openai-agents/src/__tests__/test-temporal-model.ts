@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { WorkflowClient } from '@temporalio/client';
+import { Client, WorkflowClient } from '@temporalio/client';
 import { defaultPayloadConverter } from '@temporalio/common';
 import { historyFromJSON, historyToJSON } from '@temporalio/common/lib/proto-utils';
 import { helpers } from '@temporalio/test-helpers';
@@ -12,6 +12,7 @@ import { findPayloadChange } from './helpers/payload-round-trip';
 import { FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
 import { handoffResponse, StreamingFakeModelProvider, streamingTextEvents } from './stubs/openai-agents-fakes';
 import {
+  temporalLegacyOptionsWorkflow,
   temporalModelConfigurationWorkflow,
   temporalModelConcurrentWorkflow,
   temporalModelNestedWorkflow,
@@ -269,3 +270,56 @@ test('a TemporalModel survives approval state serialization and resumes with new
     await replay(t, handle);
   });
 });
+
+for (const kind of ['mixed', 'local', 'local-regular', 'boundaries'] as const) {
+  test(`deprecated configuration and new run overrides retain ${kind} behavior and replay`, async (t) => {
+    const { createWorker, taskQueue } = helpers(t);
+    const plugin = new OpenAIAgentsPlugin({
+      modelProvider: provider(),
+      ...(kind.startsWith('local') ? {} : {
+        modelParams: { startToCloseTimeout: '5m', heartbeatTimeout: 0, summary: 'client' },
+        activityOptions: { startToCloseTimeout: '4m' },
+      }),
+    });
+    const worker = await createWorker({ plugins: [plugin] });
+    const client = new Client({ connection: t.context.env.connection, plugins: [plugin] });
+    await worker.runUntil(async () => {
+      const handle = await client.workflow.start(temporalLegacyOptionsWorkflow, {
+        workflowId: randomUUID(), taskQueue, args: [kind],
+      });
+      t.is(await handle.result(), 'done');
+      const first = await client.workflow.getHandle(handle.workflowId, handle.firstExecutionRunId).fetchHistory();
+      const histories = [first];
+      if (kind === 'boundaries') {
+        const child = first.events!.find((event) => event.childWorkflowExecutionStartedEventAttributes)
+          ?.childWorkflowExecutionStartedEventAttributes?.workflowExecution;
+        t.truthy(child);
+        histories.push(await client.workflow.getHandle(child!.workflowId!, child!.runId!).fetchHistory());
+        const continued = first.events!.find((event) => event.workflowExecutionContinuedAsNewEventAttributes)
+          ?.workflowExecutionContinuedAsNewEventAttributes!.newExecutionRunId;
+        t.truthy(continued);
+        histories.push(await client.workflow.getHandle(handle.workflowId, continued!).fetchHistory());
+      }
+      for (const history of histories) {
+        const events = scheduled(history);
+        if (kind === 'local') {
+          t.is(events.length, 0);
+          t.is(history.events!.filter((event) => event.markerRecordedEventAttributes?.markerName === 'core_local_activity').length, 2);
+        } else if (kind === 'local-regular') {
+          t.is(events.length, 1);
+          t.is(Number(events[0]!.activityTaskScheduledEventAttributes!.startToCloseTimeout!.seconds), 33);
+          t.is(Number(events[0]!.activityTaskScheduledEventAttributes!.heartbeatTimeout!.seconds), 2);
+          t.deepEqual(events.map(summary), ['run']);
+        } else if (kind !== 'boundaries' || history !== first) {
+          t.deepEqual(events.map((event) => Number(event.activityTaskScheduledEventAttributes!.startToCloseTimeout!.seconds)), [240, 33]);
+          t.true(events.every((event) => Number(event.activityTaskScheduledEventAttributes!.heartbeatTimeout?.seconds) === 0));
+          t.deepEqual(events.map(summary), ['client', 'run']);
+        }
+        await t.notThrowsAsync(Worker.runReplayHistory({
+          workflowBundle: t.context.workflowBundle,
+          plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })],
+        }, history));
+      }
+    });
+  });
+}
