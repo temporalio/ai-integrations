@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
@@ -84,8 +85,19 @@ def title_for(plugin: str) -> str:
 
 
 def _api_items(endpoint: str, field: str | None = None) -> list[dict]:
+    # Retry reads only. A failed paginated request may contain partial stdout;
+    # discard it so a retry cannot duplicate items from earlier pages.
+    for attempt in range(3):
+        try:
+            output = _gh("api", endpoint, "--paginate")
+            break
+        except subprocess.CalledProcessError as err:
+            if attempt == 2 or not re.search(r"\bHTTP (502|503|504)\b", err.stderr or ""):
+                raise
+            print(f"GitHub API gateway error reading {endpoint}; retrying", file=sys.stderr)
+            time.sleep(attempt + 1)
     items: list[dict] = []
-    for page in _json_documents(_gh("api", endpoint, "--paginate")):
+    for page in _json_documents(output):
         items.extend(page[field] if field else page)
     return items
 
@@ -254,9 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.repo or not args.run_id:
         parser.error("--repo and --run-id are required")
 
-    jobs: list[dict] = []
-    for page in _json_documents(_gh("api", f"repos/{args.repo}/actions/runs/{args.run_id}/jobs?per_page=100", "--paginate")):
-        jobs.extend(page.get("jobs", []))
+    # Large job pages can time out at GitHub's gateway on the full CI matrix.
+    jobs = _api_items(f"repos/{args.repo}/actions/runs/{args.run_id}/jobs?per_page=30", "jobs")
     failing, passing = classify(jobs)
     run_url = f"https://github.com/{args.repo}/actions/runs/{args.run_id}"
     print(f"failing: {sorted(failing)}\npassing: {sorted(passing)}")

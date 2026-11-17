@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import nightly_report
@@ -144,7 +145,10 @@ def test_report_creates_or_reuses_issue_with_qualified_title(
     def gh(*args: str) -> str:
         calls.append(args)
         if args[0] == "api":
-            return json.dumps({"jobs": [_job(f"{language} (langsmith) / matrix", conclusion)]})
+            assert args == ("api", f"repos/{repo}/actions/runs/123/jobs?per_page=30", "--paginate")
+            return json.dumps({"jobs": [_job("Conventions and tooling tests", "success")]}) + json.dumps(
+                {"jobs": [_job(f"{language} (langsmith) / matrix", conclusion)]}
+            )
         if args[:2] == ("issue", "list"):
             return json.dumps(issues)
         return ""
@@ -164,3 +168,48 @@ def test_report_creates_or_reuses_issue_with_qualified_title(
         assert actions == [("issue", "comment", "444", "--repo", repo, "--body", f"Still failing: {run_url}")]
     else:
         assert actions == [("issue", "close", "444", "--repo", repo, "--comment", f"Green again: {run_url}")]
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_api_read_retries_gateway_errors_without_duplicating_partial_pages(
+    monkeypatch: pytest.MonkeyPatch, status: int,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    delays: list[int] = []
+    endpoint = "repos/owner/repo/actions/runs/123/jobs?per_page=30"
+
+    def gh(*args: str) -> str:
+        calls.append(args)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(
+                1, args, output='{"jobs": [{"id": 1}]}', stderr=f"gh: Server Error (HTTP {status})",
+            )
+        return '{"jobs": [{"id": 1}]}\n{"jobs": [{"id": 2}]}'
+
+    monkeypatch.setattr(nightly_report, "_gh", gh)
+    monkeypatch.setattr(nightly_report.time, "sleep", delays.append)
+    assert nightly_report._api_items(endpoint, "jobs") == [{"id": 1}, {"id": 2}]
+    assert calls == [("api", endpoint, "--paginate")] * 2
+    assert delays == [1]
+
+
+@pytest.mark.parametrize("status,attempts", [(502, 3), (401, 1), (403, 1), (404, 1), (429, 1)])
+def test_api_read_propagates_permanent_or_exhausted_errors(
+    monkeypatch: pytest.MonkeyPatch, status: int, attempts: int,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    delays: list[int] = []
+    error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=f"gh: request failed (HTTP {status})")
+
+    def gh(*args: str) -> str:
+        calls.append(args)
+        raise error
+
+    monkeypatch.setattr(nightly_report, "_gh", gh)
+    monkeypatch.setattr(nightly_report.time, "sleep", delays.append)
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        nightly_report.main(["--repo", "owner/repo", "--run-id", "123"])
+    assert caught.value is error
+    assert len(calls) == attempts
+    assert all(call[0] == "api" for call in calls)
+    assert delays == list(range(1, attempts))
