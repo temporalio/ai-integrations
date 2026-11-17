@@ -396,6 +396,11 @@ When a tool's activity fails, the `AgentsWorkflowError`'s `__cause__` is that to
 `RetryState.NON_RETRYABLE_FAILURE` covers an error raised with `non_retryable=True` and one whose type is in the activity retry policy's `non_retryable_error_types`.
 The `failure_error_function` of `activity_as_tool()` does not change any of this: it only formats the error returned to the model when the tool's arguments are invalid.
 
+When the model's final output doesn't match the agent's `output_type`, `Runner.run` raises `ModelBehaviorError`, as it does outside Temporal.
+If the Workflow doesn't catch it, the Workflow fails with an `ApplicationError` of type `ModelBehaviorError`.
+It doesn't fail the Workflow Task: the model's answer is in the History, so a retried Workflow Task would get the same answer and fail again.
+To ask the model again, catch the error around the run, or set a Workflow retry policy, which reruns the whole agent run.
+
 ### Calling OpenAI Agents Tools inside Temporal Workflows
 
 For simple computations that don't involve external calls, you can call the tool directly from the workflow by using the standard OpenAI Agents SDK `@function_tool` decorator.

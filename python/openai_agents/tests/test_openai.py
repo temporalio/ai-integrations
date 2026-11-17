@@ -47,6 +47,7 @@ from agents import (
     MCPToolApprovalRequest,
     MessageOutputItem,
     Model,
+    ModelBehaviorError,
     ModelProvider,
     ModelResponse,
     ModelSettings,
@@ -4264,6 +4265,84 @@ async def test_output_type(client: Client):
             result = await workflow_handle.result()
             assert isinstance(result, OutputType)
             assert result.answer == "My answer"
+
+
+@workflow.defn
+class CaughtOutputTypeErrorWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        agent: Agent = Agent(
+            name="Assistant",
+            instructions="You are a helpful assistant, adhere to the json schema output",
+            output_type=OutputType,
+        )
+        try:
+            await Runner.run(starting_agent=agent, input="Hello!")
+        except ModelBehaviorError as e:
+            return f"caught: {e}"
+        return "not raised"
+
+
+def invalid_output_type_mock_model():
+    return TestModel.returning_responses(
+        [ResponseBuilders.output_message('{"answer": 42}')]
+    )
+
+
+async def test_invalid_output_type_fails_workflow(client: Client):
+    """A final output that doesn't match output_type fails the Workflow.
+
+    The model's answer is recorded in History, so retrying the Workflow Task
+    would replay the same answer and fail the same way forever.
+    """
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, OutputTypeWorkflow) as worker:
+            workflow_handle = await client.start_workflow(
+                OutputTypeWorkflow.run,
+                id=f"invalid-output-type-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowFailureError) as e:
+                await workflow_handle.result()
+            cause = e.value.cause
+            assert isinstance(cause, ApplicationError)
+            assert cause.type == "ModelBehaviorError"
+            assert "Invalid JSON when parsing model output" in cause.message
+
+            workflow_task_failures = [
+                event
+                async for event in workflow_handle.fetch_history_events()
+                if event.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED
+            ]
+            assert workflow_task_failures == []
+
+
+async def test_invalid_output_type_can_be_caught(client: Client):
+    """Workflow code that catches ModelBehaviorError still gets it first."""
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, CaughtOutputTypeErrorWorkflow) as worker:
+            result = await client.execute_workflow(
+                CaughtOutputTypeErrorWorkflow.run,
+                id=f"caught-output-type-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            assert result.startswith("caught: Invalid JSON when parsing model output")
 
 
 @workflow.defn

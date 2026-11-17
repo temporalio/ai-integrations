@@ -25,6 +25,7 @@ from datetime import timedelta
 import pydantic
 import pydantic_core
 from agents import ModelProvider, set_trace_provider
+from agents.exceptions import ModelBehaviorError
 from agents.mcp import MCPServer
 from agents.run import get_default_agent_runner, set_default_agent_runner
 from agents.tracing import get_trace_provider
@@ -673,7 +674,10 @@ class OpenAIAgentsPlugin(SimplePlugin):
             interceptors=[interceptor],
             activities=add_activities,
             workflow_runner=workflow_runner,
-            workflow_failure_exception_types=[AgentsWorkflowError],
+            # ModelBehaviorError, such as a final output that doesn't match the agent's
+            # output_type, comes from a model answer recorded in History. Every replay of
+            # the Workflow Task would raise it again, so it fails the Workflow instead.
+            workflow_failure_exception_types=[AgentsWorkflowError, ModelBehaviorError],
             run_context=lambda: run_context(),
         )
 
