@@ -118,6 +118,10 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			yield(nil, err)
 			return
 		}
+		// ADK has just drawn one ID for each tool and toolset it prepared. Start
+		// a new ID generator so the IDs it draws for this response do not depend
+		// on the tool list.
+		restartUUIDs(ctx)
 		ao := m.activityOptions
 		if ao.StartToCloseTimeout == 0 {
 			ao.StartToCloseTimeout = defaultModelTimeout
@@ -465,9 +469,10 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 // metadata field the latest chunk that sets it wins — all of them are folded
 // (not just usage/finish/grounding) because a model commonly emits citations,
 // logprobs, transcriptions, custom metadata, or an error/finish only on a later
-// chunk, and Gemini's terminal aggregate omits fields (e.g. ModelVersion) that
-// earlier chunks carried. (Partial/TurnComplete are managed by the streaming
-// caller; internally agg.Partial tracks whether the aggregate is partial-built.)
+// chunk, and Gemini's terminal aggregate omits fields that earlier chunks
+// carried: log probabilities and, before ADK v2.8.0, ModelVersion.
+// (Partial/TurnComplete are managed by the streaming caller; internally
+// agg.Partial tracks whether the aggregate is partial-built.)
 func aggregateResponses(agg, next *model.LLMResponse) *model.LLMResponse {
 	if next == nil {
 		return agg
@@ -490,9 +495,10 @@ func aggregateResponses(agg, next *model.LLMResponse) *model.LLMResponse {
 		// Authoritative response supersedes content accumulated from partial
 		// display chunks: folding it in would duplicate the text and drop
 		// function-call parts. Metadata still folds below, so fields the
-		// terminal response omits (Gemini's aggregate carries no ModelVersion)
-		// survive from earlier chunks. Deep copy: the caller mutates the
-		// aggregate afterwards, and the published chunks alias the original.
+		// terminal response omits (Gemini's aggregate carries no ModelVersion
+		// before ADK v2.8.0) survive from earlier chunks. Deep copy: the caller
+		// mutates the aggregate afterwards, and the published chunks alias the
+		// original.
 		agg.Content = cloneContent(next.Content)
 		agg.Partial = false
 	case !next.Partial:
@@ -627,9 +633,10 @@ func classifyModelError(err error) error {
 	if code != 0 {
 		retryable = retryableHTTPStatus(code)
 	} else {
-		// ADK's Gemini model returns this untyped error for a reply with no
-		// candidates, as for a blocked prompt. Natively the agent gets it
-		// once; a retry would send the same request again.
+		// Before ADK v2.8.0, ADK's Gemini model returns this untyped error for
+		// a non-streamed reply with no candidates, as for a blocked prompt.
+		// Natively the agent gets it once; a retry would send the same
+		// request again. From v2.8.0 that reply is a response, not an error.
 		retryable = !isEmptyResponse(err)
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)

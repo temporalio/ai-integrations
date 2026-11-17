@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, is_cancelled_exception
 
 if TYPE_CHECKING:
     from langchain_core.language_models import ModelProfile
@@ -316,6 +316,10 @@ async def run_deep_agent(
         # workflow-failure type rather than the framework's generic exception.
         cause = exc.__cause__
         if cause is not None and workflow.is_failure_exception(cause):
+            if is_cancelled_exception(cause) and workflow.patched(
+                "deepagents.raise-cancellation"
+            ):
+                raise cause
             raise DeepAgentsWorkflowError(f"Deep Agents run failed: {exc}") from cause
         raise
 

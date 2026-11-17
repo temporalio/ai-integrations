@@ -226,3 +226,54 @@ test.serial('streamDisposeFailureIsClassified', async (t) => {
     WorkflowStreamClient.fromWithinActivity = original;
   }
 });
+
+/** A model that waits 100 ms, long enough for a heartbeat timer to fire, then yields `chunks`. */
+class SlowStreamingLlm extends BaseLlm {
+  override async *generateContentAsync(
+    _llmRequest: LlmRequest,
+    _stream?: boolean,
+    _abortSignal?: AbortSignal
+  ): AsyncGenerator<LlmResponse, void> {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    yield* chunks;
+  }
+
+  override async connect(_llmRequest: LlmRequest): Promise<BaseLlmConnection> {
+    throw new Error('SlowStreamingLlm does not connect.');
+  }
+}
+
+// Unit test (MockActivityEnvironment): the model Activities heartbeat only on their
+// timer, the first time half the heartbeat timeout into the call. A streamed call
+// shorter than that sends no heartbeat, however many chunks it has, a longer one
+// does, and a `heartbeatTimeout` of 0 starts no timer.
+test.serial('streamedCallHeartbeatsOnlyOnTimer', async (t) => {
+  const original = WorkflowStreamClient.fromWithinActivity;
+  WorkflowStreamClient.fromWithinActivity = (() => ({
+    topic: () => ({ publish: () => {} }),
+    [Symbol.asyncDispose]: async () => {},
+  })) as unknown as typeof WorkflowStreamClient.fromWithinActivity;
+  try {
+    const activities = createModelActivities({ modelProvider: (model) => new SlowStreamingLlm({ model }) });
+    // With 100 ms, the timer first fires at 50 ms, before the model's 100 ms wait
+    // ends. Later ticks race that wait, so the test checks for any heartbeat.
+    for (const [heartbeatTimeoutMs, heartbeatExpected] of [
+      [10_000, false],
+      [0, false],
+      [100, true],
+    ] as const) {
+      const mockEnv = new MockActivityEnvironment({ heartbeatTimeoutMs });
+      let heartbeats = 0;
+      mockEnv.on('heartbeat', () => heartbeats++);
+      const responses: LlmResponse[] = await mockEnv.run(activities['adk-invokeModelStreaming'], {
+        model: 'slow-streaming-model',
+        request: {} as never,
+        streamingTopic: 'adk-test-stream',
+      });
+      t.is(responses.length, 3, `heartbeatTimeoutMs ${heartbeatTimeoutMs}`);
+      t.is(heartbeats > 0, heartbeatExpected, `heartbeatTimeoutMs ${heartbeatTimeoutMs}`);
+    }
+  } finally {
+    WorkflowStreamClient.fromWithinActivity = original;
+  }
+});

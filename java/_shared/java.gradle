@@ -62,6 +62,11 @@ dependencyLocking {
     def lockName = bootVersion ? "spring-boot-${bootVersion}" : 'dependencies'
     lockFile = file("gradle/dependency-locks/${lockName}$suffix")
 }
+tasks.register('resolveDependencies') {
+    // Spotless registers and resolves its formatter dependencies when this task runs.
+    dependsOn 'spotlessJava'
+    doLast { configurations.findAll { it.canBeResolved }.each { it.resolve() } }
+}
 tasks.register('resolveAndLockAll') {
     dependsOn 'spotlessJava'
     doFirst {
