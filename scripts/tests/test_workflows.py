@@ -118,9 +118,11 @@ def test_ci_status_is_the_fan_in() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     status = doc["jobs"]["ci-status"]
     assert status["if"] == "always()"
-    assert set(status["needs"]) == {"changes", "conventions", "python", "java", "go", "typescript", "dotnet"}
-    for language in ("python", "java", "go", "typescript", "dotnet"):
-        job = doc["jobs"][language]
+    lanes = ("python", "java", "go", "typescript", "dotnet", "python-lowest", "typescript-lowest")
+    assert set(status["needs"]) == {"changes", "conventions", *lanes}
+    for lane in lanes:
+        language = lane.removesuffix("-lowest")
+        job = doc["jobs"][lane]
         assert job["uses"] == f"./.github/workflows/_{language}-plugin.yml"
         assert "needs.changes.result == 'success'" in job["if"]
         assert f"needs.changes.outputs.{language} != '[]'" in job["if"]

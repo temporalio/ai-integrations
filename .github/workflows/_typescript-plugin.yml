@@ -84,6 +84,7 @@ jobs:
           case "$DEPS" in
             locked) make sync ;;
             latest) make sync-latest ;;
+            lowest) make sync-lowest ;;
             *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
           esac
       - name: Inject release version

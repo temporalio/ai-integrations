@@ -105,6 +105,13 @@ def test_check_deps_applies_cooldown_without_changing_the_lock(tmp_path: Path, r
                 assert "exclude-newer" in check.stderr
             else:
                 assert "2.0.0" in check.stderr
+            if not recent:
+                # uv records sync-lowest's mode in uv.lock; `--locked` only accepts it if later targets keep it.
+                for target, version in (("sync-latest", "2.0.0"), ("sync-lowest", "1.0.0"),
+                                        ("sync", "1.0.0"), ("sync-latest", "2.0.0")):
+                    result = make(target)
+                    assert result.returncode == 0, target + result.stdout + result.stderr
+                    assert f'name = "cooldown-test"\nversion = "{version}"' in lock.read_text(), target
         finally:
             server.shutdown()
             thread.join(timeout=5)

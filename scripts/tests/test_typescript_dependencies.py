@@ -1,4 +1,4 @@
-"""Exercise pnpm cooldown checks against a local registry without changing the project."""
+"""Exercise pnpm cooldown checks against a local registry without changing the project, and sync-lowest's pins."""
 
 from __future__ import annotations
 
@@ -124,3 +124,17 @@ def test_check_deps_preserves_the_project_and_honors_release_age(
         finally:
             server.shutdown()
             thread.join(timeout=5)
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node is required")
+def test_sync_lowest_pins_each_peer_to_the_lowest_allowed_version(tmp_path: Path) -> None:
+    peers = {"a": "^1.25.1 || ^2.0.0", "b": ">=2.0.0 <2.4.0", "c": "^4.0.0", "d": "~0.22.0", "e": "^2.0.0 || ^1.3.0"}
+    (tmp_path / "package.json").write_text(json.dumps({
+        "name": "fixture", "peerDependencies": peers,
+        "devDependencies": {"a": "^2.0.0", "b": ">=2.0.0 <2.4.0", "c": "^4.1.12", "other": "^1.0.0"},
+    }))
+    subprocess.run(["node", str(REPO / "typescript/_shared/pin-lowest-peers.mjs")], cwd=tmp_path, check=True)
+    package = json.loads((tmp_path / "package.json").read_text())
+    assert package["peerDependencies"] == peers
+    # The dev range's floor wins when it is higher (a, c); a peer without a dev copy gets one (d, e).
+    assert package["devDependencies"] == {"a": "2.0.0", "b": "2.0.0", "c": "4.1.12", "other": "^1.0.0", "d": "0.22.0", "e": "1.3.0"}

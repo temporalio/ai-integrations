@@ -12,7 +12,7 @@ on:
         type: string
         required: true
       deps:
-        description: "locked: uv.lock as committed; latest: uv lock --upgrade"
+        description: "locked: uv.lock as committed; latest: uv lock --upgrade; lowest: lowest allowed direct dependencies"
         type: string
         default: locked
       version:
@@ -96,6 +96,7 @@ jobs:
           case "$DEPS" in
             locked) make sync ;;
             latest) make sync-latest ;;
+            lowest) make sync-lowest ;;
             *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
           esac
       - name: Lint and type-check
