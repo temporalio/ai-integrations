@@ -450,11 +450,11 @@ reset it to before the affected tool call and run it on upgraded workers.
 
 Other tools run directly in the workflow, so they must be deterministic, like
 workflow code. Sync tools run there too, not in a separate thread as they do
-outside Temporal. They run again on every replay, and the Workflow Task waits
-for them: a tool that takes more than two seconds fails the Workflow Task with a
-deadlock error. Tools from packages the plugin passes through the sandbox, such
-as `strands_tools`, are not checked by it; wrap them as activities as described
-above.
+outside Temporal. They run again on every replay. Their combined work in one
+Workflow Task can trigger deadlock detection (two seconds by default), even if
+each tool takes less than two seconds. Tools from packages the plugin passes
+through the sandbox, such as `strands_tools`, are not checked by it; wrap them
+as activities as described above.
 
 **Breaking change:** a run recorded on an earlier version whose sync tool got
 an error can fail replay on this version: if the workflow then acted on what

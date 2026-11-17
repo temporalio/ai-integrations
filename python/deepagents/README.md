@@ -234,16 +234,28 @@ Sync tools, sync graph nodes and routers, LangChain output parsers, and sync
 the workflow, not in a separate thread as LangChain runs them outside Temporal.
 This applies to every workflow in a process that has a worker with the plugin,
 not only Deep Agent runs. LangGraph picks how to run a sync node or router when
-it builds the graph, so build graphs in workflow code: a graph built before the
-worker, outside the sandbox, still fails with `NotImplementedError`. Like other
-workflow code, they run again on every replay, and the Workflow Task waits for
-them: one that takes more than two seconds fails the Workflow Task with a
-deadlock error.
+it builds the graph, so build graphs in workflow code. A graph built before the
+worker, outside the sandbox, still fails with `NotImplementedError`. This
+includes a graph built at import in a module imported with
+`workflow.unsafe.imports_passed_through()`.
+
+Sync functions can compute a result, but cannot wait for a LangGraph task with
+`task(...).result()`: the task needs the Workflow event loop to run, and the
+call raises `InvalidStateError`. Use an async entrypoint or node and
+`await task(...)` instead.
+
+Like other workflow code, sync calls run again on every replay. Their combined
+work in one Workflow Task can trigger deadlock detection (two seconds by
+default), even if each call takes less than two seconds. Move slow work into
+activities.
 While one runs, LangChain runs async callback handlers on a separate thread, as
 it does outside Temporal, so keep them quick and don't call workflow APIs from
 them. Other sync LangChain calls that it would run in a thread, such as a
 sync-only cache, retriever or vector store, or `ShellToolMiddleware`, still fail
-with `NotImplementedError`; run that work in activities.
+with `NotImplementedError`; run that work in activities. If the same Worker
+also uses `LangGraphPlugin`, its executor override currently runs those calls
+inline too; [#629](https://github.com/temporalio/ai-integrations/pull/629)
+narrows that override.
 
 **Breaking change:** a run recorded on an earlier version that caught this
 `NotImplementedError` from a sync tool, output parser, runnable, graph node or

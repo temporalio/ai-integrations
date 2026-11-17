@@ -75,10 +75,8 @@ _install_lock = threading.Lock()
 
 def run_sync_calls_in_workflows() -> None:
     """Rebind the helper in ``_MODULES`` for both Workers and Replayers."""
-    try:
-        from langchain_core.runnables.config import run_in_executor
-    except ImportError:  # LangChain absent on this worker; nothing to run
-        return
+    from langchain_core.runnables.config import run_in_executor
+
     with _install_lock:
         modules = [importlib.import_module(name) for name in _MODULES]
         for module in modules:
