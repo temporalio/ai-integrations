@@ -372,7 +372,7 @@ export function createActivities(
       let streamError: unknown;
 
       const textBlocks = new Map<string, { text: string; providerMetadata: SharedV4ProviderMetadata | undefined }>();
-      const reasoningBlocks = new Map<string, string>();
+      const reasoningBlocks = new Map<string, { text: string; providerMetadata: SharedV4ProviderMetadata | undefined }>();
 
       const reader = streamResult.stream.getReader();
 
@@ -411,19 +411,25 @@ export function createActivities(
             break;
           }
           case 'reasoning-start':
-            reasoningBlocks.set(part.id, '');
+            reasoningBlocks.set(part.id, { text: '', providerMetadata: part.providerMetadata });
             break;
-          case 'reasoning-delta':
-            reasoningBlocks.set(part.id, (reasoningBlocks.get(part.id) ?? '') + part.delta);
+          case 'reasoning-delta': {
+            const block = reasoningBlocks.get(part.id) ?? { text: '', providerMetadata: undefined };
+            block.text += part.delta;
+            block.providerMetadata = part.providerMetadata ?? block.providerMetadata;
+            reasoningBlocks.set(part.id, block);
             break;
-          case 'reasoning-end':
+          }
+          case 'reasoning-end': {
+            const block = reasoningBlocks.get(part.id);
             content.push({
               type: 'reasoning',
-              text: reasoningBlocks.get(part.id) ?? '',
-              providerMetadata: part.providerMetadata,
+              text: block?.text ?? '',
+              providerMetadata: part.providerMetadata ?? block?.providerMetadata,
             });
             reasoningBlocks.delete(part.id);
             break;
+          }
           case 'response-metadata':
             responseMetadata = {
               id: part.id,
