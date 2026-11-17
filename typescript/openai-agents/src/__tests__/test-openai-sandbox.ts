@@ -1,24 +1,41 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { setTracingDisabled, withTrace } from '@openai/agents-core';
-import { WorkflowClient } from '@temporalio/client';
+import { UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';
+import { WorkflowClient, type WorkflowHandle } from '@temporalio/client';
 import { Worker } from '@temporalio/worker';
 import { helpers } from '@temporalio/test-helpers';
 import { OpenAIAgentsPlugin, OpenAIAgentsTraceClientInterceptor, SandboxClientProvider } from '..';
 import { installAgentSdkCollector } from './helpers/openai-agents-spans';
 import { makeTestFunction } from './helpers/test-fn';
 import { FakeModelProvider, handoffResponse, textResponse, toolCallResponse } from './stubs/openai-agents';
-import { FakeSandboxClient, FakeSandboxSession } from './stubs/sandbox-fakes';
 import {
+  FakeSandboxClient,
+  FakeSandboxSession,
+  LifecycleSandboxClient,
+  RootMovingSandboxClient,
+} from './stubs/sandbox-fakes';
+import {
+  approvalPausedQuery,
+  approvalResumeSignal,
   customHandoffSandboxAgentWithoutConfigWorkflow,
   customHandoffSandboxToolWorkflow,
   sandboxAgentWorkflow,
+  sandboxApprovalSequenceWorkflow,
   sandboxApprovalResumeWorkflow,
   sandboxArchiveLimitsWorkflow,
   sandboxClientChangedWorkflow,
   sandboxExecWorkflow,
   sandboxManifestResumeWorkflow,
   sandboxNestedApprovalWorkflow,
+  sandboxNestedRootResumeWorkflow,
   sandboxNoModelWorkflow,
+  sandboxResumeEnvironmentWorkflow,
+  sandboxRootResumeWorkflow,
+  sandboxSavedSessionResumeWorkflow,
   sandboxValidationWorkflow,
+  sandboxWorkerEnvWorkflow,
 } from './workflows/openai-sandbox';
 
 setTracingDisabled(false);
@@ -32,6 +49,16 @@ const PERMITTED_SPAN_DATA_KEYS = new Set(['sessionId', 'port', 'exitCode', 'byte
 
 const MANIFEST_SECRET_VAR = 'OPENAI_AGENTS_TEST_MANIFEST_SECRET';
 const MANIFEST_SECRET = 'sk-approval-resume-sentinel';
+const OTHER_SECRET_VAR = 'OPENAI_AGENTS_TEST_OTHER_SECRET';
+const APPROVAL_VAR = 'OPENAI_AGENTS_TEST_APPROVAL_VALUE';
+const OTHER_APPROVAL_VAR = 'OPENAI_AGENTS_TEST_OTHER_APPROVAL_VALUE';
+
+/** The text of every byte field in `value`, such as the payloads of history events. */
+function recordedText(value: unknown): string[] {
+  if (value instanceof Uint8Array) return [Buffer.from(value).toString('utf8')];
+  if (value === null || typeof value !== 'object') return [];
+  return Object.values(value).flatMap(recordedText);
+}
 
 test('SandboxAgent run exercises the full sandbox lifecycle through Activities', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
@@ -91,7 +118,7 @@ test.serial('applyManifest updates the Workflow-side manifest and survives resum
 });
 
 test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an approval interruption', async (t) => {
-  const { createWorker, executeWorkflow } = helpers(t);
+  const { createWorker, startWorkflow } = helpers(t);
 
   const client = new FakeSandboxClient();
   const worker = await createWorker({
@@ -101,6 +128,7 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
           toolCallResponse('run_command', { cmd: 'echo hello' }),
           textResponse('Done.'),
           toolCallResponse('run_command', { cmd: 'echo hello' }),
+          textResponse('Done.'),
         ]),
         modelParams: { startToCloseTimeout: '30s' },
         sandboxClientProviders: [new SandboxClientProvider('fake', client)],
@@ -113,19 +141,58 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
   try {
     await worker.runUntil(async () => {
       // The approved sandbox tool writes the caller's context object, not a copy rebuilt from JSON.
-      t.is(await executeWorkflow(sandboxApprovalResumeWorkflow), 'Done. writes=sandbox-tool');
-      // Restoring the state fails when the agents given don't have the paused one, and the run fails.
-      const err = await t.throwsAsync(
-        executeWorkflow(sandboxApprovalResumeWorkflow, { args: [true], workflowExecutionTimeout: '20 seconds' })
-      );
-      t.is((err as any)?.cause?.type, 'AgentsWorkflowError');
-      t.regex(String((err as any)?.cause?.message), /not found/);
+      const live = await startWorkflow(sandboxApprovalResumeWorkflow);
+      t.is(await live.result(), 'Done. writes=sandbox-tool');
+      const serialized = await startWorkflow(sandboxApprovalResumeWorkflow, { args: [true] });
+      t.regex(await serialized.result(), /^Done\./);
+      for (const handle of [live, serialized]) {
+        const recorded = recordedText((await handle.fetchHistory()).events).join('\n');
+        t.true(recorded.includes(MANIFEST_SECRET_VAR), 'history records the Worker environment variable name');
+        t.false(recorded.includes(MANIFEST_SECRET), 'history never records its value');
+      }
     });
   } finally {
     delete process.env[MANIFEST_SECRET_VAR];
   }
 
   t.true(client.resumeCalls >= 1, 'the preserved session is re-established through resume()');
+});
+
+test.serial("a resumed sandbox gets the environment of the agent's current manifest, not of the paused state", async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const client = new FakeSandboxClient();
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([
+          toolCallResponse('run_command', { cmd: 'echo hello' }),
+          textResponse('Done.'),
+          toolCallResponse('run_command', { cmd: 'echo hello' }),
+          textResponse('Done.'),
+        ]),
+        modelParams: { startToCloseTimeout: '30s' },
+        sandboxClientProviders: [new SandboxClientProvider('fake', client)],
+        resolvableWorkerEnvVars: [MANIFEST_SECRET_VAR, OTHER_SECRET_VAR],
+      }),
+    ],
+  });
+
+  process.env[MANIFEST_SECRET_VAR] = MANIFEST_SECRET;
+  try {
+    await worker.runUntil(async () => {
+      t.is(await executeWorkflow(sandboxResumeEnvironmentWorkflow, { args: ['changed'] }), 'Done.');
+      t.deepEqual(client.resumeEnvironments.at(-1), {
+        API_KEY: { type: 'temporal.worker-env-value', name: OTHER_SECRET_VAR },
+      });
+      t.is(await executeWorkflow(sandboxResumeEnvironmentWorkflow, { args: ['extra-reference'] }), 'Done.');
+      t.deepEqual(client.resumeEnvironments.at(-1), {
+        API_KEY: { type: 'temporal.worker-env-value', name: MANIFEST_SECRET_VAR },
+      });
+    });
+  } finally {
+    delete process.env[MANIFEST_SECRET_VAR];
+  }
 });
 
 for (const [copied, parentName, rebuilt] of [
@@ -140,7 +207,7 @@ for (const [copied, parentName, rebuilt] of [
 ] as const) {
   // Serial: each case starts a Worker, and starting many at once can starve a slow CI runner.
   test.serial(
-    `A nested approval behind ${copied ? 'a copy of an' : 'an'} asTool() tool in a sandbox run whose parent is named '${parentName}' ${copied ? 'fails the resume' : 'resumes'}${rebuilt ? ' with rebuilt agents' : ''}`,
+    `A nested approval behind ${copied ? 'a copy of an' : 'an'} asTool() tool in a sandbox run whose parent is named '${parentName}' resumes${rebuilt ? ' with rebuilt agents' : ''}`,
     async (t) => {
       const { createWorker, executeWorkflow } = helpers(t);
       const worker = await createWorker({
@@ -159,15 +226,213 @@ for (const [copied, parentName, rebuilt] of [
 
       await worker.runUntil(async () => {
         const result = await executeWorkflow(sandboxNestedApprovalWorkflow, { args: [copied, parentName, rebuilt] });
-        if (copied) {
-          t.regex(result, /^AgentsWorkflowError: The approval for 'confirmAction' of agent 'Nested' can't be resumed/);
-          t.regex(result, /executions=0$/);
-        } else {
-          t.is(result, 'parent done executions=1');
-        }
+        t.is(result, 'parent done executions=1');
       });
     }
   );
+}
+
+// Serial: a Worker installs its allowlist process-wide, so a Worker created alongside would switch it off.
+test.serial(
+  'Approval resumes with a new client keep the live sandbox and run it with the Worker variable the manifest names',
+  async (t) => {
+    const { createWorker, executeWorkflow } = helpers(t);
+    const backend = new LifecycleSandboxClient();
+    const third = toolCallResponse('run_approved', { cmd: 'third' });
+    Object.assign(third.output[0]!, { callId: 'call_fake_run_approved_third' });
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([
+            toolCallResponse('run_now', { cmd: 'first' }),
+            toolCallResponse('run_approved', { cmd: 'second' }),
+            third,
+            textResponse('Done.'),
+          ]),
+          sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
+          resolvableWorkerEnvVars: [APPROVAL_VAR, OTHER_APPROVAL_VAR],
+        }),
+      ],
+    });
+
+    process.env[APPROVAL_VAR] = 'resolved-on-worker';
+    process.env[OTHER_APPROVAL_VAR] = 'other-on-worker';
+    try {
+      const output = await worker.runUntil(
+        executeWorkflow(sandboxApprovalSequenceWorkflow, { args: [[APPROVAL_VAR, APPROVAL_VAR, OTHER_APPROVAL_VAR]] })
+      );
+      t.is(
+        output,
+        [
+          '#1 ran first with KEY=resolved-on-worker',
+          '#1 ran first,second with KEY=resolved-on-worker',
+          '#1 ran first,second,third with KEY=other-on-worker',
+        ].join('\n')
+      );
+      t.deepEqual(
+        backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+        ['create#1', 'delete#1']
+      );
+      t.deepEqual(backend.liveSandboxes(), []);
+    } finally {
+      delete process.env[APPROVAL_VAR];
+      delete process.env[OTHER_APPROVAL_VAR];
+    }
+  }
+);
+
+// Serial: a Worker installs its allowlist process-wide, so a Worker created alongside would switch it off.
+test.serial('An approval resume on a Worker that lost the live sandbox resumes it there and keeps it', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const backend = new LifecycleSandboxClient();
+  const workerWith = (responses: ConstructorParameters<typeof FakeModelProvider>[0]) =>
+    createWorker({
+      maxCachedWorkflows: 0,
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider(responses),
+          sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
+          resolvableWorkerEnvVars: [APPROVAL_VAR],
+        }),
+      ],
+    });
+
+  process.env[APPROVAL_VAR] = 'resolved-on-worker';
+  try {
+    const first = await workerWith([
+      toolCallResponse('run_now', { cmd: 'first' }),
+      toolCallResponse('run_approved', { cmd: 'second' }),
+    ]);
+    const handle = await first.runUntil(async () => {
+      const handle = await startWorkflow(sandboxApprovalSequenceWorkflow, {
+        args: [[APPROVAL_VAR, APPROVAL_VAR], true],
+      });
+      while (!(await handle.query(approvalPausedQuery))) await new Promise((resolve) => setTimeout(resolve, 100));
+      return handle;
+    });
+
+    // A new Worker caches no sessions, as after a restart.
+    const second = await workerWith([textResponse('Done.')]);
+    const output = await second.runUntil(async () => {
+      await handle.signal(approvalResumeSignal);
+      return await handle.result();
+    });
+
+    t.is(output, '#1 ran first with KEY=resolved-on-worker\n#1 ran first,second with KEY=resolved-on-worker');
+    t.deepEqual(
+      backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+      ['create#1', 'resume#1', 'delete#1']
+    );
+    t.deepEqual(backend.liveSandboxes(), []);
+  } finally {
+    delete process.env[APPROVAL_VAR];
+  }
+});
+
+async function workspaceRootActivities(handle: WorkflowHandle): Promise<number> {
+  const { events } = await handle.fetchHistory();
+  return (events ?? []).filter(
+    (event) =>
+      event.activityTaskScheduledEventAttributes?.activityType?.name === 'lifecycle-sandbox-client-workspace-root'
+  ).length;
+}
+
+function rootMovingWorker(
+  createWorker: ReturnType<typeof helpers>['createWorker'],
+  backend: RootMovingSandboxClient,
+  responses = [
+    toolCallResponse('run_now', { cmd: 'first' }),
+    toolCallResponse('run_approved', { cmd: 'second' }),
+    textResponse('Done.'),
+  ]
+) {
+  return createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider(responses),
+        sandboxClientProviders: [new SandboxClientProvider('lifecycle', backend)],
+      }),
+    ],
+  });
+}
+
+for (const resume of ['live', 'runState', 'sessionState'] as const) {
+  test(`An approval resume (${resume}) reuses a sandbox whose backend moved its root`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const backend = new RootMovingSandboxClient();
+    const worker = await rootMovingWorker(createWorker, backend);
+    const handle = await startWorkflow(sandboxRootResumeWorkflow, { args: [resume] });
+    t.is(await worker.runUntil(handle.result()), '#1 ran first with KEY=\n#1 ran first,second with KEY=');
+    t.is(await workspaceRootActivities(handle), 0, 'the Workflow knows the root from creating the sandbox');
+    t.deepEqual(backend.liveSandboxes(), []);
+  });
+}
+
+test('An approval resume in another Workflow asks the Worker once where the backend moved the root', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const backend = new RootMovingSandboxClient();
+  const worker = await rootMovingWorker(createWorker, backend);
+  const [paused, resumed] = await worker.runUntil(async () => {
+    const paused = await startWorkflow(sandboxRootResumeWorkflow, { args: ['pause'] });
+    const resumed = await startWorkflow(sandboxRootResumeWorkflow, { args: ['runState', await paused.result()] });
+    t.is(await resumed.result(), '#1 ran first with KEY=\n#1 ran first,second with KEY=');
+    return [paused, resumed];
+  });
+  t.is(await workspaceRootActivities(paused), 0);
+  t.is(await workspaceRootActivities(resumed), 1);
+  t.deepEqual(
+    backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+    ['create#1', 'resume#1', 'delete#1']
+  );
+});
+
+for (const root of ['/workspace', '/custom']) {
+  test(`A run in another Workflow resumes a saved sessionState with the manifest root at ${root}`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const backend = new RootMovingSandboxClient();
+    const worker = await rootMovingWorker(createWorker, backend, [
+      toolCallResponse('run_now', { cmd: 'first' }),
+      toolCallResponse('run_approved', { cmd: 'second' }),
+      toolCallResponse('run_now', { cmd: 'second' }),
+      textResponse('Done.'),
+    ]);
+    const resumed = await worker.runUntil(async () => {
+      const saved = await (await startWorkflow(sandboxSavedSessionResumeWorkflow, { args: [root] })).result();
+      const resumed = await startWorkflow(sandboxSavedSessionResumeWorkflow, { args: [root, saved] });
+      t.is(await resumed.result(), '#1 ran first,second with KEY=');
+      return resumed;
+    });
+    t.is(await workspaceRootActivities(resumed), 1);
+    t.deepEqual(
+      backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+      ['create#1', 'resume#1', 'delete#1']
+    );
+  });
+}
+
+for (const continued of [false, true]) {
+  const how = continued ? 'after continueAsNew' : 'in another Workflow';
+  test(`A nested asTool() approval resumed ${how} reuses a sandbox whose backend moved its root`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const backend = new RootMovingSandboxClient();
+    const worker = await rootMovingWorker(createWorker, backend, [
+      toolCallResponse('ask_sandbox', { input: 'run' }),
+      toolCallResponse('run_now', { cmd: 'first' }),
+      toolCallResponse('run_approved', { cmd: 'second' }),
+      textResponse('nested done'),
+      textResponse('Done.'),
+    ]);
+    const output = await worker.runUntil(async () => {
+      if (continued) return (await startWorkflow(sandboxNestedRootResumeWorkflow, { args: [undefined, true] })).result();
+      const paused = await startWorkflow(sandboxNestedRootResumeWorkflow, { args: [] });
+      return (await startWorkflow(sandboxNestedRootResumeWorkflow, { args: [await paused.result()] })).result();
+    });
+    t.is(output, 'nested done');
+    t.deepEqual(
+      backend.events.filter((event) => /^(create|resume|delete)/.test(event)),
+      ['create#1', 'resume#1', 'delete#1']
+    );
+  });
 }
 
 test("A SandboxAgent that names no model keeps its capabilities' providerData, such as compaction", async (t) => {
@@ -373,7 +638,8 @@ for (const [kind, event] of [
         t.is(session.execCalls[0]?.cmd, 'echo hello');
       } else {
         // The nested run checks the sandbox config it uses as it starts; the failure is the tool's output.
-        t.regex(output, /An error occurred while running the tool.*runOptions\.sandbox\.client must be created via/);
+        t.notRegex(output, /the nested SandboxAgent started/);
+        t.regex(output, /^An error occurred while running the tool/);
         t.is(client.createCalls.length, 0);
       }
       await Worker.runReplayHistory(
@@ -399,3 +665,38 @@ test('A custom Handoff returning a SandboxAgent without runConfig.sandbox fails 
     t.is((err as any)?.cause?.type, 'AgentsWorkflowError');
   });
 });
+
+// The Unix local sandbox can't run on Windows, where CI also runs.
+(process.platform === 'win32' ? test.skip : test)(
+  'A UnixLocal sandbox resolves a Worker environment reference after create and after an approval resume',
+  async (t) => {
+    const { createWorker, executeWorkflow } = helpers(t);
+    const variable = 'OPENAI_AGENTS_TEST_UNIX_LOCAL_SECRET';
+    process.env[variable] = 'sk-unix-local-sentinel';
+    const workspaceBaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oa-env-ws-'));
+    t.teardown(() => {
+      delete process.env[variable];
+      fs.rmSync(workspaceBaseDir, { recursive: true, force: true });
+    });
+
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([
+            toolCallResponse('run_now', { cmd: 'echo "created=$API_KEY"' }),
+            toolCallResponse('run_approved', { cmd: 'echo "resumed=$API_KEY"' }),
+            textResponse('Done.'),
+          ]),
+          sandboxClientProviders: [new SandboxClientProvider('local', new UnixLocalSandboxClient({ workspaceBaseDir }))],
+          resolvableWorkerEnvVars: [variable],
+        }),
+      ],
+    });
+
+    await worker.runUntil(async () => {
+      const output = await executeWorkflow(sandboxWorkerEnvWorkflow, { args: [variable] });
+      t.regex(output, /created=sk-unix-local-sentinel/);
+      t.regex(output, /resumed=sk-unix-local-sentinel/);
+    });
+  }
+);

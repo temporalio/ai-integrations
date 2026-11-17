@@ -1,7 +1,9 @@
 import type { ToolOutputImage } from '@openai/agents-core';
 import {
   Manifest,
+  cloneManifest,
   isEnvValueReference,
+  serializeEnvValueReference,
   type ExecCommandArgs,
   type ListDirectoryArgs,
   type MaterializeEntryArgs,
@@ -16,7 +18,14 @@ import {
   type ViewImageArgs,
   type WriteStdinArgs,
 } from '@openai/agents-core/sandbox';
-import { deserializeManifest, mergeManifestDelta, mergeManifestEntryDelta } from '@openai/agents-core/sandbox/internal';
+import {
+  assertHostPathGrantsRebound,
+  deserializeManifest,
+  mergeManifestDelta,
+  mergeManifestEntryDelta,
+  serializeHostPathGrantRedactionMetadata,
+} from '@openai/agents-core/sandbox/internal';
+import { ApplicationFailure } from '@temporalio/common';
 
 export class FakeSandboxSession implements SandboxSession {
   state: SandboxSessionState;
@@ -140,6 +149,8 @@ export class FakeSandboxClient implements SandboxClient {
   session: FakeSandboxSession;
   createCalls: SandboxClientCreateArgs[] = [];
   resumeCalls = 0;
+  /** The manifest environment each `resume()` got, with references in their serialized form. */
+  resumeEnvironments: Record<string, unknown>[] = [];
   deleteCalls = 0;
 
   constructor(session?: FakeSandboxSession) {
@@ -158,7 +169,16 @@ export class FakeSandboxClient implements SandboxClient {
   }
 
   async resume(state: SandboxSessionState): Promise<SandboxSession> {
+    assertHostPathGrantsRebound(state);
     this.resumeCalls += 1;
+    this.resumeEnvironments.push(
+      Object.fromEntries(
+        Object.entries(state.manifest.environment).map(([key, value]) => [
+          key,
+          isEnvValueReference(value) ? serializeEnvValueReference(value) : value.value,
+        ])
+      )
+    );
     this.session.state = state;
     return this.session;
   }
@@ -174,9 +194,11 @@ export class FakeSandboxClient implements SandboxClient {
         ([key]) => !state.manifest.environment[key]?.ephemeral && !isEnvValueReference(state.manifest.environment[key])
       )
     );
-    return Object.keys(environment).length > 0
-      ? { workspacePath: state.workspacePath, environment }
-      : { workspacePath: state.workspacePath };
+    return {
+      ...serializeHostPathGrantRedactionMetadata(state),
+      workspacePath: state.workspacePath,
+      ...(Object.keys(environment).length > 0 ? { environment } : {}),
+    };
   }
 
   async deserializeSessionState(state: Record<string, unknown>): Promise<SandboxSessionState> {
@@ -185,5 +207,103 @@ export class FakeSandboxClient implements SandboxClient {
       ...state,
       manifest: deserializeManifest(state.manifest as Record<string, unknown>),
     } as SandboxSessionState;
+  }
+}
+
+type LifecycleSandboxState = SandboxSessionState & { sandboxId: number };
+
+/**
+ * A backend of numbered sandboxes that records each one's lifecycle in `events`. Like a real backend, it
+ * can't use a deleted sandbox.
+ */
+export class LifecycleSandboxClient implements SandboxClient {
+  readonly backendId = 'lifecycle';
+  events: string[] = [];
+  private nextId = 1;
+  private readonly deleted = new Set<number>();
+  private readonly commands = new Map<number, string[]>();
+
+  async create(args?: SandboxClientCreateArgs | Manifest): Promise<SandboxSession> {
+    const manifest = (args instanceof Manifest ? args : args?.manifest) ?? new Manifest();
+    const sandboxId = this.nextId++;
+    this.events.push(`create#${sandboxId}`);
+    this.commands.set(sandboxId, []);
+    const state: LifecycleSandboxState = {
+      manifest: manifest instanceof Manifest ? manifest : new Manifest(manifest),
+      workspaceReady: true,
+      sandboxId,
+    };
+    state.environment = await state.manifest.resolveEnvironment();
+    return this.session(state);
+  }
+
+  async resume(state: SandboxSessionState): Promise<SandboxSession> {
+    const sandboxId = this.use(state as LifecycleSandboxState);
+    this.events.push(`resume#${sandboxId}`);
+    state.environment = await state.manifest.resolveEnvironment();
+    return this.session(state as LifecycleSandboxState);
+  }
+
+  async serializeSessionState(state: SandboxSessionState): Promise<Record<string, unknown>> {
+    return { sandboxId: (state as LifecycleSandboxState).sandboxId };
+  }
+
+  async deserializeSessionState(state: Record<string, unknown>): Promise<SandboxSessionState> {
+    return {
+      manifest: deserializeManifest(state.manifest as Record<string, unknown>),
+      workspaceReady: true,
+      sandboxId: state.sandboxId,
+    } as LifecycleSandboxState;
+  }
+
+  /** The sandboxes created and not deleted. */
+  liveSandboxes(): number[] {
+    return [...this.commands.keys()].filter((sandboxId) => !this.deleted.has(sandboxId));
+  }
+
+  private use(state: LifecycleSandboxState): number {
+    if (this.deleted.has(state.sandboxId)) {
+      throw ApplicationFailure.create({ message: `sandbox #${state.sandboxId} was deleted`, nonRetryable: true });
+    }
+    return state.sandboxId;
+  }
+
+  private session(state: LifecycleSandboxState): SandboxSession {
+    const record = (event: string) => async () => {
+      this.events.push(`${event}#${this.use(state)}`);
+    };
+    return {
+      state,
+      start: async () => {},
+      running: async () => true,
+      stop: record('stop'),
+      shutdown: record('shutdown'),
+      delete: async () => {
+        await record('delete')();
+        this.deleted.add(state.sandboxId);
+      },
+      // Lists the commands this sandbox ran, so the output shows whether its workspace survived.
+      execCommand: async (args: ExecCommandArgs) => {
+        const commands = this.commands.get(this.use(state))!;
+        commands.push(args.cmd);
+        this.events.push(`exec#${state.sandboxId}`);
+        return `#${state.sandboxId} ran ${commands.join(',')} with KEY=${state.environment?.KEY ?? ''}`;
+      },
+    };
+  }
+}
+
+/** Like Daytona and Vercel, moves the default `/workspace` root on create and in a resume's trusted manifest. */
+export class RootMovingSandboxClient extends LifecycleSandboxClient {
+  override async create(args?: SandboxClientCreateArgs | Manifest): Promise<SandboxSession> {
+    const manifest = (args instanceof Manifest ? args : args?.manifest) ?? new Manifest();
+    return super.create(this.resolveTrustedManifestForResume(cloneManifest(manifest)));
+  }
+
+  resolveTrustedManifestForResume(manifest: Manifest): Manifest {
+    if (manifest.root !== '/workspace') return manifest;
+    const moved = cloneManifest(manifest);
+    (moved as { root: string }).root = '/home/lifecycle/workspace';
+    return moved;
   }
 }

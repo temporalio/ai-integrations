@@ -3,18 +3,21 @@ import type {
   SandboxClientCreateArgs,
   SandboxClientOptions,
   SandboxClientResumeOptions,
+  SandboxPreservedSessionReuseOptions,
   SandboxRunConfig,
   SandboxSessionLike,
   SandboxSessionSerializationOptions,
 } from '@openai/agents-core/sandbox';
-import { Manifest } from '@openai/agents-core/sandbox';
+import { Manifest, cloneManifest } from '@openai/agents-core/sandbox';
 import { ApplicationFailure, type ActivityOptions } from '@temporalio/common';
 import { scheduleActivity } from '@temporalio/workflow';
 import {
+  SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX,
   SANDBOX_CLIENT_CREATE_SUFFIX,
   SANDBOX_CLIENT_DELETE_SUFFIX,
   SANDBOX_CLIENT_RESUME_SUFFIX,
   SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX,
+  SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX,
   decodeManifest,
   encodeManifest,
   reviveWorkflowSessionState,
@@ -26,6 +29,7 @@ import {
   type TemporalSandboxSessionState,
 } from '../common/sandbox-activity-types';
 import { TemporalSandboxSession } from './sandbox-session';
+import { getCurrentPluginConfig, workspaceRoots } from './plugin-config-store';
 import { maybeTemporalSpan } from './span-helpers';
 
 /**
@@ -38,12 +42,15 @@ import { maybeTemporalSpan } from './span-helpers';
  */
 export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions, TemporalSandboxSessionState> {
   readonly backendId: string;
+  /** Manifest environment references are resolved by the sandbox backend on the Worker, never in the Workflow. */
+  readonly environmentPreparation = 'client' as const;
   private readonly _name: string;
   private readonly _config: ActivityOptions;
 
   constructor(name: string, config?: ActivityOptions) {
     this._name = name;
-    this.backendId = name;
+    // Upstream has its own handling for some backend ids, such as `docker`, so this one can't be a provider's name.
+    this.backendId = `temporal:${name}`;
     this._config = config ?? { startToCloseTimeout: '5 minutes' };
   }
 
@@ -72,13 +79,33 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
       ],
       this._config
     );
-    return this.wrapSession(result);
+    const session = this.wrapSession(result);
+    if (!manifest || manifest.root === '/workspace') workspaceRoots()[this._name] = session.state.manifest.root;
+    return session;
+  }
+
+  /**
+   * Gives the trusted manifest the root the Worker's backend uses for `/workspace`, so resuming works on
+   * backends that move it, such as Daytona and Vercel.
+   */
+  resolveTrustedManifestForResume(manifest: Manifest): Manifest {
+    const root = getCurrentPluginConfig()?.workspaceRoots?.[this._name];
+    if (manifest.root !== '/workspace' || root === undefined) return manifest;
+    return Object.assign(cloneManifest(manifest), { root });
+  }
+
+  /** Before a resume, asks the Worker where its backend puts `/workspace`, unless this Workflow run already knows it. */
+  async _fetchWorkspaceRoot(clientOptions?: SandboxClientOptions): Promise<void> {
+    const name = `${this._name}${SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX}`;
+    workspaceRoots()[this._name] ??= await scheduleActivity<string>(name, [clientOptions], this._config);
   }
 
   async resume(
     state: TemporalSandboxSessionState,
     options?: SandboxClientResumeOptions
   ): Promise<SandboxSessionLike<TemporalSandboxSessionState>> {
+    const envelope = serializeSessionEnvelope(state.sessionId, state, state.providerState);
+    const { trustedManifest, archiveLimits, clientOptions } = options ?? {};
     const result = await maybeTemporalSpan(
       sandboxSpanName(SANDBOX_CLIENT_RESUME_SUFFIX),
       () =>
@@ -86,8 +113,10 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
           `${this._name}${SANDBOX_CLIENT_RESUME_SUFFIX}`,
           [
             {
-              state: serializeSessionEnvelope(state.sessionId, state, state.providerState),
-              archiveLimits: options?.archiveLimits,
+              state: envelope,
+              trustedManifest: trustedManifest && encodeManifest(trustedManifest),
+              archiveLimits,
+              clientOptions,
             },
           ],
           this._config
@@ -165,6 +194,34 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
       providerState: (providerState ?? {}) as Record<string, unknown>,
       manifest: decodeManifest(manifest as EncodedManifest),
     };
+  }
+
+  /**
+   * Asks a Worker whether upstream may reuse a session a paused run kept live. The Worker applies its
+   * backend's own check and, on reuse with a `trustedManifest`, refreshes the session's environment from it.
+   */
+  async canReusePreservedOwnedSession(
+    state: TemporalSandboxSessionState,
+    options?: SandboxPreservedSessionReuseOptions
+  ): Promise<boolean> {
+    const { trustedManifest, clientOptions, revalidateManifestEntries } = options ?? {};
+    return maybeTemporalSpan(
+      sandboxSpanName(SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX),
+      () =>
+        scheduleActivity<boolean>(
+          `${this._name}${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`,
+          [
+            {
+              state: serializeSessionEnvelope(state.sessionId, state, state.providerState),
+              trustedManifest: trustedManifest && encodeManifest(trustedManifest),
+              clientOptions,
+              revalidateManifestEntries,
+            },
+          ],
+          this._config
+        ),
+      { sessionId: state.sessionId }
+    );
   }
 
   private wrapSession(result: SandboxSessionResult): TemporalSandboxSession {

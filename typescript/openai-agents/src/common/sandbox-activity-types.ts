@@ -27,6 +27,8 @@ export const SANDBOX_CLIENT_CREATE_SUFFIX = '-sandbox-client-create';
 export const SANDBOX_CLIENT_RESUME_SUFFIX = '-sandbox-client-resume';
 export const SANDBOX_CLIENT_DELETE_SUFFIX = '-sandbox-client-delete';
 export const SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX = '-sandbox-client-serialize-session-state';
+export const SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX = '-sandbox-client-can-reuse-preserved-owned-session';
+export const SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX = '-sandbox-client-workspace-root';
 export const SANDBOX_SESSION_START_SUFFIX = '-sandbox-session-start';
 export const SANDBOX_SESSION_RUNNING_SUFFIX = '-sandbox-session-running';
 export const SANDBOX_SESSION_STOP_SUFFIX = '-sandbox-session-stop';
@@ -114,7 +116,9 @@ export interface SandboxCreateSessionInput {
 
 export interface SandboxResumeSessionInput {
   state: SerializedSandboxSessionState;
+  trustedManifest?: EncodedManifest;
   archiveLimits?: SandboxArchiveLimits | null;
+  clientOptions?: Record<string, unknown>;
 }
 
 export interface SandboxSessionStateInput {
@@ -123,6 +127,12 @@ export interface SandboxSessionStateInput {
 
 export interface SandboxSerializeSessionStateInput extends SandboxSessionStateInput {
   options?: SandboxSessionSerializationOptions;
+}
+
+export interface SandboxCanReusePreservedOwnedSessionInput extends SandboxSessionStateInput {
+  trustedManifest?: EncodedManifest;
+  clientOptions?: Record<string, unknown>;
+  revalidateManifestEntries?: boolean;
 }
 
 export interface SandboxLifecycleInput extends SandboxSessionStateInput {
@@ -368,6 +378,18 @@ export function serializeSessionEnvelope(
     ...(state.exposedPorts ? { exposedPorts: state.exposedPorts } : {}),
     providerState,
   };
+}
+
+/**
+ * `trustedManifest`'s environment, path grants and mount command allowlist replace the persisted ones, so a
+ * stale or altered RunState can't pick what the Worker resolves.
+ */
+export function withTrustedManifest(
+  envelope: SerializedSandboxSessionState,
+  trustedManifest: EncodedManifest
+): SerializedSandboxSessionState {
+  const { environment, extraPathGrants, remoteMountCommandAllowlist } = trustedManifest;
+  return { ...envelope, manifest: { ...envelope.manifest, environment, extraPathGrants, remoteMountCommandAllowlist } };
 }
 
 /** Revives the Workflow-side session state, with a live `Manifest` for the run loop. */
