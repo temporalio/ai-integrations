@@ -32,8 +32,9 @@ STRANDS_INTERRUPT_TYPE = "StrandsInterrupt"
 # side (TemporalModel.stream), because Strands recovers from it by reducing the
 # conversation; the others reach the workflow as an ActivityError. Strands' agent
 # loop also raises MaxTokensReachedException and StructuredOutputException in
-# Workflow code, where this converter doesn't see them; StrandsPlugin registers
-# them in workflow_failure_exception_types so they fail the Workflow.
+# Workflow code. When one escapes the Workflow, AgentLoopErrorInterceptor turns it
+# into a retryable ApplicationError before it gets here, so the Workflow retry
+# policy decides whether another run starts.
 _TERMINAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
     MaxTokensReachedException,
     ContextWindowOverflowException,
