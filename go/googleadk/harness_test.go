@@ -18,10 +18,12 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/nexus-rpc/sdk-go/nexus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 
@@ -221,6 +223,10 @@ type runInput struct {
 	// root agent that answers instead of the model: it calls this tool, then
 	// ends the turn.
 	CallToolFromCallback string
+	// KeepRunError makes the workflow return the events it got before an error
+	// from runner.Run, with that error in runResult.RunError, instead of
+	// failing with it.
+	KeepRunError bool
 }
 
 // runResult is the serializable output of agentRunWorkflow.
@@ -232,10 +238,22 @@ type runResult struct {
 	Authors              []string
 	// Errors holds the error messages of the run's events.
 	Errors []string
+	// ErrorCodes holds the error codes of the run's events.
+	ErrorCodes []string
+	// RunError is the error runner.Run returned, with runInput.KeepRunError.
+	RunError *runError
 	// StateFlag carries a session-state value a test workflow read back after the
 	// run (used by the in-workflow state-mutation regression test). Empty when
 	// unused.
 	StateFlag string
+}
+
+// runError describes an error runner.Run returned. Type and NonRetryable are
+// those of the Temporal ApplicationError in its chain, if it has one.
+type runError struct {
+	Message      string
+	Type         string
+	NonRetryable bool
 }
 
 // summaryFnCalled is flipped by the custom summary function installed when
@@ -265,6 +283,7 @@ type agentBuild struct {
 	subAgents      []agent.Agent
 	requestModel   *string
 	callTool       string
+	keepRunError   bool
 	// sessionService overrides the default in-memory session service. Tests that
 	// need to inspect session state/events after the run (state mutation,
 	// continue-as-new) supply their own and read it back via ExportSession.
@@ -375,7 +394,15 @@ func runAgent(ctx workflow.Context, b agentBuild) (runResult, error) {
 	var res runResult
 	for ev, rerr := range r.Run(adkCtx, userID, sessionID, msg, runCfg) {
 		if rerr != nil {
-			return res, rerr
+			if !b.keepRunError {
+				return res, rerr
+			}
+			res.RunError = &runError{Message: rerr.Error()}
+			var appErr *temporal.ApplicationError
+			if errors.As(rerr, &appErr) {
+				res.RunError.Type, res.RunError.NonRetryable = appErr.Type(), appErr.NonRetryable()
+			}
+			return res, nil
 		}
 		collectEvent(&res, ev)
 	}
@@ -390,6 +417,9 @@ func collectEvent(res *runResult, ev *session.Event) {
 	res.Authors = append(res.Authors, ev.Author)
 	if ev.ErrorMessage != "" {
 		res.Errors = append(res.Errors, ev.ErrorMessage)
+	}
+	if ev.ErrorCode != "" {
+		res.ErrorCodes = append(res.ErrorCodes, ev.ErrorCode)
 	}
 	if ev.Content == nil {
 		return
@@ -504,12 +534,91 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 		subAgents:      subAgents,
 		requestModel:   in.RequestModel,
 		callTool:       in.CallToolFromCallback,
+		keepRunError:   in.KeepRunError,
 	})
 }
 
 // ----------------------------------------------------------------------------
 // Test helpers.
 // ----------------------------------------------------------------------------
+
+// runNatively runs root with ADK's runner and no Temporal, and returns its
+// events, folded as runAgent folds them, and the error runner.Run returned.
+// Where an outcome depends on the ADK release, a test compares the workflow
+// run with this one instead of naming releases.
+func runNatively(t *testing.T, root agent.Agent, userMessage string) (runResult, error) {
+	t.Helper()
+	r, err := runner.New(runner.Config{
+		AppName:           "test-app",
+		Agent:             root,
+		SessionService:    session.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	require.NoError(t, err)
+	var res runResult
+	msg := genai.NewContentFromText(userMessage, genai.RoleUser)
+	for ev, rerr := range r.Run(t.Context(), "user-1", "session-1", msg, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
+		if rerr != nil {
+			return res, rerr
+		}
+		collectEvent(&res, ev)
+	}
+	return res, nil
+}
+
+// nativeAssistant is the root agent runAgent builds, on a model that runs in
+// the test process instead of the InvokeModel Activity.
+func nativeAssistant(t *testing.T, llm model.LLM) agent.Agent {
+	t.Helper()
+	root, err := llmagent.New(llmagent.Config{
+		Name:        "assistant",
+		Description: "root assistant",
+		Model:       llm,
+		Instruction: "be helpful",
+	})
+	require.NoError(t, err)
+	return root
+}
+
+// remoteCallErrorIsReturned reports how this ADK release ends a remote A2A
+// call the remote agent refuses, without Temporal: true when runner.Run
+// returns the error, as from ADK v2.8.0, and false when the run yields an
+// error event instead, as with ADK v2.6.0 to v2.7.1.
+func remoteCallErrorIsReturned(t *testing.T) bool {
+	t.Helper()
+	url, _ := startA2AServer(t, a2aServer{Reply: a2aReply(nil, a2a.ErrInvalidParams)})
+	remote, err := remoteagent.NewA2A(remoteagent.A2AConfig{
+		Name:              "remote",
+		AgentCardProvider: remoteagent.NewAgentCardProvider(url),
+	})
+	require.NoError(t, err)
+	res, err := runNatively(t, remote, "hello")
+	if err != nil {
+		require.Empty(t, res.Errors, "ADK returned the error and also yielded an error event")
+		return true
+	}
+	require.Len(t, res.Errors, 1, "ADK neither returned the error nor yielded an error event")
+	return false
+}
+
+// requireRemoteCallError checks that the error of a failed remote A2A call
+// reached the workflow as this ADK release delivers it. With returned (see
+// remoteCallErrorIsReturned), runner.Run returned it, as a non-retryable
+// A2AError. Otherwise one error event carries it.
+func requireRemoteCallError(t *testing.T, res runResult, returned bool, want string) {
+	t.Helper()
+	if !returned {
+		require.Nil(t, res.RunError, "ADK turns the failed call into an error event")
+		require.Len(t, res.Errors, 1, "ADK turns the failed call into an error event")
+		assert.Contains(t, res.Errors[0], want)
+		return
+	}
+	require.Empty(t, res.Errors, "ADK returns the failed call's error from the run")
+	require.NotNil(t, res.RunError, "ADK returns the failed call's error from the run")
+	assert.Contains(t, res.RunError.Message, want)
+	assert.Equal(t, googleadk.ErrorTypeA2A, res.RunError.Type)
+	assert.True(t, res.RunError.NonRetryable, "the error must be non-retryable; got %s", res.RunError.Message)
+}
 
 // warnLog keeps the messages of the warnings logged to it.
 type warnLog struct {

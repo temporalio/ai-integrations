@@ -176,16 +176,26 @@ func (e errStubGeminiAPI) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // TestGeminiModelErrorIsNonRetryable drives a real ADK gemini model whose backend
 // returns HTTP 400, or HTTP 200 with no candidates, which is how the Gemini API
-// answers a blocked prompt. It verifies the plugin classifies the genai APIError
-// and ADK's "empty response" as non-retryable, and the workflow fails fast (the
-// model Activity is attempted exactly once, not retried).
+// answers a blocked prompt. The run must end as it does without Temporal, after
+// exactly one model Activity attempt. Where ADK returns an error, the plugin
+// classifies it as non-retryable and the workflow fails fast: the genai
+// APIError and, before ADK v2.8.0, the "empty response" ADK returns for a reply
+// with no candidates. From ADK v2.8.0 that reply is a response, and the run's
+// events carry the block reason as their error code.
 func TestGeminiModelErrorIsNonRetryable(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		stub errStubGeminiAPI
+		// wantCodes are the error codes of the run's events when ADK returns
+		// the reply as a response.
+		wantCodes []string
 	}{
 		{name: "http 400", stub: errStubGeminiAPI{status: http.StatusBadRequest, body: `{"error":{"code":400,"message":"invalid argument","status":"INVALID_ARGUMENT"}}`}},
-		{name: "blocked prompt", stub: errStubGeminiAPI{status: http.StatusOK, body: `{"promptFeedback":{"blockReason":"SAFETY"}}`}},
+		{
+			name:      "blocked prompt",
+			stub:      errStubGeminiAPI{status: http.StatusOK, body: `{"promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"blocked for safety"}}`},
+			wantCodes: []string{"SAFETY"},
+		},
 		{name: "empty reply", stub: errStubGeminiAPI{status: http.StatusOK, body: `{"usageMetadata":{"promptTokenCount":3}}`}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -195,6 +205,9 @@ func TestGeminiModelErrorIsNonRetryable(t *testing.T) {
 					HTTPClient: &http.Client{Transport: tc.stub},
 				})
 			}
+			llm, err := geminiFactory(t.Context(), "gemini-2.5-flash")
+			require.NoError(t, err)
+			native, nativeErr := runNatively(t, nativeAssistant(t, llm), "hi")
 
 			var s testsuite.WorkflowTestSuite
 			env, counter := newEnv(t, &s, googleadk.Config{
@@ -207,10 +220,19 @@ func TestGeminiModelErrorIsNonRetryable(t *testing.T) {
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
-			err := env.GetWorkflowError()
-			require.Error(t, err)
-			assert.True(t, googleadk.IsNonRetryable(err), "the model error must be non-retryable; got %v", err)
-			// A non-retryable error is not retried: exactly one model Activity attempt.
+			err = env.GetWorkflowError()
+			if nativeErr != nil {
+				require.Error(t, err)
+				assert.True(t, googleadk.IsNonRetryable(err), "the model error must be non-retryable; got %v", err)
+			} else {
+				require.NoError(t, err)
+				var res runResult
+				require.NoError(t, env.GetWorkflowResult(&res))
+				assert.Equal(t, native, res, "the run must end as it does without Temporal")
+				assert.Equal(t, tc.wantCodes, res.ErrorCodes)
+			}
+			// Neither an error nor a response is retried: exactly one model
+			// Activity attempt.
 			assert.Equal(t, 1, counter.get(googleadk.InvokeModelActivityName))
 		})
 	}
