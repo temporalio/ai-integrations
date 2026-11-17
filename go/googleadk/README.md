@@ -271,7 +271,8 @@ outside Temporal. To use another model, build the agent with
   - A zero `StartToCloseTimeout` falls back to one minute, and with no
     `RetryPolicy` Temporal retries without limit. A call that fails with an HTTP
     status follows the rule under **Typed failures**. An A2A error the remote
-    agent answers with is not retried; ADK turns it into an error event. A send
+    agent answers with is not retried. Before ADK 2.8.0, ADK turns it into an
+    error event; from 2.8.0, the run returns it as an error. A send
     that times out or fails on the network is retried, which sends the message
     again and starts another remote task, so set a `StartToCloseTimeout` longer
     than the remote agent takes to answer. The same happens when the Worker
@@ -314,10 +315,11 @@ outside Temporal. To use another model, build the agent with
   errors have. A custom `model.LLM` can expose its status the same way.
   A streamed call whose chunks could not all be published fails with
   `googleadk.StreamError` (see [Streaming](#streaming)).
-  A non-streamed Gemini reply with no candidates, which is how Gemini answers a
-  blocked prompt, fails at once as a non-retryable `googleadk.ModelError`, like
-  a permanent `4xx`: ADK returns it as `empty response`, with no status. With
-  `WithStreaming`, ADK returns the block as a response with an `ErrorCode`
+  Before ADK 2.8.0, a non-streamed Gemini reply with no candidates, which is how
+  Gemini answers a blocked prompt, fails at once as a non-retryable
+  `googleadk.ModelError`, like a permanent `4xx`: ADK returns it as
+  `empty response`, with no status. With `WithStreaming`, and from ADK 2.8.0
+  without it too, ADK returns the block as a response with an `ErrorCode`
   instead. Other errors without a status are retried.
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries

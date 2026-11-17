@@ -205,7 +205,8 @@ func (i bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (
 
 // TestRemoteSubAgentErrorNotRetried proves an A2A call the remote agent
 // refuses, or a client the card cannot make, fails without retries, and the
-// turn ends as it would without Temporal: ADK turns the error into an event.
+// turn ends as it would without Temporal: before ADK 2.8.0, ADK turns the error
+// into an event; from 2.8.0, the run returns it.
 // Malformed network cards fail in ResolveA2AAgentCard; client and remote-call
 // errors fail in SendA2AMessage.
 // The last case is the control for the HTTP 401 ones: the caller's
@@ -335,15 +336,22 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
-			require.NoError(t, env.GetWorkflowError())
-			var res runResult
-			require.NoError(t, env.GetWorkflowResult(&res))
 			assert.Equal(t, 1, counter.get(googleadk.ResolveA2AAgentCardActivityName), "card resolution must not be retried")
 			if tc.cardFails {
 				assert.Zero(t, counter.get(googleadk.SendA2AMessageActivityName), "a rejected card must not reach SendA2AMessage")
 			} else {
 				assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
 			}
+			if tc.wantError != "" && googleadk.ADKAtLeast(t, "v2.8.0") {
+				// google/adk-go#1740
+				err := env.GetWorkflowError()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantError)
+				return
+			}
+			require.NoError(t, env.GetWorkflowError())
+			var res runResult
+			require.NoError(t, env.GetWorkflowResult(&res))
 			if tc.wantError != "" {
 				require.Len(t, res.Errors, 1, "ADK turns the failed call into an error event")
 				assert.Contains(t, res.Errors[0], tc.wantError)
@@ -531,7 +539,8 @@ func restA2AErrorBody(err error) string {
 // server's final events kept apart and its partial ones dropped. It also
 // proves an error after the first events comes back with those events instead
 // of a retry that would send the message again: ADK keeps them, records the
-// error and cancels the unfinished task, as without Temporal.
+// error and cancels the unfinished task, as without Temporal. From ADK 2.8.0,
+// the run returns the error instead of recording it as an event.
 func TestRemoteSubAgentStreaming(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -635,10 +644,18 @@ func TestRemoteSubAgentStreaming(t *testing.T) {
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
+			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName))
+			assert.Equal(t, tc.wantCancel, counter.get(googleadk.CancelA2ATaskActivityName), "ADK cancels a task the run leaves unfinished")
+			if tc.wantError != "" && googleadk.ADKAtLeast(t, "v2.8.0") {
+				// google/adk-go#1740
+				err := env.GetWorkflowError()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantError)
+				return
+			}
 			require.NoError(t, env.GetWorkflowError())
 			var res runResult
 			require.NoError(t, env.GetWorkflowResult(&res))
-			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName))
 			assert.Equal(t, tc.wantTexts, res.Texts)
 			if tc.wantError != "" {
 				require.Len(t, res.Errors, 1)
@@ -646,7 +663,6 @@ func TestRemoteSubAgentStreaming(t *testing.T) {
 			} else {
 				assert.Empty(t, res.Errors)
 			}
-			assert.Equal(t, tc.wantCancel, counter.get(googleadk.CancelA2ATaskActivityName), "ADK cancels a task the run leaves unfinished")
 		})
 	}
 }

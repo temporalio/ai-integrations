@@ -71,7 +71,8 @@ func nonPartial(parts ...*genai.Part) *model.LLMResponse {
 // model over a stubbed SSE transport and proves the aggregate handed back into
 // the workflow carries the message exactly once, keeps the function-call part
 // (so the tool actually runs in-workflow), and preserves metadata — including
-// ModelVersion, which the terminal response omits — from earlier chunks.
+// ModelVersion, which the terminal response omits before ADK 2.8.0 — from
+// earlier chunks.
 func TestAggregateResponsesGeminiTerminalAuthoritative(t *testing.T) {
 	llm, err := gemini.NewModel(t.Context(), "gemini-2.5-flash", &genai.ClientConfig{
 		APIKey:     "stub-key",
@@ -93,7 +94,8 @@ func TestAggregateResponsesGeminiTerminalAuthoritative(t *testing.T) {
 
 	// Pin the iterator shape the fix is built on: every raw chunk is yielded as
 	// a Partial, then the model's own aggregate arrives LAST as a non-partial
-	// response already carrying all the parts — but no ModelVersion.
+	// response already carrying all the parts. Before ADK 2.8.0 it has no
+	// ModelVersion (google/adk-go#2070).
 	require.Len(t, responses, 3)
 	assert.True(t, responses[0].Partial)
 	assert.Equal(t, "Checking weather. ", concatText(responses[0].Content))
@@ -104,8 +106,12 @@ func TestAggregateResponsesGeminiTerminalAuthoritative(t *testing.T) {
 	assert.False(t, responses[2].Partial)
 	require.NotNil(t, responses[2].Content)
 	require.Len(t, responses[2].Content.Parts, 2)
-	assert.Empty(t, responses[2].ModelVersion,
-		"gemini's terminal aggregate omits ModelVersion; folding metadata must keep it alive")
+	if ADKAtLeast(t, "v2.8.0") {
+		assert.Equal(t, "gemini-2.5-flash", responses[2].ModelVersion)
+	} else {
+		assert.Empty(t, responses[2].ModelVersion,
+			"gemini's terminal aggregate omits ModelVersion; folding metadata must keep it alive")
+	}
 
 	// The aggregate: message once, function call kept, metadata preserved.
 	require.NotNil(t, agg)

@@ -334,6 +334,12 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 // With ReuseIterator under a sequential root, ADK runs the kept iterator again
 // with the same RunConfig.
 func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
+	wantNotFound := "not found"
+	if googleadk.ADKAtLeast(t, "v2.8.0") {
+		// ADK 2.8.0 answers an unknown tool call the way adk-python does
+		// (google/adk-go#2316).
+		wantNotFound = "no tool with that name is available"
+	}
 	for _, tc := range []mcpHitlCase{
 		{},
 		{ReuseMessage: true},
@@ -358,7 +364,7 @@ func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
 
 			require.True(t, res.Paused, "agent must pause on a pending confirmation")
 			assert.EqualValues(t, 0, mcpGuardedRuns.Load(), "an excluded tool must not run after approval")
-			assert.Contains(t, res.ResumedGuardedError, "not found",
+			assert.Contains(t, res.ResumedGuardedError, wantNotFound,
 				"ADK must not find the excluded tool when it resumes the call")
 			assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName),
 				"only the pending pass reaches the worker")
