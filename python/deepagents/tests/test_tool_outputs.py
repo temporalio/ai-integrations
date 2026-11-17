@@ -24,6 +24,10 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents import DeepAgentsPlugin, tool_as_activity
 
 
+REPLAY_MAJOR = 0
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
+
+
 @tool(response_format="content_and_artifact")
 async def artifact_tool(query: str) -> tuple[str, dict]:
     """Return a retrieval result and its source record."""
@@ -211,12 +215,7 @@ async def test_pre_context_history_keeps_tool_results_and_uuid_sequence() -> Non
     # Recorded with the unchanged tool adapter at e9ade41b plus #605-#608,
     # on Temporal Server 1.32.2, using LegacyToolCallWorkflow above. The observer's
     # Activity type checks the old result, and its id checks the next RNG draw.
-    history = (
-        Path(__file__).parent
-        / "histories"
-        / "0.x"
-        / "wrapped_tool_before_call_context.json"
-    )
+    history = _HISTORIES / "wrapped_tool_before_call_context.json"
     await Replayer(
         workflows=[LegacyToolCallWorkflow], plugins=[DeepAgentsPlugin()]
     ).replay_workflow(

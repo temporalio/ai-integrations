@@ -8,12 +8,14 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 from temporalio import workflow
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
+from tests.helpers.deepagents import count_scheduled_activities
 
 with workflow.unsafe.imports_passed_through():
     from langchain_core.callbacks import AsyncCallbackManager
@@ -22,7 +24,12 @@ with workflow.unsafe.imports_passed_through():
     from langchain_core.tools import tool
 
     from temporalio.contrib.workflow_streams import WorkflowStream
-    from temporalio.deepagents import DeepAgentsPlugin, TemporalModel, tool_as_activity
+    from temporalio.deepagents import (
+        DeepAgentsPlugin,
+        TemporalModel,
+        _serde,
+        tool_as_activity,
+    )
     from temporalio.deepagents.testing import FakeModel
 
 
@@ -246,3 +253,51 @@ async def test_call_configuration_is_scoped_to_one_call(
     else:
         assert out["first"]["configurable"] == {"tenant": "first"}
         assert not out["second"]["configurable"]
+
+
+@workflow.defn
+class LegacyConfiguredCacheWorkflow:
+    @workflow.run
+    async def run(self, carried_cache: dict) -> str:
+        _serde.set_result_cache(carried_cache)
+        reply = await TemporalModel(model="fake:cached").ainvoke(
+            [HumanMessage(content="cached prompt")],
+            config={"tags": ["configured"], "configurable": {"tenant": "acme"}},
+        )
+        return str(reply.content)
+
+
+async def test_model_config_keeps_a_legacy_carried_cache_hit(
+    env: WorkflowEnvironment,
+) -> None:
+    # This key was computed on e9ade41b, before configuration was forwarded.
+    # The model key contains messages and tool schemas, not RunnableConfig.
+    carried = {
+        "af328a41aaa46015c06cfe7e0243759e66d3b2b1848fac64e598faa9a3b3d9e7": _serde.dump_object(
+            AIMessage(content="carried response")
+        )
+    }
+    queue = f"legacy-model-config-{uuid.uuid4()}"
+    plugin = DeepAgentsPlugin(model_provider=lambda _: FakeModel(["uncached response"]))
+    # Record the pre-retirement path without a patch marker, then replay it
+    # with the real patch decision. A miss would add an Activity to history.
+    with patch(
+        "temporalio.deepagents.workflow._legacy_result_cache", return_value=True
+    ):
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[LegacyConfiguredCacheWorkflow],
+            plugins=[plugin],
+        ):
+            handle = await env.client.start_workflow(
+                LegacyConfiguredCacheWorkflow.run,
+                carried,
+                id=str(uuid.uuid4()),
+                task_queue=queue,
+            )
+            assert await handle.result() == "carried response"
+    assert not (await count_scheduled_activities(handle))["deepagents.invoke_model"]
+    await Replayer(
+        workflows=[LegacyConfiguredCacheWorkflow], plugins=[plugin]
+    ).replay_workflow(await handle.fetch_history())
