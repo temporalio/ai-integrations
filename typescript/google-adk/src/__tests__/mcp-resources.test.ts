@@ -345,7 +345,8 @@ test.serial('a failing server gives up on the default bound, is skipped, and is 
   // The fixture sets no `maximumAttempts`, so this is the default the resource
   // Activities apply. Without it the Activity would retry forever on a
   // status-less MCP error and the turn below would never return.
-  const logged = mock.method(Runtime.instance().logger, 'log');
+  // SDK logger wrappers can forward warn() without going through their log().
+  const logged = mock.method(Runtime.instance().logger, 'warn');
   t.teardown(() => logged.mock.restore());
   const text = await withWorker(env, { taskQueue, plugins: [makePlugin()] }, () =>
     env.client.workflow.execute(mcpLoadResourceAgentFailing, { taskQueue, workflowId })
@@ -354,7 +355,7 @@ test.serial('a failing server gives up on the default bound, is skipped, and is 
   t.is(text, 'resource=missing; listed=none');
   // Each skip is logged with the Activity's own error, not just "Activity task failed".
   // At least once each: a retried Workflow Task may log again.
-  const messages = logged.mock.calls.map((call) => String(call.arguments[1]));
+  const messages = logged.mock.calls.map((call) => String(call.arguments[0]));
   const listSkips = messages.filter((message) => message.startsWith('Failed to list MCP resources: '));
   const readSkips = messages.filter((message) => message.startsWith("Failed to read MCP resource '"));
   t.true(listSkips.length > 0 && readSkips.length > 0, messages.join('\n'));
