@@ -127,8 +127,15 @@ def called_by_other_code(frame: Any) -> bool:
     return frame.f_code is run_in_executor_from_other_code.__code__
 
 
+def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
+
+
 def test_only_langchain_calls_run_inline() -> None:
+    from langchain_core.caches import BaseCache
     from langchain_core.runnables.config import run_in_executor
+    from langchain_core.tools import StructuredTool
 
     from temporalio.langgraph._interceptor import (
         _called_by_langchain,
@@ -148,6 +155,34 @@ def test_only_langchain_calls_run_inline() -> None:
         assert loop.run_until_complete(run_in_executor(None, lambda: 42)) == 42
         with pytest.raises(NotImplementedError):
             loop.run_in_executor(None, lambda: "unrelated")
+
+        # The helper's call for a sync tool runs inline, but its call for I/O,
+        # such as a cache's lookup, still fails.
+        tool = StructuredTool.from_function(func=add)
+        assert loop.run_until_complete(tool.ainvoke({"a": 1, "b": 2})) == 3
+
+        class SyncOnlyCache(BaseCache):
+            # Like LangChain's SQLite cache, it has no async methods of its own.
+            def lookup(self, prompt: str, llm_string: str) -> Any:
+                return None
+
+            def update(self, prompt: str, llm_string: str, return_val: Any) -> None:
+                pass
+
+            def clear(self, **kwargs: Any) -> None:
+                pass
+
+        with pytest.raises(NotImplementedError):
+            loop.run_until_complete(SyncOnlyCache().alookup("prompt", "llm"))
+
+        # LangGraph's own sync steps run inline: a node and a router.
+        g = StateGraph(State)
+        g.add_node("increment", increment)
+        g.add_edge(START, "increment")
+        g.add_conditional_edges("increment", route)
+        assert loop.run_until_complete(g.compile().ainvoke({"count": 0})) == {
+            "count": 3
+        }
 
         # Another plugin, such as Deep Agents, adds its caller to the same list.
         _run_inline_when_called_by(loop, called_by_other_code)

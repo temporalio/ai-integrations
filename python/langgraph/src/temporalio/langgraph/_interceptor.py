@@ -87,8 +87,10 @@ def _run_langchain_sync_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
     LangGraph runs a sync routing function (``add_conditional_edges``) with
     LangChain's ``run_in_executor`` helper, which calls
     ``loop.run_in_executor``. The workflow event loop has no threads and raised
-    ``NotImplementedError``, so the run never finished. Only calls from that
-    helper run inline; any other ``run_in_executor`` call fails as before.
+    ``NotImplementedError``, so the run never finished. Only the helper's calls
+    for tools, output parsers, runnables and LangGraph steps run inline; any
+    other ``run_in_executor`` call, including the helper's calls for caches,
+    retrievers and other I/O, fails as before.
     """
     _run_inline_when_called_by(loop, _called_by_langchain)
 
@@ -126,9 +128,33 @@ def _run_inline_when_called_by(
         callers.append(is_caller)
 
 
+# The modules whose calls to LangChain's run_in_executor helper run inline:
+# tools, output parsers, RunnableLambda and other runnables with only a sync
+# invoke, and LangGraph's steps. LangGraph runs a sync router's helper call as
+# its own task, so the caller is the event loop's handle in asyncio.events; any
+# helper call started as its own task runs inline too. The helper's other
+# callers, such as caches, retrievers and vector stores, do I/O and fail as
+# before.
+_INLINE_LANGCHAIN_CALLER_PACKAGES = (
+    "langchain_core.tools.",
+    "langchain_core.output_parsers.",
+)
+_INLINE_LANGCHAIN_CALLER_MODULES = (
+    "langchain_core.runnables.base",
+    "langgraph._internal._runnable",
+    "asyncio.events",
+)
+
+
 def _called_by_langchain(frame: FrameType) -> bool:
-    """Whether the caller is ``langchain_core.runnables.config.run_in_executor``."""
-    return (
+    """Whether LangChain's ``run_in_executor`` helper runs a tool, parser or graph step."""
+    if not (
         frame.f_code.co_name == "run_in_executor"
         and frame.f_globals.get("__name__") == "langchain_core.runnables.config"
+    ):
+        return False
+    caller = frame.f_back
+    module = caller.f_globals.get("__name__", "") if caller is not None else ""
+    return module in _INLINE_LANGCHAIN_CALLER_MODULES or module.startswith(
+        _INLINE_LANGCHAIN_CALLER_PACKAGES
     )
