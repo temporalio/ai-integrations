@@ -18,8 +18,10 @@ classifiers = [
 ]
 dependencies = [
   "temporalio>=1.36.0,<2",
-  "langgraph>=1.2.0",
-  "langchain-core>=0.3.0",
+  # The plugin imports langgraph._internal and langgraph.pregel._algo, which a new major can move.
+  "langgraph>=1.2.0,<2",
+  # langgraph 1.2.0 requires langchain-core>=1.4.0,<2.
+  "langchain-core>=1.4.0,<2",
     "pydantic>=2.7.4,<3",
   "typing-extensions>=4.2.0,<5",
 ]
