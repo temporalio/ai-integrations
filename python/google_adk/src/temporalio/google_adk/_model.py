@@ -1,4 +1,3 @@
-import asyncio
 from collections.abc import AsyncGenerator, Callable, Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ import temporalio.workflow
 from temporalio import activity, workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
+from temporalio.google_adk._heartbeat_decorator import auto_heartbeater
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.workflow import ActivityConfig
 
@@ -80,36 +80,6 @@ def _stream_publish_error(err: Exception, model: str, topic: str) -> Application
         type="googleadk.StreamError",
         non_retryable=non_retryable,
     )
-
-
-@contextmanager
-def _heartbeating() -> Generator[None, None, None]:
-    """Heartbeat every half heartbeat timeout while the block runs.
-
-    A cancel reaches a running Activity only in a heartbeat's response. The
-    beats come from a timer, not from the model's responses, so a call shorter
-    than half the timeout sends none. ``call_later`` starts the timer at once,
-    where a task would wait for the block's first await, so code that blocks
-    the event loop before then only delays the first beat.
-    """
-    timeout = activity.info().heartbeat_timeout
-    if not timeout:
-        yield
-        return
-    interval = timeout.total_seconds() / 2
-    loop = asyncio.get_running_loop()
-    handle: asyncio.TimerHandle
-
-    def beat() -> None:
-        nonlocal handle
-        handle = loop.call_later(interval, beat)
-        activity.heartbeat()
-
-    handle = loop.call_later(interval, beat)
-    try:
-        yield
-    finally:
-        handle.cancel()
 
 
 def _new_llm(llm_request: LlmRequest, model_name: str | None) -> BaseLlm:
@@ -183,6 +153,7 @@ class TemporalLlmRequest(LlmRequest):
 
 
 @activity.defn
+@auto_heartbeater
 async def invoke_model(llm_request: TemporalLlmRequest) -> list[LlmResponse]:
     """Activity that invokes an LLM model.
 
@@ -197,16 +168,15 @@ async def invoke_model(llm_request: TemporalLlmRequest) -> list[LlmResponse]:
         ApplicationError: Non-retryable, if no model name is provided or the
             model cannot be built.
     """
-    with _heartbeating():
-        request = llm_request.unwrap()
-        llm = _new_llm(request, llm_request.temporal_model_name)
-        request = _request_for_llm(request, llm, llm_request.temporal_model_name)
+    request = llm_request.unwrap()
+    llm = _new_llm(request, llm_request.temporal_model_name)
+    request = _request_for_llm(request, llm, llm_request.temporal_model_name)
 
-        with _classify_model_errors():
-            return [
-                response
-                async for response in llm.generate_content_async(llm_request=request)
-            ]
+    with _classify_model_errors():
+        return [
+            response
+            async for response in llm.generate_content_async(llm_request=request)
+        ]
 
 
 @dataclass
@@ -220,6 +190,7 @@ class StreamingInvokeInput:
 
 
 @activity.defn
+@auto_heartbeater
 async def invoke_model_streaming(
     input: StreamingInvokeInput,
 ) -> list[LlmResponse]:
@@ -241,39 +212,38 @@ async def invoke_model_streaming(
         ApplicationError: Of type ``googleadk.StreamError``, if the responses
             could not all be published.
     """
-    with _heartbeating():
-        llm_request = input.llm_request
-        llm = _new_llm(llm_request, input.model_name)
-        llm_request = _request_for_llm(llm_request, llm, input.model_name)
+    llm_request = input.llm_request
+    llm = _new_llm(llm_request, input.model_name)
+    llm_request = _request_for_llm(llm_request, llm, input.model_name)
 
-        responses: list[LlmResponse] = []
+    responses: list[LlmResponse] = []
 
-        stream = WorkflowStreamClient.from_within_activity(
-            batch_interval=input.streaming_batch_interval,
-        )
-        events = stream.topic(input.streaming_topic, type=LlmResponse)
-        # The stream's exit sends the last batch, and raises the error of a batch the
-        # background flush failed to send. Either way subscribers did not get every
-        # response, so the call fails instead of returning as if they had.
-        # A model error, or the Activity's cancellation, stays the call's error.
-        await stream.__aenter__()
-        try:
-            with _classify_model_errors():
-                async for response in llm.generate_content_async(
-                    llm_request=llm_request, stream=True
-                ):
-                    responses.append(response)
-                    events.publish(response)
-        except BaseException:
-            with suppress(Exception):
-                await stream.__aexit__(None, None, None)
-            raise
-        try:
+    stream = WorkflowStreamClient.from_within_activity(
+        batch_interval=input.streaming_batch_interval,
+    )
+    events = stream.topic(input.streaming_topic, type=LlmResponse)
+    # The stream's exit sends the last batch, and raises the error of a batch the
+    # background flush failed to send. Either way subscribers did not get every
+    # response, so the call fails instead of returning as if they had.
+    # A model error, or the Activity's cancellation, stays the call's error.
+    await stream.__aenter__()
+    try:
+        with _classify_model_errors():
+            async for response in llm.generate_content_async(
+                llm_request=llm_request, stream=True
+            ):
+                responses.append(response)
+                events.publish(response)
+    except BaseException:
+        with suppress(Exception):
             await stream.__aexit__(None, None, None)
-        except Exception as err:
-            raise _stream_publish_error(err, llm.model, input.streaming_topic) from err
+        raise
+    try:
+        await stream.__aexit__(None, None, None)
+    except Exception as err:
+        raise _stream_publish_error(err, llm.model, input.streaming_topic) from err
 
-        return responses
+    return responses
 
 
 def _with_serializable_response_schema(llm_request: LlmRequest) -> LlmRequest:
