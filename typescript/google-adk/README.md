@@ -56,7 +56,7 @@ dependency for ADK fixes the layout for both, with no import order to mind:
 packageExtensions:
   '@google/adk':
     dependencies:
-      uuid: '^11'
+      uuid: '^11.1.1'
 ```
 
 Under such a layout the Worker's bundler also resolves `@temporalio/workflow`
@@ -64,6 +64,20 @@ from your project, so declare it as a dependency of your application.
 
 Provide Gemini credentials to the Worker as usual, for example with
 `GOOGLE_GENAI_API_KEY`, `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
+
+### UUID dependency security
+
+The plugin requires `uuid >=11.1.1` on the 11.x line, which includes the fix for
+[GHSA-w5hq-g745-h8pq](https://github.com/uuidjs/uuid/security/advisories/GHSA-w5hq-g745-h8pq).
+ADK also installs a separate, vulnerable `uuid` 9 through `gaxios` 6.7.1. In the
+committed ADK 2.2.0 development lock, it comes through both
+`@google-cloud/vertexai` → `google-auth-library` 9 and
+`@opentelemetry/resource-detector-gcp` → `gcp-metadata` 6.
+
+Raising the plugin's direct UUID minimum does not remove these nested copies.
+[Issue #580](https://github.com/temporalio/ai-integrations/issues/580) tracks the
+remaining upstream dependency updates; the committed lock still triggers that
+UUID security alert until compatible upstream releases are available.
 
 ### Upgrading ADK
 
