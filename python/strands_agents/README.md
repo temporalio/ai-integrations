@@ -450,7 +450,11 @@ reset it to before the affected tool call and run it on upgraded workers.
 
 Other tools run directly in the workflow, so they must be deterministic, like
 workflow code. Sync tools run there too, not in a separate thread as they do
-outside Temporal.
+outside Temporal. They run again on every replay, and the Workflow Task waits
+for them: a tool that takes more than two seconds fails the Workflow Task with a
+deadlock error. Tools from packages the plugin passes through the sandbox, such
+as `strands_tools`, are not checked by it; wrap them as activities as described
+above.
 
 ## Hooks
 
@@ -542,20 +546,20 @@ class MyWorkflow:
 
 ### Tool-body interrupts
 
-A `@strands.tool` function can raise `InterruptException(Interrupt(...))` directly. The agent stops with the interrupt, the workflow handles the resume the same way as for hooks.
+A `@strands.tool(context=True)` function can call `tool_context.interrupt(name, reason=...)`. The agent stops with the interrupt, and the workflow handles the resume the same way as for hooks. On resume, Strands runs the tool again, and the call returns the response instead of raising.
 
 ```python
 from strands import tool
-from strands.interrupt import Interrupt, InterruptException
+from strands.types.tools import ToolContext
 
-@tool
-def delete_thing(name: str) -> str:
-    raise InterruptException(
-        Interrupt(id=f"delete:{name}", name="approval", reason=f"delete {name}?")
-    )
+@tool(context=True)
+def delete_thing(name: str, tool_context: ToolContext) -> str:
+    if tool_context.interrupt("approval", reason=f"delete {name}?") != "approve":
+        return f"kept {name}"
+    return f"deleted {name}"
 ```
 
-The same works from an `activity_as_tool`-wrapped activity. The plugin's failure converter preserves the `Interrupt` payload across the activity boundary, so `AgentResult.interrupts` is populated just like the in-workflow case:
+An `activity_as_tool`-wrapped activity has no `tool_context`, so it raises `InterruptException(Interrupt(...))` instead. The plugin's failure converter preserves the `Interrupt` payload across the activity boundary, so `AgentResult.interrupts` is populated just like the in-workflow case:
 
 ```python
 from strands.interrupt import Interrupt, InterruptException
