@@ -12,6 +12,7 @@ from typing import Any
 from agents.sandbox.errors import SandboxError
 from agents.sandbox.session.sandbox_client import BaseSandboxClient
 from agents.sandbox.session.sandbox_session import SandboxSession
+from agents.sandbox.session.sandbox_session_state import SandboxSessionState
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -23,6 +24,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     CreateSessionArgs,
     ExecArgs,
     HydrateWorkspaceArgs,
+    OnHostSandboxSessionState,
     PersistWorkspaceArgs,
     PersistWorkspaceResult,
     PtyExecStartArgs,
@@ -75,6 +77,11 @@ def _sandbox_activity_scope(
 _ON_HOST_BACKEND_IDS = frozenset({"docker", "unix_local"})
 
 
+def _recorded_task_queue(state: SandboxSessionState) -> str | None:
+    """The Task Queue ``state`` records, if any."""
+    return state.task_queue if isinstance(state, OnHostSandboxSessionState) else None
+
+
 class _SandboxProviderBase(abc.ABC):
     """The Activities shared by both sandbox client providers."""
 
@@ -93,8 +100,25 @@ class _SandboxProviderBase(abc.ABC):
         """Return the live session the arguments' state names."""
         ...
 
-    def _session_result(self, session: SandboxSession) -> SessionResult:
-        return SessionResult(state=session.state, supports_pty=session.supports_pty())
+    def _created_task_queue(self) -> str | None:
+        """The Task Queue that a session the running create Activity makes records in its state."""
+        return None
+
+    def _session_result(
+        self, session: SandboxSession, task_queue: str | None
+    ) -> SessionResult:
+        """Return the session's state, recording ``task_queue`` in it when given one."""
+        state = session.state
+        if task_queue is not None:
+            state = OnHostSandboxSessionState.model_validate(
+                {
+                    **state.model_dump(mode="json"),
+                    "type": "temporal_on_host",
+                    "backend_type": state.type,
+                    "task_queue": task_queue,
+                }
+            )
+        return SessionResult(state=state, supports_pty=session.supports_pty())
 
     @abc.abstractmethod
     def _own_activities(
@@ -121,7 +145,7 @@ class _SandboxProviderBase(abc.ABC):
                     options=args.client_options,
                 )
                 self._sessions[str(session.state.session_id)] = session
-                return self._session_result(session)
+                return self._session_result(session, self._created_task_queue())
 
         # -- Session-level operations (I/O and lifecycle) --
 
@@ -219,14 +243,14 @@ class _SandboxProviderBase(abc.ABC):
             with _sandbox_activity_scope(resolvable):
                 session = await self._session(args)
                 await session.start()
-                return self._session_result(session)
+                return self._session_result(session, _recorded_task_queue(args.state))
 
         @activity.defn(name=f"{prefix}-sandbox_session_stop")
         async def session_stop(args: StopArgs) -> SessionResult:
             with _sandbox_activity_scope(resolvable):
                 session = await self._session(args)
                 await session.stop()
-                return self._session_result(session)
+                return self._session_result(session, _recorded_task_queue(args.state))
 
         return [
             create_session,
@@ -315,7 +339,7 @@ class SandboxClientProvider(_SandboxProviderBase):
             with _sandbox_activity_scope(resolvable):
                 session = await self._client.resume(args.state)
                 self._sessions[str(session.state.session_id)] = session
-                return self._session_result(session)
+                return self._session_result(session, None)
 
         @activity.defn(name=f"{prefix}-sandbox_client_delete")
         async def delete_session(args: StopArgs) -> None:

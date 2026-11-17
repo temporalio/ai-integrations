@@ -1,6 +1,7 @@
 """Tests for sandbox validation in TemporalOpenAIRunner."""
 
 import asyncio
+import dataclasses
 import io
 import json
 import socket
@@ -86,6 +87,7 @@ from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
 )
 from temporalio.openai_agents.sandbox._temporal_sandbox_session import (
     TemporalSandboxSession,
+    _session_activity_config,
 )
 from temporalio.openai_agents.sandbox._temporal_worker_env_value import (
     _resolvable_worker_env_vars,
@@ -97,6 +99,8 @@ from temporalio.openai_agents.testing import (
     TestModelProvider,
 )
 from temporalio.openai_agents.workflow import temporal_sandbox_client
+from temporalio.testing import ActivityEnvironment
+from temporalio.worker import Worker, WorkerTuner
 from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
 
@@ -1597,11 +1601,11 @@ def test_sandbox_client_provider_refuses_docker_and_unix_local(
     OnHostSandboxClientProvider("local", client_type())
 
 
-def test_an_on_host_providers_task_queue_is_name_at_worker_name():
+def test_an_on_host_providers_task_queue_is_the_main_queue_slash_name_at_worker_name():
     named = OnHostSandboxClientProvider("docker", _MockSandboxClient(), worker_name="a")
-    assert named.task_queue == "docker@a"
+    assert named._task_queue_for("agents") == "agents/docker@a"
     unnamed = OnHostSandboxClientProvider("docker", _MockSandboxClient())
-    assert unnamed.task_queue == f"docker@{socket.gethostname()}"
+    assert unnamed._task_queue_for("agents") == f"agents/docker@{socket.gethostname()}"
 
 
 class _BackendSessionState(SandboxSessionState):
@@ -1621,17 +1625,33 @@ def _lost_state() -> OnHostSandboxSessionState:
         manifest=Manifest(),
         snapshot=NoopSnapshot(id=str(uuid.uuid4())),
         backend_type="test",
-        task_queue="mock@gone",
+        task_queue="main/mock@gone",
     )
 
 
 def _on_host_activities(
     client: _MockSandboxClient,
 ) -> tuple[OnHostSandboxClientProvider, dict[str, Any]]:
+    """The provider's Activities, each run where it runs on a Worker on ``main``.
+
+    Create runs on the main queue and every other Activity on the extra Worker's.
+    """
     provider = OnHostSandboxClientProvider("mock", client, worker_name="box")
+
+    def on_its_queue(name: str, act: Callable[..., Any]) -> Callable[..., Any]:
+        env = ActivityEnvironment()
+        env.info = dataclasses.replace(
+            env.info,
+            task_queue="main"
+            if name == "mock-sandbox_client_create"
+            else "main/mock@box",
+        )
+        return lambda *args: env.run(act, *args)
+
     return provider, {
-        act.__temporal_activity_definition.name: act  # type: ignore[attr-defined, union-attr]
+        name: on_its_queue(name, act)
         for act in provider._get_activities(())
+        for name in [act.__temporal_activity_definition.name]  # type: ignore[attr-defined, union-attr]
     }
 
 
@@ -1652,17 +1672,21 @@ async def test_an_on_host_provider_returns_its_own_state_with_its_task_queue():
     session = _backend_session()
     _, acts = _on_host_activities(_MockSandboxClient(session))
 
+    created = await acts["mock-sandbox_client_create"](_CREATE_ARGS)
     results = [
-        await acts["mock-sandbox_client_create"](_CREATE_ARGS),
-        await acts["mock-sandbox_session_start"](StartArgs(state=session.state)),
-        await acts["mock-sandbox_session_stop"](StopArgs(state=session.state)),
+        created,
+        await acts["mock-sandbox_session_start"](StartArgs(state=created.state)),
+        await acts["mock-sandbox_session_stop"](StopArgs(state=created.state)),
+        await acts["mock-sandbox_client_resume"](
+            ResumeSessionArgs(state=created.state)
+        ),
     ]
 
     for result in results:
         # As the Workflow receives it.
         state = SessionResult.model_validate(result.model_dump(mode="json")).state
         assert isinstance(state, OnHostSandboxSessionState)
-        assert state.task_queue == "mock@box"
+        assert state.task_queue == "main/mock@box"
         assert state.session_id == session.state.session_id
         assert state.backend_type == "test_backend"
         assert state.model_dump()["container_id"] == "backend-container"
@@ -1710,7 +1734,7 @@ async def test_an_on_host_provider_rebuilds_a_session_it_does_not_hold_with_the_
     assert "task_queue" not in rebuilt
     assert "backend_type" not in rebuilt
     assert isinstance(resumed.state, OnHostSandboxSessionState)
-    assert resumed.state.task_queue == "mock@box"
+    assert resumed.state.task_queue == "main/mock@box"
 
 
 async def test_an_on_host_provider_does_not_resume_a_state_it_did_not_return():
@@ -1762,7 +1786,7 @@ async def test_an_operation_other_than_resume_on_a_session_an_on_host_provider_d
 
     assert err.value.type == "SandboxLost"
     assert err.value.non_retryable
-    assert "'mock@gone'" in str(err.value)
+    assert "'main/mock@gone'" in str(err.value)
     assert client.resume_calls == 0
 
 
@@ -1795,8 +1819,17 @@ _ON_HOST_STATE = OnHostSandboxSessionState(
     manifest=Manifest(),
     snapshot=NoopSnapshot(id="on-host"),
     backend_type="test",
-    task_queue="mock@box",
+    task_queue="main/mock@box",
 )
+
+
+def test_a_session_state_without_a_task_queue_keeps_the_activity_config():
+    def config() -> ActivityConfig:
+        return ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=30), task_queue="configured"
+        )
+
+    assert _session_activity_config(config(), _make_state()) == config()
 
 
 @pytest.mark.parametrize("on_host", [True, False], ids=["on-host", "no-queue"])
@@ -1855,7 +1888,7 @@ async def test_the_workflow_sends_a_sessions_operations_to_the_task_queue_in_its
     assert len(operations) == 13
     for name, kwargs in operations:
         assert kwargs["start_to_close_timeout"] == timedelta(seconds=30), name
-        assert kwargs.get("task_queue") == ("mock@box" if on_host else None), name
+        assert kwargs.get("task_queue") == ("main/mock@box" if on_host else None), name
 
 
 async def test_an_on_host_state_keeps_the_backends_fields_and_its_task_queue_through_a_saved_run_state():
@@ -1875,7 +1908,7 @@ async def test_an_on_host_state_keeps_the_backends_fields_and_its_task_queue_thr
 
     for kept in (restored, carried):
         assert isinstance(kept, OnHostSandboxSessionState)
-        assert kept.task_queue == "mock@box"
+        assert kept.task_queue == "main/mock@box"
         assert kept.backend_type == "test_backend"
         assert kept.model_dump()["container_id"] == "backend-container"
 
@@ -2175,7 +2208,7 @@ async def test_every_operation_on_an_on_host_sandbox_runs_on_the_worker_that_cre
         f"#1 ran {','.join(commands[: i + 1])}" for i in range(len(commands))
     )
     assert queues[0] == ("lifecycle-sandbox_client_create", task_queue)
-    assert {queue for _, queue in queues[1:]} == {"lifecycle@A"}
+    assert {queue for _, queue in queues[1:]} == {f"{task_queue}/lifecycle@A"}
     assert first.events == ["create#1", *["exec#1"] * len(commands), "delete#1"]
     assert second.events == []
 
@@ -2225,6 +2258,97 @@ async def test_a_restart_in_the_middle_of_a_step_loses_an_on_host_sandbox_and_de
     assert failures[0].application_failure_info.non_retryable
 
 
+async def test_two_workers_built_from_one_client_each_serve_their_own_on_host_sandboxes(
+    client: Client,
+):
+    backend = _LifecycleSandboxClient()
+    shared = _on_host_client(client, backend, "shared")
+    task_queues = [f"{uuid.uuid4()}-first", f"{uuid.uuid4()}-second"]
+
+    async def run(task_queue: str) -> tuple[str, list[tuple[str, str]]]:
+        handle = await shared.start_workflow(
+            OnHostOperationsWorkflow.run,
+            ["a"],
+            id=f"on-host-shared-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        await _until_created(handle)
+        await handle.signal(OnHostOperationsWorkflow.proceed)
+        return await handle.result(), await _scheduled_queues(handle)
+
+    async with (
+        new_worker(shared, OnHostOperationsWorkflow, task_queue=task_queues[0]),
+        new_worker(shared, OnHostOperationsWorkflow, task_queue=task_queues[1]),
+    ):
+        results = await asyncio.gather(*(run(q) for q in task_queues))
+
+    assert sorted(output for output, _ in results) == ["#1 ran a", "#2 ran a"]
+    for (_, queues), task_queue in zip(results, task_queues):
+        assert queues[0] == ("lifecycle-sandbox_client_create", task_queue)
+        assert {queue for _, queue in queues[1:]} == {f"{task_queue}/lifecycle@shared"}
+
+
+async def _extra_worker_of(monkeypatch: pytest.MonkeyPatch, main: Worker) -> Worker:
+    """Run ``main`` briefly and return the extra Worker it started."""
+    created: list[Worker] = []
+
+    class _Recorded(Worker):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(
+        "temporalio.openai_agents._temporal_openai_agents.Worker", _Recorded
+    )
+    async with main:
+        while not created:
+            await asyncio.sleep(0.01)
+    [extra] = created
+    return extra
+
+
+async def test_an_on_host_providers_extra_worker_takes_its_main_workers_activity_setup(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    plugin_client = _on_host_client(client, _LifecycleSandboxClient(), "box")
+    task_queue = str(uuid.uuid4())
+    limited = await _extra_worker_of(
+        monkeypatch,
+        Worker(
+            plugin_client,
+            task_queue=task_queue,
+            workflows=[OnHostOperationsWorkflow],
+            max_concurrent_activities=3,
+            max_activities_per_second=7,
+            max_task_queue_activities_per_second=11,
+            graceful_shutdown_timeout=timedelta(seconds=2),
+        ),
+    )
+    config = limited.config()
+    assert limited.task_queue == f"{task_queue}/lifecycle@box"
+    assert config.get("max_concurrent_activities") == 3
+    assert config.get("tuner") is None
+    assert config.get("max_activities_per_second") == 7
+    assert config.get("max_task_queue_activities_per_second") == 11
+    assert config.get("graceful_shutdown_timeout") == timedelta(seconds=2)
+
+    tuner = WorkerTuner.create_resource_based(
+        target_memory_usage=0.8, target_cpu_usage=0.9
+    )
+    tuned = await _extra_worker_of(
+        monkeypatch,
+        Worker(
+            plugin_client,
+            task_queue=str(uuid.uuid4()),
+            workflows=[OnHostOperationsWorkflow],
+            tuner=tuner,
+        ),
+    )
+    assert tuned.config().get("tuner") is tuner
+    assert tuned.config().get("max_concurrent_activities") is None
+
+
 @pytest.mark.parametrize("how", ["in_place", "continue_as_new"])
 async def test_an_on_host_sandbox_comes_back_after_an_approval_pause(
     client: Client, how: str
@@ -2260,10 +2384,13 @@ async def test_an_on_host_sandbox_comes_back_after_an_approval_pause(
         "exec#1",
         "delete#1",
     ]
-    assert ("lifecycle-sandbox_client_resume", "lifecycle@paused") in queues
+    assert (
+        "lifecycle-sandbox_client_resume",
+        f"{task_queue}/lifecycle@paused",
+    ) in queues
     for name, queue in queues:
         if name.startswith("lifecycle-") and name != "lifecycle-sandbox_client_create":
-            assert queue == "lifecycle@paused", name
+            assert queue == f"{task_queue}/lifecycle@paused", name
 
 
 async def test_an_on_host_sandbox_paused_across_a_worker_restart_comes_back_through_the_backends_resume(
@@ -2308,9 +2435,10 @@ async def test_an_on_host_sandbox_paused_across_a_worker_restart_comes_back_thro
         "exec#1",
         "delete#1",
     ]
-    assert ("lifecycle-sandbox_client_resume", "lifecycle@restarted") in (
-        await _scheduled_queues(handle)
-    )
+    assert (
+        "lifecycle-sandbox_client_resume",
+        f"{task_queue}/lifecycle@restarted",
+    ) in await _scheduled_queues(handle)
 
 
 # ── JsonSafeBytes lossless serialization tests ──

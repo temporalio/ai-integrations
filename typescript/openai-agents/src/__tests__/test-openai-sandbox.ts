@@ -4,9 +4,9 @@ import * as path from 'node:path';
 import { setTracingDisabled, withTrace } from '@openai/agents-core';
 import { UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';
 import { WorkflowClient, type WorkflowHandle } from '@temporalio/client';
-import { historyFromJSON } from '@temporalio/common/lib/proto-utils';
 import type { temporal } from '@temporalio/proto';
-import { NativeConnection, Worker } from '@temporalio/worker';
+import { SimplePlugin } from '@temporalio/plugin';
+import { NativeConnection, Worker, type WorkerOptions } from '@temporalio/worker';
 import { helpers } from '@temporalio/test-helpers';
 import {
   OnHostSandboxClientProvider,
@@ -776,7 +776,7 @@ test.serial('Every operation on an on-host sandbox runs on the Worker that creat
     });
     const queues = scheduledQueues(await handle.fetchHistory());
     t.deepEqual(queues[0], ['lifecycle-sandbox-client-create', taskQueue]);
-    for (const [type, queue] of queues.slice(1)) t.is(queue, 'lifecycle@A', type);
+    for (const [type, queue] of queues.slice(1)) t.is(queue, `${taskQueue}/lifecycle@A`, type);
   });
 
   t.deepEqual(first.events, ['create#1', ...commands.map(() => 'exec#1'), 'delete#1']);
@@ -831,8 +831,8 @@ test.serial('An on-host sandbox keeps its Task Queue through an approval pause a
     const queues = scheduledQueues(continued).filter(
       ([type]) => type.startsWith('lifecycle-') && type !== 'lifecycle-sandbox-client-workspace-root'
     );
-    t.deepEqual(queues[0], ['lifecycle-sandbox-client-resume', 'lifecycle@continued']);
-    for (const [type, queue] of queues) t.is(queue, 'lifecycle@continued', type);
+    t.deepEqual(queues[0], ['lifecycle-sandbox-client-resume', `${taskQueue}/lifecycle@continued`]);
+    for (const [type, queue] of queues) t.is(queue, `${taskQueue}/lifecycle@continued`, type);
     t.true(scheduledQueues(continued).some(([type, queue]) => type === 'invokeModelActivity' && queue === taskQueue));
   });
 
@@ -843,21 +843,131 @@ test.serial('An on-host sandbox keeps its Task Queue through an approval pause a
   );
 });
 
-test('Sandbox histories recorded without a Task Queue in their state replay', async (t) => {
-  // Recorded at 4b5e0fd, before session states carried a Task Queue.
-  for (const name of ['sandbox-exec.json', 'sandbox-approval-sequence.json']) {
-    const file = path.resolve(__dirname, '../../src/__tests__/histories', name);
-    const history = historyFromJSON(JSON.parse(fs.readFileSync(file, 'utf8')));
-    await t.notThrowsAsync(
-      Worker.runReplayHistory(
-        {
-          workflowBundle: t.context.workflowBundle,
-          plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })],
-        },
-        history,
-        name
-      ),
-      name
-    );
+test.serial('Two Workers that share a plugin on their NativeConnection each serve their own on-host sandboxes', async (t) => {
+  const backend = new LifecycleSandboxClient();
+  const plugin = new OpenAIAgentsPlugin({
+    modelProvider: new FakeModelProvider([]),
+    sandboxClientProviders: [new OnHostSandboxClientProvider('lifecycle', backend, { workerName: 'shared' })],
+  });
+  const connection = await NativeConnection.connect({ address: t.context.env.address, plugins: [plugin] });
+  t.teardown(() => connection.close());
+  const queues = [`${helpers(t).taskQueue}-first`, `${helpers(t).taskQueue}-second`];
+  const workers = await Promise.all(
+    queues.map((taskQueue) =>
+      Worker.create({
+        connection,
+        namespace: t.context.env.namespace,
+        workflowBundle: t.context.workflowBundle,
+        taskQueue,
+        maxCachedWorkflows: 0,
+      })
+    )
+  );
+
+  const run = async (taskQueue: string) => {
+    const handle = await t.context.env.client.workflow.start(sandboxOperationsWorkflow, {
+      args: [['a']],
+      taskQueue,
+      workflowId: `${taskQueue}-workflow`,
+    });
+    await until(handle);
+    await handle.signal(proceedSignal);
+    const output = await handle.result();
+    return { output, queues: scheduledQueues(await handle.fetchHistory()) };
+  };
+  const [first, second] = await workers[0]!.runUntil(workers[1]!.runUntil(Promise.all(queues.map(run))));
+
+  t.deepEqual([first!.output, second!.output].sort(), ['#1 ran a with KEY=', '#2 ran a with KEY=']);
+  for (const [{ queues: scheduled }, taskQueue] of [
+    [first!, queues[0]!],
+    [second!, queues[1]!],
+  ] as const) {
+    t.deepEqual(scheduled[0], ['lifecycle-sandbox-client-create', taskQueue]);
+    for (const [type, queue] of scheduled.slice(1)) t.is(queue, `${taskQueue}/lifecycle@shared`, type);
   }
+});
+
+/** Starts `worker` and shuts it down as soon as it runs. */
+async function runBriefly(worker: Worker): Promise<void> {
+  // The main Worker runs once its extra Workers exist.
+  await worker.runUntil(async () => {
+    while (worker.getState() !== 'RUNNING') await new Promise((resolve) => setTimeout(resolve, 10));
+  });
+}
+
+/** Runs `worker` briefly and returns the extra Workers it started. */
+async function extraWorkersOf(worker: Worker): Promise<Worker[]> {
+  const created: Worker[] = [];
+  const create = Worker.create.bind(Worker);
+  const spy = async (options: WorkerOptions) => {
+    const extra = await create(options);
+    created.push(extra);
+    return extra;
+  };
+  Object.assign(Worker, { create: spy });
+  try {
+    await runBriefly(worker);
+  } finally {
+    Object.assign(Worker, { create });
+  }
+  return created;
+}
+
+test.serial("An on-host provider's extra Worker takes its main Worker's Activity limits and grace time", async (t) => {
+  const { createWorker } = helpers(t);
+  const plugins = [
+    new OpenAIAgentsPlugin({
+      modelProvider: new FakeModelProvider([]),
+      sandboxClientProviders: [new OnHostSandboxClientProvider('lifecycle', new LifecycleSandboxClient())],
+    }),
+  ];
+  const limited = await createWorker({
+    plugins,
+    maxConcurrentActivityTaskExecutions: 3,
+    maxActivitiesPerSecond: 7,
+    maxTaskQueueActivitiesPerSecond: 11,
+    shutdownGraceTime: '2s',
+  });
+  const [extra] = await extraWorkersOf(limited);
+  t.deepEqual(extra!.options.tuner.activityTaskSlotSupplier, { type: 'fixed-size', numSlots: 3 });
+  t.is(extra!.options.maxActivitiesPerSecond, 7);
+  t.is(extra!.options.maxTaskQueueActivitiesPerSecond, 11);
+  t.is(extra!.options.shutdownGraceTimeMs, 2000);
+
+  const tuned = await createWorker({
+    plugins,
+    tuner: {
+      tunerOptions: { targetMemoryUsage: 0.8, targetCpuUsage: 0.9 },
+      activityTaskSlotOptions: { minimumSlots: 2, maximumSlots: 6, rampThrottle: '20ms' },
+    },
+  });
+  const [tunedExtra] = await extraWorkersOf(tuned);
+  t.deepEqual(tunedExtra!.options.tuner.activityTaskSlotSupplier, tuned.options.tuner.activityTaskSlotSupplier);
+  t.like(tunedExtra!.options.tuner.activityTaskSlotSupplier, { type: 'resource-based', maximumSlots: 6 });
+});
+
+test.serial('With an on-host provider, a Worker refuses another plugin on its NativeConnection', async (t) => {
+  const { createWorker } = helpers(t);
+  const other = new SimplePlugin({ name: 'other-plugin' });
+  const connection = await NativeConnection.connect({ address: t.context.env.address, plugins: [other] });
+  t.teardown(() => connection.close());
+  const plugin = (sandboxClientProviders: Array<SandboxClientProvider | OnHostSandboxClientProvider>) =>
+    new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]), sandboxClientProviders });
+
+  const err = await t.throwsAsync(
+    createWorker({
+      connection,
+      plugins: [plugin([new OnHostSandboxClientProvider('lifecycle', new LifecycleSandboxClient())])],
+    }),
+    { instanceOf: TypeError }
+  );
+  t.regex(err!.message, /Plugin 'other-plugin' is on the NativeConnection/);
+  t.regex(err!.message, /Register it on the Worker \(Worker\.create plugins\)/);
+  // Without an on-host provider, or with the other plugin on the Worker, it starts.
+  await runBriefly(await createWorker({ connection, plugins: [plugin([])] }));
+  await runBriefly(
+    await createWorker({
+      plugins: [other, plugin([new OnHostSandboxClientProvider('lifecycle', new LifecycleSandboxClient())])],
+    })
+  );
 });

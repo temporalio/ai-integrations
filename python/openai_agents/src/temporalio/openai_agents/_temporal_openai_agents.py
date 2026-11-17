@@ -495,10 +495,12 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 ``SandboxClientProvider``, ``DockerSandboxClient`` in an
                 ``OnHostSandboxClientProvider``).  On the workflow side, use
                 ``temporal_sandbox_client``
-                with the matching name to target the correct backend. The worker
-                also runs a Worker on the Task Queue of each
-                ``OnHostSandboxClientProvider``, unless ``register_activities``
-                is false.
+                with the matching name to target the correct backend. For each
+                ``OnHostSandboxClientProvider``, the worker also runs an extra
+                Worker on ``<Task Queue>/<name>@<worker_name>``, unless
+                ``register_activities`` is false. It copies the worker's data
+                converter, interceptors, Activity concurrency, Activity rate
+                limits and graceful shutdown timeout, and runs no plugins.
                 Warning: sandbox_clients is experimental and behavior may change in future versions.
                 Use with caution in production environments.
             register_activities: Whether to register activities during the worker execution.
@@ -699,28 +701,44 @@ class OpenAIAgentsPlugin(SimplePlugin):
         client_config["plugins"] = []
         client = Client(**client_config)
         # Their sandbox operations ran on the main Worker before, so they keep its
-        # interceptors.
-        interceptors = worker.config(active_config=True).get("interceptors", [])
+        # Activity setup.
+        config = worker.config(active_config=True)
         on_host: list[Worker] = []
         try:
             for provider in self._on_host_providers:
+                task_queue = provider._task_queue_for(worker.task_queue)
                 try:
                     on_host.append(
                         Worker(
                             client,
-                            task_queue=provider.task_queue,
+                            task_queue=task_queue,
                             activities=provider._get_activities(
                                 self._resolvable_env_vars
                             ),
-                            interceptors=interceptors,
+                            interceptors=config.get("interceptors", []),
+                            max_concurrent_activities=config.get(
+                                "max_concurrent_activities"
+                            ),
+                            tuner=config.get("tuner"),
+                            max_activities_per_second=config.get(
+                                "max_activities_per_second"
+                            ),
+                            max_task_queue_activities_per_second=config.get(
+                                "max_task_queue_activities_per_second"
+                            ),
+                            graceful_shutdown_timeout=config.get(
+                                "graceful_shutdown_timeout", timedelta()
+                            ),
                         )
                     )
                 except Exception as err:
-                    # Core refuses a second Worker on the queue, such as from
-                    # another Worker in this process that uses the provider.
+                    # Core refuses a second Worker on the queue, such as when
+                    # another plugin on this Worker has an on-host provider with
+                    # the same name and Worker name, or another Worker in this
+                    # process polls the same main Task Queue.
                     raise RuntimeError(
                         "Cannot start the Worker of OnHostSandboxClientProvider "
-                        f"{provider.name!r} on Task Queue {provider.task_queue!r}: {err}"
+                        f"{provider.name!r} on Task Queue {task_queue!r}: {err}"
                     ) from err
         except Exception:
             await asyncio.gather(

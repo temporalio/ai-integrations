@@ -184,8 +184,8 @@ export abstract class SandboxProviderBase {
   /** The client-level Activities and session delete, which differ between the providers. */
   protected abstract ownActivities(): Record<string, ActivityFunction>;
 
-  /** The Task Queue recorded in the session states this provider returns. */
-  protected taskQueueOfSessions(): string | undefined {
+  /** The Task Queue that a session the running create Activity makes records in its state. */
+  protected createdTaskQueue(): string | undefined {
     return undefined;
   }
 
@@ -213,10 +213,14 @@ export abstract class SandboxProviderBase {
     return environment === undefined ? rest : { ...rest, environment: sanitizeEnvironmentForPersistence(state) };
   }
 
-  protected async sessionResult(sessionId: string, session: SandboxSession): Promise<SandboxSessionResult> {
+  protected async sessionResult(
+    sessionId: string,
+    session: SandboxSession,
+    taskQueue: string | undefined
+  ): Promise<SandboxSessionResult> {
     return {
       state: serializeSessionEnvelope(sessionId, session.state, await this.providerState(session.state), {
-        taskQueue: this.taskQueueOfSessions(),
+        taskQueue,
       }),
       supportsPty: session.supportsPty?.() ?? false,
     };
@@ -282,7 +286,7 @@ export abstract class SandboxProviderBase {
         // idempotency key, so a retry after the backend session is created but
         // before this result is recorded leaks that first session.
         const sessionId = randomUUID();
-        return this.sessionResult(sessionId, this.track(sessionId, session));
+        return this.sessionResult(sessionId, this.track(sessionId, session), this.createdTaskQueue());
       },
 
       [`${n}${SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX}`]: async (
@@ -294,7 +298,7 @@ export abstract class SandboxProviderBase {
           : await this.providerState(session.state);
         return serializeSessionEnvelope(input.state.sessionId, session.state, providerState, {
           defaultWorkspaceReady: false,
-          taskQueue: this.taskQueueOfSessions(),
+          taskQueue: input.state.taskQueue,
         });
       },
 
@@ -612,7 +616,7 @@ export class SandboxClientProvider extends SandboxProviderBase {
           archiveLimits: input.archiveLimits,
           clientOptions: input.clientOptions,
         });
-        return this.sessionResult(input.state.sessionId, this.track(input.state.sessionId, session));
+        return this.sessionResult(input.state.sessionId, this.track(input.state.sessionId, session), undefined);
       },
 
       [`${n}${SANDBOX_CLIENT_DELETE_SUFFIX}`]: async (input: SandboxSessionStateInput): Promise<void> => {

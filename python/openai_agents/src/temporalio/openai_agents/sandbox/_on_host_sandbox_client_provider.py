@@ -14,6 +14,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.openai_agents._temporal_worker_env_ref import AllowAllWorkerEnvVars
 from temporalio.openai_agents.sandbox._sandbox_client_provider import (
+    _recorded_task_queue,
     _sandbox_activity_scope,
     _SandboxProviderBase,
 )
@@ -37,12 +38,12 @@ class OnHostSandboxClientProvider(_SandboxProviderBase):
         Use with caution in production environments.
 
     Use it for Docker and Unix-local. Creating a sandbox runs on the run's usual
-    Task Queue, so any Worker can create one. The Worker process that creates it
-    keeps the live session and records its own Task Queue,
-    ``<name>@<worker_name>``, in the session state, and every later operation on
-    that sandbox goes to that queue, which an extra Worker in the same process
-    polls. The plugin starts that Worker with the main one and stops it with the
-    main one.
+    Task Queue, so any Worker can create one. The Worker that creates it keeps
+    the live session and records the Task Queue of an extra Worker beside it,
+    ``<Task Queue>/<name>@<worker_name>``, in the session state. Every later
+    operation on that sandbox goes to that queue. The plugin starts one extra
+    Worker for each main Worker, with the main Worker's Activity settings, and
+    stops it with the main one.
 
     The state the Workflow keeps carries the backend's own state. The process
     rebuilds a session it doesn't hold only when OpenAI's SDK resumes it, as
@@ -70,10 +71,11 @@ class OnHostSandboxClientProvider(_SandboxProviderBase):
             on the workflow side.
         client: The real ``BaseSandboxClient`` that performs sandbox lifecycle
             and I/O operations on the worker.
-        worker_name: Names this Worker process. Only one running Worker may use
-            a name: give each Worker on a machine its own, and let the old
-            process exit before a restart starts the new one. Defaults to the
-            machine's hostname.
+        worker_name: Names this Worker process. For each Task Queue, only one
+            running process may use a name: give each process on a machine
+            that serves the same Task Queue its own, and let the old process
+            exit before a restart starts the new one. Workers in one process
+            can share a name. Defaults to the machine's hostname.
     """
 
     def __init__(
@@ -85,44 +87,31 @@ class OnHostSandboxClientProvider(_SandboxProviderBase):
     ) -> None:
         """Initialize the provider."""
         super().__init__(name, client)
-        if worker_name is None:
-            worker_name = socket.gethostname()
-        self._task_queue = f"{name}@{worker_name}"
+        self._worker_name = (
+            worker_name if worker_name is not None else socket.gethostname()
+        )
 
-    @property
-    def task_queue(self) -> str:
-        """The Task Queue this process's sandboxes are served on: ``<name>@<worker_name>``."""
-        return self._task_queue
+    def _task_queue_for(self, main_task_queue: str) -> str:
+        """The Task Queue of the extra Worker beside a main Worker on ``main_task_queue``."""
+        return f"{main_task_queue}/{self._name}@{self._worker_name}"
+
+    def _created_task_queue(self) -> str:
+        # The create Activity runs on the main Worker, so its own queue names
+        # the extra Worker beside it.
+        return self._task_queue_for(activity.info().task_queue)
 
     async def _session(self, args: _HasState) -> SandboxSession:
         session = self._sessions.get(str(args.state.session_id))
         if session is not None:
             return session
-        queue = (
-            args.state.task_queue
-            if isinstance(args.state, OnHostSandboxSessionState)
-            else self._task_queue
-        )
+        queue = _recorded_task_queue(args.state)
+        where = "" if queue is None else f" on Task Queue '{queue}'"
         raise ApplicationError(
             f"Sandbox session '{args.state.session_id}' is lost: the Worker process "
-            f"that created it on Task Queue '{queue}' has stopped.",
+            f"that created it{where} has stopped.",
             type=SANDBOX_LOST_ERROR_TYPE,
             # A retry would land on this same process.
             non_retryable=True,
-        )
-
-    def _session_result(self, session: SandboxSession) -> SessionResult:
-        state = session.state
-        return SessionResult(
-            state=OnHostSandboxSessionState.model_validate(
-                {
-                    **state.model_dump(mode="json"),
-                    "type": "temporal_on_host",
-                    "backend_type": state.type,
-                    "task_queue": self._task_queue,
-                }
-            ),
-            supports_pty=session.supports_pty(),
         )
 
     def _own_activities(
@@ -138,10 +127,11 @@ class OnHostSandboxClientProvider(_SandboxProviderBase):
                     if not isinstance(args.state, OnHostSandboxSessionState):
                         # A state this provider didn't return carries nothing to
                         # rebuild from, so this raises SandboxLost.
-                        return self._session_result(await self._session(args))
+                        return self._session_result(await self._session(args), None)
                     session = await self._client.resume(_backend_state(args.state))
                     self._sessions[str(session.state.session_id)] = session
-                return self._session_result(session)
+                # Resume runs on the extra Worker, so it keeps the recorded queue.
+                return self._session_result(session, _recorded_task_queue(args.state))
 
         @activity.defn(name=f"{prefix}-sandbox_client_delete")
         async def delete_session(args: StopArgs) -> None:

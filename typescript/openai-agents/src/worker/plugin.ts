@@ -72,6 +72,13 @@ interface OnHostProvider {
   activities: Record<string, ActivityFunction>;
 }
 
+/** A Worker's Activity slot setting. */
+type ActivityConcurrency = Pick<WorkerOptions, 'tuner' | 'maxConcurrentActivityTaskExecutions'>;
+
+function workerKey(namespace: string | undefined, taskQueue: string | undefined): string {
+  return JSON.stringify([namespace ?? 'default', taskQueue]);
+}
+
 /**
  * Ends a Worker that has not started polling. There is no public way to stop one. With Core shut down
  * first, the pollers end at once and run()'s own teardown releases the connection.
@@ -105,8 +112,12 @@ export interface OpenAIAgentsPluginOptions {
    * Reference them from Workflows via `temporalSandboxClient(name)`.
    *
    * The Worker also runs an extra Worker, on the same connection, for each
-   * `OnHostSandboxClientProvider`: it polls the provider's per-process Task Queue,
-   * starts when the Worker runs and stops with it.
+   * `OnHostSandboxClientProvider`: it polls the Task Queue
+   * `<Task Queue>/<provider name>@<workerName>`, starts when the Worker runs and stops with it,
+   * and takes the Worker's data converter, Activity interceptors, Activity concurrency, Activity
+   * rate limits and shutdown grace time. No plugin runs on it, so with an on-host provider the
+   * plugin refuses a Worker whose `NativeConnection` has a plugin other than `OpenAIAgentsPlugin`:
+   * register that plugin on the Worker instead.
    *
    * @experimental Sandbox support is experimental and may change without notice.
    */
@@ -173,6 +184,9 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
   private readonly activityProviders: ReadonlyMap<string, string>;
   private readonly tracingApiKey?: TracingApiKeyResolver;
   private readonly onHostProviders: readonly OnHostProvider[];
+  // The Activity slot setting of each main Worker this plugin configured, by namespace and Task Queue:
+  // the compiled options of a running Worker keep only the native form of its tuner.
+  private readonly activityConcurrency = new Map<string, ActivityConcurrency>();
 
   constructor(options: OpenAIAgentsPluginOptions) {
     const modelActivities = createModelActivity(options.modelProvider, options.hostedToolCredentials);
@@ -274,6 +288,21 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
   override configureWorker(options: WorkerOptions): WorkerOptions {
     // The Worker of an OnHostSandboxClientProvider gets what it needs from its main Worker.
     if ((options as { [ON_HOST_WORKER_OPTIONS]?: boolean })[ON_HOST_WORKER_OPTIONS] === true) return options;
+    if (this.onHostProviders.length > 0) {
+      // Worker.create applies the NativeConnection's plugins to the extra Workers too.
+      const other = options.connection?.plugins.find((plugin) => !(plugin instanceof OpenAIAgentsPlugin));
+      if (other !== undefined) {
+        throw new TypeError(
+          `Plugin '${other.name}' is on the NativeConnection, so it would also run on the extra Worker of ` +
+            "OpenAIAgentsPlugin's OnHostSandboxClientProvider. Register it on the Worker (Worker.create " +
+            'plugins) instead of the NativeConnection.'
+        );
+      }
+      this.activityConcurrency.set(workerKey(options.namespace, options.taskQueue), {
+        tuner: options.tuner,
+        maxConcurrentActivityTaskExecutions: options.maxConcurrentActivityTaskExecutions,
+      });
+    }
     const existing = options.activities as Record<string, unknown> | undefined;
     for (const [name, fn] of Object.entries(this.options.activities as object)) {
       const other = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
@@ -315,28 +344,37 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
     const { connection } = worker;
     if (this.onHostProviders.length === 0 || connection === undefined) return next(worker);
     const { Worker: WorkerClass } = await import('@temporalio/worker');
+    const { namespace, taskQueue } = worker.options;
+    const concurrency = this.activityConcurrency.get(workerKey(namespace, taskQueue));
+    this.activityConcurrency.delete(workerKey(namespace, taskQueue));
     const onHost: Worker[] = [];
     try {
       for (const { provider, activities } of this.onHostProviders) {
-        // Its sandbox operations ran on the main Worker before, so they keep its data converter and
-        // Activity interceptors.
+        const extraTaskQueue = provider._taskQueueFor(taskQueue);
+        // Its sandbox operations ran on the main Worker before, so it keeps the main Worker's Activity
+        // setup.
         const options: WorkerOptions = {
           connection,
-          namespace: worker.options.namespace,
-          taskQueue: provider.taskQueue,
+          namespace,
+          taskQueue: extraTaskQueue,
           activities,
           dataConverter: worker.options.dataConverter,
           interceptors: { activity: worker.options.interceptors.activity },
+          ...concurrency,
+          maxActivitiesPerSecond: worker.options.maxActivitiesPerSecond,
+          maxTaskQueueActivitiesPerSecond: worker.options.maxTaskQueueActivitiesPerSecond,
+          shutdownGraceTime: worker.options.shutdownGraceTime,
         };
         let created: Worker;
         try {
           created = await WorkerClass.create(Object.assign(options, { [ON_HOST_WORKER_OPTIONS]: true }));
         } catch (err) {
-          // Core refuses a second Worker on the queue, such as from another Worker in this process that
-          // uses the provider, or another provider with the same name and Worker name.
+          // Core refuses a second Worker on the queue, such as when another plugin on this Worker has an
+          // on-host provider with the same name and Worker name, or another Worker in this process polls
+          // the same main Task Queue.
           throw new Error(
             `Cannot start the Worker of OnHostSandboxClientProvider '${provider.name}' on Task Queue ` +
-              `'${provider.taskQueue}': ${err instanceof Error ? err.message : String(err)}`,
+              `'${extraTaskQueue}': ${err instanceof Error ? err.message : String(err)}`,
             { cause: err }
           );
         }

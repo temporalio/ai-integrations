@@ -958,9 +958,9 @@ The name passed to `temporal_sandbox_client()` must exactly match the name of th
 
 ### Docker and Unix-local Sandboxes
 
-`OnHostSandboxClientProvider` pins each sandbox to the worker process that created it. Any worker can create a sandbox, and every later operation on it goes to the task queue `<provider name>@<worker_name>`, which the plugin polls with an extra worker in the same process, started and stopped with your worker. `worker_name` defaults to the machine's hostname.
+`OnHostSandboxClientProvider` pins each sandbox to the worker process that created it. Any worker can create a sandbox, and every later operation on it goes to the task queue `<task queue>/<provider name>@<worker_name>`, where `<task queue>` is the queue of the worker that created it. The plugin polls that queue with an extra worker beside each of your workers, started and stopped with it, and the extra worker takes your worker's activity concurrency, rate limits and graceful shutdown timeout. `worker_name` defaults to the machine's hostname.
 
-Only one running worker may use a `worker_name`: give each worker on a machine its own name, and let the old process exit before its restart starts the new one.
+Workers in one process can share a `worker_name`, but processes on one machine that serve the same task queue each need their own, and the old process must exit before its restart starts the new one.
 
 A run paused for approval, or continued as new, comes back to its sandbox on the worker with the same name on the same machine, even after that worker restarts: the worker rebuilds the sandbox with the backend's own `resume()`. A restart in the middle of a step still loses the sandbox, and the step's next operation fails with the non-retryable `ApplicationError` type `SandboxLost`. The plugin doesn't start a fresh sandbox in its place or clean up the containers and workspaces left behind. If a worker never comes back, its runs' operations wait on its queue; set `schedule_to_start_timeout` in the config you pass to `temporal_sandbox_client()` to bound that wait.
 

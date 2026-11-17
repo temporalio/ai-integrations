@@ -22,6 +22,8 @@ import {
 } from '@openai/agents-core/sandbox/internal';
 import { ApplicationFailure } from '@temporalio/common';
 import type { ActivityOptions } from '@temporalio/workflow';
+import { MockActivityEnvironment } from '@temporalio/testing';
+import { DefaultLogger } from '@temporalio/worker';
 import { setActivator } from '@temporalio/workflow/lib/global-attributes';
 import {
   SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX,
@@ -65,14 +67,27 @@ import { OnHostSandboxClientProvider } from '../worker/on-host-sandbox-provider'
 import { SandboxClientProvider } from '../worker/sandbox-provider';
 import { workerEnvValue } from '../common/worker-env-vars';
 import { TemporalSandboxClient, temporalSandboxClient } from '../workflow/sandbox-client';
-import { TemporalSandboxSession } from '../workflow/sandbox-session';
+import { TemporalSandboxSession, sessionActivityOptions } from '../workflow/sandbox-session';
 import { TemporalOpenAIRunner } from '../workflow/runner';
 import { FakeSandboxClient, FakeSandboxSession } from './stubs/sandbox-fakes';
+
+/** An Activity context on `taskQueue`, which leaves the failures tests expect out of the log. */
+function activityContext(taskQueue: string): MockActivityEnvironment {
+  return new MockActivityEnvironment({ taskQueue }, { logger: new DefaultLogger('ERROR') });
+}
+
+// As a Worker on the Task Queue 'main' runs them.
+const activityEnvironment = activityContext('main');
 
 function activityMap(
   provider: SandboxClientProvider | OnHostSandboxClientProvider
 ): Record<string, (...args: any[]) => Promise<any>> {
-  return provider._getActivities();
+  return Object.fromEntries(
+    Object.entries(provider._getActivities()).map(([name, fn]) => [
+      name,
+      (...args: unknown[]) => activityEnvironment.run(fn, ...args),
+    ])
+  );
 }
 
 /** A provider of either kind for `client`. */
@@ -1201,22 +1216,26 @@ test('SandboxClientProvider refuses Docker and Unix-local clients and points to 
   }
 });
 
-test("an on-host provider's Task Queue is <name>@<workerName>, with the hostname by default", (t) => {
+test("an on-host provider's Task Queue is <Task Queue>/<name>@<workerName>, with the hostname by default", (t) => {
   const client = new FakeSandboxClient();
   const named = new OnHostSandboxClientProvider('docker', client, { workerName: 'build-box-1' });
-  t.is(named.taskQueue, 'docker@build-box-1');
-  t.is(new OnHostSandboxClientProvider('docker', client).taskQueue, `docker@${os.hostname()}`);
+  t.is(named._taskQueueFor('agents'), 'agents/docker@build-box-1');
+  t.is(new OnHostSandboxClientProvider('docker', client)._taskQueueFor('agents'), `agents/docker@${os.hostname()}`);
 });
 
-test('an on-host provider records its Task Queue in the session states it returns', async (t) => {
-  const acts = activityMap(new OnHostSandboxClientProvider('fake', new FakeSandboxClient(), { workerName: 'w' }));
-  const created = await createSession(acts);
-  t.is(created.state.taskQueue, 'fake@w');
-  const resumed: SandboxSessionResult = await acts[`fake${SANDBOX_CLIENT_RESUME_SUFFIX}`]!({ state: created.state });
-  t.is(resumed.state.taskQueue, 'fake@w');
+test("an on-host provider records the create's Task Queue in the session states it returns", async (t) => {
+  const provider = new OnHostSandboxClientProvider('fake', new FakeSandboxClient(), { workerName: 'w' });
+  const created = await createSession(activityMap(provider));
+  t.is(created.state.taskQueue, 'main/fake@w');
+  // The other Activities run on the extra Worker's queue, so they keep the one in the state.
+  const elsewhere = activityContext('main/fake@w');
+  const acts = provider._getActivities() as Record<string, (...args: any[]) => Promise<any>>;
+  const resume = acts[`fake${SANDBOX_CLIENT_RESUME_SUFFIX}`]!;
+  const resumed: SandboxSessionResult = await elsewhere.run(resume, { state: created.state });
+  t.is(resumed.state.taskQueue, 'main/fake@w');
   const serialize = acts[`fake${SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX}`]!;
-  const serialized: SerializedSandboxSessionState = await serialize({ state: created.state });
-  t.is(serialized.taskQueue, 'fake@w');
+  const serialized: SerializedSandboxSessionState = await elsewhere.run(serialize, { state: created.state });
+  t.is(serialized.taskQueue, 'main/fake@w');
 
   const hosted = await createSession(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())));
   t.false('taskQueue' in hosted.state);
@@ -1256,7 +1275,7 @@ test('an operation other than delete on a session an on-host provider lost fails
     const err = await t.throwsAsync(acts[`fake${suffix}`]!({ state }), { instanceOf: ApplicationFailure }, suffix);
     t.is(err?.type, 'SandboxLost', suffix);
     t.true(err?.nonRetryable, suffix);
-    t.regex(err!.message, /fake@w/, suffix);
+    t.regex(err!.message, /'main\/fake@w'/, suffix);
   }
   t.is(client.resumeCalls, 0);
   t.is(client.createCalls.length, 0);
@@ -1344,6 +1363,12 @@ for (const [kind, suffix] of [
   });
 }
 
+test('sessionActivityOptions keeps the options of a session state without a Task Queue', (t) => {
+  const config = (): ActivityOptions => ({ startToCloseTimeout: '1 minute', taskQueue: 'configured' });
+  const state: { sessionId: string; taskQueue?: string } = { sessionId: 's' };
+  t.deepEqual(sessionActivityOptions(config(), state), config());
+});
+
 for (const kind of ['hosted', 'on-host'] as const) {
   test.serial(`the Workflow sends a session's operations to the Task Queue in its state (${kind})`, async (t) => {
     const acts = activityMap(providerOf(kind, new FakeSandboxClient()));
@@ -1365,7 +1390,7 @@ for (const kind of ['hosted', 'on-host'] as const) {
     t.is(create.activityType, `fake${SANDBOX_CLIENT_CREATE_SUFFIX}`);
     t.deepEqual(create.options, config);
     t.is(operations.length, 7);
-    const expected = kind === 'hosted' ? config : { ...config, taskQueue: 'fake@w' };
+    const expected = kind === 'hosted' ? config : { ...config, taskQueue: 'main/fake@w' };
     for (const { activityType, options } of operations) t.deepEqual(options, expected, activityType);
   });
 }
@@ -1377,10 +1402,10 @@ test.serial('serializeSessionState and deserializeSessionState carry the Task Qu
     const session = await client.create();
     return client.serializeSessionState(session.state);
   });
-  t.is(record.taskQueue, 'fake@w');
+  t.is(record.taskQueue, 'main/fake@w');
 
   const restored = await client.deserializeSessionState({ ...record, manifest: encodeManifest(new Manifest()) });
-  t.is(restored.taskQueue, 'fake@w');
+  t.is(restored.taskQueue, 'main/fake@w');
   const hosted = await client.deserializeSessionState({ sessionId: 's', manifest: encodeManifest(new Manifest()) });
   t.false('taskQueue' in hosted);
   const err = await t.throwsAsync(
