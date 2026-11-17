@@ -272,11 +272,11 @@ def find_tool_arg_messages(
     name = _tool_arg_class_name(type(value), types)
     if name is not None:
         found.append((list(path), name))
-        # The converter writes only the fields that were set, extras included.
+        # Converters can include default-filled fields as well as extras.
+        # Record those values too; the loader skips fields the converter omits.
         fields = {**vars(value), **(value.model_extra or {})}
         for key, item in fields.items():
-            if key in value.model_fields_set:
-                found.extend(find_tool_arg_messages(item, types, (*path, key)))
+            found.extend(find_tool_arg_messages(item, types, (*path, key)))
     elif isinstance(value, (list, tuple)):
         for i, item in enumerate(value):
             found.extend(find_tool_arg_messages(item, types, (*path, i)))
@@ -306,9 +306,17 @@ def load_tool_arg_messages(
         if cls is None:
             raise ValueError(f"Unknown tool argument class {name!r}")
         parent: Any = args
-        for key in path[:-1]:
-            parent = parent[key]
-        parent[path[-1]] = cls.model_validate(parent[path[-1]])
+        try:
+            for key in path[:-1]:
+                parent = parent[key]
+            value = parent[path[-1]]
+        except (KeyError, IndexError, TypeError):
+            # Older converters exclude unset fields, and a caller's converter
+            # can honor Field(exclude=True). There is no value to reconstruct.
+            continue
+        if value is None:
+            continue
+        parent[path[-1]] = cls.model_validate(value)
     return args
 
 
