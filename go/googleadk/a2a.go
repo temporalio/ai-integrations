@@ -537,8 +537,14 @@ func (e *a2aHTTPStatusError) Error() string { return "unexpected HTTP status: " 
 // model callback that gets past the model-call check: a BeforeModelCallbacks
 // entry that answers instead of the model, or an OnModelErrorCallbacks entry
 // that turns the refusal into a transfer. It sees the agent that an agenttool
-// in an agent's Tools wraps, but not one in its Toolsets, and not the agents
-// below a wrapped agent.
+// in an agent's Tools wraps, but not one in its Toolsets, not the agents
+// below a wrapped agent, and not an agent that is a node of a workflowagent
+// graph.
+//
+// Later 1.x releases may refuse more agent shapes that send from Workflow
+// code, so a tree that passes today may be refused in new runs after an
+// upgrade. A new check will not change how Histories recorded on earlier 1.x
+// releases replay.
 func NewRunnerPlugin(root agent.Agent) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: "googleadk",
