@@ -36,6 +36,7 @@ from types import FrameType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from google.adk.tools.base_toolset import BaseToolset
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.tool_context import ToolContext
@@ -101,6 +102,7 @@ class _FakeTool:
         return {"echo": args}
 
 
+@BaseToolset.register
 class _FakeToolset:
     """In-memory stand-in for ``google.adk.tools.mcp_tool.McpToolset``."""
 
@@ -968,14 +970,18 @@ class StatefulMcpBlockEndsWorkflow:
             start_to_close_timeout=timedelta(seconds=20),
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
-        if case == "factory_fails":
+        if case in ("factory_fails", "invalid_factory_result"):
             # A session that ends on its own, without a refused retry.
             async with TemporalStatefulMcpToolSet(
                 "stateful_server",
                 config=config,
                 server_session_config=ActivityConfig(
                     start_to_close_timeout=timedelta(minutes=1),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
+                    retry_policy=(
+                        None
+                        if case == "invalid_factory_result"
+                        else RetryPolicy(maximum_attempts=1)
+                    ),
                 ),
             ) as toolset:
                 return [t.name for t in await toolset.get_tools()]
@@ -999,12 +1005,24 @@ class StatefulMcpBlockEndsWorkflow:
 
 @pytest.mark.timeout(90)
 @pytest.mark.parametrize(
-    "case", ["factory_fails", "tool_from_earlier_block", "compensation_raise_first"]
+    "case",
+    [
+        "factory_fails",
+        "invalid_factory_result",
+        "tool_from_earlier_block",
+        "compensation_raise_first",
+    ],
 )
 async def test_stateful_block_exit_error(client: Client, case: str):
+    factory_calls = 0
+
     def factory(_: Any) -> McpToolset:
+        nonlocal factory_calls
+        factory_calls += 1
         if case == "factory_fails":
             raise RuntimeError("factory failed")
+        if case == "invalid_factory_result":
+            return cast(McpToolset, cast(object, None))
         return _stdio_toolset(_MCP_SERVER)
 
     provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
@@ -1040,15 +1058,27 @@ async def test_stateful_block_exit_error(client: Client, case: str):
     assert isinstance(err.value.cause, ApplicationError)
     assert err.value.cause.type == "DedicatedWorkerFailure"
     messages: list[str] = []
+    causes: list[BaseException] = []
     cause: BaseException | None = err.value.cause
     while cause is not None:
         messages.append(str(cause))
+        causes.append(cause)
         cause = cause.__cause__
-    expected = (
-        "factory failed"
-        if case == "factory_fails"
-        else "List the toolset's tools again inside an open block."
-    )
+    expected = {
+        "factory_fails": "factory failed",
+        "invalid_factory_result": (
+            "MCP toolset factory 'stateful_server-stateful' returned builtins.NoneType"
+        ),
+    }.get(case, "List the toolset's tools again inside an open block.")
+    if case == "invalid_factory_result":
+        failure = next(
+            c
+            for c in causes
+            if isinstance(c, ApplicationError)
+            and c.type == "MCPToolsetFactoryTypeError"
+        )
+        assert failure.non_retryable
+        assert factory_calls == 1
     assert any(expected in message for message in messages), messages
 
 
