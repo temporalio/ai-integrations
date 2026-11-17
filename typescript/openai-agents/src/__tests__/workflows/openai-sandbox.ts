@@ -9,7 +9,15 @@ import {
   type SandboxSessionLike,
   type SandboxSessionState,
 } from '@openai/agents-core/sandbox';
-import { ApplicationFailure, condition, continueAsNew, defineQuery, defineSignal, setHandler } from '@temporalio/workflow';
+import {
+  ActivityFailure,
+  ApplicationFailure,
+  condition,
+  continueAsNew,
+  defineQuery,
+  defineSignal,
+  setHandler,
+} from '@temporalio/workflow';
 import { TemporalOpenAIRunner, workerEnvValue, temporalSandboxClient } from '../../workflow';
 import { serializeSessionEnvelope, type TemporalSandboxSessionState } from '../../common/sandbox-activity-types';
 
@@ -350,6 +358,63 @@ export async function sandboxNestedRootResumeWorkflow(
   const state = await RunState.fromString(lead, pausedState);
   for (const interruption of state.getInterruptions()) state.approve(interruption);
   const resumed = await runner.run(lead, state, { runConfig });
+  return resumed.newItems
+    .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
+    .join('\n');
+}
+
+export const sessionCreatedQuery = defineQuery<boolean>('sessionCreated');
+export const proceedSignal = defineSignal('proceed');
+
+/**
+ * Creates a session on the `lifecycle` provider, waits for `proceedSignal`, runs each command, and
+ * deletes the session. Returns the commands' outputs, or the failure type of the first command that
+ * failed.
+ */
+export async function sandboxOperationsWorkflow(commands: string[]): Promise<string> {
+  let created = false;
+  let proceed = false;
+  setHandler(sessionCreatedQuery, () => created);
+  setHandler(proceedSignal, () => {
+    proceed = true;
+  });
+  const session = await temporalSandboxClient('lifecycle').create();
+  created = true;
+  await condition(() => proceed);
+  const outputs: string[] = [];
+  try {
+    for (const cmd of commands) outputs.push(await session.execCommand!({ cmd }));
+  } catch (err) {
+    if (err instanceof ActivityFailure && err.cause instanceof ApplicationFailure) {
+      outputs.push(`failed: ${err.cause.type}`);
+    } else {
+      throw err;
+    }
+  } finally {
+    await session.delete!();
+  }
+  return outputs.join('\n');
+}
+
+/**
+ * Runs a sandbox agent on the `lifecycle` provider until it pauses for approval, then continues as new
+ * with the paused state's string and resumes from it there. Returns the resumed run's command outputs.
+ */
+export async function sandboxContinueAsNewWorkflow(serialized?: string): Promise<string> {
+  const agent = new SandboxAgent({
+    name: 'sandbox-continue-as-new',
+    model: 'gpt-4o-mini',
+    capabilities: [new EchoSandboxCapability()],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const runConfig = { sandbox: { client: temporalSandboxClient('lifecycle') } };
+  if (serialized === undefined) {
+    const result = await runner.run(agent, 'run commands', { runConfig });
+    if (result.interruptions.length === 0) return 'no-interruption';
+    for (const interruption of result.interruptions) result.state.approve(interruption);
+    return await continueAsNew<typeof sandboxContinueAsNewWorkflow>(result.state.toString());
+  }
+  const resumed = await runner.run(agent, await RunState.fromString(agent, serialized), { runConfig });
   return resumed.newItems
     .flatMap((item) => (item.type === 'tool_call_output_item' ? [`${item.output}`] : []))
     .join('\n');

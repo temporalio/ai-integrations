@@ -851,7 +851,9 @@ The sandbox integration lets `SandboxAgent` from the OpenAI Agents SDK execute i
 
 Every sandbox operation — creating a session, running commands, reading/writing files, PTY interactions — is dispatched as a Temporal activity. This means sandbox work is fully observable, retryable, and recoverable like any other activity, and sandbox session state is serialized with the workflow. With a hosted backend, any worker can reconnect to the sandbox from that state, so a session survives worker restarts.
 
-The Docker and Unix-local backends run the sandbox on the worker's own machine, where other workers can't reach it, so they are supported for local development only, with a single worker. In production, use a hosted backend.
+Register a hosted backend with `SandboxClientProvider`. The Docker and Unix-local backends run the sandbox on the worker's own machine, where other workers can't reach it, so register them with `OnHostSandboxClientProvider` instead, with one worker or several. `SandboxClientProvider` refuses them.
+
+Changing a sandbox agent's configuration (environment, folder grants, mounts) while runs that use it are paused for approval isn't supported, with either provider.
 
 ### Architecture
 
@@ -867,21 +869,26 @@ sandbox agent calls session.exec / session.read / session.write / …
 TemporalSandboxSession routes each call as a Temporal activity
 ("daytona-sandbox_session_exec", "daytona-sandbox_session_read", …)
   ↓
-SandboxClientProvider activities on the worker call the real sandbox client
+SandboxClientProvider or OnHostSandboxClientProvider activities on the worker call the real sandbox client
   ↓
 Actual sandbox backend (Daytona, Docker, local, …)
 ```
 
 ### Worker Configuration
 
-Register one or more `SandboxClientProvider` instances with the plugin. Each provider pairs a unique name with a real `BaseSandboxClient` implementation. The plugin automatically registers all required activities on the worker.
+Register one or more sandbox client providers with the plugin. Each provider pairs a unique name with a real `BaseSandboxClient` implementation. The plugin automatically registers all required activities on the worker.
 
 ```python
 import asyncio
 from datetime import timedelta
 from temporalio.client import Client
 from temporalio.worker import Worker
-from temporalio.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider, ModelActivityParameters
+from temporalio.openai_agents import (
+    ModelActivityParameters,
+    OnHostSandboxClientProvider,
+    OpenAIAgentsPlugin,
+    SandboxClientProvider,
+)
 from agents.extensions.sandbox.daytona import DaytonaSandboxClient
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 
@@ -895,7 +902,9 @@ async def main():
                 ),
                 sandbox_clients=[
                     SandboxClientProvider("daytona", DaytonaSandboxClient()),
-                    SandboxClientProvider("local", UnixLocalSandboxClient()),  # local development only
+                    OnHostSandboxClientProvider(
+                        "local", UnixLocalSandboxClient(), worker_name="build-box-1"
+                    ),
                 ],
             ),
         ],
@@ -945,7 +954,17 @@ class MyWorkflow:
         return result.final_output
 ```
 
-The name passed to `temporal_sandbox_client()` must exactly match the name used in `SandboxClientProvider` on the worker.
+The name passed to `temporal_sandbox_client()` must exactly match the name of the provider on the worker.
+
+### Docker and Unix-local Sandboxes
+
+`OnHostSandboxClientProvider` pins each sandbox to the worker process that created it. Any worker can create a sandbox, and every later operation on it goes to the task queue `<task queue>/<provider name>@<worker_name>`, where `<task queue>` is the queue of the worker that created it. The plugin polls that queue with an extra worker beside each of your workers, started and stopped with it, and the extra worker takes your worker's activity concurrency, rate limits and graceful shutdown timeout. `worker_name` defaults to the machine's hostname.
+
+Workers in one process can share a `worker_name`, but processes on one machine that serve the same task queue each need their own, and the old process must exit before its restart starts the new one.
+
+A run paused for approval, or continued as new, comes back to its sandbox on the worker with the same name on the same machine, even after that worker restarts: the worker rebuilds the sandbox with the backend's own `resume()`. A restart in the middle of a step still loses the sandbox, and the step's next operation fails with the non-retryable `ApplicationError` type `SandboxLost`. The plugin doesn't start a fresh sandbox in its place or clean up the containers and workspaces left behind. If a worker never comes back, its runs' operations wait on its queue; set `schedule_to_start_timeout` in the config you pass to `temporal_sandbox_client()` to bound that wait.
+
+Before any worker switches a provider to `OnHostSandboxClientProvider`, every worker running these workflows must run a plugin release that has it, so that each workflow task sends operations to the sandbox's queue. Switching a provider loses its open runs' sandboxes.
 
 ### Multiple Backends
 
@@ -961,7 +980,7 @@ result = await Runner.run(
     )),
 )
 
-# Run a different task on the "local" backend (local development only)
+# Run a different task on the "local" backend
 result = await Runner.run(
     agent, prompt,
     run_config=RunConfig(sandbox=SandboxRunConfig(

@@ -285,7 +285,7 @@ The Worker plugin does five things:
 
 - Registers the model Activity used by Workflow-side model calls.
 - Registers Activities for configured MCP server providers.
-- Registers Activities for configured sandbox client providers.
+- Registers Activities for configured sandbox client providers, and runs a Worker for each `OnHostSandboxClientProvider`.
 - Adds Workflow, Activity, and Nexus interceptors for trace propagation.
 - Installs Workflow bundle polyfills required by the OpenAI Agents SDK.
 
@@ -621,22 +621,26 @@ Adding a resolver to a Workflow that has open runs, including moving one off the
 
 An OpenAI Agents SDK `SandboxAgent` runs commands, edits files, and keeps a workspace inside a sandbox. This plugin dispatches each of those operations as an Activity.
 
-The Docker and Unix-local backends run the sandbox on the Worker's own machine, where other Workers can't reach it, so they're supported for local development only, with a single Worker. For production, use a hosted backend, such as E2B or Daytona from `@openai/agents-extensions`.
+Register a hosted backend, such as E2B or Daytona from `@openai/agents-extensions`, with `SandboxClientProvider`. Any Worker can serve its sandboxes. The Docker and Unix-local backends run the sandbox on the Worker's own machine, where other Workers can't reach it, so register them with `OnHostSandboxClientProvider` instead, with one Worker or several. `SandboxClientProvider` refuses them.
 
-A process started by `exec` outlives the Worker holding the session only if the backend can reconnect it after `resume`; Docker and Unix-local can't.
+A process started by `exec` outlives the Worker holding a hosted session only if the backend can reconnect it after `resume`.
+
+Changing a sandbox agent's configuration (environment, folder grants, mounts) while runs that use it are paused for approval isn't supported, with either provider.
 
 In-container mounts that need `withInContainerMountCredentialExposureAcknowledged()` or `withInContainerMountBroadCredentialExposureAcknowledged()` on the manifest aren't supported, because that acknowledgement never reaches the Worker. A sandbox with any other in-container mount, or a mount upstream can't verify after persistence, needs the Worker that created it, even on a hosted backend, because upstream refuses to resume such a session.
 
-Register your sandbox backend client under a name on the Worker plugin. This example uses Unix-local, for local development:
+Register your sandbox backend client under a name on the Worker plugin. This example uses Docker:
 
 ```ts
-import { UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';
+import { DockerSandboxClient } from '@openai/agents-core/sandbox/local';
 import { OpenAIProvider } from '@openai/agents-openai';
-import { OpenAIAgentsPlugin, SandboxClientProvider } from '@temporalio/openai-agents';
+import { OnHostSandboxClientProvider, OpenAIAgentsPlugin } from '@temporalio/openai-agents';
 
 const plugin = new OpenAIAgentsPlugin({
   modelProvider: new OpenAIProvider(),
-  sandboxClientProviders: [new SandboxClientProvider('local', new UnixLocalSandboxClient())],
+  sandboxClientProviders: [
+    new OnHostSandboxClientProvider('docker', new DockerSandboxClient(), { workerName: 'build-box-1' }),
+  ],
 });
 ```
 
@@ -654,11 +658,19 @@ export async function sandboxWorkflow(prompt: string): Promise<string> {
   });
 
   const result = await new TemporalOpenAIRunner().run(agent, prompt, {
-    runConfig: { sandbox: { client: temporalSandboxClient('local') } },
+    runConfig: { sandbox: { client: temporalSandboxClient('docker') } },
   });
   return result.finalOutput ?? '';
 }
 ```
+
+### Docker and Unix-local sandboxes
+
+`OnHostSandboxClientProvider` pins each sandbox to the Worker process that created it. Any Worker can create a sandbox, and every later operation on it goes to the Task Queue `<Task Queue>/<provider name>@<workerName>`, where `<Task Queue>` is the queue of the Worker that created it. The plugin polls that queue with an extra Worker beside each of your Workers, started and stopped with it, and the extra Worker takes your Worker's Activity concurrency, rate limits and shutdown grace and force times. `workerName` defaults to the machine's hostname.
+
+Workers in one process can share a `workerName`, but processes on one machine that serve the same Task Queue each need their own, and the old process must exit before its restart starts the new one. No other plugin runs on the extra Worker, so with an `OnHostSandboxClientProvider`, register your other plugins on the Worker (`Worker.create` `plugins`), not the `NativeConnection`; `Worker.create` refuses them there. A restarted Worker polls the same queue but no longer holds its sandboxes, so the next operation on one, even in a run paused for approval, fails with the non-retryable `ApplicationFailure` type `SandboxLost`. The plugin never starts a fresh sandbox in its place and doesn't clean up the containers and workspaces left behind. If a Worker never comes back, its runs' operations wait on its queue; set `scheduleToStartTimeout` in the options you pass to `temporalSandboxClient()` to bound that wait.
+
+Before any Worker switches a provider to `OnHostSandboxClientProvider`, every Worker running these Workflows must run a plugin release that has it, so that each Workflow Task sends operations to the sandbox's queue. Switching a provider loses its open runs' sandboxes, like a restart.
 
 ## Credentials
 
@@ -816,7 +828,7 @@ Most applications use two import paths: `@temporalio/openai-agents` in Worker an
 | `@temporalio/openai-agents/otel`                 | Worker or Client | Replay-safe OpenTelemetry setup                             |
 | `@temporalio/openai-agents/workflow-interceptor` | Worker bundling  | Manual `workflowInterceptorModules` wiring without a plugin |
 
-`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
+`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, `OnHostSandboxClientProvider`, model option types, hosted tool credential types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
 
 `@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool` (deprecated), `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`.
 
@@ -841,7 +853,7 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Hosted tools            | Supported                | Executed server-side by the model provider                                                     |
 | Stateless MCP servers   | Supported                | Via `StatelessMCPServerProvider` and `statelessMcpServer()`                                    |
 | Stateful MCP servers    | Supported                | Via `StatefulMCPServerProvider` and `statefulMcpServer()`                                      |
-| Sandbox agents          | Supported (experimental) | Via `SandboxClientProvider` and `temporalSandboxClient()`                                      |
+| Sandbox agents          | Supported (experimental) | Via `SandboxClientProvider` or `OnHostSandboxClientProvider`, and `temporalSandboxClient()`    |
 | Sessions                | Supported                | Via `WorkflowSafeMemorySession`; upstream `MemorySession` is rejected                          |
 | Run state and approvals | Supported                | Serialize with `result.state.toString()` and rehydrate with `RunState.fromString`              |
 | Guardrails              | Supported                | Guardrail callbacks must be deterministic                                                      |
