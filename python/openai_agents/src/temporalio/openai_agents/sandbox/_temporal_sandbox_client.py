@@ -106,12 +106,11 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
             arg=ResumeSessionArgs(
                 state=state,
                 # Serializing the state drops the mount credentials the Runner
-                # rebound into it, so its manifest carries them to the Worker. A
-                # state whose credentials weren't rebound sends none, so the
-                # backend still refuses it.
-                trusted_manifest=None
-                if state.mount_authority_redacted
-                else state.manifest,
+                # rebound into it, so only then does its manifest carry them to
+                # the Worker. A state with nothing rebound sends none.
+                trusted_manifest=state.manifest
+                if state.mount_authority_rebound
+                else None,
             ),
             result_type=SessionResult,
             **_session_activity_config(self._config, state),
