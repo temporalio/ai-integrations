@@ -364,7 +364,9 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
           ...concurrency,
           maxActivitiesPerSecond: worker.options.maxActivitiesPerSecond,
           maxTaskQueueActivitiesPerSecond: worker.options.maxTaskQueueActivitiesPerSecond,
-          shutdownGraceTime: worker.options.shutdownGraceTime,
+          // In milliseconds: from @temporalio/worker 1.26, TypeScript can't check the compiled
+          // `shutdownGraceTime` type against WorkerOptions (TS2859).
+          shutdownGraceTime: worker.options.shutdownGraceTimeMs,
           shutdownForceTime: worker.options.shutdownForceTime,
         };
         let created: Worker;
