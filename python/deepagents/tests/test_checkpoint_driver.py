@@ -232,6 +232,30 @@ async def test_uuid_thread_id_survives_rollover() -> None:
     assert carries[0][_checkpoint.SNAPSHOT_KEY]["thread_id"] == str(thread_id)
 
 
+async def test_rollover_uses_checkpoint_id_generator_installed_after_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import langgraph.checkpoint.base.id as checkpoint_ids
+
+    model = FakeModel([_tool_reply(0), _tool_reply(1), "Done."])
+    original = checkpoint_ids.uuid6
+    restored_steps: list[int] = []
+
+    def installed_generator(*, clock_seq: int) -> Any:
+        restored_steps.append(clock_seq)
+        return original(clock_seq=clock_seq)
+
+    # Workers install the replay-safe generator after importing this driver.
+    monkeypatch.setattr(checkpoint_ids, "uuid6", installed_generator)
+
+    def factory() -> Any:
+        return create_deep_agent(name="test-agent", model=model)
+
+    result, carries = await _drive(factory, rollover=True)
+    assert result["messages"][-1].content == "Done."
+    assert len(restored_steps) == len(carries) >= 2
+
+
 async def test_checkpoint_ordering_survives_worker_clock_skew(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

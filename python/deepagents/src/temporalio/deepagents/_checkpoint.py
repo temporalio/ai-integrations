@@ -23,7 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.channels.base import BaseChannel
 from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
-from langgraph.checkpoint.base.id import uuid6
+from langgraph.checkpoint.base import id as checkpoint_ids
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.errors import GraphRecursionError
@@ -530,7 +530,7 @@ async def run(
                 "Invalid Deep Agents checkpoint snapshot."
             ) from exc
         configurable.pop("checkpoint_id", None)
-        checkpoint["id"] = str(uuid6(clock_seq=step))
+        checkpoint["id"] = str(checkpoint_ids.uuid6(clock_seq=step))
         await saver.aput(
             {
                 "configurable": {
