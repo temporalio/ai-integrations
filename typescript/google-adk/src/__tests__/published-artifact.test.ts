@@ -28,6 +28,7 @@ test('cjsRequireExposesPublicExports', (t) => {
   t.is(typeof workflow.markModelFailureHandled, 'function');
   t.is(workflow.MODEL_ERROR_FAILURE_TYPE, 'GoogleAdkModelError');
   t.is(workflow.MCP_TOOL_NOT_FOUND_FAILURE_TYPE, 'GoogleAdkMCPToolNotFound');
+  t.is(workflow.MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE, 'GoogleAdkMCPToolsetFactoryTypeError');
   t.is(workflow.MCP_ERROR_FAILURE_TYPE, 'GoogleAdkMCPError');
   t.is(workflow.STREAM_ERROR_FAILURE_TYPE, 'GoogleAdkStreamError');
   t.is(workflow.STREAMING_TOPIC_REQUIRED_FAILURE_TYPE, 'GoogleAdkStreamingTopicRequired');
