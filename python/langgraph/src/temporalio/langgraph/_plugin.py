@@ -33,7 +33,11 @@ from temporalio.langgraph._task_cache import (
     set_task_cache,
     task_id,
 )
-from temporalio.langgraph._workflow import wrap_workflow
+from temporalio.langgraph._workflow import (
+    scope_router,
+    track_invocations,
+    wrap_workflow,
+)
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
@@ -308,6 +312,21 @@ class LangGraphPlugin(SimplePlugin):
                         context_schema=graph.context_schema,
                     )
                     runnable.func = None
+                # Routers run in the workflow and can call tasks too.
+                for source, branches in graph.branches.items():
+                    for branch_name, branch in branches.items():
+                        branches[branch_name] = branch._replace(
+                            path=scope_router(
+                                f"{graph_name}.{source}.{branch_name}", branch.path
+                            )
+                        )
+
+        # Functional API: an entrypoint runs in the workflow; each invocation
+        # tracks its calls, so a failed one can be invoked again.
+        for program in (entrypoints or {}).values():
+            for pregel_node in program.nodes.values():
+                if isinstance(pregel_node.bound, RunnableCallable):
+                    track_invocations(pregel_node.bound)
 
         # Functional API: Wrap @task functions as Temporal Activities.
         if tasks:
@@ -412,7 +431,10 @@ class LangGraphPlugin(SimplePlugin):
             )
         elif execute_in == "workflow":
             return wrap_workflow(
-                func, streaming_topic=self._streaming_topic, summary_fn=summary_fn
+                activity_name,
+                func,
+                streaming_topic=self._streaming_topic,
+                summary_fn=summary_fn,
             )
         else:
             raise ValueError(f"Invalid execute_in value: {execute_in}")
@@ -426,8 +448,9 @@ def graph(
     Args:
         name: Graph name as registered with LangGraphPlugin.
         cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed nodes are
-            not re-executed after continue-as-new.
+            Restores cached results so that node calls completed before
+            continue-as-new are not re-executed when the run makes them
+            again, in the same order.
     """
     set_task_cache(cache or {})
     graphs = _workflow_graphs.get(workflow.info().run_id)
@@ -448,8 +471,9 @@ def entrypoint(
     Args:
         name: Entrypoint name as registered with Plugin.
         cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed tasks are
-            not re-executed after continue-as-new.
+            Restores cached results so that task calls completed before
+            continue-as-new are not re-executed when the run makes them
+            again, in the same order.
     """
     set_task_cache(cache or {})
     entrypoints = _workflow_entrypoints.get(workflow.info().run_id)
