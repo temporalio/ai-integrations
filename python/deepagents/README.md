@@ -265,15 +265,12 @@ also uses `LangGraphPlugin`, its executor override currently runs those calls
 inline too; [#629](https://github.com/temporalio/ai-integrations/pull/629)
 narrows that override.
 
-**Breaking change:** a run recorded on an earlier version that caught this
-`NotImplementedError` from a sync tool, output parser, runnable, graph node or
-router, and then issued commands, can fail replay on this version with
-`[TMPRL1100]`. Let those runs finish on their original workers first, or keep
-them there with Worker Versioning.
-
-Sync graph calls that previously ran on LangGraph's threads are now refused.
-This can also change commands on replay. Keep affected open runs on their
-original workers and use the async graph APIs or an activity for new runs.
+**Upgrading:** a run that made one of these sync calls on an earlier version
+keeps that version's behavior, so its history still replays: the call fails
+with `NotImplementedError` again, and LangChain's thread pool stays open to the
+run. A run stuck on that error has no recorded call yet, so a worker with this
+version runs the call in the workflow, and the run completes. A patch marker,
+`deepagents-sync-calls-inline`, records which way each run went.
 
 `activity_as_tool` takes every activity option through `activity_options`, an
 `ActivityConfig`: timeouts (`start_to_close_timeout` or

@@ -15,6 +15,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, Self, TypedDict
 
@@ -25,6 +26,7 @@ from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
+from temporalio.client import WorkflowHistory  # noqa: E402
 from temporalio.common import RetryPolicy  # noqa: E402
 from temporalio.worker import Replayer, Worker  # noqa: E402
 from temporalio.workflow import ActivityConfig  # noqa: E402
@@ -1153,3 +1155,51 @@ async def test_sync_langchain_calls_run_in_the_workflow(
         graph.add_edge(START, "step")
         with pytest.raises(ValueError, match="is sync"):
             graph.compile()
+
+
+# Replay is promised within a major, so these 0.x histories have to replay until
+# Deep Agents 1.0.
+REPLAY_MAJOR = 0
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
+
+
+@workflow.defn
+class CaughtSyncToolWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        agent = create_deep_agent(model="fake:model", tools=[add])
+        try:
+            result = await agent.ainvoke(
+                {"messages": [HumanMessage("What is 20 + 22?")]}
+            )
+        except Exception as err:
+            return f"agent failed: {type(err).__name__}"
+        return str(result["messages"][-1].content)
+
+
+@workflow.defn
+class SyncGraphWorkflow:
+    @workflow.run
+    async def run(self) -> Any:
+        return fanout_graph([]).invoke({})
+
+
+@pytest.mark.parametrize(
+    ("workflow_class", "fixture"),
+    [
+        (CaughtSyncToolWorkflow, "sync_tool_error_caught.json"),
+        (SyncGraphWorkflow, "sync_graph_on_threads.json"),
+    ],
+)
+async def test_sync_call_histories_from_0x_replay(
+    workflow_class: type, fixture: str
+) -> None:
+    # Recorded on main at cd37f54a with the workflows above, before sync calls
+    # ran in the workflow: the agent caught the sync tool's NotImplementedError,
+    # and the graph's nodes ran on LangChain's threads. The patch marker keeps
+    # both paths for runs without it.
+    await Replayer(
+        workflows=[workflow_class], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(
+        WorkflowHistory.from_json(fixture, (_HISTORIES / fixture).read_text())
+    )

@@ -53,6 +53,10 @@ _MODULES = (
 _TIMEOUT_CHECK = "langgraph.pregel._utils"
 _EXECUTOR_CHECK = "_is_executor_backed_afunc"
 
+# Runs recorded before this change keep their old path: sync calls fail as
+# before, and the thread pool stays open to them.
+_PATCH = "deepagents-sync-calls-inline"
+
 _POOL_MESSAGE = (
     "LangChain tried to run work on its thread pool in a Workflow, for example a "
     "LangGraph step with several nodes, batch() or RunnableParallel. Those threads "
@@ -66,7 +70,11 @@ def _refuse_in_workflows(pool: type) -> type:
         refuses_workflow_work = True
 
         def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
-            if workflow.in_workflow() or workflow.unsafe.in_sandbox():
+            if (
+                workflow.patched(_PATCH)
+                if workflow.in_workflow()
+                else workflow.unsafe.in_sandbox()
+            ):
                 raise RestrictedWorkflowAccessError(
                     "langchain_core.runnables.config.ContextThreadPoolExecutor",
                     override_message=_POOL_MESSAGE,
@@ -79,7 +87,7 @@ def _refuse_in_workflows(pool: type) -> type:
 async def _run_in_executor(
     executor_or_config: Any, func: Callable[..., Any], *args: Any, **kwargs: Any
 ) -> Any:
-    if not workflow.in_workflow():
+    if not workflow.in_workflow() or not workflow.patched(_PATCH):
         from langchain_core.runnables.config import run_in_executor
 
         return await run_in_executor(executor_or_config, func, *args, **kwargs)
