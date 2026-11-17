@@ -702,15 +702,12 @@ exception type to the Worker's `workflow_failure_exception_types`.
 ## Limits
 
 - An unwrapped tool has to be `async def`. See the Tools section.
-- `tool_as_activity` gives the model the tool's name, description and argument
-  schema, and returns the tool's content. It does not carry `return_direct`,
-  the result's error status or its artifact: the model is called again after a
-  `return_direct` tool, a handled tool error arrives as a success, and
-  `ToolMessage.artifact` is `None`.
-- A tool that takes `ToolRuntime` or returns a `Command` cannot be wrapped with
-  `tool_as_activity`: the Workflow Task fails, for a `Command` after the tool
-  has run. A wrapped tool also gets no `RunnableConfig` values such as
-  `configurable` and `metadata`.
+- `tool_as_activity` does not support `return_direct=True`. New calls fail
+  with `DeepAgentsWorkflowError` before the Activity runs. Return from the
+  Workflow explicitly after calling the tool instead.
+- A tool that takes `ToolRuntime` or returns a `Command` cannot be wrapped
+  with `tool_as_activity`: the Workflow Task fails, for a `Command` after
+  the tool has run.
 - Tool `extras` are not sent to the model provider, for wrapped and unwrapped
   tools.
 - `agent.astream(..., subgraphs=True)` fails the Workflow Task when the agent
