@@ -217,6 +217,11 @@ def test_unrecoverable_overflow_fails_the_workflow_not_its_task() -> None:
 async def test_agent_summarizes_after_provider_overflow(
     env: WorkflowEnvironment, provider: str
 ) -> None:
+    summarization = importlib.import_module("deepagents.middleware.summarization")
+    if provider == "openai-compatible" and not hasattr(
+        summarization, "_is_context_overflow"
+    ):
+        pytest.skip("Deep Agents recovers from this overflow only from 0.7.14.")
     SEEN.clear()
     native = await create_deep_agent(
         model=SmallContextModel(provider=provider)
