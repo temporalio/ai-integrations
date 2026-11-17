@@ -24,6 +24,7 @@ from temporalio.openai_agents._temporal_worker_env_ref import (
     temporal_worker_env_ref,
 )
 from temporalio.openai_agents.sandbox._on_host_sandbox_client_provider import (
+    SANDBOX_LOST_ERROR_TYPE,
     OnHostSandboxClientProvider,
 )
 from temporalio.openai_agents.sandbox._sandbox_client_provider import (
@@ -44,6 +45,7 @@ __all__ = [
     "OnHostSandboxClientProvider",
     "OpenAIAgentsPlugin",
     "OpenAIPayloadConverter",
+    "SANDBOX_LOST_ERROR_TYPE",
     "SandboxClientProvider",
     "StatelessMCPServerProvider",
     "StatefulMCPServerProvider",

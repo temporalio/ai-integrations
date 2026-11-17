@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from agents.sandbox import Manifest
 from agents.sandbox.errors import SandboxError
 from agents.sandbox.session.sandbox_client import BaseSandboxClient
 from agents.sandbox.session.sandbox_session import SandboxSession
@@ -82,6 +83,21 @@ def _recorded_task_queue(state: SandboxSessionState) -> str | None:
     return state.task_queue if isinstance(state, OnHostSandboxSessionState) else None
 
 
+def _with_trusted_mounts(
+    state: SandboxSessionState, trusted_manifest: Manifest | None
+) -> SandboxSessionState:
+    """Return ``state`` with the mount credentials of ``trusted_manifest``.
+
+    The data converter drops them from the state, and a backend's ``resume()``
+    refuses a state without them.
+    """
+    if trusted_manifest is None:
+        return state
+    return state.rebind_persisted_mount_authority(
+        trusted_manifest, provider_backend_id=state.type
+    )
+
+
 class _SandboxProviderBase(abc.ABC):
     """The Activities shared by both sandbox client providers."""
 
@@ -111,12 +127,7 @@ class _SandboxProviderBase(abc.ABC):
         state = session.state
         if task_queue is not None:
             state = OnHostSandboxSessionState.model_validate(
-                {
-                    **state.model_dump(mode="json"),
-                    "type": "temporal_on_host",
-                    "backend_type": state.type,
-                    "task_queue": task_queue,
-                }
+                {**state.model_dump(mode="json"), "task_queue": task_queue}
             )
         return SessionResult(state=state, supports_pty=session.supports_pty())
 
@@ -144,8 +155,12 @@ class _SandboxProviderBase(abc.ABC):
                     manifest=args.manifest,
                     options=args.client_options,
                 )
-                self._sessions[str(session.state.session_id)] = session
-                return self._session_result(session, self._created_task_queue())
+                result = self._session_result(session, self._created_task_queue())
+                # Held under the id the Workflow gets back: an on-host state is
+                # the backend's serialized state, which can carry another id,
+                # as Docker's does with mount credentials.
+                self._sessions[str(result.state.session_id)] = session
+                return result
 
         # -- Session-level operations (I/O and lifecycle) --
 
@@ -337,7 +352,9 @@ class SandboxClientProvider(_SandboxProviderBase):
         @activity.defn(name=f"{prefix}-sandbox_client_resume")
         async def resume_session(args: ResumeSessionArgs) -> SessionResult:
             with _sandbox_activity_scope(resolvable):
-                session = await self._client.resume(args.state)
+                session = await self._client.resume(
+                    _with_trusted_mounts(args.state, args.trusted_manifest)
+                )
                 self._sessions[str(session.state.session_id)] = session
                 return self._session_result(session, None)
 

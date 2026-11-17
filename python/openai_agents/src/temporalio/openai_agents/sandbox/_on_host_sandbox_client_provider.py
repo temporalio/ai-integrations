@@ -17,6 +17,7 @@ from temporalio.openai_agents.sandbox._sandbox_client_provider import (
     _recorded_task_queue,
     _sandbox_activity_scope,
     _SandboxProviderBase,
+    _with_trusted_mounts,
 )
 from temporalio.openai_agents.sandbox._temporal_activity_models import (
     OnHostSandboxSessionState,
@@ -122,16 +123,24 @@ class OnHostSandboxClientProvider(_SandboxProviderBase):
         @activity.defn(name=f"{prefix}-sandbox_client_resume")
         async def resume_session(args: ResumeSessionArgs) -> SessionResult:
             with _sandbox_activity_scope(resolvable):
-                session = self._sessions.get(str(args.state.session_id))
-                if session is None:
-                    if not isinstance(args.state, OnHostSandboxSessionState):
-                        # A state this provider didn't return carries nothing to
-                        # rebuild from, so this raises SandboxLost.
-                        return self._session_result(await self._session(args), None)
-                    session = await self._client.resume(_backend_state(args.state))
-                    self._sessions[str(session.state.session_id)] = session
                 # Resume runs on the extra Worker, so it keeps the recorded queue.
-                return self._session_result(session, _recorded_task_queue(args.state))
+                queue = _recorded_task_queue(args.state)
+                session = self._sessions.get(str(args.state.session_id))
+                if session is not None:
+                    return self._session_result(session, queue)
+                if not isinstance(args.state, OnHostSandboxSessionState):
+                    # A state this provider didn't return carries nothing to
+                    # rebuild from, so this raises SandboxLost.
+                    return self._session_result(await self._session(args), None)
+                session = await self._client.resume(
+                    _with_trusted_mounts(
+                        _backend_state(args.state), args.trusted_manifest
+                    )
+                )
+                result = self._session_result(session, queue)
+                # Held under the id the Workflow gets back, as at create.
+                self._sessions[str(result.state.session_id)] = session
+                return result
 
         @activity.defn(name=f"{prefix}-sandbox_client_delete")
         async def delete_session(args: StopArgs) -> None:
@@ -142,12 +151,13 @@ class OnHostSandboxClientProvider(_SandboxProviderBase):
             try:
                 with _sandbox_activity_scope(resolvable):
                     await self._client.delete(session)
-            except ApplicationError:
-                # Terminal failure: stop holding the session. A retryable error
-                # keeps it so the activity's retry can still delete it.
-                del self._sessions[key]
+            except ApplicationError as err:
+                # A retryable error keeps the session, so the Activity's retry
+                # can still delete the sandbox.
+                if err.non_retryable:
+                    self._sessions.pop(key, None)
                 raise
-            del self._sessions[key]
+            self._sessions.pop(key, None)
             return None
 
         # Unlike SandboxClientProvider, shutdown keeps the session: the delete
@@ -166,5 +176,4 @@ def _backend_state(state: OnHostSandboxSessionState) -> SandboxSessionState:
     """Return the backend's own state, which ``state`` carries."""
     payload = state.model_dump(mode="json")
     del payload["task_queue"]
-    payload["type"] = payload.pop("backend_type")
     return SandboxSessionState.parse(payload)

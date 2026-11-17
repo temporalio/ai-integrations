@@ -22,6 +22,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ResumeSessionArgs,
     SessionResult,
     StopArgs,
+    _parse_session_state,
 )
 from temporalio.openai_agents.sandbox._temporal_sandbox_session import (
     TemporalSandboxSession,
@@ -102,7 +103,16 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
         _reject_host_path_grants(state.manifest)
         result: SessionResult = await workflow.execute_activity(
             f"{self._name}-sandbox_client_resume",
-            arg=ResumeSessionArgs(state=state),
+            arg=ResumeSessionArgs(
+                state=state,
+                # Serializing the state drops the mount credentials the Runner
+                # rebound into it, so its manifest carries them to the Worker. A
+                # state whose credentials weren't rebound sends none, so the
+                # backend still refuses it.
+                trusted_manifest=None
+                if state.mount_authority_redacted
+                else state.manifest,
+            ),
             result_type=SessionResult,
             **_session_activity_config(self._config, state),
         )
@@ -128,7 +138,7 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
 
     def deserialize_session_state(self, payload: dict[str, Any]) -> SandboxSessionState:
         """Deserialize a session state from a dict."""
-        return SandboxSessionState.parse(payload)
+        return _parse_session_state(payload)
 
 
 def _reject_host_path_grants(manifest: Manifest | None) -> None:

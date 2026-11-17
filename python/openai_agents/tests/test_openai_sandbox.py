@@ -22,6 +22,7 @@ from agents import (
     Tool,
 )
 from agents.sandbox import Capability, Manifest, SandboxAgent, SandboxRunConfig
+from agents.sandbox.entries import DockerVolumeMountStrategy, S3Mount
 from agents.sandbox.errors import (
     ExecTransportError,
     SandboxError,
@@ -1624,7 +1625,7 @@ def _lost_state() -> OnHostSandboxSessionState:
     return OnHostSandboxSessionState(
         manifest=Manifest(),
         snapshot=NoopSnapshot(id=str(uuid.uuid4())),
-        backend_type="test",
+        type="test",
         task_queue="main/mock@gone",
     )
 
@@ -1688,7 +1689,7 @@ async def test_an_on_host_provider_returns_its_own_state_with_its_task_queue():
         assert isinstance(state, OnHostSandboxSessionState)
         assert state.task_queue == "main/mock@box"
         assert state.session_id == session.state.session_id
-        assert state.backend_type == "test_backend"
+        assert state.type == "test_backend"
         assert state.model_dump()["container_id"] == "backend-container"
 
 
@@ -1732,9 +1733,88 @@ async def test_an_on_host_provider_rebuilds_a_session_it_does_not_hold_with_the_
     assert rebuilt["container_id"] == "backend-container"
     assert rebuilt["session_id"] == created.state.session_id
     assert "task_queue" not in rebuilt
-    assert "backend_type" not in rebuilt
     assert isinstance(resumed.state, OnHostSandboxSessionState)
     assert resumed.state.task_queue == "main/mock@box"
+
+
+class _DockerLikeSessionState(SandboxSessionState):
+    """A backend state whose ``type`` allows a Docker-volume mount."""
+
+    type: Literal["docker"] = "docker"  # type: ignore
+
+
+class _MountCredentialCheckingClient(_MockSandboxClient):
+    """Refuses to resume a state without its mount credentials, as OpenAI's backends do."""
+
+    async def resume(self, state: SandboxSessionState) -> SandboxSession:
+        state.assert_path_grants_rebound()
+        return await super().resume(state)
+
+
+def _credentialed_manifest() -> Manifest:
+    return Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="key-id",
+                secret_access_key="secret",
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        }
+    )
+
+
+async def test_an_on_host_session_with_mount_credentials_comes_back_after_a_pause_across_a_restart(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session = _MockSandboxSession()
+    session.state = _DockerLikeSessionState(
+        manifest=Manifest(), snapshot=NoopSnapshot(id=str(uuid.uuid4()))
+    )
+    client = _MountCredentialCheckingClient(session)
+    _, acts = _on_host_activities(client)
+    created = await acts["mock-sandbox_client_create"](
+        CreateSessionArgs(manifest=_credentialed_manifest())
+    )
+    # As the Workflow receives it.
+    state = SessionResult.model_validate_json(created.model_dump_json()).state
+    await acts["mock-sandbox_session_exec"](ExecArgs(state=state, command=["true"]))
+
+    # How OpenAI's Runner saves the state at a pause, restores it, and rebinds
+    # its mount credentials from the run's manifest.
+    workflow_client = TemporalSandboxClient("mock")
+    restored = workflow_client.deserialize_session_state(
+        json.loads(json.dumps(workflow_client.serialize_session_state(state)))
+    )
+    rebound = restored.rebind_persisted_mount_authority(
+        _credentialed_manifest(), provider_backend_id=restored.type
+    )
+    # The resume reaches the Worker after a restart, so it doesn't hold the session.
+    _, restarted = _on_host_activities(client)
+    results: list[SessionResult] = []
+
+    async def execute_activity(
+        name: str,
+        *,
+        arg: ResumeSessionArgs,
+        result_type: Any = None,  # type: ignore[reportUnusedParameter]
+        **kwargs: Any,  # type: ignore[reportUnusedParameter]
+    ) -> SessionResult:
+        sent = ResumeSessionArgs.model_validate_json(arg.model_dump_json())
+        result = await restarted[name](sent)
+        results.append(SessionResult.model_validate_json(result.model_dump_json()))
+        return results[-1]
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    await workflow_client.resume(rebound)
+
+    assert client.resume_calls == 1
+    mount = session.state.manifest.entries["data"]
+    assert isinstance(mount, S3Mount)
+    assert mount.secret_access_key == "secret"
+    await restarted["mock-sandbox_session_exec"](
+        ExecArgs(state=results[0].state, command=["true"])
+    )
 
 
 async def test_an_on_host_provider_does_not_resume_a_state_it_did_not_return():
@@ -1815,10 +1895,40 @@ async def test_an_on_host_provider_keeps_a_shut_down_session_until_it_deletes_it
         await acts["mock-sandbox_session_exec"](ExecArgs(state=state, command=["x"]))
 
 
+class _DeleteFailsOnceClient(_MockSandboxClient):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    async def delete(self, session: SandboxSession) -> SandboxSession:
+        await super().delete(session)
+        if self.delete_calls == 1:
+            raise self.error
+        return session
+
+
+@pytest.mark.parametrize("non_retryable", [False, True], ids=["retryable", "terminal"])
+async def test_an_on_host_provider_keeps_a_session_whose_delete_failed_only_for_a_retry(
+    non_retryable: bool,
+):
+    client = _DeleteFailsOnceClient(
+        ApplicationError("delete failed", non_retryable=non_retryable)
+    )
+    _, acts = _on_host_activities(client)
+    state = (await acts["mock-sandbox_client_create"](_CREATE_ARGS)).state
+
+    with pytest.raises(ApplicationError, match="delete failed"):
+        await acts["mock-sandbox_client_delete"](StopArgs(state=state))
+    # Temporal retries only the retryable error, but run it again either way.
+    await acts["mock-sandbox_client_delete"](StopArgs(state=state))
+
+    assert client.delete_calls == (1 if non_retryable else 2)
+
+
 _ON_HOST_STATE = OnHostSandboxSessionState(
     manifest=Manifest(),
     snapshot=NoopSnapshot(id="on-host"),
-    backend_type="test",
+    type="test",
     task_queue="main/mock@box",
 )
 
@@ -1909,8 +2019,48 @@ async def test_an_on_host_state_keeps_the_backends_fields_and_its_task_queue_thr
     for kept in (restored, carried):
         assert isinstance(kept, OnHostSandboxSessionState)
         assert kept.task_queue == "main/mock@box"
-        assert kept.backend_type == "test_backend"
+        assert kept.type == "test_backend"
         assert kept.model_dump()["container_id"] == "backend-container"
+
+
+async def test_an_on_host_state_with_a_docker_volume_mount_passes_openais_mount_check(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mount = S3Mount(
+        bucket="bucket", mount_strategy=DockerVolumeMountStrategy(driver="rclone")
+    )
+    # As the Workflow receives it.
+    state = SessionResult.model_validate_json(
+        SessionResult(
+            state=OnHostSandboxSessionState(
+                type="docker",
+                manifest=Manifest(entries={"data": mount}),
+                snapshot=NoopSnapshot(id="on-host"),
+                task_queue="main/mock@box",
+            ),
+            supports_pty=False,
+        ).model_dump_json()
+    ).state
+    results: dict[Any, Any] = {
+        SessionResult: SessionResult(state=state, supports_pty=False),
+        PersistWorkspaceResult: PersistWorkspaceResult(data=b""),
+    }
+
+    async def execute_activity(
+        name: str,  # type: ignore[reportUnusedParameter]
+        *,
+        arg: Any,  # type: ignore[reportUnusedParameter]
+        result_type: Any = None,
+        **kwargs: Any,  # type: ignore[reportUnusedParameter]
+    ) -> Any:
+        return results[result_type]
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    session = await TemporalSandboxClient("mock").resume(state)
+
+    # OpenAI checks the mounts against the session's backend before it persists
+    # the workspace.
+    await session.persist_workspace()
 
 
 class _LifecycleSession(_MockSandboxSession):

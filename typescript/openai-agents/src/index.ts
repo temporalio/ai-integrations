@@ -15,6 +15,7 @@ export type {
   SerializableModelActivityOptions,
 } from './common/model-activity-options';
 export { DEDICATED_WORKER_FAILURE_TYPE, TOOL_FILTER_UNSUPPORTED_TYPE, TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from './common/mcp-types';
+export { SANDBOX_LOST_FAILURE_TYPE } from './common/sandbox-activity-types';
 export type {
   HostedToolCredentials,
   HostedToolCredentialsResolver,

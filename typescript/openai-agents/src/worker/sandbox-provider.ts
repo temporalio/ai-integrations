@@ -18,6 +18,7 @@ import type {
 import { Manifest, SandboxError, SandboxMountError } from '@openai/agents-core/sandbox';
 import {
   captureLiveMountCredentialAuthorityIfAbsent,
+  deserializeHostPathGrantRedactionMetadata,
   isStringRecord,
   liveMountEnvironmentAuthorityMatches,
   rebindPersistedMountCredentials,
@@ -547,8 +548,8 @@ export class SandboxClientProvider extends SandboxProviderBase {
   }
 
   /**
-   * Backends refuse a resumed state whose mounts weren't rebound from a trusted manifest: the one the
-   * Workflow sends, or else the envelope's own.
+   * Backends refuse a resumed state whose mounts or path grant `hostPath`s weren't rebound from a trusted
+   * manifest: the one the Workflow sends, or else the envelope's own.
    */
   private async resumableState(
     payload: SerializedSandboxSessionState,
@@ -562,6 +563,12 @@ export class SandboxClientProvider extends SandboxProviderBase {
     const rebound = rebindPersistedMountCredentials(state, trusted);
     state.manifest = rebound.manifest;
     for (const key of Object.keys(state)) if (!(key in rebound)) delete state[key];
+    const grants = new Map(trusted.extraPathGrants.map((grant) => [grant.path, grant]));
+    const { extraPathGrants } = state.manifest;
+    for (const [index, grant] of extraPathGrants.entries()) extraPathGrants[index] = grants.get(grant.path) ?? grant;
+    for (const [key, paths] of Object.entries(deserializeHostPathGrantRedactionMetadata(state))) {
+      if ((paths as string[]).every((path) => grants.get(path)?.hostPath !== undefined)) delete state[key];
+    }
     return state;
   }
 

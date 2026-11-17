@@ -341,8 +341,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
   }
 
   private async runWithOnHostWorkers(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
-    const { connection } = worker;
-    if (this.onHostProviders.length === 0 || connection === undefined) return next(worker);
+    if (this.onHostProviders.length === 0 || worker.connection === undefined) return next(worker);
     const { Worker: WorkerClass } = await import('@temporalio/worker');
     const { namespace, taskQueue } = worker.options;
     const concurrency = this.activityConcurrency.get(workerKey(namespace, taskQueue));
@@ -354,7 +353,9 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         // Its sandbox operations ran on the main Worker before, so it keeps the main Worker's Activity
         // setup.
         const options: WorkerOptions = {
-          connection,
+          // Without a connection from the user, each Worker opens and closes its own: a Worker can't close
+          // the one it opened while another Worker still uses it. No Worker closes the user's connection.
+          connection: worker.options.connection,
           namespace,
           taskQueue: extraTaskQueue,
           activities,
@@ -364,6 +365,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
           maxActivitiesPerSecond: worker.options.maxActivitiesPerSecond,
           maxTaskQueueActivitiesPerSecond: worker.options.maxTaskQueueActivitiesPerSecond,
           shutdownGraceTime: worker.options.shutdownGraceTime,
+          shutdownForceTime: worker.options.shutdownForceTime,
         };
         let created: Worker;
         try {

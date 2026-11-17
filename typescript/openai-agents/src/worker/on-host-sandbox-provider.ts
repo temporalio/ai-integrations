@@ -11,6 +11,7 @@ import {
   SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX,
   SANDBOX_CLIENT_DELETE_SUFFIX,
   SANDBOX_CLIENT_RESUME_SUFFIX,
+  SANDBOX_LOST_FAILURE_TYPE,
   SANDBOX_SESSION_DELETE_SUFFIX,
   type SandboxCanReusePreservedOwnedSessionInput,
   type SandboxLifecycleInput,
@@ -20,9 +21,6 @@ import {
   type SerializedSandboxSessionState,
 } from '../common/sandbox-activity-types';
 import { isNonRetryable, SandboxProviderBase, type ActivityFunction } from './sandbox-provider';
-
-/** The `ApplicationFailure` type of an operation on a sandbox whose Worker process is gone. */
-export const SANDBOX_LOST_FAILURE_TYPE = 'SandboxLost';
 
 export interface OnHostSandboxClientProviderOptions {
   /**

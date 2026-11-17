@@ -23,6 +23,9 @@ import { Manifest, isEnvValueReference, serializeEnvValueReference } from '@open
 import { ApplicationFailure } from '@temporalio/common';
 import { bindWorkerEnvVarReferences } from './worker-env-vars';
 
+/** The `ApplicationFailure` type of an operation on a sandbox whose Worker process is gone. */
+export const SANDBOX_LOST_FAILURE_TYPE = 'SandboxLost';
+
 export const SANDBOX_CLIENT_CREATE_SUFFIX = '-sandbox-client-create';
 export const SANDBOX_CLIENT_RESUME_SUFFIX = '-sandbox-client-resume';
 export const SANDBOX_CLIENT_DELETE_SUFFIX = '-sandbox-client-delete';

@@ -8,7 +8,7 @@ model instance rather than a positional arg list.
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, cast
 
 from agents.sandbox import Manifest
 from agents.sandbox.session.sandbox_client import BaseSandboxClientOptions
@@ -49,21 +49,26 @@ JsonSafeBytes = Annotated[
 class OnHostSandboxSessionState(SandboxSessionState):
     """The Workflow's state of a sandbox created by an ``OnHostSandboxClientProvider``.
 
-    It records the Task Queue of the Worker process holding the sandbox, and the
-    Workflow sends every operation on the sandbox there. It also carries the
-    backend's own state, as undeclared fields with the backend's ``type`` in
-    ``backend_type``, so a Worker with that queue can rebuild the session with
-    the backend's ``resume()`` when OpenAI's SDK resumes it. OpenAI saves and
-    restores session states by ``type``, so all of it survives a pause and
-    continue-as-new.
+    It is the backend's own state, with the backend's ``type`` and its other
+    fields kept as undeclared fields, plus the Task Queue of the Worker process
+    holding the sandbox. The Workflow sends every operation on the sandbox to
+    that queue, and a Worker with that queue can rebuild the session with the
+    backend's ``resume()`` when OpenAI's SDK resumes it. Its ``type`` isn't a
+    ``Literal``, so OpenAI doesn't register it by ``type``: the plugin parses a
+    state that has a ``task_queue`` as this class.
     """
 
     # Pydantic merges this with the base model's config.
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["temporal_on_host"] = "temporal_on_host"  # type: ignore[assignment]
-    backend_type: str
     task_queue: str
+
+
+def _parse_session_state(value: object) -> SandboxSessionState:
+    """Parse a session state, as an ``OnHostSandboxSessionState`` when it has a ``task_queue``."""
+    if isinstance(value, dict) and "task_queue" in value:
+        return OnHostSandboxSessionState.model_validate(value)
+    return SandboxSessionState.parse(value)
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +82,7 @@ class _HasState(BaseModel):
     @field_validator("state", mode="before")
     @classmethod
     def _coerce_state(cls, value: object) -> SandboxSessionState:
-        return SandboxSessionState.parse(value)
+        return _parse_session_state(value)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +240,9 @@ class CreateSessionArgs(BaseModel):
 class ResumeSessionArgs(_HasState):
     """Arguments for resume session activity."""
 
-    pass
+    # The state's manifest with the mount credentials that serializing the state
+    # drops. The Worker rebinds them into the state for the backend's resume().
+    trusted_manifest: Manifest | None = None
 
 
 class SessionResult(_HasState):

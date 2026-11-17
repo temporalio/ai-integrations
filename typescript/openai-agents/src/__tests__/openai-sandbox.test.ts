@@ -1043,6 +1043,19 @@ test('a fresh provider (worker restart) self-heals via client.resume', async (t)
   t.is(client.resumeCalls, 1);
 });
 
+test('a fresh provider resumes a session whose path grant has a hostPath', async (t) => {
+  const client = new FakeSandboxClient();
+  const acts = activityMap(new SandboxClientProvider('fake', client));
+  const { state } = await acts[`fake${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+    manifest: encodeManifest(new Manifest({ extraPathGrants: [{ path: '/data', hostPath: '/srv/data' }] })),
+  });
+
+  const fresh = activityMap(new SandboxClientProvider('fake', client));
+  await fresh[`fake${SANDBOX_SESSION_EXEC_SUFFIX}`]!({ state, args: { cmd: 'x' } });
+  t.is(client.resumeCalls, 1);
+  t.is(client.session.state.manifest.extraPathGrants[0]?.hostPath, '/srv/data');
+});
+
 test('operations on an unknown session fail non-retryably when the client cannot resume', async (t) => {
   const client = new FakeSandboxClient();
   (client as { resume?: unknown }).resume = undefined;
