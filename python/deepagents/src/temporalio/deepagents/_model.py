@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from datetime import timedelta
 from typing import Any
 
@@ -41,9 +42,18 @@ with workflow.unsafe.imports_passed_through():
         CallbackManagerForLLMRun,
     )
     from langchain_core.exceptions import ContextOverflowError
-    from langchain_core.language_models import BaseChatModel
-    from langchain_core.messages import AIMessageChunk, BaseMessage
+    from langchain_core.language_models import BaseChatModel, LanguageModelInput
+    from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
     from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+    from langchain_core.runnables import RunnableConfig
+    from langchain_core.runnables.config import ensure_config
+
+
+# BaseChatModel consumes RunnableConfig before its generation hooks run. Keep
+# only the portable subset for this invocation, including concurrent calls.
+_model_config: ContextVar[dict[str, Any] | None] = ContextVar(
+    "_temporal_deepagents_model_config", default=None
+)
 
 
 def _as_message_chunk(message: Any) -> Any:
@@ -165,6 +175,50 @@ class TemporalModel(BaseChatModel):
     def _llm_type(self) -> str:
         return "temporal-deepagents"
 
+    async def ainvoke(
+        self,
+        input: LanguageModelInput,
+        config: RunnableConfig | None = None,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> AIMessage:
+        """Keep the call's portable configuration available to the activity seam."""
+        token = _model_config.set(_serde.strip_runnable_config(ensure_config(config)))
+        try:
+            return await super().ainvoke(input, config, stop=stop, **kwargs)
+        finally:
+            _model_config.reset(token)
+
+    async def astream(
+        self,
+        input: LanguageModelInput,
+        config: RunnableConfig | None = None,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[AIMessageChunk]:
+        """Forward portable configuration without leaking it across yielded chunks."""
+        portable = _serde.strip_runnable_config(ensure_config(config))
+        stream = super().astream(input, config, stop=stop, **kwargs)
+        try:
+            while True:
+                token = _model_config.set(portable)
+                try:
+                    chunk = await anext(stream)
+                except StopAsyncIteration:
+                    break
+                finally:
+                    _model_config.reset(token)
+                yield chunk
+        finally:
+            token = _model_config.set(portable)
+            try:
+                if close := getattr(stream, "aclose", None):
+                    await close()
+            finally:
+                _model_config.reset(token)
+
     def bind_tools(
         self,
         tools: Sequence[Any],
@@ -215,7 +269,9 @@ class TemporalModel(BaseChatModel):
             messages=_serde.dump_messages(messages),
             tool_schemas=tool_schemas,
             bind_kwargs=bind_kwargs,
-            config=_serde.strip_runnable_config(kwargs.get("config") or {}),
+            config=_serde.strip_runnable_config(
+                kwargs.get("config") or _model_config.get() or {}
+            ),
             streaming_topic=streaming_topic,
         )
 
