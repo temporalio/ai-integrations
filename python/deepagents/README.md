@@ -427,6 +427,29 @@ count.
   and the plugin warns if you pass one — prefer the snapshot + continue-as-new
   path above.
 
+## Call configuration and tool results
+
+`TemporalModel.ainvoke` and `TemporalModel.astream` forward the call's
+`RunnableConfig` to the model Activity. Tools wrapped with `tool_as_activity`
+forward it too. The payload keeps tags, run name and ID, recursion limit,
+JSON-compatible metadata and non-internal `configurable` values. Callbacks,
+live objects and `configurable` keys beginning with `__` stay in the Workflow.
+Forwarded values are recorded in History; keep credentials in the Worker's
+`model_provider` and tool implementation.
+
+When called with a model's tool-call ID, a wrapped tool returns its complete
+`ToolMessage`, including error status and artifact, with that same ID. Calling
+it with bare arguments returns content, as LangChain does. An artifact must be
+serializable by LangChain. `ToolRuntime` and `Command` are still unsupported.
+New calls to a wrapped `return_direct=True` tool fail with
+`DeepAgentsWorkflowError` before the Activity runs. Return from the Workflow
+explicitly after calling the tool instead.
+
+Runs recorded before `deepagents.wrapped-tool-call-context` retain the earlier
+wrapped-tool behavior during replay and subsequent calls: content-only
+results, generated tool-call IDs and empty configuration. New runs record
+the patch and use the complete results and call configuration.
+
 ## Runtime behavior
 
 While a worker built with this plugin is running, the plugin wraps
@@ -461,6 +484,12 @@ Activity name fails at Worker start with `ValueError: More than one activity
 named ...`, as it does without the plugin. That includes a caller Activity
 with one of these names. A second, different
 dynamic Activity fails with `TypeError: More than one dynamic activity`.
+
+Cancellation escaping `run_deep_agent` closes the Workflow as `CANCELED`.
+Use `temporalio.exceptions.is_cancelled_exception` to recognize cancellation.
+Other Temporal failures remain `DeepAgentsWorkflowError`. Histories recorded
+before the `deepagents.raise-cancellation` patch retain the earlier failure
+and cleanup behavior during replay.
 
 ## Composing with other plugins
 

@@ -58,7 +58,10 @@ from tests.test_gemini import (
 )
 
 _ECHO_SERVER = str(Path(__file__).parent / "echo_mcp_server.py")
-_HISTORIES = Path(__file__).parent / "histories"
+# Replay is promised only within a major (see AGENTS.md), so only the histories
+# in the current major's folder replay.
+REPLAY_MAJOR = 1
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
 
 
 @asynccontextmanager
@@ -706,3 +709,102 @@ async def test_mcp_transport_error_evicts_connection(
     finally:
         loop.set_exception_handler(previous_handler)
     assert reported == []
+
+
+async def test_mcp_stale_record_does_not_remove_replacement():
+    """A closing/failing old connection must not touch its replacement."""
+    from temporalio.google_genai import _mcp
+
+    server = f"stale-{uuid4()}"
+    closing = asyncio.Event()
+    finish = asyncio.Event()
+
+    @asynccontextmanager
+    async def old_factory() -> AsyncGenerator[Any, None]:
+        yield object()
+        closing.set()
+        await finish.wait()
+        raise RuntimeError("old close failed")
+
+    @asynccontextmanager
+    async def new_factory() -> AsyncGenerator[Any, None]:
+        yield object()
+
+    old = _mcp._ConnectionRecord(server, old_factory, timedelta(seconds=30))
+    _mcp._CONNECTIONS[server] = old
+    await old.session()
+    close = asyncio.create_task(_mcp._evict_connection(server))
+    await closing.wait()
+    new = _mcp._ConnectionRecord(server, new_factory, timedelta(seconds=30))
+    _mcp._CONNECTIONS[server] = new
+    await new.session()
+    finish.set()
+    await close
+    # The old owner's failure must not drop the replacement from the pool.
+    assert _mcp._CONNECTIONS.get(server) is new
+    assert not new._owner.done()
+
+    # A stale idle-eviction must not close the replacement either.
+    await old._maybe_evict()
+    assert _mcp._CONNECTIONS.get(server) is new
+    assert not new._owner.done()
+    await _mcp._evict_connection(server)
+
+
+async def test_cancelling_one_mcp_caller_leaves_the_other_waiting() -> None:
+    """Cancelling one waiter must not cancel the shared MCP connect."""
+    from temporalio.google_genai import _mcp
+
+    session = object()
+    connected = asyncio.Event()
+    release = asyncio.Event()
+
+    def factory() -> Any:
+        @asynccontextmanager
+        async def connect() -> AsyncGenerator[Any, None]:
+            connected.set()
+            await release.wait()
+            yield session
+
+        return connect()
+
+    server = f"cancel-one-{uuid4()}"
+    first = asyncio.create_task(
+        _mcp.get_connection(server, factory, timedelta(minutes=5))
+    )
+    second: asyncio.Task[tuple[Any, Any]] | None = None
+    try:
+        await connected.wait()
+        second = asyncio.create_task(
+            _mcp.get_connection(server, factory, timedelta(minutes=5))
+        )
+        record = _mcp._CONNECTIONS[server]
+        for _ in range(50):
+            if record._inflight >= 2 and not record._ready.done():
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("second caller did not wait on the shared connect")
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        # The connect, and the caller nobody cancelled, keep going.
+        assert not record._ready.cancelled()
+        assert not record._owner.done()
+        assert not second.done()
+
+        release.set()
+        got, held = await second
+        assert got is session
+        held.release()
+    finally:
+        release.set()
+        pending = [
+            task for task in (first, second) if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await _mcp._evict_connection(server)

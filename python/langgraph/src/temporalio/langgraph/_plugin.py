@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.metadata
 import inspect
 import sys
@@ -15,12 +16,17 @@ from typing import Any, Callable
 from langgraph._internal._runnable import RunnableCallable
 from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
+from langgraph.types import CachePolicy, TimeoutPolicy
 
 from temporalio import activity, workflow
 from temporalio.langgraph._activity import (
     ValueTypes,
     wrap_activity,
     wrap_execute_activity,
+)
+from temporalio.langgraph._entrypoint import (
+    validate_entrypoint_checkpointers,
+    workflow_entrypoint,
 )
 from temporalio.langgraph._interceptor import (
     LangGraphInterceptor,
@@ -35,7 +41,7 @@ from temporalio.langgraph._task_cache import (
 )
 from temporalio.langgraph._workflow import wrap_workflow
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkflowRunner
+from temporalio.worker import Interceptor, ReplayerConfig, WorkerConfig, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 _ACTIVITY_OPTION_KEYS: frozenset[str] = frozenset(
@@ -106,6 +112,88 @@ def _merge_activity_opts(
     return merged
 
 
+def _refuse_clock_policies(
+    owner: str,
+    timeout: TimeoutPolicy | None,
+    cache_policy: CachePolicy | None,
+    how: str = "set",
+) -> None:
+    """Refuse the LangGraph policies that depend on the system clock.
+
+    A ``run_timeout`` fires on a Workflow timer and a cache policy without a
+    ``ttl`` never expires, so they pass.
+    """
+    if timeout is not None and timeout.idle_timeout is not None:
+        raise ValueError(
+            f"{owner} has a LangGraph idle_timeout {how}. LangGraph times it "
+            f"with the system clock, so the Workflow would not be "
+            f"deterministic. Use run_timeout or Temporal activity options "
+            f"instead, e.g. heartbeat_timeout."
+        )
+    if cache_policy is not None and cache_policy.ttl is not None:
+        raise ValueError(
+            f"{owner} has a LangGraph cache_policy ttl {how}. LangGraph's "
+            f"InMemoryCache expires entries by the system clock, so the "
+            f"Workflow would not be deterministic. Remove the ttl."
+        )
+
+
+def _refuse_unsupported_policies(
+    graphs: dict[str, StateGraph[Any, Any, Any, Any]],
+    entrypoints: dict[str, Pregel[Any, Any, Any, Any]],
+    tasks: list,
+) -> None:
+    """Refuse the LangGraph policies that the plugin can't support.
+
+    A node's or a task's own ``retry_policy`` is refused where the plugin
+    wraps it.
+    """
+    for graph_name, graph in graphs.items():
+        # compile() gives these to every node that sets none of its own. It
+        # runs in the Workflow, after the plugin has looked at the nodes.
+        defaults = graph._node_defaults
+        if defaults.retry_policy:
+            raise ValueError(
+                f"Graph {graph_name} has a LangGraph retry_policy set with "
+                f"set_node_defaults. Use Temporal activity options instead, "
+                f"e.g. pass retry_policy=RetryPolicy(...) via "
+                f"default_activity_options or in each node's metadata dict."
+            )
+        _refuse_clock_policies(
+            f"Graph {graph_name}",
+            defaults.timeout,
+            defaults.cache_policy,
+            how="set with set_node_defaults",
+        )
+        for node_name, node in graph.nodes.items():
+            _refuse_clock_policies(
+                f"Node {graph_name}.{node_name}", node.timeout, node.cache_policy
+            )
+    for task in tasks:
+        _refuse_clock_policies(
+            f"Task {task.func.__name__}", task.timeout, task.cache_policy
+        )
+    for name, program in entrypoints.items():
+        if program.retry_policy:
+            raise ValueError(
+                f"Entrypoint {name} has a LangGraph retry_policy set. Use "
+                f"Temporal activity options instead, e.g. pass "
+                f"retry_policy=RetryPolicy(...) via default_activity_options "
+                f"or activity_options[task_name]."
+            )
+        if program.cache is not None:
+            raise ValueError(
+                f"Entrypoint {name} has a LangGraph cache set. Every Workflow "
+                f"run on the Worker would share it, so one run would get "
+                f"another run's results. Remove it."
+            )
+        # @entrypoint puts its timeout on the node that runs the function.
+        for function_node in program.nodes.values():
+            _refuse_clock_policies(
+                f"Entrypoint {name}", function_node.timeout, program.cache_policy
+            )
+
+
 class LangGraphPlugin(SimplePlugin):
     """LangGraph plugin for Temporal SDK.
 
@@ -113,6 +201,12 @@ class LangGraphPlugin(SimplePlugin):
     and tasks as Temporal Activities, giving your AI agent workflows durable
     execution, automatic retries, and timeouts. It supports both the LangGraph Graph
     API (``StateGraph``) and Functional API (``@entrypoint`` / ``@task``).
+
+    Give a Worker or a Replayer one instance with all its graphs, entrypoints
+    and tasks. A Workflow can only use the graphs and entrypoints of one
+    instance, so a second instance raises ``ValueError`` when the Worker or the
+    Replayer is created. A Worker also gets the plugins of its Client, and
+    applies an instance that is on both once.
 
     Args:
         graphs: Graph API graphs to make available to workflows, keyed by name.
@@ -125,8 +219,9 @@ class LangGraphPlugin(SimplePlugin):
         entrypoints: Functional API entrypoints to make available to
             workflows, keyed by name. Workflows retrieve them with
             :func:`entrypoint`.
-        tasks: Functional API ``@task`` functions to wrap as Temporal
-            Activities.
+        tasks: Functional API ``@task`` functions to run as Temporal
+            Activities or in the workflow, as their ``execute_in`` option
+            says. A task that is not listed here runs in the workflow.
         activity_options: Per-task activity options for the Functional
             API, keyed by task function name. Each entry must include
             ``execute_in`` and may include any
@@ -139,9 +234,10 @@ class LangGraphPlugin(SimplePlugin):
             inherited default of either form.
         streaming_topic: When set, ``langgraph.config.get_stream_writer()``
             inside a node publishes to this topic on the workflow's
-            :class:`WorkflowStream`. The workflow must construct
-            ``WorkflowStream()`` in its ``@workflow.init`` (the plugin's
-            interceptor verifies this on workflow start). Nodes with
+            :class:`WorkflowStream`. Every workflow type on the worker
+            must construct ``WorkflowStream()`` in its ``@workflow.init``,
+            including one that uses no graph (the plugin's interceptor
+            verifies this on workflow start). Nodes with
             ``execute_in='activity'`` publish through
             :class:`WorkflowStreamClient` (signal); nodes with
             ``execute_in='workflow'`` publish synchronously to the
@@ -158,6 +254,12 @@ class LangGraphPlugin(SimplePlugin):
             non-interactive aggregation, lower toward 10–50ms only if
             you've measured the latency need and accept the history
             cost.
+
+    Raises:
+        ValueError: If a graph, task or entrypoint sets a LangGraph option
+            that the plugin refuses: a ``retry_policy``, an ``idle_timeout``,
+            a cache policy ``ttl``, or a ``cache`` on an entrypoint. The
+            README says what to use instead.
     """
 
     def __init__(
@@ -211,6 +313,7 @@ class LangGraphPlugin(SimplePlugin):
         self._streaming_topic = streaming_topic
         self._streaming_batch_interval = streaming_batch_interval
         self._context_schemas: dict[str, type[Any]] = {}
+        validate_entrypoint_checkpointers(entrypoints or {})
         schemas: list[type[Any] | None] = [
             *(graph.context_schema for graph in (graphs or {}).values()),
             *(program.context_schema for program in (entrypoints or {}).values()),
@@ -236,6 +339,8 @@ class LangGraphPlugin(SimplePlugin):
                 *(task.func for task in tasks or []),
             ],
         )
+
+        _refuse_unsupported_policies(graphs or {}, entrypoints or {}, tasks or [])
 
         # Graph API: Wrap graph nodes as Temporal Activities.
         if graphs:
@@ -345,15 +450,14 @@ class LangGraphPlugin(SimplePlugin):
                 )
             return runner
 
+        self._interceptor = LangGraphInterceptor(
+            graphs or {}, entrypoints or {}, streaming_topic=streaming_topic
+        )
         super().__init__(
             "langchain.LangGraphPlugin",
             activities=self.activities,
             workflow_runner=workflow_runner,
-            interceptors=[
-                LangGraphInterceptor(
-                    graphs or {}, entrypoints or {}, streaming_topic=streaming_topic
-                )
-            ],
+            interceptors=[self._interceptor],
         )
 
     def version(self) -> str:
@@ -362,6 +466,56 @@ class LangGraphPlugin(SimplePlugin):
             return importlib.metadata.version("temporalio-langgraph")
         except importlib.metadata.PackageNotFoundError:
             return ""
+
+    def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
+        """See base class. Also refuses a second instance, and applies this one once."""
+        self._refuse_second_instance(
+            config, "Worker", " A Worker also gets the plugins of its Client."
+        )
+        before = list(config.get("activities") or [])
+        config["activities"] = before
+        config = super().configure_worker(config)
+        registered = {id(a) for a in before}
+        config["activities"] = [
+            *before,
+            *(a for a in self.activities if id(a) not in registered),
+        ]
+        interceptors: list[Interceptor] = []
+        own_seen = False
+        for interceptor in config.get("interceptors", []):
+            if interceptor is self._interceptor:
+                if own_seen:
+                    continue
+                own_seen = True
+            interceptors.append(interceptor)
+        config["interceptors"] = interceptors
+        return config
+
+    def configure_replayer(self, config: ReplayerConfig) -> ReplayerConfig:
+        """See base class. Also refuses a second instance on the Replayer."""
+        self._refuse_second_instance(config, "Replayer")
+        return super().configure_replayer(config)
+
+    def _refuse_second_instance(
+        self, config: WorkerConfig | ReplayerConfig, target: str, hint: str = ""
+    ) -> None:
+        """Raise if another instance has configured ``config``.
+
+        Every instance leaves its interceptor in ``config``, so the interceptor
+        of another instance there means that this one is a second instance.
+        """
+        # Written back as a list, because reading a one-shot iterable empties it.
+        interceptors = config["interceptors"] = list(config.get("interceptors") or [])
+        if any(
+            isinstance(i, LangGraphInterceptor) and i is not self._interceptor
+            for i in interceptors
+        ):
+            raise ValueError(
+                f"This {target} has more than one LangGraphPlugin instance. Use "
+                "one instance with all the graphs, entrypoints and tasks: a "
+                "Workflow can only use the graphs and entrypoints of one "
+                f"instance.{hint}"
+            )
 
     def execute(
         self,
@@ -419,6 +573,10 @@ def graph(
 ) -> StateGraph[Any, Any, Any, Any]:
     """Retrieve a registered graph by name.
 
+    Each call returns a shallow copy of the graph with its own nodes, so
+    ``compile()`` can add to it and set node defaults without changing the
+    registered graph.
+
     Args:
         name: Graph name as registered with LangGraphPlugin.
         cache: Optional task result cache from a previous cache() call.
@@ -433,7 +591,14 @@ def graph(
         )
     if name not in graphs:
         raise KeyError(f"Graph {name!r} not found. Available graphs: {list(graphs)}")
-    return graphs[name]
+    # compile() adds the default error handler's node to its builder, raising
+    # if the node is already there, and sets node defaults on the node specs.
+    # The registered builder serves every run on the Worker, so copy both. The
+    # copied specs share their runnables, which hold the Activity wrappers.
+    registered = graphs[name]
+    builder = copy.copy(registered)
+    builder.nodes = {key: copy.copy(node) for key, node in registered.nodes.items()}
+    return builder
 
 
 def entrypoint(
@@ -457,7 +622,7 @@ def entrypoint(
         raise KeyError(
             f"Entrypoint {name!r} not found. Available entrypoints: {list(entrypoints)}"
         )
-    return entrypoints[name]
+    return workflow_entrypoint(entrypoints[name])
 
 
 def cache() -> dict[str, Any] | None:

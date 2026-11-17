@@ -12,8 +12,8 @@ scripted two-identical-tool-call agent through ``run_deep_agent`` on a local
 dev server. ``legacy_cache_carried_messages_across_can.json`` was recorded the
 same way on ai-integrations ``5e91c26`` with ``_legacy_result_cache`` forced
 on (no patch marker), for a wrapped tool whose arguments hold a message.
-Delete these tests and the fixtures together when the patch id goes through
-``workflow.deprecate_patch``.
+The fixtures live in ``histories/0.x`` and replay for as long as 0 is the
+plugin's current major (``REPLAY_MAJOR``).
 """
 
 from __future__ import annotations
@@ -46,7 +46,11 @@ with workflow.unsafe.imports_passed_through():
 # the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-_HISTORY = Path(__file__).parent / "histories" / "legacy_dedup_repeated_tool_calls.json"
+# The plugin's current major, the major of its next release. Replay is promised
+# within a major, so these 0.x histories have to replay until 1.0 ships.
+REPLAY_MAJOR = 0
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
+_HISTORY = _HISTORIES / "legacy_dedup_repeated_tool_calls.json"
 
 
 @tool("pairing_weather")
@@ -105,8 +109,6 @@ with workflow.unsafe.imports_passed_through():
 from temporalio.deepagents import _activity
 from temporalio.deepagents._tools import register_tool
 from temporalio.deepagents.workflow import call_tool
-
-_HISTORIES = Path(__file__).parent / "histories"
 
 
 @_lc_tool("legacy_echo")

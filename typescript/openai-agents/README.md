@@ -312,6 +312,10 @@ const plugin = new OpenAIAgentsPlugin({
 
 See `ModelActivityOptions` for the public field list. `summary` can be a string in plugin config; `ModelSummaryProvider` functions are intentionally not serialized into Workflow headers.
 
+The model Activities get a 10-second `heartbeatTimeout` by default. They heartbeat every half timeout, starting half the timeout into the call, so a call that ends sooner sends no heartbeat. Set `heartbeatTimeout` in `modelParams` or the runner's `defaultModelParams` to change it, or set it to `0` to turn heartbeats off. Local Activities don't heartbeat.
+
+The heartbeat timeout counts from the start of the attempt, and the Worker encodes each heartbeat with your payload codecs before sending it. So the first heartbeat arrives after the Worker's startup work for the attempt (interceptors and payload decoding), plus half the timeout, plus the encoding time. Startup and encoding together must comfortably fit in the other half: under 5 seconds with the default. If they can take longer, such as with a codec that calls a remote key service, raise `heartbeatTimeout` to more than twice that time, or set it to `0`. Otherwise a healthy model call longer than half the timeout fails with a heartbeat timeout on every attempt.
+
 ## Tools
 
 Inline function tools, hosted tools, Activity-backed tools, Nexus operation tools, nested agent tools, and MCP tools can all be used from a Temporal-backed agent. Any tool that does I/O must run outside the Workflow sandbox, usually through an Activity or Nexus Operation.
@@ -467,7 +471,7 @@ The framework reads an `asTool()` tool's `runConfig` and `runOptions` only when 
 
 The integration supports stateless and stateful [Model Context Protocol](https://modelcontextprotocol.io/) servers.
 
-Both providers require factories to return a server with callable `connect`, `close`, `listTools` and `callTool` methods. An invalid result fails the Activity with a non-retryable `ApplicationFailure` of type `MCPServerFactoryTypeError` before the server is connected or registered. Plain objects implementing these methods are accepted. A partial server that previously worked for one operation must now provide all four methods. Other invalid results previously failed with ordinary runtime errors that could be retried. Fix these factories before upgrading: deploying a corrected Worker will not automatically resume an Activity that has already failed.
+Both providers require a factory function, and refuse anything else with a `TypeError` when you create them, so the Worker doesn't start. They also require factories to return a server with callable `connect`, `close`, `listTools` and `callTool` methods. An invalid result fails the Activity with a non-retryable `ApplicationFailure` of type `MCPServerFactoryTypeError` before the server is connected or registered. Plain objects implementing these methods are accepted. A partial server that previously worked for one operation must now provide all four methods. Other invalid results previously failed with ordinary runtime errors that could be retried. Fix these factories before upgrading: deploying a corrected Worker will not automatically resume an Activity that has already failed.
 
 ### Stateless MCP servers
 
@@ -571,7 +575,7 @@ Some consequences:
 
 Only the session Activity's Worker serves the server's operations. With a schedule-to-start timeout (the default `config.scheduleToStartTimeout` is 30 seconds), an operation fails with `DedicatedWorkerFailure` when it expires. With `scheduleToStartTimeout: 0`, an operation fails with `DedicatedWorkerFailure` as soon as the session Activity has ended, for example after a graceful shutdown of its Worker, and an operation still waiting then is cancelled. A caller's own cancellation still cancels the operation, and wins over the session's end.
 
-A run follows its session this way only once it records the patch marker `openai-agents-stateful-mcp-session-watch`, which it does at its first operation with `scheduleToStartTimeout: 0`. Histories recorded on an earlier version have no marker, so they schedule such operations as before and replay on this version; a run that continues on this version records the marker at its next such operation. A run with the marker fails replay on an earlier version, and so can any run whose session failed with `DedicatedWorkerFailure` (a refused retry or a refused describe) and that then went on, so do not roll back while such runs are open. Drain the earlier version's Workers before starting this one: while Workers of both versions run, a run whose session gets a refusal can fail replay when it moves from one to the other.
+Runs recorded on 1.x schedule such operations without watching the session, and some of them fail replay on this version, such as a run whose caller cancelled operations on two servers while one of them had `scheduleToStartTimeout: 0`. A run whose session failed with `DedicatedWorkerFailure` (a refused retry or a refused describe) and that then went on can fail replay on an earlier version, so do not roll back while such runs are open. Drain the earlier version's Workers before starting this one: while Workers of both versions run, a run whose session gets a refusal can fail replay when it moves from one to the other.
 
 ### MCP tool filters
 

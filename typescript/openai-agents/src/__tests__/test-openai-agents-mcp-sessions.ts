@@ -206,20 +206,17 @@ test('Stateful MCP: slow connect heartbeat regression', async (t) => {
   });
 });
 
-test('Stateful MCP: histories recorded on an earlier version replay', async (t) => {
-  // Recorded on main at ea04762 with the Workflow Worker stopped, so that one
-  // activation resolves a stateful tool call together with plain Activities
-  // (gather) or with a Workflow cancel (cancel); and a caller's cancellation of
-  // calls to two servers, one without a schedule-to-start timeout (caller-cancel).
+// Replay is promised only within a major (see AGENTS.md), so only the histories
+// in the current major's folder replay.
+const REPLAY_MAJOR = 2;
+
+test('Stateful MCP: recorded histories replay', async (t) => {
   for (const name of [
-    'stateful-mcp-gather.json',
-    'stateful-mcp-gather-sts0.json',
-    'stateful-mcp-cancel-sts0.json',
+    // A caller's cancellation of calls to two servers, one without a
+    // schedule-to-start timeout.
     'stateful-mcp-caller-cancel.json',
-    // Recorded on this version, with the patch marker.
-    'stateful-mcp-caller-cancel-marker.json',
   ]) {
-    const file = path.resolve(__dirname, '../../src/__tests__/histories', name);
+    const file = path.resolve(__dirname, '../../src/__tests__/histories', `${REPLAY_MAJOR}.x`, name);
     const history = historyFromJSON(JSON.parse(fs.readFileSync(file, 'utf8')));
     await t.notThrowsAsync(
       Worker.runReplayHistory(

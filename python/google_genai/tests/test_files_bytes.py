@@ -9,9 +9,7 @@ workflow handed to the client:
 * a workflow-level test per payload (a valid PNG, a non-UTF-8 byte string, every
   byte value, ASCII);
 * activity-level tests, including inputs shaped as an older version recorded
-  them;
-* a replay of histories recorded on ``7eea646`` (upstream main before this
-  change), when ``bytes`` went into the activity input model as JSON text.
+  them.
 """
 
 from __future__ import annotations
@@ -25,7 +23,6 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -34,7 +31,7 @@ from google.genai import Client as GeminiClient
 from google.genai import types
 
 from temporalio import workflow
-from temporalio.client import Client, WorkflowHistory
+from temporalio.client import Client
 from temporalio.google_genai import GoogleGenAIPlugin, TemporalAsyncClient
 from temporalio.google_genai._gemini_activity import GeminiApiCaller
 from temporalio.google_genai._models import (
@@ -42,10 +39,7 @@ from temporalio.google_genai._models import (
     _GeminiUploadToFileSearchStoreRequest,
 )
 from temporalio.testing import ActivityEnvironment
-from temporalio.worker import Replayer
 from tests.helpers import new_worker
-
-HISTORIES = Path(__file__).parent / "histories"
 
 # A 1x1 PNG: the bytes of a real image, whose first byte (0x89) is not valid UTF-8.
 PNG = base64.b64decode(
@@ -411,29 +405,3 @@ async def test_files_download_activity_returns_binary_bytes():
         )
 
     assert result == DOWNLOAD_BODY
-
-
-# ---------------------------------------------------------------------------
-# Replay of histories recorded before this change
-# ---------------------------------------------------------------------------
-
-
-def _history(name: str) -> WorkflowHistory:
-    return WorkflowHistory.from_json(
-        "legacy-replay", (HISTORIES / f"{name}.json").read_text()
-    )
-
-
-async def test_replay_history_recorded_with_text_bytes_in_the_input():
-    """A history from before this change still replays.
-
-    ``legacy_ascii_files.json`` was recorded on ``7eea646`` by running
-    ``BinaryFilesWorkflow`` unchanged with ``ASCII`` bytes (the only kind that
-    version could upload). It has the old activity inputs, with the bytes inside
-    the request as a JSON string, and a binary download result. The replay runs
-    the workflow code under test against them.
-    """
-    await Replayer(
-        workflows=[BinaryFilesWorkflow],
-        plugins=[GoogleGenAIPlugin(GeminiClient(api_key="fake-test-key"))],
-    ).replay_workflow(_history("legacy_ascii_files"))

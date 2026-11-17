@@ -73,6 +73,7 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - If something doesn't work in the framework itself, because it's unsupported or because of a framework bug, the plugin doesn't have to make it work either. Document the limit in the README. Fix framework bugs upstream, not with a plugin workaround, and raise the dependency floor once the fix ships.
 - Run the framework's own code and hook in through its extension points. Don't copy its objects or depend on their private fields; copies drift from upstream.
 - A behavior change that can alter recorded histories must be gated with a patch, or called out as breaking in the PR with guidance for in-flight runs. This takes precedence over the rules above.
+- Replay is promised only within a major version. Histories from releases of the same major must replay on every later release of that major; across majors there is no promise. A gate that only keeps an older major's runs replaying is removed before the next major ships. Committed replay histories go in a folder per major (`histories/<major>.x/`, `0.x/` below 1.0), and each replay test's `REPLAY_MAJOR` constant names the plugin's current major, the major of its next release, so CI replays only that folder. Older majors' folders stay in the repo.
 
 ## Plugin contract
 
@@ -121,6 +122,14 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   Spring Boot major series. Run `resolveAndLockAll --write-locks --refresh-dependencies`
   first; subsequent test and build commands reuse a separate ignored latest lock.
   Ordinary CI and releases default to `-PdependencyMode=locked` and committed locks.
+- Shared Java CI resolves dependencies before offline lint, tests and packaging.
+  `scripts/ci/resolve_java_dependencies.py` allows three fresh Gradle invocations,
+  waiting 10 then 30 seconds only after transient dependency-download errors;
+  authentication, missing artifacts, TLS, integrity and lock failures remain terminal.
+  `resolveDependencies` preserves committed locks; latest mode uses `resolveAndLockAll`.
+  External Gradle caches are keyed by OS, architecture, plugin, Java, Boot, dependency
+  mode and build/lock inputs, with fallback only within the same matrix variant.
+  Successful default-branch jobs save caches; latest runs use a fresh snapshot key.
 
 ## TypeScript conventions
 
@@ -238,6 +247,24 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   the `global.json` SDK plus its runtime, fails if `dotnet --version` leaves the SDK channel, and
   runs `make test TEST_FRAMEWORK=net<runtime>`. A plain `make test` runs every listed runtime, so a
   machine needs their runtimes installed next to the SDK.
+
+## Pull requests
+
+PRs are squash-merged, so the PR title becomes the commit subject and a line in the plugin's
+release notes. Start each title with the plugin it changes:
+
+```
+[python/openai_agents] breaking: remove the gates that kept 1.x runs replaying
+[python/mcp] say that `timedelta(0)` also turns heartbeats off
+```
+
+- The tag is the plugin's folder path, as written in its release tags: `python/openai_agents`,
+  `typescript/vercel-ai-sdk`, `go/googleadk`.
+- A PR that changes up to three plugins lists them all:
+  `[python/strands_agents, python/deepagents]`. One that changes more than three has no tag, and
+  one that changes no plugin uses `[repo]`.
+- Write the text after the tag in lowercase, and don't repeat the plugin's name. Start with
+  `breaking:` when the change is breaking. Other PRs get no type word.
 
 ## CI
 

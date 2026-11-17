@@ -105,8 +105,8 @@ func TestClassifyModelErrorRetryability(t *testing.T) {
 		assert.Equal(t, !tc.retryable, IsNonRetryable(classified), "code %d", tc.code)
 	}
 
-	// ADK's Gemini model returns this untyped error for a reply with no
-	// candidates, such as a blocked prompt.
+	// Before ADK v2.8.0, ADK's Gemini model returns this untyped error for a
+	// non-streamed reply with no candidates, such as a blocked prompt.
 	empty := fmt.Errorf("empty response")
 	assert.True(t, IsNonRetryable(classifyModelError(empty)), "empty response")
 	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("wrapped: %w", empty))), "wrapped empty response")
