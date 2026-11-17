@@ -63,6 +63,24 @@ test('StatelessMCPServerProvider rejects invalid factory results before connecti
   t.is(closes, 0);
 });
 
+test('a rejecting async factory fails the Activity without an unhandled rejection', async (t) => {
+  const unhandled: unknown[] = [];
+  const listener = (reason: unknown) => unhandled.push(reason);
+  process.on('unhandledRejection', listener);
+  try {
+    const activities = new StatelessMCPServerProvider('files', (async () => {
+      throw new Error('server not ready');
+    }) as unknown as () => MCPServer)._getActivities();
+    const err = await t.throwsAsync(activities['files-stateless-list-tools']!({}), { instanceOf: ApplicationFailure });
+    t.is(err?.type, 'MCPServerFactoryTypeError');
+    // Unhandled rejections surface after the microtask queue drains and a macrotask turn.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    t.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
+});
+
 test('MCP server providers refuse a factory that is not a function when they are built', (t) => {
   const invalidFactories: [unknown, string][] = [
     [undefined, 'undefined'],

@@ -26,6 +26,11 @@ export function assertMCPServerFactory(name: string, factory: unknown): void {
 export function assertMCPServer(name: string, server: unknown): asserts server is MCPServer {
   const methods = ['connect', 'close', 'listTools', 'callTool'] as const;
   if (server != null && methods.every((method) => typeof (server as MCPServer)[method] === 'function')) return;
+  // An async factory returns a Promise that may reject. Nothing awaits it, so mark it handled: the
+  // type error below fails the Activity, and an unhandled rejection would otherwise crash the Worker.
+  if (typeof (server as PromiseLike<unknown> | null)?.then === 'function') {
+    Promise.resolve(server).catch(() => {});
+  }
   throw ApplicationFailure.create({
     message:
       `MCP server factory '${name}' returned ${describeValue(server)}, ` +
