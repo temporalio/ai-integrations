@@ -18,18 +18,11 @@ if TYPE_CHECKING:
     from google.adk.workflow import FunctionNode
 
 _TOOL_CONTEXT_PARAM = "tool_context"
-# Workflows started before this patch pass an activity's empty *args as one
-# extra argument; keep that on replay.
-_VAR_ARGS_PATCH = "google_adk.activity-as-tool-var-args"
 
 
 @dataclass(frozen=True)
 class ToolContextSnapshot:
     """Serializable snapshot of the ADK ``ToolContext`` for activity-backed tools.
-
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
 
     ADK's ``ToolContext`` holds live, non-serializable objects, so it cannot
     cross the activity boundary: activity inputs are sent to the server and
@@ -426,10 +419,6 @@ def _snapshot_tool_context(tool_context: Any) -> ToolContextSnapshot:
 def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     """Decorator/Wrapper to wrap a Temporal Activity as an ADK Tool.
 
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
-
     This ensures the activity's signature is preserved for ADK's tool schema generation
     while marking it as a tool that executes via 'workflow.execute_activity'.
 
@@ -502,7 +491,7 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
             else:
                 return result
 
-        if has_var_args and workflow.patched(_VAR_ARGS_PATCH):
+        if has_var_args:
             # bound.args spreads *args; bound.arguments holds it as one tuple.
             activity_args = list(bound.args)
 
@@ -565,10 +554,6 @@ def activity_node(
     **kwargs: Any,
 ) -> "FunctionNode":
     """Wraps a Temporal Activity as a node for an ADK workflow graph.
-
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
 
     The returned ``google.adk.workflow.FunctionNode`` can be placed in a
     ``Workflow(edges=[...])`` graph or invoked from a dynamic node via

@@ -39,15 +39,17 @@ test('With no model named, the Worker adds the model settings defaults for its o
   const previous = process.env.OPENAI_DEFAULT_MODEL;
   try {
     await worker.runUntil(async () => {
-      // The Workflow's default model is gpt-5.4-mini. A Worker whose default isn't a GPT-5 model gets
+      // The Workflow's default model is upstream's, a GPT-5 model. A Worker whose default isn't a GPT-5 model gets
       // none of its settings, directly or in a nested run.
       process.env.OPENAI_DEFAULT_MODEL = 'gpt-4.1';
       await run({ runSettings: { temperature: 0.3 } });
       await run({ leadModel: 'gpt-5', runSettings: { temperature: 0.3 } });
       delete process.env.OPENAI_DEFAULT_MODEL;
       await run({ runSettings: { temperature: 0.3 } });
-      // The agent's own settings replace the defaults, as upstream.
+      // The agent's own settings replace the defaults, as upstream. Its effort marker is upstream's, so it's left out.
+      const ownSettingsCalls = calls.length;
       await run({ runSettings: { temperature: 0.3 }, agentSettings: { temperature: 0.9 } });
+      t.deepEqual(calls.splice(ownSettingsCalls).map((call) => call.modelSettings), [{ temperature: 0.9 }]);
       // A nested run takes the run's settings without `toolChoice` and `parallelToolCalls`.
       await run({ leadModel: 'gpt-5', runSettings: { temperature: 0.3, toolChoice: 'required', parallelToolCalls: true } });
       // Upstream clears `toolChoice` after the tool call.
@@ -74,7 +76,6 @@ test('With no model named, the Worker adds the model settings defaults for its o
     },
     { model: '', modelSettings: { temperature: 0.3 }, reasoningEffortImplicit: false },
     { model: '', modelSettings: { ...gpt5Defaults, temperature: 0.3 }, reasoningEffortImplicit: true },
-    { model: '', modelSettings: { temperature: 0.9 }, reasoningEffortImplicit: false },
     {
       model: 'gpt-5',
       modelSettings: {

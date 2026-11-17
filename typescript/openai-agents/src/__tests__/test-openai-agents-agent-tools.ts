@@ -65,6 +65,7 @@ test('agent.asTool() runs take the run model, model settings and runner defaults
     t.is(modelActivities.length, 4);
     for (const e of modelActivities) {
       t.is(Number(e.activityTaskScheduledEventAttributes?.startToCloseTimeout?.seconds), 17);
+      t.is(Number(e.activityTaskScheduledEventAttributes?.heartbeatTimeout?.seconds), 10);
       const summary = Buffer.from(e.userMetadata?.summary?.data ?? []).toString('utf-8');
       t.true(summary.includes('runner default'), summary);
     }
@@ -145,14 +146,12 @@ for (const [title, onAfterStart] of [
 
 test('A nested agent.asTool() run fails to stream when model calls are local Activities', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
-  const leadInputs: any[] = [];
   let streamed = false;
   const provider = {
     getModel() {
       return {
         // Answers from the request, not a call count, so a rerun local Activity gets the same answer.
         async getResponse(request: any) {
-          leadInputs.push(request.input);
           const answered =
             Array.isArray(request.input) && request.input.some((item: any) => item.type === 'function_call_result');
           return answered ? textResponse('done') : toolCallResponse('ask_streamer', { input: 'q' });
@@ -173,9 +172,6 @@ test('A nested agent.asTool() run fails to stream when model calls are local Act
     });
     t.deepEqual(await handle.result(), { output: 'done', onStream: [], on: [] });
     t.false(streamed, 'the nested model is not called');
-    // A nested run's failure is the tool's output, as upstream.
-    const toolOutputs = leadInputs.flat().filter((item: any) => item?.type === 'function_call_result');
-    t.regex(JSON.stringify(toolOutputs), /Streaming is incompatible with useLocalActivity/);
     await replay(t, handle);
   });
 });

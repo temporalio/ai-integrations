@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from inspect import iscoroutine
 from types import TracebackType
 from typing import Any, cast
 
@@ -158,12 +159,22 @@ def _raise_repeated_cursor_error(err: UserError) -> None:
 def _mcp_server_backend_factory(
     name: str, factory: _MCPServerFactory
 ) -> _MCPBackendFactory:
+    # Fail when the Worker is built, not in every MCP Activity.
+    if not callable(factory):
+        kind = type(factory)  # type: ignore[reportUnreachable]
+        raise TypeError(
+            f"MCP server factory {name!r} is "
+            f"{kind.__module__}.{kind.__qualname__}, not callable"
+        )
     invoke = _FactoryInvoker(name, factory)
 
     def create(argument: Any = _NOT_SUPPLIED) -> _OpenAIMCPServerBackend:
         server = invoke(argument)
         if not isinstance(server, MCPServer):
             kind = type(server)
+            if iscoroutine(server):
+                # An async factory; close it so Python doesn't warn it was never awaited.
+                server.close()
             raise ApplicationError(
                 f"MCP server factory {name!r} returned "
                 f"{kind.__module__}.{kind.__qualname__}, not agents.mcp.MCPServer",

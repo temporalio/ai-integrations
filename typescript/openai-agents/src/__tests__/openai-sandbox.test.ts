@@ -1,21 +1,37 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import test from 'ava';
-import { Agent, handoff } from '@openai/agents-core';
+import { Agent, UserError, handoff } from '@openai/agents-core';
+import { DockerSandboxClient, UnixLocalSandboxClient } from '@openai/agents-core/sandbox/local';
 import {
   Manifest,
   SandboxAgent,
   SandboxError,
+  type SandboxClientResumeOptions,
   type SandboxExecResult,
+  type SandboxPreservedSessionReuseOptions,
   type SandboxSession,
   type SandboxSessionState,
 } from '@openai/agents-core/sandbox';
-import { deserializeManifest, serializeManifestRecord } from '@openai/agents-core/sandbox/internal';
-import { ApplicationFailure, type ActivityOptions } from '@temporalio/common';
+import {
+  assertMountCredentialsRebound,
+  deserializeManifest,
+  serializeManifestRecord,
+  serializeMountCredentialRedactionMetadata,
+} from '@openai/agents-core/sandbox/internal';
+import { ApplicationFailure } from '@temporalio/common';
+import type { ActivityOptions } from '@temporalio/workflow';
+import { MockActivityEnvironment } from '@temporalio/testing';
+import { DefaultLogger } from '@temporalio/worker';
 import { setActivator } from '@temporalio/workflow/lib/global-attributes';
 import {
+  SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX,
   SANDBOX_CLIENT_CREATE_SUFFIX,
   SANDBOX_CLIENT_DELETE_SUFFIX,
   SANDBOX_CLIENT_RESUME_SUFFIX,
   SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX,
+  SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX,
   SANDBOX_EDITOR_CREATE_FILE_SUFFIX,
   SANDBOX_EDITOR_DELETE_FILE_SUFFIX,
   SANDBOX_EDITOR_UPDATE_FILE_SUFFIX,
@@ -47,30 +63,99 @@ import {
   type SerializedSandboxSessionState,
   type SerializedToolOutputImage,
 } from '../common/sandbox-activity-types';
+import { OnHostSandboxClientProvider } from '../worker/on-host-sandbox-provider';
 import { SandboxClientProvider } from '../worker/sandbox-provider';
 import { workerEnvValue } from '../common/worker-env-vars';
 import { TemporalSandboxClient, temporalSandboxClient } from '../workflow/sandbox-client';
-import { TemporalSandboxSession } from '../workflow/sandbox-session';
+import { TemporalSandboxSession, sessionActivityOptions } from '../workflow/sandbox-session';
 import { TemporalOpenAIRunner } from '../workflow/runner';
 import { FakeSandboxClient, FakeSandboxSession } from './stubs/sandbox-fakes';
 
-function activityMap(provider: SandboxClientProvider): Record<string, (...args: any[]) => Promise<any>> {
-  return provider._getActivities();
+/** An Activity context on `taskQueue`, which leaves the failures tests expect out of the log. */
+function activityContext(taskQueue: string): MockActivityEnvironment {
+  return new MockActivityEnvironment({ taskQueue }, { logger: new DefaultLogger('ERROR') });
+}
+
+// As a Worker on the Task Queue 'main' runs them.
+const activityEnvironment = activityContext('main');
+
+function activityMap(
+  provider: SandboxClientProvider | OnHostSandboxClientProvider
+): Record<string, (...args: any[]) => Promise<any>> {
+  return Object.fromEntries(
+    Object.entries(provider._getActivities()).map(([name, fn]) => [
+      name,
+      (...args: unknown[]) => activityEnvironment.run(fn, ...args),
+    ])
+  );
+}
+
+/** A provider of either kind for `client`. */
+function providerOf(kind: 'hosted' | 'on-host', client: FakeSandboxClient) {
+  return kind === 'hosted'
+    ? new SandboxClientProvider('fake', client)
+    : new OnHostSandboxClientProvider('fake', client, { workerName: 'w' });
 }
 
 async function createSession(
   acts: Record<string, (...args: any[]) => Promise<any>>,
-  name = 'fake'
+  name = 'fake',
+  manifest?: Manifest
 ): Promise<SandboxSessionResult> {
-  return acts[`${name}${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({});
+  return acts[`${name}${SANDBOX_CLIENT_CREATE_SUFFIX}`]!(manifest ? { manifest: encodeManifest(manifest) } : {});
 }
+
+/** Runs `fn` as Workflow code whose Activities run in `acts`, with their input through JSON as Temporal sends it. */
+async function inWorkflow<T>(
+  acts: Record<string, (...args: any[]) => Promise<any>>,
+  fn: () => Promise<T>
+): Promise<{ result: T; scheduled: any[] }> {
+  const scheduled: any[] = [];
+  setActivator({
+    info: { workflowId: 'sandbox-workflow', runId: 'sandbox-run' },
+    bindCurrentRandom: (bound: (...args: any[]) => any) => bound,
+    nextSeqs: { activity: 1 },
+    interceptors: {
+      outbound: [
+        {
+          scheduleActivity: async (input: any) => {
+            const sent = { ...input, args: JSON.parse(JSON.stringify(input.args)) };
+            scheduled.push(sent);
+            return acts[sent.activityType]!(...sent.args);
+          },
+        },
+      ],
+    },
+  } as any);
+  try {
+    return { result: await fn(), scheduled };
+  } finally {
+    setActivator(undefined);
+  }
+}
+
+/** A mount upstream can't verify after persistence, so it refuses to resume a session with it. */
+const OPAQUE_MOUNT = {
+  type: 's3_mount',
+  bucket: 'bucket',
+  mountPath: 'data',
+  mountStrategy: { type: 'docker_volume', driver: 'rclone', driverOptions: { option: 'value' } },
+} as const;
+
+/** A mount that takes its credentials from the sandbox environment. */
+const ENVIRONMENT_CREDENTIAL_MOUNT = {
+  type: 's3_mount',
+  bucket: 'bucket',
+  mountPath: 'data',
+  mountStrategy: { type: 'e2b_cloud_bucket' },
+} as const;
 
 // ── temporalSandboxClient factory ──
 
-test('temporalSandboxClient returns a TemporalSandboxClient with backendId = name', (t) => {
-  const client = temporalSandboxClient('my-backend');
+test("temporalSandboxClient returns a TemporalSandboxClient whose backendId isn't a provider's name", (t) => {
+  const client = temporalSandboxClient('docker');
   t.true(client instanceof TemporalSandboxClient);
-  t.is(client.backendId, 'my-backend');
+  t.is(client.backendId, 'temporal:docker');
 });
 
 test('temporalSandboxClient honors activity config overrides', (t) => {
@@ -176,6 +261,8 @@ const sandboxActivitySuffixes = [
   SANDBOX_CLIENT_RESUME_SUFFIX,
   SANDBOX_CLIENT_DELETE_SUFFIX,
   SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX,
+  SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX,
+  SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX,
   SANDBOX_SESSION_START_SUFFIX,
   SANDBOX_SESSION_RUNNING_SUFFIX,
   SANDBOX_SESSION_STOP_SUFFIX,
@@ -198,11 +285,12 @@ const sandboxActivitySuffixes = [
   SANDBOX_EDITOR_DELETE_FILE_SUFFIX,
 ];
 
-test('provider registers all prefixed activities', (t) => {
-  const provider = new SandboxClientProvider('fake', new FakeSandboxClient());
-  const names = Object.keys(provider._getActivities());
-  t.deepEqual(new Set(names), new Set(sandboxActivitySuffixes.map((suffix) => `fake${suffix}`)));
-});
+for (const kind of ['hosted', 'on-host'] as const) {
+  test(`provider registers all prefixed activities (${kind})`, (t) => {
+    const names = Object.keys(providerOf(kind, new FakeSandboxClient())._getActivities());
+    t.deepEqual(names.sort(), sandboxActivitySuffixes.map((suffix) => `fake${suffix}`).sort());
+  });
+}
 
 test('multiple providers register disjoint activity sets', (t) => {
   const names1 = new Set(Object.keys(new SandboxClientProvider('daytona', new FakeSandboxClient())._getActivities()));
@@ -242,6 +330,296 @@ test('resume delegates to the real client', async (t) => {
   const result: SandboxSessionResult = await acts[`fake-sandbox-client-resume`]!({ state });
   t.is(client.resumeCalls, 1);
   t.is(result.state.sessionId, state.sessionId);
+});
+
+test.serial('resume passes its client options to the backend', async (t) => {
+  const options: (SandboxClientResumeOptions | undefined)[] = [];
+  class OptionsClient extends FakeSandboxClient {
+    override async resume(state: SandboxSessionState, received?: SandboxClientResumeOptions): Promise<SandboxSession> {
+      options.push(received);
+      return super.resume(state);
+    }
+  }
+  const acts = activityMap(new SandboxClientProvider('fake', new OptionsClient()));
+  const { state } = await createSession(acts);
+
+  await inWorkflow(acts, () =>
+    temporalSandboxClient('fake').resume(reviveWorkflowSessionState(state), { clientOptions: { image: 'other' } })
+  );
+  t.deepEqual(options[0]?.clientOptions, { image: 'other' });
+});
+
+test.serial("resume takes a mount's credentials from the trusted manifest and keeps the run's other entries", async (t) => {
+  const mount = {
+    type: 's3_mount',
+    bucket: 'bucket',
+    mountPath: 'data',
+    mountStrategy: { type: 'modal_cloud_bucket' },
+    accessKeyId: 'AKIA',
+    secretAccessKey: 'secret',
+  } as const;
+  const saved = await temporalSandboxClient('fake').deserializeSessionState({
+    sessionId: 'saved',
+    providerState: {},
+    manifest: serializeManifestRecord(
+      new Manifest({ entries: { data: mount, 'notes.txt': { type: 'file', content: 'added during the run' } } })
+    ),
+  });
+  const client = new FakeSandboxClient();
+
+  await inWorkflow(activityMap(new SandboxClientProvider('fake', client)), () =>
+    temporalSandboxClient('fake').resume(saved, { trustedManifest: new Manifest({ entries: { data: mount } }) })
+  );
+  const { entries } = client.session.state.manifest;
+  t.like(entries.data, { accessKeyId: 'AKIA', secretAccessKey: 'secret' });
+  t.like(entries['notes.txt'], { content: 'added during the run' });
+});
+
+for (const kind of ['hosted', 'on-host'] as const) {
+  test(`a reuse check leaves the live session unchanged (${kind})`, async (t) => {
+    const client = new FakeSandboxClient();
+    const acts = activityMap(providerOf(kind, client));
+    const { state } = await acts[`fake${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+      manifest: encodeManifest(
+        new Manifest({
+          environment: { KEEP: 'old', LITERAL: 'stays' },
+          extraPathGrants: [{ path: '/old' }],
+          remoteMountCommandAllowlist: ['old'],
+        })
+      ),
+    });
+
+    const reusable = await acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({
+      state,
+      trustedManifest: encodeManifest(
+        new Manifest({
+          environment: { KEEP: 'new', ADDED: 'added' },
+          extraPathGrants: [{ path: '/new', readOnly: true }],
+          remoteMountCommandAllowlist: ['new'],
+        })
+      ),
+    });
+    t.true(reusable);
+    const { environment, manifest } = client.session.state;
+    t.deepEqual(environment, { KEEP: 'old', LITERAL: 'stays' });
+    t.deepEqual(Object.keys(manifest.environment), ['KEEP', 'LITERAL']);
+    t.deepEqual(
+      manifest.extraPathGrants.map(({ path }) => path),
+      ['/old']
+    );
+    t.deepEqual(manifest.remoteMountCommandAllowlist, ['old']);
+    t.is(client.resumeCalls, 0);
+  });
+}
+
+test("a reuse check without a trusted manifest asks the backend's own check and leaves the session alone", async (t) => {
+  const options: (SandboxPreservedSessionReuseOptions | undefined)[] = [];
+  const client = Object.assign(new FakeSandboxClient(), {
+    canReusePreservedOwnedSession: async (_: SandboxSessionState, received?: SandboxPreservedSessionReuseOptions) => {
+      options.push(received);
+      return true;
+    },
+  });
+  const acts = activityMap(new SandboxClientProvider('fake', client));
+  const { state } = await acts[`fake${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+    manifest: encodeManifest(new Manifest({ environment: { KEY: 'old' } })),
+  });
+
+  t.true(await acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({ state }));
+  t.is(options.length, 1);
+  t.is(options[0]?.trustedManifest, undefined);
+  t.deepEqual(client.session.state.environment, { KEY: 'old' });
+  t.deepEqual(Object.keys(client.session.state.manifest.environment), ['KEY']);
+});
+
+for (const kind of ['hosted', 'on-host'] as const) {
+  test(`a reuse check passes the trusted manifest and client options to the backend's own check (${kind})`, async (t) => {
+    const options: SandboxPreservedSessionReuseOptions[] = [];
+    const client = Object.assign(new FakeSandboxClient(), {
+      canReusePreservedOwnedSession: async (_: SandboxSessionState, received: SandboxPreservedSessionReuseOptions) => {
+        options.push(received);
+        return false;
+      },
+    });
+    const acts = activityMap(providerOf(kind, client));
+    const { state } = await acts[`fake${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+      manifest: encodeManifest(new Manifest({ environment: { KEY: 'old' } })),
+    });
+
+    const reusable = await acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({
+      state,
+      trustedManifest: encodeManifest(new Manifest({ environment: { KEY: 'new' } })),
+      clientOptions: { image: 'other' },
+      revalidateManifestEntries: true,
+    });
+    t.false(reusable);
+    t.deepEqual(options[0]?.clientOptions, { image: 'other' });
+    t.true(options[0]?.revalidateManifestEntries);
+    t.is(options[0]?.trustedManifest?.environment.KEY?.value, 'new');
+    t.deepEqual(client.session.state.environment, { KEY: 'old' });
+  });
+
+  test(`a reuse check fails non-retryably when the backend's own check throws a UserError (${kind})`, async (t) => {
+    const client = Object.assign(new FakeSandboxClient(), {
+      canReusePreservedOwnedSession: async () => {
+        throw new UserError('invalid client options');
+      },
+    });
+    const acts = activityMap(providerOf(kind, client));
+    const { state } = await createSession(acts);
+
+    const err = await t.throwsAsync(acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({ state }), {
+      instanceOf: ApplicationFailure,
+      message: 'invalid client options',
+    });
+    t.true(err?.nonRetryable);
+  });
+}
+
+test.serial('a reuse check without a trusted manifest still asks the Worker', async (t) => {
+  const acts = activityMap(new SandboxClientProvider('fake', new FakeSandboxClient()));
+  const created = await createSession(acts);
+
+  const { result, scheduled } = await inWorkflow(acts, () =>
+    temporalSandboxClient('fake').canReusePreservedOwnedSession(reviveWorkflowSessionState(created.state))
+  );
+  t.true(result);
+  t.is(scheduled.length, 1);
+  t.false('trustedManifest' in scheduled[0].args[0]);
+});
+
+test("a reuse check answers false for a session upstream won't resume after a Worker restart", async (t) => {
+  const { state } = await createSession(
+    activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())),
+    'fake',
+    new Manifest({ entries: { data: OPAQUE_MOUNT } })
+  );
+  const acts = activityMap(new SandboxClientProvider('fake', new FakeSandboxClient()));
+
+  t.false(await acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({ state }));
+});
+
+test("a reuse check rethrows a failure to rehydrate the session other than upstream's refusal", async (t) => {
+  const { state } = await createSession(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())));
+  const client = Object.assign(new FakeSandboxClient(), {
+    resume: async () => {
+      throw new SandboxError('provider auth expired', 'provider_error', { retryable: false });
+    },
+  });
+  const acts = activityMap(new SandboxClientProvider('fake', client));
+
+  await t.throwsAsync(acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({ state }), {
+    message: 'provider auth expired',
+  });
+});
+
+test('a reuse check that resumes on a cache miss passes its client options to resume', async (t) => {
+  const { state } = await createSession(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())));
+  const options: (SandboxClientResumeOptions | undefined)[] = [];
+  class OptionsClient extends FakeSandboxClient {
+    override async resume(state: SandboxSessionState, received?: SandboxClientResumeOptions): Promise<SandboxSession> {
+      options.push(received);
+      return super.resume(state);
+    }
+  }
+  const acts = activityMap(new SandboxClientProvider('fake', new OptionsClient()));
+
+  await acts[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({
+    state,
+    clientOptions: { image: 'other' },
+  });
+  t.deepEqual(
+    options.map((received) => received?.clientOptions),
+    [{ image: 'other' }]
+  );
+});
+
+test("a reuse check with no backend check of its own refuses a change to a mount's credentials", async (t) => {
+  const mount = ENVIRONMENT_CREDENTIAL_MOUNT;
+  const acts = activityMap(new SandboxClientProvider('fake', new FakeSandboxClient()));
+  const { state } = await createSession(acts, 'fake', new Manifest({ entries: { data: mount } }));
+  const canReuse = (on: typeof acts, environment: Record<string, string>) =>
+    on[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({
+      state,
+      trustedManifest: encodeManifest(new Manifest({ entries: { data: mount }, environment })),
+    });
+
+  t.false(await canReuse(acts, { AWS_ACCESS_KEY_ID: 'AKIA' }));
+  // A Worker that lost the session rebuilds it, and still accepts other changes.
+  t.true(await canReuse(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())), { OTHER: 'value' }));
+});
+
+test('a reuse check with no backend check of its own reuses unchanged mount credentials', async (t) => {
+  const manifest = (key: string) =>
+    new Manifest({ entries: { data: ENVIRONMENT_CREDENTIAL_MOUNT }, environment: { AWS_ACCESS_KEY_ID: key } });
+  const acts = activityMap(new SandboxClientProvider('fake', new FakeSandboxClient()));
+  const { state } = await createSession(acts, 'fake', manifest('AKIA'));
+  const canReuse = (on: typeof acts, key: string) =>
+    on[`fake${SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX}`]!({
+      state,
+      trustedManifest: encodeManifest(manifest(key)),
+    });
+  // A Worker that lost the session rebuilds it from the saved state.
+  const rebuilt = () => activityMap(new SandboxClientProvider('fake', new FakeSandboxClient()));
+
+  t.true(await canReuse(acts, 'AKIA'));
+  t.false(await canReuse(acts, 'AKIA-NEW'));
+  t.true(await canReuse(rebuilt(), 'AKIA'));
+  t.false(await canReuse(rebuilt(), 'AKIA-NEW'));
+});
+
+test("a cache-miss resume hands the backend the state its own deserializeSessionState returned", async (t) => {
+  const { state } = await createSession(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())));
+  // Like Cloudflare, which refuses to resume a state it deserialized.
+  const deserialized = new WeakSet<object>();
+  class CloudflareLike extends FakeSandboxClient {
+    override async deserializeSessionState(record: Record<string, unknown>): Promise<SandboxSessionState> {
+      const restored = await super.deserializeSessionState(record);
+      deserialized.add(restored);
+      return restored;
+    }
+    override async resume(state: SandboxSessionState): Promise<SandboxSession> {
+      if (deserialized.has(state)) throw new UserError('cannot safely resume persisted session state');
+      return super.resume(state);
+    }
+  }
+  const acts = activityMap(new SandboxClientProvider('fake', new CloudflareLike()));
+
+  await t.throwsAsync(acts[`fake${SANDBOX_SESSION_EXEC_COMMAND_SUFFIX}`]!({ state, args: { cmd: 'ls' } }), {
+    message: 'cannot safely resume persisted session state',
+  });
+});
+
+test("a cache-miss resume clears the state's record of the mount credentials it rebound", async (t) => {
+  // Like the remote backends, which record the redacted mount credentials and check them on resume.
+  class RemoteLike extends FakeSandboxClient {
+    override async serializeSessionState(state: SandboxSessionState): Promise<Record<string, unknown>> {
+      return { ...(await super.serializeSessionState(state)), ...serializeMountCredentialRedactionMetadata(state) };
+    }
+    override async resume(state: SandboxSessionState): Promise<SandboxSession> {
+      assertMountCredentialsRebound(state);
+      return super.resume(state);
+    }
+  }
+  const mount = {
+    type: 's3_mount',
+    bucket: 'bucket',
+    mountPath: 'data',
+    mountStrategy: { type: 'modal_cloud_bucket' },
+    accessKeyId: 'AKIA',
+    secretAccessKey: 'secret',
+  } as const;
+  const manifest = new Manifest({ entries: { data: mount } });
+  const { state } = await createSession(
+    activityMap(new SandboxClientProvider('fake', new RemoteLike())),
+    'fake',
+    manifest
+  );
+  const acts = activityMap(new SandboxClientProvider('fake', new RemoteLike()));
+
+  await t.notThrowsAsync(
+    acts[`fake${SANDBOX_CLIENT_RESUME_SUFFIX}`]!({ state, trustedManifest: encodeManifest(manifest) })
+  );
 });
 
 test('ephemeral mount and env reach the backend on create; only the mount survives resume', async (t) => {
@@ -615,6 +993,21 @@ test("deserializeSessionState decodes the SDK's real serialized manifest record"
   t.deepEqual(restored.providerState, { workspacePath: '/tmp/w' });
 });
 
+test("the workspace root Activity answers with the root the backend's resume hook gives `/workspace`, or `/workspace` without a hook", async (t) => {
+  const workspaceRoot = (client: FakeSandboxClient) =>
+    activityMap(new SandboxClientProvider('fake', client))[`fake${SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX}`]!({ id: 1 });
+  const received: unknown[] = [];
+  const moving = Object.assign(new FakeSandboxClient(), {
+    resolveTrustedManifestForResume: (manifest: Manifest, options: unknown): Manifest => {
+      received.push(options);
+      return new Manifest({ root: manifest.root === '/workspace' ? '/moved' : manifest.root });
+    },
+  });
+  t.is(await workspaceRoot(moving), '/moved');
+  t.deepEqual(received, [{ id: 1 }]);
+  t.is(await workspaceRoot(new FakeSandboxClient()), '/workspace');
+});
+
 // ── Session caching and resume-based self-heal ──
 
 test('repeated operations reuse the cached session without resuming', async (t) => {
@@ -648,6 +1041,19 @@ test('a fresh provider (worker restart) self-heals via client.resume', async (t)
 
   await freshActs[`fake${SANDBOX_SESSION_EXEC_SUFFIX}`]!({ state, args: { cmd: 'again' } });
   t.is(client.resumeCalls, 1);
+});
+
+test('a fresh provider resumes a session whose path grant has a hostPath', async (t) => {
+  const client = new FakeSandboxClient();
+  const acts = activityMap(new SandboxClientProvider('fake', client));
+  const { state } = await acts[`fake${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+    manifest: encodeManifest(new Manifest({ extraPathGrants: [{ path: '/data', hostPath: '/srv/data' }] })),
+  });
+
+  const fresh = activityMap(new SandboxClientProvider('fake', client));
+  await fresh[`fake${SANDBOX_SESSION_EXEC_SUFFIX}`]!({ state, args: { cmd: 'x' } });
+  t.is(client.resumeCalls, 1);
+  t.is(client.session.state.manifest.extraPathGrants[0]?.hostPath, '/srv/data');
 });
 
 test('operations on an unknown session fail non-retryably when the client cannot resume', async (t) => {
@@ -792,6 +1198,236 @@ test('unclassified SandboxError (retryable null) propagates unchanged', async (t
   await t.throwsAsync(execWithError(error), { instanceOf: SandboxError });
 });
 
+test("a backend's plain UserError from resume fails each Activity non-retryably", async (t) => {
+  const { state } = await createSession(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())));
+  const client = Object.assign(new FakeSandboxClient(), {
+    resume: async () => {
+      throw new UserError('resources are unavailable');
+    },
+  });
+  const acts = activityMap(new SandboxClientProvider('fake', client));
+
+  for (const suffix of [
+    SANDBOX_CLIENT_RESUME_SUFFIX,
+    SANDBOX_CLIENT_CAN_REUSE_PRESERVED_OWNED_SESSION_SUFFIX,
+    SANDBOX_SESSION_EXEC_COMMAND_SUFFIX,
+  ]) {
+    const err = await t.throwsAsync(acts[`fake${suffix}`]!({ state, args: { cmd: 'ls' } }), {
+      instanceOf: ApplicationFailure,
+      message: 'resources are unavailable',
+    });
+    t.true(err?.nonRetryable, suffix);
+  }
+});
+
+// ── Local backends and OnHostSandboxClientProvider ──
+
+test('SandboxClientProvider refuses Docker and Unix-local clients and points to OnHostSandboxClientProvider', (t) => {
+  for (const client of [new DockerSandboxClient(), new UnixLocalSandboxClient()]) {
+    t.throws(() => new SandboxClientProvider('local', client), { message: /OnHostSandboxClientProvider/ });
+    t.notThrows(() => new OnHostSandboxClientProvider('local', client));
+  }
+});
+
+test("an on-host provider's Task Queue is <Task Queue>/<name>@<workerName>, with the hostname by default", (t) => {
+  const client = new FakeSandboxClient();
+  const named = new OnHostSandboxClientProvider('docker', client, { workerName: 'build-box-1' });
+  t.is(named._taskQueueFor('agents'), 'agents/docker@build-box-1');
+  t.is(new OnHostSandboxClientProvider('docker', client)._taskQueueFor('agents'), `agents/docker@${os.hostname()}`);
+});
+
+test("an on-host provider records the create's Task Queue in the session states it returns", async (t) => {
+  const provider = new OnHostSandboxClientProvider('fake', new FakeSandboxClient(), { workerName: 'w' });
+  const created = await createSession(activityMap(provider));
+  t.is(created.state.taskQueue, 'main/fake@w');
+  // The other Activities run on the extra Worker's queue, so they keep the one in the state.
+  const elsewhere = activityContext('main/fake@w');
+  const acts = provider._getActivities() as Record<string, (...args: any[]) => Promise<any>>;
+  const resume = acts[`fake${SANDBOX_CLIENT_RESUME_SUFFIX}`]!;
+  const resumed: SandboxSessionResult = await elsewhere.run(resume, { state: created.state });
+  t.is(resumed.state.taskQueue, 'main/fake@w');
+  const serialize = acts[`fake${SANDBOX_CLIENT_SERIALIZE_SESSION_STATE_SUFFIX}`]!;
+  const serialized: SerializedSandboxSessionState = await elsewhere.run(serialize, { state: created.state });
+  t.is(serialized.taskQueue, 'main/fake@w');
+
+  const hosted = await createSession(activityMap(new SandboxClientProvider('fake', new FakeSandboxClient())));
+  t.false('taskQueue' in hosted.state);
+});
+
+test('an on-host provider resumes a session it holds as it is, without the backend', async (t) => {
+  const client = new FakeSandboxClient();
+  const acts = activityMap(new OnHostSandboxClientProvider('fake', client, { workerName: 'w' }));
+  const { state } = await createSession(acts, 'fake', new Manifest({ environment: { KEY: 'old' } }));
+
+  const resumed: SandboxSessionResult = await acts[`fake${SANDBOX_CLIENT_RESUME_SUFFIX}`]!({
+    state,
+    trustedManifest: encodeManifest(new Manifest({ environment: { KEY: 'new' } })),
+    clientOptions: { image: 'other' },
+  });
+  t.is(client.resumeCalls, 0);
+  t.is(resumed.state.sessionId, state.sessionId);
+  t.deepEqual(client.session.state.environment, { KEY: 'old' });
+  t.is(await acts[`fake${SANDBOX_SESSION_EXEC_COMMAND_SUFFIX}`]!({ state, args: { cmd: 'ls' } }), 'ran:ls');
+});
+
+test('an operation other than delete on a session an on-host provider lost fails with SandboxLost', async (t) => {
+  const client = new FakeSandboxClient();
+  const acts = activityMap(new OnHostSandboxClientProvider('fake', client, { workerName: 'w' }));
+  // Created by the process that had this name before a restart.
+  const { state } = await createSession(
+    activityMap(new OnHostSandboxClientProvider('fake', new FakeSandboxClient(), { workerName: 'w' }))
+  );
+
+  const deletes = [
+    SANDBOX_CLIENT_CREATE_SUFFIX,
+    SANDBOX_CLIENT_WORKSPACE_ROOT_SUFFIX,
+    SANDBOX_CLIENT_DELETE_SUFFIX,
+    SANDBOX_SESSION_DELETE_SUFFIX,
+  ];
+  for (const suffix of sandboxActivitySuffixes.filter((suffix) => !deletes.includes(suffix))) {
+    const err = await t.throwsAsync(acts[`fake${suffix}`]!({ state }), { instanceOf: ApplicationFailure }, suffix);
+    t.is(err?.type, 'SandboxLost', suffix);
+    t.true(err?.nonRetryable, suffix);
+    t.regex(err!.message, /'main\/fake@w'/, suffix);
+  }
+  t.is(client.resumeCalls, 0);
+  t.is(client.createCalls.length, 0);
+});
+
+test('deleting a session an on-host provider does not hold does nothing', async (t) => {
+  const client = new FakeSandboxClient();
+  const acts = activityMap(new OnHostSandboxClientProvider('fake', client, { workerName: 'w' }));
+  const { state } = await createSession(
+    activityMap(new OnHostSandboxClientProvider('fake', new FakeSandboxClient(), { workerName: 'w' }))
+  );
+
+  await acts[`fake${SANDBOX_SESSION_DELETE_SUFFIX}`]!({ state });
+  await acts[`fake${SANDBOX_CLIENT_DELETE_SUFFIX}`]!({ state });
+  t.is(client.deleteCalls, 0);
+  t.is(client.session.deleteCalls, 0);
+  t.is(client.resumeCalls, 0);
+});
+
+for (const [kind, suffix] of [
+  ['session', SANDBOX_SESSION_DELETE_SUFFIX],
+  ['client', SANDBOX_CLIENT_DELETE_SUFFIX],
+] as const) {
+  test(`an on-host provider stops holding a session it deletes (${kind} delete)`, async (t) => {
+    const client = new FakeSandboxClient();
+    const acts = activityMap(new OnHostSandboxClientProvider('fake', client, { workerName: 'w' }));
+    const { state } = await createSession(acts);
+
+    await acts[`fake${suffix}`]!({ state });
+    t.is(client.deleteCalls + client.session.deleteCalls, 1);
+    const err = await t.throwsAsync(acts[`fake${SANDBOX_SESSION_EXEC_SUFFIX}`]!({ state, args: { cmd: 'x' } }), {
+      instanceOf: ApplicationFailure,
+    });
+    t.is(err?.type, 'SandboxLost');
+  });
+}
+
+/** Makes `target.delete` fail its first call with `error`, then delete as before. Counts the calls. */
+function failFirstDelete(target: { delete(...args: never[]): Promise<void> }, error: Error): { calls: number } {
+  const original = target.delete.bind(target);
+  const counter = { calls: 0 };
+  target.delete = async (...args: never[]) => {
+    counter.calls += 1;
+    if (counter.calls === 1) throw error;
+    return original(...args);
+  };
+  return counter;
+}
+
+for (const [kind, suffix] of [
+  ['session', SANDBOX_SESSION_DELETE_SUFFIX],
+  ['client', SANDBOX_CLIENT_DELETE_SUFFIX],
+] as const) {
+  test(`an on-host provider keeps a session whose delete fails with a retryable error, so the retry deletes it (${kind} delete)`, async (t) => {
+    const client = new FakeSandboxClient();
+    const acts = activityMap(new OnHostSandboxClientProvider('fake', client, { workerName: 'w' }));
+    const { state } = await createSession(acts);
+    const busy = new SandboxError('daemon busy', 'exec_transport_error', { retryable: true });
+    const deletes = failFirstDelete(kind === 'session' ? client.session : client, busy);
+
+    await t.throwsAsync(acts[`fake${suffix}`]!({ state }), { is: busy });
+    // Temporal retries the Activity.
+    await acts[`fake${suffix}`]!({ state });
+
+    t.is(deletes.calls, 2);
+    t.is(client.deleteCalls + client.session.deleteCalls, 1);
+    const err = await t.throwsAsync(acts[`fake${SANDBOX_SESSION_EXEC_SUFFIX}`]!({ state, args: { cmd: 'x' } }), {
+      instanceOf: ApplicationFailure,
+    });
+    t.is(err?.type, 'SandboxLost');
+  });
+
+  test(`an on-host provider stops holding a session whose delete fails without a retry (${kind} delete)`, async (t) => {
+    const client = new FakeSandboxClient();
+    const acts = activityMap(new OnHostSandboxClientProvider('fake', client, { workerName: 'w' }));
+    const { state } = await createSession(acts);
+    const gone = new SandboxError('container gone', 'exec_transport_error', { retryable: false });
+    const deletes = failFirstDelete(kind === 'session' ? client.session : client, gone);
+
+    const err = await t.throwsAsync(acts[`fake${suffix}`]!({ state }), { instanceOf: ApplicationFailure });
+    t.true(err?.nonRetryable);
+    await acts[`fake${suffix}`]!({ state });
+
+    t.is(deletes.calls, 1);
+  });
+}
+
+test('sessionActivityOptions keeps the options of a session state without a Task Queue', (t) => {
+  const config = (): ActivityOptions => ({ startToCloseTimeout: '1 minute', taskQueue: 'configured' });
+  const state: { sessionId: string; taskQueue?: string } = { sessionId: 's' };
+  t.deepEqual(sessionActivityOptions(config(), state), config());
+});
+
+for (const kind of ['hosted', 'on-host'] as const) {
+  test.serial(`the Workflow sends a session's operations to the Task Queue in its state (${kind})`, async (t) => {
+    const acts = activityMap(providerOf(kind, new FakeSandboxClient()));
+    const config: ActivityOptions = { startToCloseTimeout: '1 minute', taskQueue: 'configured' };
+
+    const { scheduled } = await inWorkflow(acts, async () => {
+      const client = temporalSandboxClient('fake', config);
+      const session = (await client.create()) as TemporalSandboxSession;
+      await session.execCommand({ cmd: 'ls' });
+      await session.createEditor().createFile({ type: 'create_file', path: 'a.txt', diff: '' });
+      await client.serializeSessionState(session.state);
+      await client.canReusePreservedOwnedSession(session.state);
+      const resumed = (await client.resume(session.state)) as TemporalSandboxSession;
+      await resumed.delete();
+      await client.delete(session.state);
+    });
+
+    const [create, ...operations] = scheduled;
+    t.is(create.activityType, `fake${SANDBOX_CLIENT_CREATE_SUFFIX}`);
+    t.deepEqual(create.options, config);
+    t.is(operations.length, 7);
+    const expected = kind === 'hosted' ? config : { ...config, taskQueue: 'main/fake@w' };
+    for (const { activityType, options } of operations) t.deepEqual(options, expected, activityType);
+  });
+}
+
+test.serial('serializeSessionState and deserializeSessionState carry the Task Queue', async (t) => {
+  const acts = activityMap(new OnHostSandboxClientProvider('fake', new FakeSandboxClient(), { workerName: 'w' }));
+  const client = temporalSandboxClient('fake');
+  const { result: record } = await inWorkflow(acts, async () => {
+    const session = await client.create();
+    return client.serializeSessionState(session.state);
+  });
+  t.is(record.taskQueue, 'main/fake@w');
+
+  const restored = await client.deserializeSessionState({ ...record, manifest: encodeManifest(new Manifest()) });
+  t.is(restored.taskQueue, 'main/fake@w');
+  const hosted = await client.deserializeSessionState({ sessionId: 's', manifest: encodeManifest(new Manifest()) });
+  t.false('taskQueue' in hosted);
+  const err = await t.throwsAsync(
+    client.deserializeSessionState({ ...record, taskQueue: 7, manifest: encodeManifest(new Manifest()) }),
+    { instanceOf: ApplicationFailure }
+  );
+  t.is(err?.type, 'SandboxSessionStateInvalid');
+});
+
 // ── Workflow-side sync touch-points ──
 
 function makeWorkflowSession(supportsPty = true): TemporalSandboxSession {
@@ -832,7 +1468,7 @@ test.serial('serialize refresh synchronizes the existing Workflow state object',
       snapshotFingerprint: 'new-fingerprint',
     },
     { workspacePath: '/tmp/refreshed' },
-    false
+    { defaultWorkspaceReady: false }
   );
 
   const client = temporalSandboxClient('fake');
@@ -996,3 +1632,33 @@ test('session envelope survives a JSON round-trip and revives a live Manifest', 
   t.deepEqual(decoded.exposedPorts, { 'port:8080': { host: 'localhost', port: 8080 } });
   t.deepEqual(decoded.providerState, { workspacePath: '/tmp/w' });
 });
+
+// The Unix local sandbox can't run on Windows, where CI also runs.
+(process.platform === 'win32' ? test.skip : test)(
+  'A manifest applied to a UnixLocal session resolves its Worker environment references',
+  async (t) => {
+    const variable = 'OPENAI_AGENTS_TEST_APPLIED_SECRET';
+    process.env[variable] = 'sk-applied-sentinel';
+    const workspaceBaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oa-apply-ws-'));
+    t.teardown(() => {
+      delete process.env[variable];
+      fs.rmSync(workspaceBaseDir, { recursive: true, force: true });
+    });
+    const provider = new OnHostSandboxClientProvider('local', new UnixLocalSandboxClient({ workspaceBaseDir }));
+    provider._setResolvableWorkerEnvVars([variable]);
+    const activities = activityMap(provider);
+    const { state } = await activities[`local${SANDBOX_CLIENT_CREATE_SUFFIX}`]!({
+      manifest: encodeManifest(new Manifest()),
+    });
+
+    const manifest = await activities[`local${SANDBOX_SESSION_APPLY_MANIFEST_SUFFIX}`]!({
+      state,
+      manifest: encodeManifest(new Manifest({ environment: { API_KEY: workerEnvValue(variable) } })),
+    });
+    const output = await activities[`local${SANDBOX_SESSION_EXEC_COMMAND_SUFFIX}`]!({
+      state: { ...state, manifest },
+      args: { cmd: 'echo "applied=$API_KEY"' },
+    });
+    t.regex(output, /applied=sk-applied-sentinel/);
+  }
+);

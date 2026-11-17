@@ -242,6 +242,17 @@ The plugin automatically handles several important setup tasks:
 - Registers an activity for invoking model calls with the Temporal worker.
 - Configures OpenAI Agents SDK to run model calls as Temporal activities.
 
+OpenAI's response models can lag behind the live API, so a value that holds a model response can
+fail strict validation when it's decoded. When that happens, the plugin builds the OpenAI models in
+it without validating them, like the OpenAI SDK does with live responses. If the value holds one of
+your own Pydantic models, Pydantic validates it from the decoded JSON, and the result has to encode
+back to the same JSON. If that's not possible, decoding fails with the original validation error.
+Before 2.0.0, you got a plain `dict` instead.
+
+**Important:** if you upgrade from 1.x, Workflow code that read such a value as a `dict` fails, and
+a Signal whose argument can't be decoded is dropped. Keep runs that started on 1.x on that version
+with Worker Versioning, or let them finish first.
+
 ### File 3: Client Execution (`run_hello_world_workflow.py`)
 
 ```python
@@ -574,6 +585,12 @@ Activity and are never shared across workflows.
 `temporalio.mcp.x.*`. Do not register the same MCP server name through
 both plugins on one worker; Temporal rejects the duplicate Activity types.
 
+A factory that returns something other than an `agents.mcp.MCPServer` fails
+the Activity with a non-retryable `ApplicationError` of type
+`MCPServerFactoryTypeError`. A factory that isn't callable makes
+`OpenAIAgentsPlugin(...)` raise `TypeError`, so the Worker doesn't start, even
+when no workflow uses that server.
+
 An optional `factory_argument` can select worker-side configuration such as a
 tenant endpoint:
 
@@ -626,7 +643,9 @@ workflow-history compatibility and can still run with MCP Python SDK v1 when
 the `mcp` extra is not installed. New integrations should use `mcp_servers` and
 `temporal_mcp_server()`, which require the `mcp` extra and MCP Python SDK v2.
 The legacy stateful path retains its dedicated per-workflow worker and
-persistent-session behavior. To require tool approval on these servers, pass
+persistent-session behavior. Both providers raise `TypeError` for a factory
+that isn't callable, so the Worker doesn't start.
+To require tool approval on these servers, pass
 `require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
 as with `temporal_mcp_server()`, a policy on the factory's server is rejected
 unless it never asks for approval. So are a callable `tool_filter`, a
@@ -726,31 +745,24 @@ caller's own cancellation still cancels the operation, and a cancellation that
 leaves the block wins over the block's `DedicatedWorkerFailure`, though not over
 an `ActivityError` from a session that failed for another reason.
 
-A run follows its session this way only once it records the patch marker
-`openai-agents-stateful-mcp-session-watch`, which it does at its first
-operation whose `config` has neither timeout. Histories recorded on an earlier
-version have no marker, so they schedule such operations as before and replay
-on this version, with two exceptions. A block whose last timer fired ahead of
-its session's end now raises `DedicatedWorkerFailure` with no cause, as above,
-so a run that hit this and caught the bare `CancelledError`, or that failed
-with it although it catches `ApplicationError` or `Exception` around the
-block, schedules different commands on this version. The same applies to a
-legacy run that raised `DedicatedWorkerFailure` in place of a cancellation
-when its session ended in the same workflow task. Let such open runs finish
-before upgrading, and expect replays of such closed runs (queries, replay
-tests) to fail. A run that continues on this version records the marker at its
-next such operation only if it scheduled none before the upgrade. Otherwise the
-Temporal Python SDK keeps the decision it made while replaying that earlier
-operation, so the run never records the marker and schedules such operations as
-before until it ends: one scheduled after its session ended waits until the
-caller cancels it or the run ends. A run with the marker fails replay on an
-earlier version, and so can any run whose session failed with
-`DedicatedWorkerFailure` (a refused retry or a refused describe) and that then
-went on, whether it caught the block's failure or a cancellation, and any run
-that caught that unmarked `DedicatedWorkerFailure` and went on, so do not roll
-back while such runs are open. Drain the earlier version's workers before starting this one: while
-workers of both versions run, a run whose session gets a refusal can fail
-replay when it moves from one to the other.
+Runs recorded on 1.x schedule such operations without watching the session, and
+some of them fail replay on this version: a run in which an operation with
+`cancellation_type=WAIT_CANCELLATION_COMPLETED` finished in the same workflow
+task as another activity, and two more cases. A block whose last timer fired
+ahead of its session's end now raises `DedicatedWorkerFailure` with no cause,
+as above, so a run that hit this and caught the bare `CancelledError`, or that
+failed with it although it catches `ApplicationError` or `Exception` around the
+block, schedules different commands on this version. The same applies to a 1.x
+run that raised `DedicatedWorkerFailure` in place of a cancellation when its
+session ended in the same workflow task. Let such open runs finish before
+upgrading, and expect replays of such closed runs (queries, replay tests) to
+fail. A run whose session failed with `DedicatedWorkerFailure` (a refused retry
+or a refused describe) and that then went on can fail replay on an earlier
+version, whether it caught the block's failure or a cancellation, and so can
+any run that caught a `DedicatedWorkerFailure` with no cause and went on, so do
+not roll back while such runs are open. Drain the earlier version's workers
+before starting this one: while workers of both versions run, a run whose
+session gets a refusal can fail replay when it moves from one to the other.
 
 ### Hosted MCP Tool
 
@@ -835,9 +847,13 @@ Pass that manifest to `SandboxRunConfig(manifest=...)`. This reads `PROD_OPENAI_
 
 ⚠️ **Pre-release** - This functionality is subject to change prior to General Availability.
 
-The sandbox integration lets `SandboxAgent` from the OpenAI Agents SDK execute inside a remote or local sandbox (Daytona, Docker, E2B, local Unix, etc.) while keeping all coordination durable in Temporal.
+The sandbox integration lets `SandboxAgent` from the OpenAI Agents SDK execute inside a sandbox, such as one hosted by Daytona, E2B or Modal, while keeping all coordination durable in Temporal.
 
-Every sandbox operation — creating a session, running commands, reading/writing files, PTY interactions — is dispatched as a Temporal activity. This means sandbox work is fully observable, retryable, and recoverable like any other activity, and sandbox session state is serialized with the workflow so it survives worker restarts.
+Every sandbox operation — creating a session, running commands, reading/writing files, PTY interactions — is dispatched as a Temporal activity. This means sandbox work is fully observable, retryable, and recoverable like any other activity, and sandbox session state is serialized with the workflow. With a hosted backend, any worker can reconnect to the sandbox from that state, so a session survives worker restarts.
+
+Register a hosted backend with `SandboxClientProvider`. The Docker and Unix-local backends run the sandbox on the worker's own machine, where other workers can't reach it, so register them with `OnHostSandboxClientProvider` instead, with one worker or several. `SandboxClientProvider` refuses them.
+
+Changing a sandbox agent's configuration (environment, folder grants, mounts) while runs that use it are paused for approval isn't supported, with either provider.
 
 ### Architecture
 
@@ -853,21 +869,26 @@ sandbox agent calls session.exec / session.read / session.write / …
 TemporalSandboxSession routes each call as a Temporal activity
 ("daytona-sandbox_session_exec", "daytona-sandbox_session_read", …)
   ↓
-SandboxClientProvider activities on the worker call the real sandbox client
+SandboxClientProvider or OnHostSandboxClientProvider activities on the worker call the real sandbox client
   ↓
 Actual sandbox backend (Daytona, Docker, local, …)
 ```
 
 ### Worker Configuration
 
-Register one or more `SandboxClientProvider` instances with the plugin. Each provider pairs a unique name with a real `BaseSandboxClient` implementation. The plugin automatically registers all required activities on the worker.
+Register one or more sandbox client providers with the plugin. Each provider pairs a unique name with a real `BaseSandboxClient` implementation. The plugin automatically registers all required activities on the worker.
 
 ```python
 import asyncio
 from datetime import timedelta
 from temporalio.client import Client
 from temporalio.worker import Worker
-from temporalio.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider, ModelActivityParameters
+from temporalio.openai_agents import (
+    ModelActivityParameters,
+    OnHostSandboxClientProvider,
+    OpenAIAgentsPlugin,
+    SandboxClientProvider,
+)
 from agents.extensions.sandbox.daytona import DaytonaSandboxClient
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 
@@ -881,7 +902,9 @@ async def main():
                 ),
                 sandbox_clients=[
                     SandboxClientProvider("daytona", DaytonaSandboxClient()),
-                    SandboxClientProvider("local", UnixLocalSandboxClient()),
+                    OnHostSandboxClientProvider(
+                        "local", UnixLocalSandboxClient(), worker_name="build-box-1"
+                    ),
                 ],
             ),
         ],
@@ -931,7 +954,17 @@ class MyWorkflow:
         return result.final_output
 ```
 
-The name passed to `temporal_sandbox_client()` must exactly match the name used in `SandboxClientProvider` on the worker.
+The name passed to `temporal_sandbox_client()` must exactly match the name of the provider on the worker.
+
+### Docker and Unix-local Sandboxes
+
+`OnHostSandboxClientProvider` pins each sandbox to the worker process that created it. Any worker can create a sandbox, and every later operation on it goes to the task queue `<task queue>/<provider name>@<worker_name>`, where `<task queue>` is the queue of the worker that created it. The plugin polls that queue with an extra worker beside each of your workers, started and stopped with it, and the extra worker takes your worker's activity concurrency, rate limits and graceful shutdown timeout. `worker_name` defaults to the machine's hostname.
+
+Workers in one process can share a `worker_name`, but processes on one machine that serve the same task queue each need their own, and the old process must exit before its restart starts the new one.
+
+A run paused for approval, or continued as new, comes back to its sandbox on the worker with the same name on the same machine, even after that worker restarts: the worker rebuilds the sandbox with the backend's own `resume()`. A restart in the middle of a step still loses the sandbox, and the step's next operation fails with the non-retryable `ApplicationError` type `SandboxLost`. The plugin doesn't start a fresh sandbox in its place or clean up the containers and workspaces left behind. If a worker never comes back, its runs' operations wait on its queue; set `schedule_to_start_timeout` in the config you pass to `temporal_sandbox_client()` to bound that wait.
+
+Before any worker switches a provider to `OnHostSandboxClientProvider`, every worker running these workflows must run a plugin release that has it, so that each workflow task sends operations to the sandbox's queue. Switching a provider loses its open runs' sandboxes.
 
 ### Multiple Backends
 
@@ -1119,9 +1152,7 @@ Model calls run in an Activity on the Worker, so they use the provider set on th
 `OpenAIAgentsPlugin(model_provider=...)`. To use several providers, set a `MultiProvider` with a
 prefix map there and choose a provider by model name. A Workflow cannot set its own provider:
 `Runner.run` raises `ValueError` when `RunConfig.model_provider` is anything other than the default.
-A run that started on an earlier version and already passed its own provider keeps using the
-Worker's provider, so that it replays; a run that passes one for the first time after the upgrade
-gets the error.
+A run recorded on 1.x that passed its own provider fails replay on this version.
 
 Without `model_provider`, the plugin uses an `OpenAIProvider` on the client set with the framework's
 `set_default_openai_client`, as it is: give that client `max_retries=0` to leave retries to Temporal.
