@@ -25,12 +25,11 @@ from temporalio.exceptions import ApplicationError
 # can rebuild a real ``Interrupt``.
 STRANDS_INTERRUPT_TYPE = "StrandsInterrupt"
 
-# Strands' model/session exceptions that are deterministic failures (token
-# limits, context overflow, structured-output validation, session I/O). They
-# won't succeed on retry, so they cross the boundary as non-retryable typed
-# ApplicationErrors. Only ContextWindowOverflowException is rebuilt on the workflow
-# side (TemporalModel.stream), because Strands recovers from it by reducing the
-# conversation; the others reach the workflow as an ActivityError.
+# When an Activity raises one of these Strands exceptions, serialize it as a
+# non-retryable application failure. TemporalModel.stream reconstructs context
+# overflow so Strands can reduce the conversation. The other Activity failures
+# reach the Workflow as ActivityError. The Workflow interceptor separately handles
+# token limits and structured-output errors raised by the agent loop itself.
 _TERMINAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
     MaxTokensReachedException,
     ContextWindowOverflowException,

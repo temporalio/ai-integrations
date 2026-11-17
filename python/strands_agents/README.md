@@ -172,6 +172,12 @@ class MyWorkflow:
         return result.structured_output
 ```
 
+Workflow code can catch Strands' `StructuredOutputException` and
+`MaxTokensReachedException` around an invocation. If either exception escapes
+the Workflow or an Update handler, the plugin reports a non-retryable
+`ApplicationError` with the Strands exception's class name as its failure type.
+Explicit Workflow or Worker failure exception settings still take precedence.
+
 ## Streaming
 
 To forward model chunks to external consumers, pass `streaming_topic="..."` to `TemporalAgent` and host a `WorkflowStream` on the workflow. Each `StreamEvent` is published on the named topic from inside the model activity; subscribers read via `WorkflowStreamClient`. Chunks are batched on `streaming_batch_interval` (default 100ms).

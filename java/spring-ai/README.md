@@ -79,6 +79,33 @@ separate model/client if calls outside Temporal need SDK retries. Without this
 configuration, Spring AI 2.0.1's three internal OpenAI retries can produce twelve
 requests across the default three Activity attempts.
 
+## Structured output failures
+
+Spring AI converts `call().entity(...)` and `call().responseEntity(...)` results
+on the Workflow thread. With the built-in bean converter, invalid JSON or a
+JSON value that cannot be mapped to the target type raises a Jackson 3
+`tools.jackson.core.JacksonException`, which Workflow code can catch.
+
+To make an uncaught conversion error fail the Workflow or Update, register the
+exception type on the affected Workflow implementation. The default Temporal
+policy retries the Workflow Task and reuses the recorded model response.
+
+```java
+import io.temporal.worker.WorkflowImplementationOptions;
+import tools.jackson.core.JacksonException;
+
+worker.registerWorkflowImplementationTypes(
+    WorkflowImplementationOptions.newBuilder()
+        .setFailWorkflowExceptionTypes(JacksonException.class)
+        .build(),
+    AnswerWorkflowImpl.class);
+```
+
+This setting applies to all uncaught Jackson exceptions in that implementation.
+A Workflow retry policy can still retry the entire Workflow. For a non-retryable
+failure, catch `JacksonException` around the entity call and throw the exception
+returned by `ApplicationFailure.newNonRetryableFailure(...)`.
+
 ## Development
 
 ```bash

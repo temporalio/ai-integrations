@@ -24,6 +24,7 @@ from ._failure_converter import (
     strands_failure_converter_class,
     strands_failure_converter_class_keeping_caller,
 )
+from ._failure_interceptor import AgentFailureInterceptor
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._sync_calls import refuse_sync_calls_in_workflows
@@ -155,6 +156,7 @@ class StrandsPlugin(SimplePlugin):
             workflow_runner=_workflow_runner,
             data_converter=_data_converter,
             activities=activities or None,
+            interceptors=[AgentFailureInterceptor()],
             # Strands re-raises this when its conversation manager cannot reduce the
             # context any further; fail the workflow instead of retrying the task forever.
             workflow_failure_exception_types=[ContextWindowOverflowException],

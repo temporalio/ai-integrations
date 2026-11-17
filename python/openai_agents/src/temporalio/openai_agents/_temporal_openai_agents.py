@@ -49,6 +49,7 @@ from temporalio.converter import (
     JSONPlainPayloadConverter,
 )
 from temporalio.openai_agents._errors import AgentsWorkflowError
+from temporalio.openai_agents._failure_interceptor import AgentFailureInterceptor
 from temporalio.openai_agents._invoke_model_activity import ModelActivity
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._openai_runner import (
@@ -670,7 +671,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         super().__init__(
             name="OpenAIAgentsPlugin",
             data_converter=_data_converter,
-            interceptors=[interceptor],
+            interceptors=[interceptor, AgentFailureInterceptor()],
             activities=add_activities,
             workflow_runner=workflow_runner,
             workflow_failure_exception_types=[AgentsWorkflowError],
