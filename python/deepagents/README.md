@@ -244,6 +244,12 @@ Sync functions can compute a result, but cannot wait for a LangGraph task with
 call raises `InvalidStateError`. Use an async entrypoint or node and
 `await task(...)` instead.
 
+Call compiled graphs with `await graph.ainvoke(...)` or `graph.astream(...)`.
+Sync graph calls such as `graph.invoke(...)` and `graph.stream(...)`, including
+calls from a sync tool, raise `DeepAgentsWorkflowError` before any node runs.
+LangGraph would otherwise run those nodes on threads outside Workflow execution.
+Move a graph into an activity if it needs the sync APIs.
+
 Like other workflow code, sync calls run again on every replay. Their combined
 work in one Workflow Task can trigger deadlock detection (two seconds by
 default), even if each call takes less than two seconds. Move slow work into
@@ -262,6 +268,10 @@ narrows that override.
 router, and then issued commands, can fail replay on this version with
 `[TMPRL1100]`. Let those runs finish on their original workers first, or keep
 them there with Worker Versioning.
+
+Sync graph calls that previously ran on LangGraph's threads are now refused.
+This can also change commands on replay. Keep affected open runs on their
+original workers and use the async graph APIs or an activity for new runs.
 
 `activity_as_tool` takes every activity option through `activity_options`, an
 `ActivityConfig`: timeouts (`start_to_close_timeout` or

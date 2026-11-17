@@ -20,7 +20,7 @@ from typing import Annotated, Any, Self, TypedDict
 
 import pytest
 
-from temporalio.testing import WorkflowEnvironment
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 
 pytest.importorskip("langchain_core")
 
@@ -42,6 +42,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
     from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
+    from temporalio.deepagents.workflow import DeepAgentsWorkflowError  # noqa: E402
 
 INVOKE_TOOL = "deepagents.invoke_tool"
 # Dedicated queue for tool activities, so tests can prove task-queue routing.
@@ -1003,6 +1004,34 @@ def count_graph() -> Any:
 COUNT_GRAPH = count_graph()
 
 
+class Fanout(TypedDict, total=False):
+    left: bool
+    right: bool
+
+
+def fanout_graph(visited: list[str]) -> Any:
+    def left(state: Fanout) -> Fanout:
+        visited.append("left")
+        return {**state, "left": workflow.in_workflow()}
+
+    def right(state: Fanout) -> Fanout:
+        visited.append("right")
+        return {**state, "right": workflow.in_workflow()}
+
+    graph = StateGraph(Fanout)
+    graph.add_node("a", left)
+    graph.add_node("b", right)
+    for node in ("a", "b"):
+        graph.add_edge(START, node)
+        graph.add_edge(node, END)
+    return graph.compile()
+
+
+# Bound during collection, before the Worker installs the executor guard.
+EARLY_GRAPH_VISITS: list[str] = []
+EARLY_GRAPH_STREAM = fanout_graph(EARLY_GRAPH_VISITS).stream
+
+
 @workflow.defn
 class SyncLangChainCallsWorkflow:
     @workflow.run
@@ -1034,6 +1063,39 @@ class SyncLangChainCallsWorkflow:
                 results.append("ran")
             except NotImplementedError:
                 results.append("rejected")
+
+        visited: list[str] = []
+        graph = fanout_graph(visited)
+        results.append(await graph.ainvoke({}))
+        results.append(
+            [state async for state in graph.astream({}, stream_mode="values")][-1]
+        )
+        visited.clear()
+        # Get the host's pre-bound method, rather than the sandbox's fresh copy.
+        with workflow.unsafe.imports_passed_through():
+            from tests.test_tools import EARLY_GRAPH_STREAM, EARLY_GRAPH_VISITS
+
+        EARLY_GRAPH_VISITS.clear()
+        graph_calls: list[Callable[[], Any]] = [
+            lambda: graph.invoke({}),
+            lambda: list(graph.stream({})),
+            lambda: list(EARLY_GRAPH_STREAM({})),
+        ]
+        rejected: list[bool] = []
+        for call in graph_calls:
+            try:
+                call()
+                rejected.append(False)
+            except DeepAgentsWorkflowError as err:
+                rejected.append("ainvoke" in str(err))
+        try:
+            await StructuredTool.from_function(
+                func=graph_calls[0], name="sync_graph", description="Run a graph."
+            ).ainvoke({})
+            rejected.append(False)
+        except DeepAgentsWorkflowError as err:
+            rejected.append("ainvoke" in str(err))
+        results.append([rejected, visited, list(EARLY_GRAPH_VISITS)])
         return results
 
 
@@ -1047,14 +1109,16 @@ async def test_sync_langchain_calls_run_in_the_workflow(
         task_queue=task_queue,
         workflows=[SyncLangChainCallsWorkflow],
         plugins=[DeepAgentsPlugin()],
+        max_cached_workflows=0,
     ):
-        result = await env.client.execute_workflow(
+        handle = await env.client.start_workflow(
             SyncLangChainCallsWorkflow.run,
             str(tmp_path),
             id=f"da-sync-calls-{uuid.uuid4()}",
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=10),
         )
+        result = await handle.result()
     assert result == [
         3,
         "HI",
@@ -1068,7 +1132,22 @@ async def test_sync_langchain_calls_run_in_the_workflow(
         "rejected",
         "rejected",
         "rejected",
+        {"left": True, "right": True},
+        {"left": True, "right": True},
+        [[True, True, True, True], [], []],
     ]
+
+    # Sync graph calls still work outside Workflows, including in Activities.
+    graph = fanout_graph([])
+    assert graph.invoke({}) == {"left": False, "right": False}
+    assert ActivityEnvironment().run(graph.invoke, {}) == {
+        "left": False,
+        "right": False,
+    }
+
+    await Replayer(
+        workflows=[SyncLangChainCallsWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(await handle.fetch_history())
 
     # Outside a workflow, LangChain still runs a sync tool on a thread.
     tool_thread = await StructuredTool.from_function(func=thread_id).ainvoke({})
