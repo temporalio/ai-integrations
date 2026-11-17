@@ -262,8 +262,7 @@ them. Other sync LangChain calls that it would run in a thread, such as a
 sync-only cache, retriever or vector store, or `ShellToolMiddleware`, still fail
 with `NotImplementedError`; run that work in activities. If the same Worker
 also uses `LangGraphPlugin`, its executor override currently runs those calls
-inline too; [#629](https://github.com/temporalio/ai-integrations/pull/629)
-narrows that override.
+inline too.
 
 **Upgrading:** a run that made one of these sync calls on an earlier version
 keeps that version's behavior, so its history still replays: the call fails
