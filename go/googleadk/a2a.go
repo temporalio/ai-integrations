@@ -219,8 +219,9 @@ type a2aSendResult struct {
 	// Error is the error that ended the stream after Events. It comes back
 	// with the events instead of failing the Activity because the remote agent
 	// has started the task: a retry would send the message again and start a
-	// second one. ADK keeps the events, turns the error into an error event and
-	// cancels the task, as without Temporal.
+	// second one. As without Temporal, ADK keeps the events and cancels the
+	// task. It turns the error into an error event or, from ADK v2.8.0,
+	// returns it from the agent's run.
 	Error string
 }
 
@@ -380,8 +381,9 @@ func appendA2APart(parts a2a.ContentParts, p *a2a.Part) a2a.ContentParts {
 //   - a call that failed with an HTTP status is retried for 408, 409, 429 and
 //     5xx, as a model call is;
 //   - an A2A error the remote agent answers with is not: sending again would
-//     start another task, and ADK turns the failed call into an error event,
-//     as without Temporal;
+//     start another task, and ADK ends the failed call as it does without
+//     Temporal, with an error event or, from ADK v2.8.0, with an error from
+//     the agent's run;
 //   - a card source ADK cannot read, an interface URL that does not parse or
 //     is untrusted, or a reply that is not valid JSON, is not;
 //   - anything else, such as a network error or a card file missing on this
@@ -431,10 +433,11 @@ var defaultA2AClientFactory = a2aclient.NewFactory(
 )
 
 // a2aStatusTransport turns an HTTP error status into an a2aHTTPStatusError, so
-// a2aError can decide retries from the status. a2a-go's JSON-RPC transport
-// reports the status only as text, and its REST transport turns any error body
-// into an A2A error: a JSON one with no A2A reason becomes an internal error,
-// which is not retried, and any other one a server error. A redirect is left
+// a2aError can decide retries from the status. a2a-go's own transports do not
+// expose the status. Depending on the transport and the a2a-go release, an
+// error status comes back as a plain error, which is retried whatever the
+// status, or as an A2A error, which is not retried: a2a-go's REST transport
+// turns a gateway's JSON 503 into an internal error. A redirect is left
 // to the http.Client, which follows it. With keepA2AErrors, an error body that
 // names an A2A error, as a2a-go's REST server writes it, is left to a2a-go,
 // also when it comes as application/a2a+json, the media type the A2A spec
@@ -458,7 +461,7 @@ func (t a2aStatusTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 	_ = resp.Body.Close()
 	if err == nil && isA2AErrorBody(body) {
-		// a2a-go decodes an error body only as application/json.
+		// Before v2.7.0, a2a-go decodes an error body only as application/json.
 		resp.Header.Set("Content-Type", "application/json")
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return resp, nil

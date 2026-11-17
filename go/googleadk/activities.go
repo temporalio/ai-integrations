@@ -97,8 +97,9 @@ type Config struct {
 	// own, so the Activity's timeouts bound each call. Build it with
 	// NewA2AClientFactory to add options to those transports, for example call
 	// interceptors that add credentials. A factory built otherwise uses its own
-	// transports: a2a-go's default ones stop every call at 3 minutes, and an
-	// HTTP error status they report as text is retried.
+	// transports: a2a-go's default ones stop every call at 3 minutes, and
+	// whether an HTTP error status is retried depends on how they report it,
+	// not on the status.
 	A2AClientFactory *a2aclient.Factory
 }
 

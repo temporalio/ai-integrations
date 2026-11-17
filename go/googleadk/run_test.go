@@ -205,13 +205,14 @@ func (i bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (
 
 // TestRemoteSubAgentErrorNotRetried proves an A2A call the remote agent
 // refuses, or a client the card cannot make, fails without retries, and the
-// turn ends as it would without Temporal: before ADK 2.8.0, ADK turns the error
-// into an event; from 2.8.0, the run returns it.
+// turn ends as it would without Temporal: ADK v2.6.0 to v2.7.1 turn the error
+// into an event, and from v2.8.0 runner.Run returns it.
 // Malformed network cards fail in ResolveA2AAgentCard; client and remote-call
 // errors fail in SendA2AMessage.
 // The last case is the control for the HTTP 401 ones: the caller's
 // A2AClientFactory adds the right credentials and the remote agent answers.
 func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
+	returned := remoteCallErrorIsReturned(t)
 	for _, tc := range []struct {
 		name      string
 		server    a2aServer
@@ -329,10 +330,11 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			})
 
 			env.ExecuteWorkflow(agentRunWorkflow, runInput{
-				ModelName:   "root-model",
-				UserMessage: "ask the remote agent",
-				SubAgents:   []subAgentSpec{remoteSubAgent(url)},
-				SSE:         tc.sse,
+				ModelName:    "root-model",
+				UserMessage:  "ask the remote agent",
+				SubAgents:    []subAgentSpec{remoteSubAgent(url)},
+				SSE:          tc.sse,
+				KeepRunError: true,
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
@@ -342,21 +344,14 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			} else {
 				assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
 			}
-			if tc.wantError != "" && googleadk.ADKAtLeast(t, "v2.8.0") {
-				// google/adk-go#1740
-				err := env.GetWorkflowError()
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tc.wantError)
-				return
-			}
 			require.NoError(t, env.GetWorkflowError())
 			var res runResult
 			require.NoError(t, env.GetWorkflowResult(&res))
 			if tc.wantError != "" {
-				require.Len(t, res.Errors, 1, "ADK turns the failed call into an error event")
-				assert.Contains(t, res.Errors[0], tc.wantError)
+				requireRemoteCallError(t, res, returned, tc.wantError)
 			} else {
 				assert.Empty(t, res.Errors)
+				assert.Nil(t, res.RunError)
 				assert.Contains(t, res.Texts, tc.wantText)
 			}
 		})
@@ -538,10 +533,11 @@ func restA2AErrorBody(err error) string {
 // grows with the reply rather than with the number of chunks, and an ADK
 // server's final events kept apart and its partial ones dropped. It also
 // proves an error after the first events comes back with those events instead
-// of a retry that would send the message again: ADK keeps them, records the
-// error and cancels the unfinished task, as without Temporal. From ADK 2.8.0,
-// the run returns the error instead of recording it as an event.
+// of a retry that would send the message again. As without Temporal, ADK
+// keeps the events and cancels the unfinished task. It records the error in
+// an event or, from v2.8.0, returns it from runner.Run.
 func TestRemoteSubAgentStreaming(t *testing.T) {
+	returned := remoteCallErrorIsReturned(t)
 	for _, tc := range []struct {
 		name       string
 		server     a2aServer
@@ -637,31 +633,25 @@ func TestRemoteSubAgentStreaming(t *testing.T) {
 			})
 
 			env.ExecuteWorkflow(agentRunWorkflow, runInput{
-				ModelName:   "root-model",
-				UserMessage: "ask the remote agent",
-				SubAgents:   []subAgentSpec{remoteSubAgent(url)},
-				SSE:         true,
+				ModelName:    "root-model",
+				UserMessage:  "ask the remote agent",
+				SubAgents:    []subAgentSpec{remoteSubAgent(url)},
+				SSE:          true,
+				KeepRunError: true,
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
 			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName))
 			assert.Equal(t, tc.wantCancel, counter.get(googleadk.CancelA2ATaskActivityName), "ADK cancels a task the run leaves unfinished")
-			if tc.wantError != "" && googleadk.ADKAtLeast(t, "v2.8.0") {
-				// google/adk-go#1740
-				err := env.GetWorkflowError()
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tc.wantError)
-				return
-			}
 			require.NoError(t, env.GetWorkflowError())
 			var res runResult
 			require.NoError(t, env.GetWorkflowResult(&res))
 			assert.Equal(t, tc.wantTexts, res.Texts)
 			if tc.wantError != "" {
-				require.Len(t, res.Errors, 1)
-				assert.Contains(t, res.Errors[0], tc.wantError)
+				requireRemoteCallError(t, res, returned, tc.wantError)
 			} else {
 				assert.Empty(t, res.Errors)
+				assert.Nil(t, res.RunError)
 			}
 		})
 	}
