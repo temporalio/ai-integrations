@@ -44,7 +44,8 @@ jobs:
       - id: matrix
         env:
           PLUGIN: ${{ inputs.plugin }}
-        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "python/$PLUGIN" --github-output "$GITHUB_OUTPUT"
+          DEPS: ${{ inputs.deps }}
+        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "python/$PLUGIN" --deps "$DEPS" --github-output "$GITHUB_OUTPUT"
 
   test:
     name: ${{ inputs.plugin }} (${{ matrix.os }}, py${{ matrix.runtime }})

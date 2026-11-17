@@ -15,6 +15,9 @@ def test_matrix_is_ubuntu_min_max_plus_macos_and_windows_at_max() -> None:
     ]
     dist_cells = [e for e in m["include"] if e["dist"]]
     assert dist_cells == [{"os": "ubuntu-latest", "runtime": "3.15", "dist": True}]
+    # Floors are tested where they must install: the oldest runtime.
+    assert matrix.build_matrix(["3.11", "3.12", "3.15"], deps="lowest") == {
+        "include": [{"os": "ubuntu-latest", "runtime": "3.11", "dist": False}]}
 
 
 def test_single_version_still_covers_three_operating_systems() -> None:
@@ -40,6 +43,8 @@ def test_cli_reads_plugin_toml(tmp_path: Path) -> None:
     result = matrix.main(["--plugin-dir", str(d), "--github-output", str(out)])
     assert result["include"][0]["runtime"] == "3.11"
     assert out.read_text().startswith('matrix={"include":')
+    assert matrix.main(["--plugin-dir", str(d), "--deps", "lowest"])["include"] == [
+        {"os": "ubuntu-latest", "runtime": "3.11", "dist": False}]
 
 
 def test_cli_preserves_go_patch_floor_and_selects_all_platforms(tmp_path: Path) -> None:

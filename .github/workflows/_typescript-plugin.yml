@@ -41,7 +41,8 @@ jobs:
       - id: matrix
         env:
           PLUGIN: ${{ inputs.plugin }}
-        run: python3 scripts/ci/matrix.py --plugin-dir "typescript/$PLUGIN" --github-output "$GITHUB_OUTPUT"
+          DEPS: ${{ inputs.deps }}
+        run: python3 scripts/ci/matrix.py --plugin-dir "typescript/$PLUGIN" --deps "$DEPS" --github-output "$GITHUB_OUTPUT"
 
   test:
     name: ${{ inputs.plugin }} (${{ matrix.os }}, node${{ matrix.runtime }})
