@@ -456,6 +456,13 @@ deadlock error. Tools from packages the plugin passes through the sandbox, such
 as `strands_tools`, are not checked by it; wrap them as activities as described
 above.
 
+**Breaking change:** a run recorded on an earlier version whose sync tool got
+an error can fail replay on this version: if the workflow then acted on what
+the tool now does, if the tool issues commands itself or takes more than two
+seconds, or if a `Swarm` agent handed off. Let runs that called a sync tool
+finish on their original workers first, or keep them there with Worker
+Versioning.
+
 ## Hooks
 
 Strands' [hook system](https://strandsagents.com/) (`strands.hooks`) lets you subscribe callbacks to events in the agent lifecycle — invocation start/end, model call before/after, tool call before/after, message added. Pass `hooks=[MyHookProvider()]` to `TemporalAgent`: every single-agent hook event fires in workflow context, so deterministic callbacks just work.

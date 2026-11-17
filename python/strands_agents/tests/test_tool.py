@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import pytest
 from strands import tool
+from strands.tools.tools import PythonAgentTool
+from strands.types.tools import ToolResult, ToolUse
 from strands_tools import calculator  # pyright: ignore[reportMissingTypeStubs]
 
 from temporalio import activity, workflow
@@ -31,6 +33,33 @@ from tests.postponed_activities import LoadParcels
 @tool
 def letter_counter(word: str, letter: str) -> int:
     return word.lower().count(letter.lower())
+
+
+def _shout(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
+    word = tool_use["input"]["word"]
+    return {
+        "toolUseId": tool_use["toolUseId"],
+        "status": "success",
+        "content": [{"text": word.upper()}],
+    }
+
+
+# A module-based sync tool, which Strands runs from strands.tools.tools.
+shout = PythonAgentTool(
+    "shout",
+    {
+        "name": "shout",
+        "description": "Upper-case a word.",
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {"word": {"type": "string"}},
+                "required": ["word"],
+            }
+        },
+    },
+    _shout,
+)
 
 
 @activity.defn(name="read_file")
@@ -145,6 +174,7 @@ class ToolWorkflow:
                     start_to_close_timeout=timedelta(seconds=15),
                 ),
                 letter_counter,
+                shout,
                 activity_as_tool(
                     TrackParcel, start_to_close_timeout=timedelta(seconds=15)
                 ),
@@ -184,6 +214,7 @@ async def test_tool(client: Client, tmp_path: Path):
                         "name": "letter_counter",
                         "input": {"word": "strawberry", "letter": "R"},
                     },
+                    {"name": "shout", "input": {"word": "strawberry"}},
                     {"name": "track_parcel", "input": {"parcel_id": "P-1"}},
                     {"name": "quote_parcel", "input": {"parcel_id": "P-2"}},
                     {"name": "ship_parcel", "input": {"parcel_id": "P-3"}},
@@ -235,6 +266,8 @@ async def test_tool(client: Client, tmp_path: Path):
         "invoke_model",
         # letter_counter (in-workflow)
         "invoke_model",
+        # shout (in-workflow)
+        "invoke_model",
         "track_parcel",
         "invoke_model",
         "quote_parcel",
@@ -248,9 +281,12 @@ async def test_tool(client: Client, tmp_path: Path):
         "locate_parcel",
         "invoke_model",
     ]
-    # The model got the result of letter_counter, the third tool, a sync tool
-    # run in the workflow.
-    assert get_tool_results(history)[2] == [{"text": "3"}]
+    # The model got the results of letter_counter and shout, sync tools run in
+    # the workflow: a @tool function and a module tool.
+    assert get_tool_results(history)[2:4] == [
+        [{"text": "3"}],
+        [{"text": "STRAWBERRY"}],
+    ]
     assert _activity_calls(client, history, "parcel") == [
         (["P-1"], "parcel P-1 via acme-post"),
         (["P-2"], "quote for P-2 via acme-post"),
