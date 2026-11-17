@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import weakref
 from collections.abc import Awaitable
 from inspect import iscoroutinefunction
 from typing import Any, Callable
@@ -16,7 +17,7 @@ from langgraph._internal._runnable import RunnableCallable
 
 from temporalio import workflow
 from temporalio.contrib.workflow_streams._stream import _PUBLISH_SIGNAL
-from temporalio.langgraph._task_cache import call_scope
+from temporalio.langgraph._task_cache import call_scope, invocation_scope
 
 
 def wrap_workflow(
@@ -104,6 +105,36 @@ def scope_router(name: str, path: Runnable[Any, Any]) -> Runnable[Any, Any]:
     return RunnableCallable(
         route, aroute, name=path.get_name(), trace=False, recurse=False
     )
+
+
+# The entrypoint functions that track_invocations() has wrapped.
+_tracked: weakref.WeakSet[RunnableCallable] = weakref.WeakSet()
+
+
+def track_invocations(runnable: RunnableCallable) -> None:
+    """Run an entrypoint's function in an invocation scope, in place.
+
+    Each invocation then tracks its calls (see :func:`invocation_scope`).
+    Wraps a function once, however many plugins are built with it.
+    """
+    if runnable in _tracked:
+        return
+    func, afunc = runnable.func, runnable.afunc
+    if func is not None:
+
+        def tracked(*args: Any, **kwargs: Any) -> Any:
+            with invocation_scope():
+                return func(*args, **kwargs)
+
+        runnable.func = tracked
+    if afunc is not None:
+
+        async def atracked(*args: Any, **kwargs: Any) -> Any:
+            with invocation_scope():
+                return await afunc(*args, **kwargs)
+
+        runnable.afunc = atracked
+    _tracked.add(runnable)
 
 
 def _task_path(config: RunnableConfig) -> Any:

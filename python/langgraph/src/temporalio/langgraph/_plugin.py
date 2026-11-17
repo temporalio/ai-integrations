@@ -33,7 +33,11 @@ from temporalio.langgraph._task_cache import (
     set_task_cache,
     task_id,
 )
-from temporalio.langgraph._workflow import scope_router, wrap_workflow
+from temporalio.langgraph._workflow import (
+    scope_router,
+    track_invocations,
+    wrap_workflow,
+)
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
@@ -316,6 +320,13 @@ class LangGraphPlugin(SimplePlugin):
                                 f"{graph_name}.{source}.{branch_name}", branch.path
                             )
                         )
+
+        # Functional API: an entrypoint runs in the workflow; each invocation
+        # tracks its calls, so a failed one can be invoked again.
+        for program in (entrypoints or {}).values():
+            for pregel_node in program.nodes.values():
+                if isinstance(pregel_node.bound, RunnableCallable):
+                    track_invocations(pregel_node.bound)
 
         # Functional API: Wrap @task functions as Temporal Activities.
         if tasks:

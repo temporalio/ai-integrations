@@ -5,6 +5,7 @@ node that routes back to itself, with the same input until a job is done must
 see the job finish under the plugin too.
 """
 
+import asyncio
 import operator
 import sys
 import time
@@ -171,10 +172,24 @@ def fail_second_call(job_id: str) -> str:
     return value
 
 
+# Calls of slow_first_call per job ID, counted where the Activities run.
+_slow_calls: dict[str, int] = {}
+
+
+def slow_first_call(job_id: str) -> str:
+    """Take 2 seconds the first time for ``job_id``, return at once after."""
+    _slow_calls[job_id] = _slow_calls.get(job_id, 0) + 1
+    if _slow_calls[job_id] == 1:
+        time.sleep(2)
+        return "slow"
+    return "fast"
+
+
 _wait = task(wait_for_value)
 _next = task(next_value)
 _fail_first = task(fail_first_call)
 _fail_second = task(fail_second_call)
+_slow_first = task(slow_first_call)
 
 
 @task
@@ -237,6 +252,32 @@ _recover_twice_graph.add_node(
     "take", take_twice_node, metadata={"execute_in": "workflow"}
 )
 _recover_twice_graph.add_edge(START, "take")
+
+
+async def take_three_node(state: ValueState) -> dict[str, str]:
+    """Take a new value, then make two calls that each fail the first time."""
+    job_id = state["job_id"]
+    first = await _next(job_id)
+    second = await _fail_first(f"{job_id}-b")
+    return {"value": f"{first} {second} {await _fail_first(f'{job_id}-c')}"}
+
+
+_recover_thrice_graph = StateGraph(ValueState)
+_recover_thrice_graph.add_node(
+    "take", take_three_node, metadata={"execute_in": "workflow"}
+)
+_recover_thrice_graph.add_edge(START, "take")
+
+
+async def take_then_slow_node(state: ValueState) -> dict[str, str]:
+    """Take a new value, then make a call that is slow the first time."""
+    first = await _next(state["job_id"])
+    return {"value": f"{first} {await _slow_first(state['job_id'])}"}
+
+
+_cancel_graph = StateGraph(ValueState)
+_cancel_graph.add_node("take", take_then_slow_node, metadata={"execute_in": "workflow"})
+_cancel_graph.add_edge(START, "take")
 
 
 class RouteState(TypedDict):
@@ -365,11 +406,18 @@ def _callers_plugin() -> LangGraphPlugin:
     async def fetch_with_client(request: dict[str, Any]) -> str:
         return await fetch_with(request["job_id"], ValueClient())
 
+    @lg_entrypoint()
+    async def take_then_fail_entry(request: dict[str, Any]) -> list[str]:
+        job_id = request["job_id"]
+        return [await _next(job_id), await _fail_first(f"{job_id}-f")]
+
     return LangGraphPlugin(
         graphs={
             "value": _value_graph,
             "recover": _recover_graph,
             "recover-twice": _recover_twice_graph,
+            "recover-thrice": _recover_thrice_graph,
+            "cancel": _cancel_graph,
             "routes": _routes_graph,
         },
         entrypoints={
@@ -380,12 +428,14 @@ def _callers_plugin() -> LangGraphPlugin:
             "two-subgraphs": two_subgraphs,
             "other-input-after-failure": other_input_after_failure,
             "fetch-with-client": fetch_with_client,
+            "take-then-fail": take_then_fail_entry,
         },
         tasks=[
             _wait,
             _next,
             _fail_first,
             _fail_second,
+            _slow_first,
             wait_then_call,
             take_then_fail,
             take_unless,
@@ -397,6 +447,7 @@ def _callers_plugin() -> LangGraphPlugin:
             "next_value": {"execute_in": "activity"},
             "fail_first_call": {"execute_in": "activity"},
             "fail_second_call": {"execute_in": "activity"},
+            "slow_first_call": {"execute_in": "activity"},
             "wait_then_call": {"execute_in": "workflow"},
             "take_then_fail": {"execute_in": "workflow"},
             "take_unless": {"execute_in": "workflow"},
@@ -476,7 +527,8 @@ class ApproveAcrossContinueAsNewWorkflow:
 class RecoverAcrossContinueAsNewWorkflow:
     """Runs graph ``name``, resuming it from its checkpoint if it fails.
 
-    Then continues-as-new with the cache until it has run ``runs`` times.
+    If the resumed run fails too, runs the graph again on a new thread. Then
+    continues-as-new with the cache until it has run ``runs`` times.
     Returns each run's value.
     """
 
@@ -487,8 +539,77 @@ class RecoverAcrossContinueAsNewWorkflow:
         try:
             result = await app.ainvoke({"job_id": input.job_id}, config)
         except ActivityError:
-            result = await app.ainvoke(None, config)
+            try:
+                result = await app.ainvoke(None, config)
+            except ActivityError:
+                result = await app.ainvoke(
+                    {"job_id": input.job_id},
+                    RunnableConfig({"configurable": {"thread_id": "2"}}),
+                )
         seen = [*input.seen, result["value"]]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    name=input.name,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+@workflow.defn
+class CancelAcrossContinueAsNewWorkflow:
+    """In its first run, cancels graph ``name`` after a second, then runs it again.
+
+    Then continues-as-new with the cache until it has run ``runs`` times.
+    Returns each run's value.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        app = graph(input.name, cache=input.cache).compile()
+        if not input.seen:
+            attempt = asyncio.ensure_future(app.ainvoke({"job_id": input.job_id}))
+            await asyncio.sleep(1)
+            attempt.cancel()
+            try:
+                await attempt
+            except asyncio.CancelledError:
+                pass
+        result = await app.ainvoke({"job_id": input.job_id})
+        seen = [*input.seen, result["value"]]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    name=input.name,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+@workflow.defn
+class RetryInvocationAcrossContinueAsNewWorkflow:
+    """Invokes entrypoint ``name`` again if an invocation fails.
+
+    Then continues-as-new with the cache until it has run ``runs`` times.
+    Returns each run's result.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        app = entrypoint(input.name, cache=input.cache)
+        try:
+            result = await app.ainvoke({"job_id": input.job_id})
+        except ActivityError:
+            result = await app.ainvoke({"job_id": input.job_id})
+        seen = [*input.seen, result]
         if len(seen) < input.runs:
             workflow.continue_as_new(
                 RepeatAcrossContinueAsNewInput(
@@ -934,6 +1055,84 @@ async def test_node_resumed_with_repeated_call_keeps_results_after_continue_as_n
     assert seen == [first, first]
     assert [len(_scheduled(h)) for h in histories] == [3, 0]
     assert _calls[job_id] == 3
+
+
+@_needs_functional_api
+async def test_node_failing_again_after_resuming_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """A node that fails again after resuming from its checkpoint is retried in full.
+
+    The node's first call succeeds and its second fails. Resumed from its
+    checkpoint, it gets the first call's result from the checkpoint, the
+    second succeeds and the third fails. The graph then runs again on a new
+    thread, which makes all three calls again. After continue-as-new all
+    three get the last attempt's results, including the first call, which
+    the resumed attempt did not make.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "recover-thrice",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=RecoverAcrossContinueAsNewWorkflow,
+    )
+
+    first = f"{job_id}:2 {job_id}-b:3 {job_id}-c:2"
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [7, 0]
+
+
+@_needs_functional_api
+async def test_cancelled_node_keeps_results_after_continue_as_new(client: Client):
+    """A node cancelled after one of its calls finished is retried in full.
+
+    The graph is cancelled while the node's second call runs, after its
+    first returned, and the workflow runs the graph again. After
+    continue-as-new the first call gets the retry's result, not the
+    cancelled attempt's.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "cancel",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=CancelAcrossContinueAsNewWorkflow,
+    )
+
+    first = f"{job_id}:2 fast"
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_invocation_retried_after_failure_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """An entrypoint invoked again after a failed invocation keeps the retry's results.
+
+    The entrypoint's first call succeeds and its second fails, so the
+    workflow invokes it again, which makes both calls again. After
+    continue-as-new the one invocation gets both of the retry's results and
+    runs nothing.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "take-then-fail",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=RetryInvocationAcrossContinueAsNewWorkflow,
+    )
+
+    first = [f"{job_id}:2", f"{job_id}-f:2"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
 
 
 @_needs_functional_api

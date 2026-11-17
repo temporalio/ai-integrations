@@ -10,8 +10,9 @@ workflow.continue_as_new().
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -46,12 +47,17 @@ _free_places: ContextVar[dict[str, list[int]] | None] = ContextVar(
 _scope: ContextVar[str] = ContextVar("_temporal_task_scope", default="")
 # The keys that the calls made in that call took, its nested calls' included.
 _taken: ContextVar[list[str] | None] = ContextVar("_temporal_task_taken", default=None)
+# The keys whose places the calls of the current entrypoint invocation gave
+# back (see invocation_scope()), or None outside one.
+_returned: ContextVar[list[str] | None] = ContextVar(
+    "_temporal_task_returned", default=None
+)
 # Cache entries written in this run by calls made in a node or task call that
 # then failed (see call_scope()). Not part of the cache either.
 _stale: ContextVar[set[str] | None] = ContextVar("_temporal_task_stale", default=None)
 # Per scope whose last call failed: the LangGraph task that call ran as, and
-# the keys the calls made in it took (see call_scope()). Not part of the
-# cache either.
+# the keys the calls made in it took, those of earlier attempts resumed from
+# the checkpoint included (see call_scope()). Not part of the cache either.
 _failed: ContextVar[dict[str, tuple[str | None, list[str]]] | None] = ContextVar(
     "_temporal_task_failed", default=None
 )
@@ -109,6 +115,57 @@ def release(key: str) -> None:
     if free is not None:
         base, sep, n = key.rpartition("#")
         heappush(free.setdefault(base if sep else key, []), int(n) if sep else 0)
+        returned = _returned.get()
+        if returned is not None:
+            returned.append(key)
+
+
+def _abandoned(err: BaseException) -> bool:
+    """Return whether ``err`` ends a call for good.
+
+    A failure or a cancellation does; an interrupt (``GraphBubbleUp``) does
+    not, since LangGraph resumes the call.
+    """
+    return isinstance(err, (Exception, asyncio.CancelledError)) and not isinstance(
+        err, GraphBubbleUp
+    )
+
+
+@contextmanager
+def invocation_scope() -> Generator[None, None, None]:
+    """Track the calls made by one invocation of an entrypoint.
+
+    Calls made directly by an entrypoint keep their keys (see
+    :func:`occurrence_key`). Without this, a Workflow that invokes the
+    entrypoint again after a failed or cancelled invocation would make the
+    calls that had succeeded under their next places, while their earlier
+    results kept the first ones for the next run to find. So if the
+    invocation fails or is cancelled, the results of its calls become stale
+    and the places they still hold are given back: invoked again, it makes
+    them under the same keys, runs them again and replaces their results.
+    An entrypoint invoked inside a workflow-side node or task is tracked by
+    that call's scope instead.
+    """
+    if _taken.get() is not None:
+        yield
+        return
+    taken: list[str] = []
+    returned: list[str] = []
+    taken_token = _taken.set(taken)
+    returned_token = _returned.set(returned)
+    try:
+        yield
+    except BaseException as err:
+        if _abandoned(err):
+            _retire(taken)
+            # A place given back may have been taken again since, by this
+            # invocation or another, so only the places still held go back.
+            for key in (Counter(taken) - Counter(returned)).elements():
+                release(key)
+        raise
+    finally:
+        _returned.reset(returned_token)
+        _taken.reset(taken_token)
 
 
 @contextmanager
@@ -127,31 +184,35 @@ def call_scope(
     in, and calls with other input never share one. If the block raises,
     its place is given back, as a failed call's is.
 
-    If it fails, rather than being interrupted, the results of the calls
-    made in it become stale. When LangGraph runs it again from its
+    If it fails or is cancelled, rather than interrupted, the results of the
+    calls made in it become stale. When LangGraph runs it again from its
     checkpoint, as the same task, those calls keep their places: one
     LangGraph restores from the checkpoint is not made again and keeps its
     result for the next run, and the one that failed takes the place it gave
-    back. When it is called again as another task, such as by a retry, its
-    calls count from the first place again, so they are made under the same
-    keys, run again and replace their results.
+    back. If that attempt fails too, the restored calls still count as the
+    call's own. When it is called again as another task, such as by a retry,
+    its calls count from the first place again, so they are made under the
+    same keys, run again and replace their results.
     """
     caller = {k: v for k, v in (kwargs or {}).items() if k not in _INJECTED_KWARGS}
     key = occurrence_key(_scope_key(name, args, caller))
     scope = sha256(key.encode()).hexdigest()[:16]
     task = _langgraph_task()
     failed = _failed.get()
+    restored: list[str] = []
     if failed is not None and scope in failed:
         failed_task, failed_keys = failed.pop(scope)
         if task is None or task != failed_task:
             _restart(failed_keys)
-    taken: list[str] = []
+        else:
+            restored = failed_keys
+    taken: list[str] = list(restored)
     token = _scope.set(scope)
     taken_token = _taken.set(taken)
     try:
         yield
     except BaseException as err:
-        if isinstance(err, Exception) and not isinstance(err, GraphBubbleUp):
+        if _abandoned(err):
             _retire(taken)
             if failed is not None:
                 failed[scope] = (task, taken)
@@ -162,7 +223,8 @@ def call_scope(
         _scope.reset(token)
         outer = _taken.get()
         if outer is not None:
-            outer.extend(taken)
+            # The enclosing call has the restored keys from the earlier attempt.
+            outer.extend(taken[len(restored) :])
 
 
 def _langgraph_task() -> str | None:
