@@ -232,7 +232,7 @@ class LongResearchAgent:
 
     @workflow.run
     async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
-        agent = create_deep_agent(model="anthropic:claude-sonnet-5-5")
+        agent = create_deep_agent(name="research", model="anthropic:claude-sonnet-5-5")
         return await run_deep_agent(
             agent,
             input,
@@ -277,7 +277,7 @@ class ChatAgent:
 
     @workflow.run
     async def run(self, input: dict, state_snapshot: dict | None = None) -> list[str]:
-        agent = create_deep_agent(model="fake:model")
+        agent = create_deep_agent(name="chat", model="fake:model")
         result = await run_deep_agent(agent, input, state_snapshot=state_snapshot)
         if state_snapshot is None:
             workflow.continue_as_new(
