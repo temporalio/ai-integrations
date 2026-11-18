@@ -375,8 +375,9 @@ found through the wrappers RxJava and futures add around the error, so ADK's Gem
 raises it from a future, is classified the same way. A response the model reports as an error (for
 example a safety block) is not a failure: ADK emits it as a final event with an error code and no
 text, exactly as outside Temporal. MCP failures use `googleadk.McpError`: an unknown toolset or tool
-is non-retryable, a failing server call is retried, while a call the tool rejects outright (for
-example because of a null argument value) is not. Live-output publishing failures use
+is non-retryable, as are JSON-RPC errors a retry cannot fix (parse error, invalid request, method
+not found, invalid params); any other failing server call is retried, while a call the tool rejects
+outright (for example because of a null argument value) is not. Live-output publishing failures use
 `googleadk.StreamError`: a missing or mismatched Workflow Streams artifact or a refused batch is
 non-retryable; outages and rate limiting remain retryable after the stream retry window (see
 [Live model output](#live-model-output)). Model and MCP calls run on a background thread, including

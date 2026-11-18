@@ -9,7 +9,11 @@ public final class FailureTypes {
   /** A model call failed; GenAI API errors with status 408, 409, 429, or 5xx are retryable. */
   public static final String MODEL_ERROR = "googleadk.ModelError";
 
-  /** An MCP toolset operation failed; unknown toolsets and tools are non-retryable. */
+  /**
+   * An MCP toolset operation failed; unknown toolsets and tools, and JSON-RPC protocol errors a
+   * retry cannot fix (parse error, invalid request, method not found, invalid params), are
+   * non-retryable.
+   */
   public static final String MCP_ERROR = "googleadk.McpError";
 
   /**

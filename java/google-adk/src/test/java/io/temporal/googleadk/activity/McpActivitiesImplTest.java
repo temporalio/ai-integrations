@@ -10,8 +10,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.adk.agents.ReadonlyContext;
 import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.BaseToolset;
+import com.google.adk.tools.ToolContext;
 import com.google.genai.types.FunctionDeclaration;
+import io.modelcontextprotocol.spec.McpError;
+import io.modelcontextprotocol.spec.McpSchema.ErrorCodes;
 import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.core.Single;
 import io.temporal.activity.ActivityOptions;
 import io.temporal.client.WorkflowClientOptions;
 import io.temporal.failure.ActivityFailure;
@@ -23,6 +27,7 @@ import io.temporal.testing.TestEnvironmentOptions;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -42,6 +47,12 @@ class McpActivitiesImplTest {
   private final CountDownLatch blocked = new CountDownLatch(1);
 
   private final CountDownLatch gate = new CountDownLatch(1);
+
+  /** What the failing toolset's listing raises. */
+  private final AtomicReference<Throwable> listingError = new AtomicReference<>();
+
+  /** What the failing toolset's {@code reject} tool raises when called. */
+  private final AtomicReference<Throwable> callError = new AtomicReference<>();
 
   /** Counted down when the blocking-listing toolset is closed. */
   private final CountDownLatch blockingClosed = new CountDownLatch(1);
@@ -69,6 +80,8 @@ class McpActivitiesImplTest {
                 },
                 "blocking-listing",
                 BlockingListingToolset::new,
+                "failing",
+                () -> new FailingToolset(listingError, callError),
                 "broken",
                 () -> {
                   throw new IllegalStateException("cannot start the server");
@@ -302,6 +315,129 @@ class McpActivitiesImplTest {
     assertTrue(
         failure.getOriginalMessage().contains("Creating MCP toolset 'broken' failed: cannot start"),
         failure.getOriginalMessage());
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      ints = {
+        ErrorCodes.PARSE_ERROR,
+        ErrorCodes.INVALID_REQUEST,
+        ErrorCodes.METHOD_NOT_FOUND,
+        ErrorCodes.INVALID_PARAMS
+      })
+  void protocolErrorsARetryCannotFix_failNonRetryably(int code) {
+    listingError.set(McpError.builder(code).message("rejected").build());
+    McpActivities activities = env.newActivityStub(McpActivities.class);
+
+    ApplicationFailure listed =
+        applicationFailure(() -> activities.listMcpTools(new ListMcpToolsInput("failing")));
+
+    assertEquals("googleadk.McpError", listed.getType());
+    assertTrue(listed.isNonRetryable(), "code " + code + " cannot succeed on a retry");
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      ints = {
+        ErrorCodes.PARSE_ERROR,
+        ErrorCodes.INVALID_REQUEST,
+        ErrorCodes.METHOD_NOT_FOUND,
+        ErrorCodes.INVALID_PARAMS
+      })
+  void toolCallRejectedWithProtocolError_failsNonRetryably(int code) {
+    callError.set(McpError.builder(code).message("rejected").build());
+    McpActivities activities = env.newActivityStub(McpActivities.class);
+
+    ApplicationFailure failure =
+        applicationFailure(
+            () -> activities.callMcpTool(new CallMcpToolInput("failing", "reject", Map.of())));
+
+    assertEquals("googleadk.McpError", failure.getType());
+    assertTrue(failure.isNonRetryable(), "code " + code + " cannot succeed on a retry");
+  }
+
+  @Test
+  void toolCallFailingWithInternalError_staysRetryable() {
+    callError.set(McpError.builder(ErrorCodes.INTERNAL_ERROR).message("oops").build());
+    McpActivities activities = env.newActivityStub(McpActivities.class);
+
+    ApplicationFailure failure =
+        applicationFailure(
+            () -> activities.callMcpTool(new CallMcpToolInput("failing", "reject", Map.of())));
+
+    assertFalse(failure.isNonRetryable());
+  }
+
+  @Test
+  void protocolErrorBehindAWrapper_failsNonRetryably() {
+    listingError.set(
+        new IllegalStateException(
+            "listing failed",
+            McpError.builder(ErrorCodes.INVALID_PARAMS).message("bad params").build()));
+    McpActivities activities = env.newActivityStub(McpActivities.class);
+
+    ApplicationFailure failure =
+        applicationFailure(() -> activities.listMcpTools(new ListMcpToolsInput("failing")));
+
+    assertTrue(failure.isNonRetryable());
+  }
+
+  @Test
+  void internalProtocolError_staysRetryable() {
+    listingError.set(McpError.builder(ErrorCodes.INTERNAL_ERROR).message("oops").build());
+    McpActivities activities = env.newActivityStub(McpActivities.class);
+
+    ApplicationFailure failure =
+        applicationFailure(() -> activities.listMcpTools(new ListMcpToolsInput("failing")));
+
+    assertEquals("googleadk.McpError", failure.getType());
+    assertFalse(failure.isNonRetryable(), "a server-side internal error may clear up");
+  }
+
+  /**
+   * A toolset whose listing fails with the given error, or, when none is set, lists a {@code
+   * reject} tool that fails with the given call error.
+   */
+  private static final class FailingToolset implements BaseToolset {
+    private final AtomicReference<Throwable> listingError;
+    private final AtomicReference<Throwable> callError;
+
+    FailingToolset(AtomicReference<Throwable> listingError, AtomicReference<Throwable> callError) {
+      this.listingError = listingError;
+      this.callError = callError;
+    }
+
+    @Override
+    public Flowable<BaseTool> getTools(ReadonlyContext readonlyContext) {
+      if (listingError.get() != null) {
+        return Flowable.error(listingError.get());
+      }
+      return Flowable.just(new RejectingTool(callError));
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  /** A tool whose call fails with the given error. */
+  private static final class RejectingTool extends BaseTool {
+    private final AtomicReference<Throwable> error;
+
+    RejectingTool(AtomicReference<Throwable> error) {
+      super("reject", "Always fails.");
+      this.error = error;
+    }
+
+    @Override
+    public Optional<FunctionDeclaration> declaration() {
+      return Optional.of(
+          FunctionDeclaration.builder().name("reject").description("Always fails.").build());
+    }
+
+    @Override
+    public Single<Map<String, Object>> runAsync(Map<String, Object> args, ToolContext toolContext) {
+      return Single.error(error.get());
+    }
   }
 
   private static ApplicationFailure applicationFailure(Runnable call) {
