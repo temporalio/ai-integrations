@@ -126,6 +126,7 @@ from temporalio.client import (
     WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
+    WorkflowUpdateFailedError,
 )
 from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -544,6 +545,20 @@ class NexusToolCancelWorkflow:
             tools.append(function_tool(self.fail, failure_error_function=None))
         elif case == "tool_bug":
             tools.append(function_tool(self.bug, failure_error_function=None))
+        elif case == "nested_invalid_output":
+            # An agent used as a tool whose final output doesn't match its output_type.
+            invalid = Agent[str](
+                name="Invalid",
+                instructions="You are a helpful agent.",
+                output_type=OutputType,
+            )
+            tools.append(
+                invalid.as_tool(
+                    tool_name="invalid",
+                    tool_description="Runs an agent.",
+                    failure_error_function=None,
+                )
+            )
         if case in ("nested", "nested_tool_fails"):
             inner = Agent[str](
                 name="Inner", instructions="You are a helpful agent.", tools=tools
@@ -4347,6 +4362,128 @@ async def test_invalid_output_type_can_be_caught(client: Client):
                 execution_timeout=timedelta(seconds=30),
             )
             assert result.startswith("caught: Invalid JSON when parsing model output")
+
+
+async def test_invalid_output_waits_for_nexus_tool_cancellation(
+    client: Client, env: WorkflowEnvironment
+):
+    """A ModelBehaviorError that fails the Workflow waits for sibling Nexus tools.
+
+    An agent used as a tool returns invalid output while a sibling Nexus tool runs. The
+    run cancels the tool and waits for its WAIT_COMPLETED cancellation, as for other
+    Workflow failures, before the Workflow fails.
+    """
+    if env.supports_time_skipping:
+        pytest.skip("Nexus tests don't work with time-skipping server")
+
+    held_id = f"held-{uuid.uuid4()}-slow"
+    hold_call = ResponseBuilders.tool_call(json.dumps({"input": held_id}), "hold")
+    invalid_call = ResponseBuilders.tool_call(
+        json.dumps({"input": "Answer"}), "invalid", call_id="invalid", item_id="invalid"
+    )
+    responses = [
+        ModelResponse(
+            output=[*hold_call.output, *invalid_call.output],
+            usage=Usage(),
+            response_id=None,
+        ),
+        ResponseBuilders.output_message('{"answer": 42}'),
+    ]
+    async with AgentEnvironment(
+        model=TestModel.returning_responses(responses),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
+    ) as agent_env:
+        client = agent_env.applied_on_client(client)
+
+        async with new_worker(
+            client,
+            NexusToolCancelWorkflow,
+            HeldWorkflow,
+            nexus_service_handlers=[HeldServiceHandler()],
+        ) as worker:
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+            )
+            workflow_handle = await client.start_workflow(
+                NexusToolCancelWorkflow.run,
+                "nested_invalid_output",
+                id=f"nexus-tool-invalid-output-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            held_handle = client.get_workflow_handle(held_id)
+
+            async def cancel_delivered() -> None:
+                events = [e async for e in workflow_handle.fetch_history_events()]
+                assert any(
+                    e.HasField(
+                        "nexus_operation_cancel_request_completed_event_attributes"
+                    )
+                    for e in events
+                )
+
+            await assert_eventually(cancel_delivered)
+            # The operation delays its cancellation until released, so the run waits.
+            assert (await workflow_handle.describe()).status == (
+                WorkflowExecutionStatus.RUNNING
+            )
+            await held_handle.signal(HeldWorkflow.release)
+
+            with pytest.raises(WorkflowFailureError) as err:
+                await workflow_handle.result()
+            cause = err.value.cause
+            assert isinstance(cause, ApplicationError)
+            assert cause.type == "ModelBehaviorError"
+            assert (await held_handle.describe()).status == (
+                WorkflowExecutionStatus.CANCELED
+            )
+
+
+@workflow.defn
+class InvalidOutputUpdateWorkflow:
+    """Runs the agent in an Update handler while the Workflow waits."""
+
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(lambda: False)
+
+    @workflow.update
+    async def ask(self) -> str:
+        agent: Agent = Agent(
+            name="Assistant",
+            instructions="You are a helpful assistant, adhere to the json schema output",
+            output_type=OutputType,
+        )
+        result = await Runner.run(starting_agent=agent, input="Hello!")
+        return result.final_output.answer
+
+
+async def test_invalid_output_in_update_fails_only_the_update(client: Client):
+    """A ModelBehaviorError that escapes an Update handler fails the Update, not the Workflow."""
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, InvalidOutputUpdateWorkflow) as worker:
+            handle = await client.start_workflow(
+                InvalidOutputUpdateWorkflow.run,
+                id=f"invalid-output-update-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowUpdateFailedError) as err:
+                await handle.execute_update(InvalidOutputUpdateWorkflow.ask)
+            cause = err.value.cause
+            assert isinstance(cause, ApplicationError)
+            assert cause.type == "ModelBehaviorError"
+            assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
+            await handle.terminate()
 
 
 @workflow.defn

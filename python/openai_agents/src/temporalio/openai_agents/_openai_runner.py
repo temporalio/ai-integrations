@@ -42,6 +42,7 @@ from temporalio.openai_agents._temporal_model_stub import (
 )
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents._workflow_failure import (
+    fails_workflow_if_uncaught,
     model_behavior_error_fails_workflow,
 )
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
@@ -436,9 +437,13 @@ class TemporalOpenAIRunner(AgentRunner):
                 # only when the error fails the Workflow: an error that fails the Workflow
                 # Task must leave no new commands, so that a fixed Worker can replay it.
                 if (
-                    e.__cause__ is not None
-                    and workflow.is_failure_exception(e.__cause__)
-                ) or workflow.is_failure_exception(e):
+                    (
+                        e.__cause__ is not None
+                        and workflow.is_failure_exception(e.__cause__)
+                    )
+                    or workflow.is_failure_exception(e)
+                    or fails_workflow_if_uncaught(e)
+                ):
                     if await _wait_for_tool_operations(run):
                         # The Workflow was cancelled during the wait.
                         raise asyncio.CancelledError() from e

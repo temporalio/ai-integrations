@@ -32,6 +32,15 @@ def model_behavior_error_fails_workflow() -> bool:
     return workflow.patched(MODEL_BEHAVIOR_ERROR_FAILS_WORKFLOW_PATCH)
 
 
+def fails_workflow_if_uncaught(e: BaseException) -> bool:
+    """Return whether ``e`` fails the Workflow if Workflow code doesn't catch it.
+
+    ``Runner.run`` uses it to wait for the run's tool operations to finish cancelling
+    first, as it does for other Workflow failures.
+    """
+    return isinstance(e, ModelBehaviorError) and model_behavior_error_fails_workflow()
+
+
 def _raise_workflow_failure(e: ModelBehaviorError) -> NoReturn:
     if not model_behavior_error_fails_workflow():
         raise e
