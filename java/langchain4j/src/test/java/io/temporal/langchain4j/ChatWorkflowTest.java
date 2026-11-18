@@ -19,6 +19,7 @@ import dev.langchain4j.model.chat.Capability;
 import dev.langchain4j.model.chat.request.ResponseFormatType;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.output.OutputParsingException;
 import io.temporal.activity.ActivityOptions;
 import io.temporal.api.history.v1.HistoryEvent;
 import io.temporal.client.WorkflowClient;
@@ -37,6 +38,7 @@ import io.temporal.testing.TestEnvironmentOptions;
 import io.temporal.testing.TestWorkflowEnvironment;
 import io.temporal.testing.WorkflowReplayer;
 import io.temporal.worker.Worker;
+import io.temporal.worker.WorkflowImplementationOptions;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 import java.time.Duration;
@@ -262,6 +264,40 @@ class ChatWorkflowTest {
     assertEquals(ResponseFormatType.JSON, format.type());
     assertNotNull(format.jsonSchema());
     assertNotNull(format.jsonSchema().rootElement());
+  }
+
+  @Test
+  void invalidStructuredOutputFailsTheWorkflowWhenRegisteredAsAFailure() {
+    ScriptedChatModel model =
+        new ScriptedChatModel(
+            request -> ChatResponse.builder().aiMessage(AiMessage.from("Not JSON")).build());
+    testEnv =
+        TestWorkflowEnvironment.newInstance(
+            TestEnvironmentOptions.newBuilder()
+                .setWorkflowClientOptions(
+                    WorkflowClientOptions.newBuilder()
+                        .setPlugins(
+                            LangChain4jPlugin.newBuilder().chatModel("scripted", model).build())
+                        .build())
+                .build());
+    Worker worker = testEnv.newWorker(TASK_QUEUE);
+    worker.registerWorkflowImplementationTypes(
+        WorkflowImplementationOptions.newBuilder()
+            .setFailWorkflowExceptionTypes(OutputParsingException.class)
+            .build(),
+        ForecastWorkflowImpl.class);
+    testEnv.start();
+    WorkflowClient client = testEnv.getWorkflowClient();
+
+    // Without the option, the workflow task would fail on every retry and the workflow would stay
+    // running.
+    WorkflowFailedException failure =
+        assertThrows(
+            WorkflowFailedException.class,
+            () -> stub(client, ForecastWorkflow.class).forecast("Oslo"));
+    ApplicationFailure cause = assertInstanceOf(ApplicationFailure.class, failure.getCause());
+    assertEquals(OutputParsingException.class.getName(), cause.getType());
+    assertEquals(1, model.requests.size());
   }
 
   // --- Failure classification ---

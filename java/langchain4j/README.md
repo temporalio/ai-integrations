@@ -93,6 +93,25 @@ A `MessageWindowChatMemory` (or `TokenWindowChatMemory`) created in the workflow
 conversation in workflow state. Replay rebuilds it from the model Activities' results, so no
 external `ChatMemoryStore` is needed.
 
+### Structured output
+
+An AI Service method that returns a POJO, a record or another non-text type converts the model's
+answer in workflow code, after the model Activity has completed. When the answer doesn't match the
+return type, LangChain4j throws `OutputParsingException`. If the workflow doesn't handle it, the
+workflow task fails and is retried, but the model's answer is already in the history, so every
+retry fails the same way and the workflow stays running.
+
+Catch the exception around the call, for example to ask the model again or return a fallback, or
+make it fail the workflow so a workflow retry policy can start another run:
+
+```java
+WorkflowImplementationOptions options =
+    WorkflowImplementationOptions.newBuilder()
+        .setFailWorkflowExceptionTypes(OutputParsingException.class)
+        .build();
+worker.registerWorkflowImplementationTypes(options, MyWorkflowImpl.class);
+```
+
 ### Payloads
 
 The Activity input and result are built from LangChain4j's own JSON forms: messages are written by
