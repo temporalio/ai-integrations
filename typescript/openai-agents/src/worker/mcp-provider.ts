@@ -28,9 +28,9 @@ export function assertMCPServer(name: string, server: unknown): asserts server i
   if (server != null && methods.every((method) => typeof (server as MCPServer)[method] === 'function')) return;
   // An async factory returns a Promise that may reject. Nothing awaits it, so mark it handled: the
   // type error below fails the Activity, and an unhandled rejection would otherwise crash the Worker.
-  if (typeof (server as PromiseLike<unknown> | null)?.then === 'function') {
-    Promise.resolve(server).catch(() => {});
-  }
+  // Only a genuine Promise is touched: a lazy thenable's `.then` can start work, and a throwing one
+  // would bypass the non-retryable error below.
+  if (server instanceof Promise) server.catch(() => undefined);
   throw ApplicationFailure.create({
     message:
       `MCP server factory '${name}' returned ${describeValue(server)}, ` +

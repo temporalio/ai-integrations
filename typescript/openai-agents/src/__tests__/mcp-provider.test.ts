@@ -81,6 +81,27 @@ test('a rejecting async factory fails the Activity without an unhandled rejectio
   }
 });
 
+test('a thenable factory result is rejected without calling its then', async (t) => {
+  let thenCalls = 0;
+  const lazy = {
+    then() {
+      thenCalls++;
+    },
+  };
+  const throwing = {
+    get then(): never {
+      throw new Error('then getter');
+    },
+  };
+  for (const result of [lazy, throwing]) {
+    const activities = new StatelessMCPServerProvider('files', (() => result) as unknown as () => MCPServer)._getActivities();
+    const err = await t.throwsAsync(activities['files-stateless-list-tools']!({}), { instanceOf: ApplicationFailure });
+    t.is(err?.type, 'MCPServerFactoryTypeError');
+    t.true(err?.nonRetryable);
+  }
+  t.is(thenCalls, 0);
+});
+
 test('MCP server providers refuse a factory that is not a function when they are built', (t) => {
   const invalidFactories: [unknown, string][] = [
     [undefined, 'undefined'],
