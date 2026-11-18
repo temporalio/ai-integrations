@@ -529,7 +529,13 @@ class TemporalOpenAIRunner(AgentRunner):
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
         streamed_run = _StreamedRun()
+        # The run's tools and nested agent runs register with it, as with Runner.run.
+        agent_run = _AgentRun()
+        parent = _current_agent_run.get()
+        if parent is not None:
+            parent.nested.add(agent_run)
         token = _current_streamed_run.set(streamed_run)
+        agent_run_token = _current_agent_run.set(agent_run)
         try:
             with (
                 capture_scope(run_config.model_settings),
@@ -540,7 +546,12 @@ class TemporalOpenAIRunner(AgentRunner):
                     input=input,
                     **kwargs,
                 )
+        except BaseException:
+            if parent is not None:
+                parent.nested.discard(agent_run)
+            raise
         finally:
+            _current_agent_run.reset(agent_run_token)
             _current_streamed_run.reset(token)
         # The model stub reads it to watch the run's parallel input guardrails.
         streamed_run.result = streamed_result
@@ -561,26 +572,39 @@ class TemporalOpenAIRunner(AgentRunner):
         original_stream_events = streamed_result.stream_events
         run_loop_task = streamed_result.run_loop_task
 
+        def _defer_tool_cleanup(e: AgentsException) -> None:
+            # As in Runner.run: raise at once, and leave the wait for the run's tools to
+            # the Workflow boundary, if the error escapes and fails the Workflow.
+            if fails_workflow_if_uncaught(e):
+                _mark_stopping(agent_run)
+                defer_tool_operations_wait(e, agent_run)
+
         async def _stream_events_with_rewrap() -> AsyncIterator[Any]:
             try:
-                async for event in original_stream_events():
-                    yield event
-            except AgentsException as e:
-                _reraise_workflow_failure(e)
-                raise
-            # The agents framework may have stored the run-loop
-            # exception on ``_stored_exception`` (or surfaced it through
-            # the iterator) without re-raising it through stream_events.
-            # By the time the iterator is exhausted, ``run_loop_task``
-            # is done — surface its exception here so a failed run
-            # cannot appear successful, applying the workflow-failure
-            # rewrap when applicable.
-            if run_loop_task is not None and run_loop_task.done():
-                exc = run_loop_task.exception()
-                if exc is not None:
-                    if isinstance(exc, AgentsException):
-                        _reraise_workflow_failure(exc)
-                    raise exc
+                try:
+                    async for event in original_stream_events():
+                        yield event
+                except AgentsException as e:
+                    _defer_tool_cleanup(e)
+                    _reraise_workflow_failure(e)
+                    raise
+                # The agents framework may have stored the run-loop
+                # exception on ``_stored_exception`` (or surfaced it through
+                # the iterator) without re-raising it through stream_events.
+                # By the time the iterator is exhausted, ``run_loop_task``
+                # is done — surface its exception here so a failed run
+                # cannot appear successful, applying the workflow-failure
+                # rewrap when applicable.
+                if run_loop_task is not None and run_loop_task.done():
+                    exc = run_loop_task.exception()
+                    if exc is not None:
+                        if isinstance(exc, AgentsException):
+                            _defer_tool_cleanup(exc)
+                            _reraise_workflow_failure(exc)
+                        raise exc
+            finally:
+                if parent is not None:
+                    parent.nested.discard(agent_run)
 
         streamed_result.stream_events = _stream_events_with_rewrap  # type: ignore[method-assign]
         return streamed_result

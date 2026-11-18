@@ -63,10 +63,14 @@ async def _raise_workflow_failure(e: ModelBehaviorError) -> NoReturn:
     # Imported here: the runner imports this module.
     from temporalio.openai_agents._openai_runner import _wait_for_tool_operations
 
+    cancel_requested = False
     for run in e.__dict__.get(_STOPPED_RUNS_ATTRIBUTE, ()):
+        # Finish every recorded run's wait, even after a cancel request arrived during an
+        # earlier one, so no WAIT_COMPLETED tool is still cancelling when the Workflow closes.
         if await _wait_for_tool_operations(run):
-            # The Workflow was cancelled during the wait.
-            raise asyncio.CancelledError() from e
+            cancel_requested = True
+    if cancel_requested:
+        raise asyncio.CancelledError() from e
     # The model's answer is in the History, so retrying the Workflow Task would get
     # the same answer and fail the same way. A retryable ApplicationError fails the
     # Workflow and leaves another run to the Workflow retry policy.
@@ -87,19 +91,33 @@ class ModelBehaviorErrorInterceptor(temporalio.worker.Interceptor):
 class _ModelBehaviorErrorWorkflowInboundInterceptor(
     temporalio.worker.WorkflowInboundInterceptor
 ):
+    def __init__(self, next: temporalio.worker.WorkflowInboundInterceptor) -> None:
+        super().__init__(next)
+        # Signal handlers whose escaped ModelBehaviorError waits for tool cleanup before it
+        # fails the Workflow.
+        self._failing_signals = 0
+
     async def execute_workflow(
         self, input: temporalio.worker.ExecuteWorkflowInput
     ) -> Any:
         try:
-            return await self.next.execute_workflow(input)
+            result = await self.next.execute_workflow(input)
         except ModelBehaviorError as e:
             await _raise_workflow_failure(e)
+        # A Signal failure that is still waiting for tool cleanup must fail the Workflow,
+        # so the run method doesn't complete it first.
+        await workflow.wait_condition(lambda: self._failing_signals == 0)
+        return result
 
     async def handle_signal(self, input: temporalio.worker.HandleSignalInput) -> None:
         try:
             return await self.next.handle_signal(input)
         except ModelBehaviorError as e:
-            await _raise_workflow_failure(e)
+            self._failing_signals += 1
+            try:
+                await _raise_workflow_failure(e)
+            finally:
+                self._failing_signals -= 1
 
     async def handle_update_handler(
         self, input: temporalio.worker.HandleUpdateInput
