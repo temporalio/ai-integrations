@@ -31,8 +31,16 @@ export function assertMCPServer(name: string, server: unknown): asserts server i
   // type error below fails the Activity, and an unhandled rejection would otherwise crash the Worker.
   // Only a native Promise is touched: a lazy thenable's `.then` can start work, a throwing one would
   // bypass the non-retryable error below, and `.catch()` on a Proxy-wrapped Promise throws.
-  // `types.isPromise` excludes proxies and also accepts Promises from another realm.
-  if (types.isPromise(server)) server.catch(() => undefined);
+  // `types.isPromise` excludes proxies and also accepts Promises from another realm. The handler is
+  // attached with the built-in `then`, so an overridden `catch` or a throwing `then` getter on a
+  // native Promise cannot bypass the non-retryable error either.
+  if (types.isPromise(server)) {
+    try {
+      void Promise.prototype.then.call(server, undefined, () => undefined);
+    } catch {
+      // Best effort: the type error below must still be raised.
+    }
+  }
   throw ApplicationFailure.create({
     message:
       `MCP server factory '${name}' returned ${describeValue(server)}, ` +

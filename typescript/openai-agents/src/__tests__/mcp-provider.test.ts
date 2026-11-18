@@ -94,7 +94,17 @@ test('a thenable factory result is rejected without calling its then', async (t)
     },
   };
   const proxied = new Proxy(Promise.resolve(), {});
-  for (const result of [lazy, throwing, proxied]) {
+  const customCatch = Promise.resolve();
+  customCatch.catch = () => {
+    throw new Error('catch override');
+  };
+  const customThen = Promise.resolve();
+  void Object.defineProperty(customThen, 'then', {
+    get(): never {
+      throw new Error('then getter on a native Promise');
+    },
+  });
+  for (const result of [lazy, throwing, proxied, customCatch, customThen]) {
     const activities = new StatelessMCPServerProvider('files', (() => result) as unknown as () => MCPServer)._getActivities();
     const err = await t.throwsAsync(activities['files-stateless-list-tools']!({}), { instanceOf: ApplicationFailure });
     t.is(err?.type, 'MCPServerFactoryTypeError');
