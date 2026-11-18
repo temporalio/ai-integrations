@@ -7,21 +7,26 @@ expected activity.
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import importlib
+import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Self, TypedDict
 
 import pytest
 
-from temporalio.testing import WorkflowEnvironment
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 
 pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
+from temporalio.client import WorkflowHistory  # noqa: E402
 from temporalio.common import RetryPolicy  # noqa: E402
 from temporalio.worker import Replayer, Worker  # noqa: E402
 from temporalio.workflow import ActivityConfig  # noqa: E402
@@ -39,6 +44,14 @@ with workflow.unsafe.imports_passed_through():
     )
     from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
     from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
+    from temporalio.worker.workflow_sandbox import (  # noqa: E402
+        RestrictedWorkflowAccessError,
+    )
+    from tests.prebound_graph import (  # noqa: E402
+        EARLY_GRAPH_STREAM,
+        EARLY_GRAPH_VISITS,
+        fanout_graph,
+    )
 
 INVOKE_TOOL = "deepagents.invoke_tool"
 # Dedicated queue for tool activities, so tests can prove task-queue routing.
@@ -49,8 +62,24 @@ TEN_SECONDS = ActivityConfig(start_to_close_timeout=timedelta(seconds=10))
 # the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
+from langchain.agents.middleware import ShellToolMiddleware  # noqa: E402
+from langchain_core.caches import BaseCache  # noqa: E402
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
-from langchain_core.tools import StructuredTool, tool  # noqa: E402
+from langchain_core.output_parsers import (  # noqa: E402
+    JsonOutputParser,
+    StrOutputParser,
+)
+from langchain_core.runnables import RunnableLambda, RunnableParallel  # noqa: E402
+from langchain_core.tools import BaseTool, StructuredTool, Tool, tool  # noqa: E402
+from langgraph.func import (  # noqa: E402  # pyright: ignore[reportMissingTypeStubs]
+    entrypoint,
+    task,
+)
+from langgraph.graph import (  # noqa: E402  # pyright: ignore[reportMissingTypeStubs]
+    END,
+    START,
+    StateGraph,
+)
 from langgraph.prebuilt import InjectedState  # noqa: E402
 from pydantic import BaseModel, ConfigDict, ValidationError  # noqa: E402
 
@@ -905,3 +934,272 @@ async def test_repeated_tool_calls_with_same_args_both_run(
 
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_TOOL] == 2, counts
+
+
+class Count(TypedDict):
+    n: int
+
+
+def count_step(state: Count) -> Count:
+    return {"n": state["n"] + 1}
+
+
+def increment(n: int) -> int:
+    return n + 1
+
+
+def count_route(state: Count) -> str:
+    return "done" if state["n"] > 1 else "again"
+
+
+class SyncOnlyCache(BaseCache):
+    # Like LangChain's SQLite cache, it has no async methods of its own.
+    def lookup(self, prompt: str, llm_string: str) -> Any:
+        return None
+
+    def update(self, prompt: str, llm_string: str, return_val: Any) -> None:
+        pass
+
+    def clear(self, **kwargs: Any) -> None:
+        pass
+
+
+def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
+
+
+def shout(word: str) -> str:
+    return word.upper()
+
+
+def thread_id() -> int:
+    """Return the current thread's id."""
+    return threading.get_ident()
+
+
+class Double(BaseTool):
+    name: str = "double"
+    description: str = "Double a number."
+
+    def _run(self, n: int) -> int:
+        return 2 * n
+
+
+async def words() -> AsyncIterator[str]:
+    yield "a"
+    yield "b"
+
+
+@task
+def triple(n: int) -> int:
+    return 3 * n
+
+
+@entrypoint()
+async def triple_flow(n: int) -> int:
+    return await triple(n)
+
+
+def count_graph() -> Any:
+    graph = StateGraph(Count)
+    graph.add_node("step", count_step)
+    graph.add_edge(START, "step")
+    graph.add_conditional_edges("step", count_route, {"again": "step", "done": END})
+    return graph.compile()
+
+
+# Built when the module is imported, as many graphs are.
+COUNT_GRAPH = count_graph()
+
+
+@workflow.defn
+class SyncLangChainCallsWorkflow:
+    @workflow.run
+    async def run(self, workspace: str) -> list[Any]:
+        # Tools, output parsers, a RunnableLambda, a graph's sync node and
+        # sync router, and a sync task run in the workflow.
+        results: list[Any] = [
+            await StructuredTool.from_function(func=add).ainvoke({"a": 1, "b": 2}),
+            await Tool.from_function(shout, "shout", "Shout a word.").ainvoke("hi"),
+            await Double().ainvoke({"n": 2}),
+            await JsonOutputParser().ainvoke('{"x": 1}'),
+            [chunk async for chunk in StrOutputParser().atransform(words())],
+            await RunnableLambda(increment).ainvoke(1),
+            await count_graph().ainvoke({"n": 0}),
+            await COUNT_GRAPH.ainvoke({"n": 0}),
+            await triple_flow.ainvoke(2),
+        ]
+        # LangChain's calls for I/O, such as a cache or ShellToolMiddleware,
+        # still fail, and so do other callers.
+        shell = ShellToolMiddleware(workspace_root=workspace)
+        calls: list[Callable[[], Any]] = [
+            lambda: SyncOnlyCache().alookup("prompt", "llm"),
+            lambda: shell.abefore_agent({"messages": []}, None),  # type: ignore[arg-type]
+            lambda: asyncio.to_thread(lambda: "unrelated"),
+        ]
+        for call in calls:
+            try:
+                await call()
+                results.append("ran")
+            except NotImplementedError:
+                results.append("rejected")
+
+        visited: list[str] = []
+        graph = fanout_graph(visited)
+        results.append(await graph.ainvoke({}))
+        results.append(
+            [state async for state in graph.astream({}, stream_mode="values")][-1]
+        )
+        # A sync graph whose steps each run one node runs in the workflow.
+        results.append(count_graph().invoke({"n": 0}))
+        visited.clear()
+        EARLY_GRAPH_VISITS.clear()
+        # Calls that would run work on LangChain's thread pool are refused,
+        # also for a graph built before the Worker.
+        graph_calls: list[Callable[[], Any]] = [
+            lambda: graph.invoke({}),
+            lambda: list(graph.stream({})),
+            lambda: list(EARLY_GRAPH_STREAM({})),
+            lambda: count_graph().batch([{"n": 0}, {"n": 0}]),
+            lambda: RunnableParallel(a=count_graph(), b=count_graph()).invoke({"n": 0}),
+        ]
+        rejected: list[bool] = []
+        for call in graph_calls:
+            try:
+                call()
+                rejected.append(False)
+            except RestrictedWorkflowAccessError as err:
+                rejected.append("ainvoke" in str(err))
+        try:
+            await StructuredTool.from_function(
+                func=graph_calls[0], name="sync_graph", description="Run a graph."
+            ).ainvoke({})
+            rejected.append(False)
+        except RestrictedWorkflowAccessError as err:
+            rejected.append("ainvoke" in str(err))
+        results.append([rejected, visited, list(EARLY_GRAPH_VISITS)])
+        return results
+
+
+@pytest.mark.asyncio
+async def test_sync_langchain_calls_run_in_the_workflow(
+    env: WorkflowEnvironment, tmp_path: Any
+) -> None:
+    task_queue = f"da-sync-calls-{uuid.uuid4()}"
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[SyncLangChainCallsWorkflow],
+        plugins=[DeepAgentsPlugin()],
+        max_cached_workflows=0,
+    ):
+        handle = await env.client.start_workflow(
+            SyncLangChainCallsWorkflow.run,
+            str(tmp_path),
+            id=f"da-sync-calls-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=10),
+        )
+        result = await handle.result()
+    assert result == [
+        3,
+        "HI",
+        4,
+        {"x": 1},
+        ["a", "b"],
+        2,
+        {"n": 2},
+        {"n": 2},
+        6,
+        "rejected",
+        "rejected",
+        "rejected",
+        {"left": True, "right": True},
+        {"left": True, "right": True},
+        {"n": 2},
+        [[True, True, True, True, True, True], [], []],
+    ]
+
+    # Sync graph calls still work outside Workflows, including in Activities.
+    graph = fanout_graph([])
+    assert graph.invoke({}) == {"left": False, "right": False}
+    assert ActivityEnvironment().run(graph.invoke, {}) == {
+        "left": False,
+        "right": False,
+    }
+
+    await Replayer(
+        workflows=[SyncLangChainCallsWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(await handle.fetch_history())
+
+    # Outside a workflow, LangChain still runs a sync tool on a thread.
+    tool_thread = await StructuredTool.from_function(func=thread_id).ainvoke({})
+    assert tool_thread != threading.get_ident()
+
+    # LangGraph still refuses a timeout on a sync node, whether the node was
+    # added before the plugin swapped LangChain's helper or after.
+    from langchain_core.runnables.config import run_in_executor
+
+    early = StateGraph(Count)
+    with pytest.MonkeyPatch.context() as before_swap:
+        before_swap.setattr(
+            importlib.import_module("langgraph._internal._runnable"),
+            "run_in_executor",
+            run_in_executor,
+        )
+        early.add_node("step", count_step, timeout=1.0)
+    late = StateGraph(Count)
+    late.add_node("step", count_step, timeout=1.0)
+    for graph in (early, late):
+        graph.add_edge(START, "step")
+        with pytest.raises(ValueError, match="is sync"):
+            graph.compile()
+
+
+# Replay is promised within a major, so these 0.x histories have to replay until
+# Deep Agents 1.0.
+REPLAY_MAJOR = 0
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
+
+
+@workflow.defn
+class CaughtSyncToolWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        agent = create_deep_agent(model="fake:model", tools=[add])
+        try:
+            result = await agent.ainvoke(
+                {"messages": [HumanMessage("What is 20 + 22?")]}
+            )
+        except Exception as err:
+            return f"agent failed: {type(err).__name__}"
+        return str(result["messages"][-1].content)
+
+
+@workflow.defn
+class SyncGraphWorkflow:
+    @workflow.run
+    async def run(self) -> Any:
+        return fanout_graph([]).invoke({})
+
+
+@pytest.mark.parametrize(
+    ("workflow_class", "fixture"),
+    [
+        (CaughtSyncToolWorkflow, "sync_tool_error_caught.json"),
+        (SyncGraphWorkflow, "sync_graph_on_threads.json"),
+    ],
+)
+async def test_sync_call_histories_from_0x_replay(
+    workflow_class: type, fixture: str
+) -> None:
+    # Recorded on main at cd37f54a with the workflows above, before sync calls
+    # ran in the workflow: the agent caught the sync tool's NotImplementedError,
+    # and the graph's nodes ran on LangChain's threads. The patch marker keeps
+    # both paths for runs without it.
+    await Replayer(
+        workflows=[workflow_class], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(
+        WorkflowHistory.from_json(fixture, (_HISTORIES / fixture).read_text())
+    )
