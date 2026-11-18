@@ -21,6 +21,7 @@ from ._temporal_mcp_client import MCPToolNameConflictError, TemporalMCPClient
 from ._temporal_mcp_tool import TemporalMCPTool
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
+from ._workflow_failure import agent_loop_errors_fail_workflow
 
 _SNAPSHOT_DISABLED = (
     "TemporalAgent disables take_snapshot()/load_snapshot(). Temporal "
@@ -282,6 +283,8 @@ class TemporalAgent(Agent):
         before it starts the agent span. Loading here keeps Strands' rejection,
         deduplication and cancellation of overlapping invocations unchanged.
         """
+        # Evaluate the gate before the invocation schedules its first Activity.
+        agent_loop_errors_fail_workflow()
         await self._temporal_model._load_config()
         if self._temporal_model.stateful:
             self._use_server_side_state()
