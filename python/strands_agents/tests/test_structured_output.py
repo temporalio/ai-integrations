@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from strands.types.exceptions import StructuredOutputException
 from strands.types.streaming import StreamEvent
 
+import temporalio.worker
 from temporalio import workflow
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import (
@@ -17,6 +18,7 @@ from temporalio.client import (
     WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
+    WorkflowUpdateFailedError,
 )
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
@@ -266,6 +268,89 @@ async def test_structured_output_missing_follows_workflow_retry_policy(client: C
     )
 
 
+class _EscapedExceptionRecorder(temporalio.worker.Interceptor):
+    """Records the exceptions that escape the Workflow's run method on this Worker.
+
+    Worker interceptors wrap the plugin's, so it sees what the plugin lets through.
+    """
+
+    def __init__(self) -> None:
+        self.escaped: list[BaseException] = []
+
+    def workflow_interceptor_class(
+        self, input: temporalio.worker.WorkflowInterceptorClassInput
+    ) -> type[temporalio.worker.WorkflowInboundInterceptor]:
+        escaped = self.escaped
+
+        class _Inbound(temporalio.worker.WorkflowInboundInterceptor):
+            async def execute_workflow(
+                self, input: temporalio.worker.ExecuteWorkflowInput
+            ) -> Any:
+                try:
+                    return await self.next.execute_workflow(input)
+                except BaseException as e:
+                    escaped.append(e)
+                    raise
+
+        return _Inbound
+
+
+@workflow.defn
+class StructuredOutputUpdateWorkflow:
+    """Runs the agent in an Update handler while the Workflow waits."""
+
+    def __init__(self) -> None:
+        self.agent = TemporalAgent(
+            model="mock",
+            start_to_close_timeout=timedelta(seconds=15),
+            structured_output_model=PersonInfo,
+        )
+
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(lambda: False)
+
+    @workflow.update
+    async def ask(self, prompt: str) -> PersonInfo:
+        result = await self.agent.invoke_async(prompt)
+        assert isinstance(result.structured_output, PersonInfo)
+        return result.structured_output
+
+
+async def test_structured_output_missing_in_update_fails_only_the_update(
+    client: Client,
+):
+    """An exception that escapes an Update handler fails the Update, not the Workflow."""
+    task_queue = f"test_structured_output_update-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"mock": lambda: MockModel(["I'd rather answer in prose."] * 5)}
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StructuredOutputUpdateWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            StructuredOutputUpdateWorkflow.run,
+            id=f"test_structured_output_update_{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        with pytest.raises(WorkflowUpdateFailedError) as err:
+            await handle.execute_update(
+                StructuredOutputUpdateWorkflow.ask,
+                "John Smith is a 30 year-old software engineer",
+            )
+        cause = err.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "StructuredOutputException"
+        assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
+        await handle.terminate()
+
+
 @workflow.defn(name="StructuredOutputWorkflow")
 class FixedStructuredOutputWorkflow:
     """StructuredOutputWorkflow after a code fix that catches the exception."""
@@ -332,15 +417,23 @@ async def test_structured_output_missing_upgrade_keeps_retrying_run_recoverable(
 
             old_attempt = await assert_eventually(failed_once)
 
+    recorder = _EscapedExceptionRecorder()
     async with Worker(
         client,
         task_queue=task_queue,
         workflows=[StructuredOutputWorkflow],
         plugins=[plugin],
+        interceptors=[recorder],
         max_cached_workflows=0,
     ):
 
         async def failed_on_upgraded_worker() -> None:
+            # The upgraded Worker itself replays the run and gets the original
+            # exception, not an ApplicationError that would fail the Workflow.
+            assert any(
+                isinstance(e, StructuredOutputException) for e in recorder.escaped
+            )
+            assert not any(isinstance(e, ApplicationError) for e in recorder.escaped)
             attempt = await pending_workflow_task_attempt(handle)
             assert attempt > old_attempt
 
