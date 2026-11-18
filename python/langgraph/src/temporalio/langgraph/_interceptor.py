@@ -15,6 +15,7 @@ from langgraph.pregel import Pregel
 from temporalio import workflow
 from temporalio.contrib.workflow_streams._stream import _PUBLISH_SIGNAL
 from temporalio.langgraph._activity import clear_store_warning
+from temporalio.langgraph._event_loop import enable_workflow_streams
 from temporalio.worker import (
     ExecuteWorkflowInput,
     Interceptor,
@@ -57,6 +58,7 @@ class LangGraphInterceptor(Interceptor):
                 super().init(outbound)
 
             async def execute_workflow(self, input: ExecuteWorkflowInput) -> Any:
+                enable_workflow_streams()
                 _run_langchain_sync_calls_inline(asyncio.get_running_loop())
                 if (
                     streaming_topic is not None

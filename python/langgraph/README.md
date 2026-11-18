@@ -473,7 +473,15 @@ class AstreamBridge:
         topic.publish({"done": True})
 ```
 
-Bridge `"updates"`, `"values"` or `"debug"`. In workflow code `astream()` yields nothing for `"messages"`.
+Bridge `"updates"`, `"values"` or `"debug"`. Model tokens emitted inside an
+Activity node are not forwarded through the Workflow's `"messages"` mode; publish
+them from the Activity to a topic when external subscribers need live tokens.
+
+`app.astream_events(..., version="v2")` also works in Workflow code. Events are
+local to the Workflow; publish them to a `WorkflowStream` topic when external
+subscribers need them. The plugin schedules stream callbacks only from the same
+Workflow event loop; cross-thread callbacks remain unsupported. Existing histories
+retain their previous behavior through the `langchain-same-loop-streams` patch.
 
 ### Retry semantics
 

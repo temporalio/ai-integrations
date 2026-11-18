@@ -548,11 +548,13 @@ class StreamingAgent:
         return final["messages"][-1].content
 ```
 
-In the Workflow, read the final state from `"values"`. The `"messages"` items
-do not arrive there: LangGraph hands them over with
-`loop.call_soon_threadsafe`, which the Workflow event loop does not implement,
-so LangChain logs `NotImplementedError` warnings from `StreamMessagesHandler`
-and the tokens go to the topic only.
+In the Workflow, read the final state from `"values"`. Local `"messages"`
+items represent the model Activity's completed result, not live provider tokens.
+Use the topic for live token delivery. `agent.astream_events(..., version="v2")`
+also yields local lifecycle events and finishes when the agent finishes.
+The plugin schedules stream callbacks only from the same Workflow event loop;
+cross-thread callbacks remain unsupported. Existing histories retain their
+previous behavior through the `langchain-same-loop-streams` patch.
 
 Subscribers read the topic with `WorkflowStreamClient`; each item is an
 `AIMessageChunk` in `langchain_core.load.dumpd` form:

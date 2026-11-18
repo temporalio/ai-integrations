@@ -50,6 +50,7 @@ from temporalio import activity as activity_mod
 from temporalio.converter import DataConverter
 from temporalio.deepagents import _serde, _sync_calls, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
+from temporalio.deepagents._event_loop import StreamingInterceptor
 from temporalio.deepagents.workflow import DeepAgentsWorkflowError
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
@@ -170,6 +171,7 @@ class DeepAgentsPlugin(SimplePlugin):
         super().__init__(
             "langchain.DeepAgentsPlugin",
             activities=list(self._builtin_activities),
+            interceptors=[StreamingInterceptor()],
             data_converter=self._configure_data_converter,
             workflow_runner=self._make_workflow_runner(),
             workflow_failure_exception_types=_workflow_failure_exception_types,
