@@ -19,7 +19,7 @@ from contextvars import ContextVar
 from datetime import date, time, timedelta
 from enum import Enum
 from hashlib import sha256
-from heapq import heappop, heappush
+from heapq import heapify, heappop, heappush
 from json import dumps
 from numbers import Number
 from pathlib import PurePath
@@ -61,6 +61,12 @@ _stale: ContextVar[set[str] | None] = ContextVar("_temporal_task_stale", default
 _failed: ContextVar[dict[str, tuple[str | None, list[str]]] | None] = ContextVar(
     "_temporal_task_failed", default=None
 )
+# Per LangGraph task of an entrypoint invocation that failed or was cancelled:
+# the places its finished calls held, which it gave back, and the keys its
+# calls took (see invocation_scope()). Not part of the cache either.
+_failed_invocations: ContextVar[dict[str, tuple[list[str], list[str]]] | None] = (
+    ContextVar("_temporal_task_failed_invocations", default=None)
+)
 # Keyword arguments LangGraph injects into a node function: the plugin keeps
 # these two (see _plugin.py). They are not the caller's input.
 _INJECTED_KWARGS = frozenset({"config", "runtime"})
@@ -73,6 +79,7 @@ def set_task_cache(cache: dict[str, Any] | None) -> None:
     _free_places.set({})
     _stale.set(set())
     _failed.set({})
+    _failed_invocations.set({})
 
 
 def occurrence_key(key: str) -> str:
@@ -143,13 +150,26 @@ def invocation_scope() -> Generator[None, None, None]:
     invocation fails or is cancelled, the results of its calls become stale
     and the places they still hold are given back: invoked again, it makes
     them under the same keys, runs them again and replaces their results.
-    An entrypoint invoked inside a workflow-side node or task is tracked by
-    that call's scope instead.
+
+    When LangGraph resumes the invocation from its checkpoint instead, as the
+    same task, the calls it restores are not made again, so they take their
+    places back and keep their results for the next run, and the call that
+    failed takes the place it gave back. If that attempt fails too, the
+    restored calls still count as the invocation's own.
+
+    An entrypoint invoked inside another invocation, or inside a
+    workflow-side node or task, is tracked the same way, so a failure the
+    enclosing code catches is cleaned up too; its calls also count as the
+    enclosing call's.
     """
-    if _taken.get() is not None:
-        yield
-        return
-    taken: list[str] = []
+    task = _langgraph_task()
+    failed = _failed_invocations.get()
+    restored: list[str] = []
+    if failed is not None and task is not None and task in failed:
+        held, restored = failed.pop(task)
+        _reclaim(held)
+    outer_taken, outer_returned = _taken.get(), _returned.get()
+    taken: list[str] = list(restored)
     returned: list[str] = []
     taken_token = _taken.set(taken)
     returned_token = _returned.set(returned)
@@ -160,12 +180,20 @@ def invocation_scope() -> Generator[None, None, None]:
             _retire(taken)
             # A place given back may have been taken again since, by this
             # invocation or another, so only the places still held go back.
-            for key in (Counter(taken) - Counter(returned)).elements():
+            held = list((Counter(taken) - Counter(returned)).elements())
+            for key in held:
                 release(key)
+            if failed is not None and task is not None:
+                failed[task] = (held, taken)
         raise
     finally:
         _returned.reset(returned_token)
         _taken.reset(taken_token)
+        if outer_taken is not None:
+            # The enclosing call has the restored keys from the earlier attempt.
+            outer_taken.extend(taken[len(restored) :])
+        if outer_returned is not None:
+            outer_returned.extend(returned)
 
 
 @contextmanager
@@ -248,6 +276,24 @@ def _retire(keys: list[str]) -> None:
     if cache is not None and stale is not None:
         for key in keys:
             stale.update(entry for entry in _entries(key) if entry in cache)
+
+
+def _reclaim(keys: list[str]) -> None:
+    """Take back the places of the calls under ``keys`` that are still free.
+
+    LangGraph restores those calls from a checkpoint without making them,
+    so they keep their places, and their results stay for the next run.
+    """
+    free = _free_places.get()
+    if free is None:
+        return
+    for key in keys:
+        base, sep, n = key.rpartition("#")
+        base, place = (base, int(n)) if sep else (key, 0)
+        places = free.get(base)
+        if places and place in places:
+            places.remove(place)
+            heapify(places)
 
 
 def _restart(keys: list[str]) -> None:

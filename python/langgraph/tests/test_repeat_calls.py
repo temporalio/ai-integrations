@@ -411,6 +411,20 @@ def _callers_plugin() -> LangGraphPlugin:
         job_id = request["job_id"]
         return [await _next(job_id), await _fail_first(f"{job_id}-f")]
 
+    @lg_entrypoint(checkpointer=InMemorySaver())
+    async def fail_second_of_two(request: dict[str, Any]) -> list[str]:
+        return [
+            await _fail_second(request["job_id"]),
+            await _fail_second(request["job_id"]),
+        ]
+
+    @lg_entrypoint()
+    async def retry_inner_entrypoint(request: dict[str, Any]) -> Any:
+        try:
+            return await take_then_fail_entry.ainvoke(request)
+        except ActivityError:
+            return await take_then_fail_entry.ainvoke(request)
+
     return LangGraphPlugin(
         graphs={
             "value": _value_graph,
@@ -429,6 +443,8 @@ def _callers_plugin() -> LangGraphPlugin:
             "other-input-after-failure": other_input_after_failure,
             "fetch-with-client": fetch_with_client,
             "take-then-fail": take_then_fail_entry,
+            "fail-second-of-two": fail_second_of_two,
+            "retry-inner-entrypoint": retry_inner_entrypoint,
         },
         tasks=[
             _wait,
@@ -609,6 +625,38 @@ class RetryInvocationAcrossContinueAsNewWorkflow:
             result = await app.ainvoke({"job_id": input.job_id})
         except ActivityError:
             result = await app.ainvoke({"job_id": input.job_id})
+        seen = [*input.seen, result]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    name=input.name,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+@workflow.defn
+class RecoverInvocationAcrossContinueAsNewWorkflow:
+    """Invokes entrypoint ``name``, resuming it from its checkpoint if it fails.
+
+    Then continues-as-new with the cache until it has run ``runs`` times.
+    Returns each run's result.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        app = entrypoint(input.name, cache=input.cache)
+        config = RunnableConfig(
+            {"configurable": {"thread_id": f"{input.job_id}-{len(input.seen)}"}}
+        )
+        try:
+            result = await app.ainvoke({"job_id": input.job_id}, config)
+        except ActivityError:
+            result = await app.ainvoke(None, config)
         seen = [*input.seen, result]
         if len(seen) < input.runs:
             workflow.continue_as_new(
@@ -1128,6 +1176,56 @@ async def test_invocation_retried_after_failure_keeps_results_after_continue_as_
         runs=2,
         plugin=_callers_plugin(),
         workflow_cls=RetryInvocationAcrossContinueAsNewWorkflow,
+    )
+
+    first = [f"{job_id}:2", f"{job_id}-f:2"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_invocation_resumed_from_checkpoint_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """An entrypoint resumed from its checkpoint keeps the restored call's result.
+
+    The entrypoint makes the same call twice and the second fails, so the
+    workflow resumes it from its checkpoint: LangGraph restores the first
+    call without making it, and the second runs again. After
+    continue-as-new the run gets the same two results and runs nothing.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "fail-second-of-two",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=RecoverInvocationAcrossContinueAsNewWorkflow,
+    )
+
+    first = [f"{job_id}:1", f"{job_id}:3"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [3, 0]
+
+
+@_needs_functional_api
+async def test_nested_invocation_retried_after_failure_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """An entrypoint retried by an enclosing one keeps the retry's results.
+
+    The outer entrypoint catches the inner one's failure and invokes it
+    again, so the outer invocation never fails. After continue-as-new the
+    run still gets both of the retry's results and runs nothing.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "retry-inner-entrypoint",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
     )
 
     first = [f"{job_id}:2", f"{job_id}-f:2"]
