@@ -67,10 +67,7 @@ public final class McpActivitiesImpl implements McpActivities, AutoCloseable {
           try {
             created = Objects.requireNonNull(factory.get(), "toolset factory returned null");
           } catch (RuntimeException e) {
-            throw ApplicationFailure.newFailureWithCause(
-                "Creating MCP toolset '" + name + "' failed: " + e.getMessage(),
-                FailureTypes.MCP_ERROR,
-                e);
+            throw failure("Creating MCP toolset '" + name + "' failed: " + e.getMessage(), e);
           }
         }
         return created;

@@ -54,6 +54,9 @@ class McpActivitiesImplTest {
   /** What the failing toolset's {@code reject} tool raises when called. */
   private final AtomicReference<Throwable> callError = new AtomicReference<>();
 
+  /** The JSON-RPC code the rejecting factory's server answers with while initializing. */
+  private final AtomicReference<Integer> factoryErrorCode = new AtomicReference<>();
+
   /** Counted down when the blocking-listing toolset is closed. */
   private final CountDownLatch blockingClosed = new CountDownLatch(1);
 
@@ -82,6 +85,10 @@ class McpActivitiesImplTest {
                 BlockingListingToolset::new,
                 "failing",
                 () -> new FailingToolset(listingError, callError),
+                "rejecting-factory",
+                () -> {
+                  throw McpError.builder(factoryErrorCode.get()).message("rejected").build();
+                },
                 "broken",
                 () -> {
                   throw new IllegalStateException("cannot start the server");
@@ -354,6 +361,23 @@ class McpActivitiesImplTest {
 
     assertEquals("googleadk.McpError", failure.getType());
     assertTrue(failure.isNonRetryable(), "code " + code + " cannot succeed on a retry");
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {ErrorCodes.INVALID_PARAMS, ErrorCodes.INTERNAL_ERROR})
+  void protocolErrorRaisedByToolsetFactory_isClassifiedLikeOtherErrors(int code) {
+    factoryErrorCode.set(code);
+    McpActivities activities = env.newActivityStub(McpActivities.class);
+
+    ApplicationFailure failure =
+        applicationFailure(
+            () -> activities.listMcpTools(new ListMcpToolsInput("rejecting-factory")));
+
+    assertEquals("googleadk.McpError", failure.getType());
+    assertEquals(
+        code == ErrorCodes.INVALID_PARAMS,
+        failure.isNonRetryable(),
+        "only an error a retry cannot fix is non-retryable");
   }
 
   @Test
