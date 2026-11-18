@@ -873,6 +873,7 @@ async def test_mcp_failure_after_connect_reported_and_creates_fresh_connection()
         # 2. Trigger an exception after the session has been established
         trigger_fail.set()
         await asyncio.wait([record._owner])
+        assert record._owner.exception() is None
 
         # 3. Verify that the existing connection record reports the original exception when session() is called again
         with pytest.raises(RuntimeError) as exc_info:
@@ -888,7 +889,7 @@ async def test_mcp_failure_after_connect_reported_and_creates_fresh_connection()
         fresh_record.release()
 
         # 5. Verify that no Task exception was never retrieved warning is emitted
-        del record
+        del exc_info, err, record
         await asyncio.sleep(0)
         gc.collect()
         assert reported == []
