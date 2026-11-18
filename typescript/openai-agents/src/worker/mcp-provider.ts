@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
 import {
@@ -28,9 +29,10 @@ export function assertMCPServer(name: string, server: unknown): asserts server i
   if (server != null && methods.every((method) => typeof (server as MCPServer)[method] === 'function')) return;
   // An async factory returns a Promise that may reject. Nothing awaits it, so mark it handled: the
   // type error below fails the Activity, and an unhandled rejection would otherwise crash the Worker.
-  // Only a genuine Promise is touched: a lazy thenable's `.then` can start work, and a throwing one
-  // would bypass the non-retryable error below.
-  if (server instanceof Promise) server.catch(() => undefined);
+  // Only a native Promise is touched: a lazy thenable's `.then` can start work, a throwing one would
+  // bypass the non-retryable error below, and `.catch()` on a Proxy-wrapped Promise throws.
+  // `types.isPromise` excludes proxies and also accepts Promises from another realm.
+  if (types.isPromise(server)) server.catch(() => undefined);
   throw ApplicationFailure.create({
     message:
       `MCP server factory '${name}' returned ${describeValue(server)}, ` +

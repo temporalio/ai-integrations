@@ -93,7 +93,8 @@ test('a thenable factory result is rejected without calling its then', async (t)
       throw new Error('then getter');
     },
   };
-  for (const result of [lazy, throwing]) {
+  const proxied = new Proxy(Promise.resolve(), {});
+  for (const result of [lazy, throwing, proxied]) {
     const activities = new StatelessMCPServerProvider('files', (() => result) as unknown as () => MCPServer)._getActivities();
     const err = await t.throwsAsync(activities['files-stateless-list-tools']!({}), { instanceOf: ApplicationFailure });
     t.is(err?.type, 'MCPServerFactoryTypeError');
