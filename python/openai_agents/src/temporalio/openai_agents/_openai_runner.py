@@ -42,6 +42,7 @@ from temporalio.openai_agents._temporal_model_stub import (
 )
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents._workflow_failure import (
+    defer_tool_operations_wait,
     fails_workflow_if_uncaught,
     model_behavior_error_fails_workflow,
 )
@@ -104,6 +105,13 @@ def _track_tool_operation() -> Generator[_ToolOperation, None, None]:
             run.operations.discard(operation)
 
 
+def _mark_stopping(run: _AgentRun) -> None:
+    """Mark the run as stopped, and its tools' calls as cancelled by the Agents SDK."""
+    run.stopping = True
+    for operation in run.operations:
+        operation.cancelled = True
+
+
 async def _wait_for_tool_operations(run: _AgentRun) -> bool:
     """Wait for the run's pending Nexus operations after it was cancelled or failed.
 
@@ -121,9 +129,7 @@ async def _wait_for_tool_operations(run: _AgentRun) -> bool:
     wait goes on until every tool's call has ended. Returns whether a cancel request arrived
     during the wait; the caller then raises.
     """
-    run.stopping = True
-    for operation in run.operations:
-        operation.cancelled = True
+    _mark_stopping(run)
     if not run.pending(all_nested=True):
         return False
     cancel_requested = False
@@ -437,16 +443,19 @@ class TemporalOpenAIRunner(AgentRunner):
                 # only when the error fails the Workflow: an error that fails the Workflow
                 # Task must leave no new commands, so that a fixed Worker can replay it.
                 if (
-                    (
-                        e.__cause__ is not None
-                        and workflow.is_failure_exception(e.__cause__)
-                    )
-                    or workflow.is_failure_exception(e)
-                    or fails_workflow_if_uncaught(e)
-                ):
+                    e.__cause__ is not None
+                    and workflow.is_failure_exception(e.__cause__)
+                ) or workflow.is_failure_exception(e):
                     if await _wait_for_tool_operations(run):
                         # The Workflow was cancelled during the wait.
                         raise asyncio.CancelledError() from e
+                elif fails_workflow_if_uncaught(e):
+                    # Raise at once, as the Agents SDK does, so Workflow code that catches
+                    # the error can act before the tools finish cancelling. The Workflow
+                    # boundary waits for them only if the error escapes and fails the
+                    # Workflow.
+                    _mark_stopping(run)
+                    defer_tool_operations_wait(e, run)
                 # In order for workflow failures to properly fail the workflow, we need to rewrap them in
                 # a Temporal error
                 _reraise_workflow_failure(e)

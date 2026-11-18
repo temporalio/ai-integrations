@@ -5,6 +5,7 @@ Workflow code can catch them as it would outside Temporal. Only an exception tha
 escapes the Workflow, or one of its signal or update handlers, is classified here.
 """
 
+import asyncio
 from typing import Any, NoReturn
 
 from agents.exceptions import ModelBehaviorError
@@ -33,17 +34,39 @@ def model_behavior_error_fails_workflow() -> bool:
 
 
 def fails_workflow_if_uncaught(e: BaseException) -> bool:
-    """Return whether ``e`` fails the Workflow if Workflow code doesn't catch it.
-
-    ``Runner.run`` uses it to wait for the run's tool operations to finish cancelling
-    first, as it does for other Workflow failures.
-    """
+    """Return whether ``e`` fails the Workflow if Workflow code doesn't catch it."""
     return isinstance(e, ModelBehaviorError) and model_behavior_error_fails_workflow()
 
 
-def _raise_workflow_failure(e: ModelBehaviorError) -> NoReturn:
+_STOPPED_RUNS_ATTRIBUTE = "_temporal_openai_agents_stopped_runs"
+
+
+def defer_tool_operations_wait(e: BaseException, run: Any) -> None:
+    """Record that ``run`` stopped with ``e`` and may still have tools cancelling.
+
+    ``Runner.run`` raises ``e`` without waiting, so Workflow code can catch it as it would
+    outside Temporal. If ``e`` escapes the Workflow, the interceptor waits for the
+    recorded runs' tool operations before it fails the Workflow, as ``Runner.run`` does
+    for other Workflow failures. An agent used as a tool records its run first, then
+    each enclosing run records its own.
+    """
+    runs: list[Any] | None = e.__dict__.get(_STOPPED_RUNS_ATTRIBUTE)
+    if runs is None:
+        runs = []
+        setattr(e, _STOPPED_RUNS_ATTRIBUTE, runs)
+    runs.append(run)
+
+
+async def _raise_workflow_failure(e: ModelBehaviorError) -> NoReturn:
     if not model_behavior_error_fails_workflow():
         raise e
+    # Imported here: the runner imports this module.
+    from temporalio.openai_agents._openai_runner import _wait_for_tool_operations
+
+    for run in e.__dict__.get(_STOPPED_RUNS_ATTRIBUTE, ()):
+        if await _wait_for_tool_operations(run):
+            # The Workflow was cancelled during the wait.
+            raise asyncio.CancelledError() from e
     # The model's answer is in the History, so retrying the Workflow Task would get
     # the same answer and fail the same way. A retryable ApplicationError fails the
     # Workflow and leaves another run to the Workflow retry policy.
@@ -70,13 +93,13 @@ class _ModelBehaviorErrorWorkflowInboundInterceptor(
         try:
             return await self.next.execute_workflow(input)
         except ModelBehaviorError as e:
-            _raise_workflow_failure(e)
+            await _raise_workflow_failure(e)
 
     async def handle_signal(self, input: temporalio.worker.HandleSignalInput) -> None:
         try:
             return await self.next.handle_signal(input)
         except ModelBehaviorError as e:
-            _raise_workflow_failure(e)
+            await _raise_workflow_failure(e)
 
     async def handle_update_handler(
         self, input: temporalio.worker.HandleUpdateInput
@@ -84,4 +107,4 @@ class _ModelBehaviorErrorWorkflowInboundInterceptor(
         try:
             return await self.next.handle_update_handler(input)
         except ModelBehaviorError as e:
-            _raise_workflow_failure(e)
+            await _raise_workflow_failure(e)
