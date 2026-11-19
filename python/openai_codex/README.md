@@ -201,3 +201,26 @@ storage/payload strategy where needed. The subprocess reader accepts lines up to
 16 MiB; the Temporal payload limit is usually smaller. Exceeding that line limit
 or another terminal stdout read failure raises `TransportClosedError` without
 retrying the failed reader.
+
+## Checkpoint a thread between Workers
+
+`SessionCheckpoint` is opt-in. Use it in an Activity on the Worker that owns
+the thread after Codex app-server has shut down. Give `checkpoint` the
+dedicated `CODEX_HOME`, the thread ID, and a storage callback. The callback
+receives a mapping of relative paths to native files and the prior storage key,
+if any. It returns an immutable key after it has saved the files. Persist the
+returned versioned reference with the thread and last completed turn IDs.
+
+On a replacement Worker, call `restore` in an Activity before launching
+app-server. Supply the saved reference, thread ID, a fresh staging directory,
+and a callback that materializes and verifies the stored files. Activate the
+staging directory at the same absolute `CODEX_HOME` before resuming or forking.
+
+The checkpoint retains active and archived rollouts, the session index, and the state,
+goals, memories, and queue SQLite databases with their WAL files when present.
+A worker-side `include_optional(relative_path, kind, size)` predicate can omit
+generated Markdown `memory-note` files. Authentication, settings, bundled skills, logs,
+SQLite shared-memory files, and locks are outside the eligible set. The thread
+history database is rebuilt by app-server from the rollouts. Callbacks
+and file contents stay on the Worker. Keep each in-flight restore in a separate
+staging directory and activate only the confirmed attempt.

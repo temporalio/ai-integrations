@@ -3,6 +3,7 @@
 Installed from the ``temporalio-openai-codex`` distribution as ``temporalio.openai_codex``.
 """
 
+from ._checkpoint import SessionCheckpoint
 from ._plugin import OpenAICodexPlugin
 from ._subprocess import SubprocessConnector
 from ._types import (
@@ -14,6 +15,7 @@ from ._types import (
 )
 
 __all__ = [
+    "SessionCheckpoint",
     "OpenAICodexPlugin",
     "TemporalCodexConfig",
     "SubprocessConnector",
