@@ -222,13 +222,54 @@ search_tool = tool_as_activity(
 ```
 
 Pass both to `create_temporal_deep_agent(..., tools=[weather_tool,
-search_tool])`. An unwrapped tool runs in-workflow, so it has to be
-deterministic and `async def`. An unwrapped sync tool fails the Workflow Task
-until the code changes, because LangChain runs it on a thread and a Workflow
-has none. The plugin warns about an unwrapped tool passed in the `tools=`
-keyword. It does not check `tools` passed by position or a sub-agent's tools.
+search_tool])`. An unwrapped tool, sync or async, runs in-workflow, so it has to
+be deterministic. The plugin warns about an unwrapped tool passed in the
+`tools=` keyword. It does not check `tools` passed by position, a sub-agent's
+tools, or tools added by middleware.
 Deep Agents' built-in file tools on the default state backend stay in-workflow
 by design.
+
+Sync tools, sync graph nodes and routers, LangChain output parsers, and sync
+`RunnableLambda`s (or other runnables with only a sync `invoke`) run directly in
+the workflow, not in a separate thread as LangChain runs them outside Temporal.
+This applies to every workflow in a process that has a worker with the plugin,
+not only Deep Agent runs. LangGraph picks how to run a sync node or router when
+it builds the graph, so build graphs in workflow code. A graph built before the
+worker, outside the sandbox, still fails with `NotImplementedError`. This
+includes a graph built at import in a module imported with
+`workflow.unsafe.imports_passed_through()`.
+
+Sync functions can compute a result, but cannot wait for a LangGraph task with
+`task(...).result()`: the task needs the Workflow event loop to run, and the
+call raises `InvalidStateError`. Use an async entrypoint or node and
+`await task(...)` instead.
+
+Call compiled graphs with `await graph.ainvoke(...)` or `graph.astream(...)`.
+A sync call such as `graph.invoke(...)` or `graph.stream(...)`, including one
+from a sync tool, runs in the workflow only while each step runs one node.
+LangChain runs a step with several nodes, `batch(...)` and `RunnableParallel`
+on its own thread pool, outside the workflow, so in a workflow they fail the
+Workflow Task with `RestrictedWorkflowAccessError` before any of that work
+starts. Use the async form, or move the call into an activity.
+
+Like other workflow code, sync calls run again on every replay. Their combined
+work in one Workflow Task can trigger deadlock detection (two seconds by
+default), even if each call takes less than two seconds. Move slow work into
+activities.
+While one runs, LangChain runs async callback handlers on a separate thread, as
+it does outside Temporal, so keep them quick and don't call workflow APIs from
+them. Other sync LangChain calls that it would run in a thread, such as a
+sync-only cache, retriever or vector store, or `ShellToolMiddleware`, still fail
+with `NotImplementedError`; run that work in activities. If the same Worker
+also uses `LangGraphPlugin`, its executor override currently runs those calls
+inline too.
+
+**Upgrading:** a run that made one of these sync calls on an earlier version
+keeps that version's behavior, so its history still replays: the call fails
+with `NotImplementedError` again, and LangChain's thread pool stays open to the
+run. A run stuck on that error has no recorded call yet, so a worker with this
+version runs the call in the workflow, and the run completes. A patch marker,
+`deepagents-sync-calls-inline`, records which way each run went.
 
 `activity_as_tool` takes every activity option through `activity_options`, an
 `ActivityConfig`: timeouts (`start_to_close_timeout` or
@@ -885,7 +926,6 @@ exception type to the Worker's `workflow_failure_exception_types`.
 
 ## Limits
 
-- An unwrapped tool has to be `async def`. See the Tools section.
 - `tool_as_activity` does not support `return_direct=True`. New calls fail
   with `DeepAgentsWorkflowError` before the Activity runs. Return from the
   Workflow explicitly after calling the tool instead.

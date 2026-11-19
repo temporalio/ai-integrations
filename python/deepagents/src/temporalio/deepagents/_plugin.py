@@ -14,6 +14,8 @@ inside a ``@workflow.defn`` with no other changes:
   resolution seam (``deepagents.graph.resolve_model``) to auto-route bare
   ``model=`` strings through activities — regardless of how the user imported
   ``create_deep_agent``;
+* runs LangChain's sync calls (sync tools, graph nodes, routers, output
+  parsers) directly in each workflow;
 * registers :class:`DeepAgentsWorkflowError` as a workflow-failure type;
 * pushes the model / tool dispatch defaults down to the seams that read them.
 
@@ -46,7 +48,7 @@ from typing import Any, Callable
 
 from temporalio import activity as activity_mod
 from temporalio.converter import DataConverter
-from temporalio.deepagents import _serde, _tools
+from temporalio.deepagents import _serde, _sync_calls, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
 from temporalio.deepagents.workflow import DeepAgentsWorkflowError
 from temporalio.plugin import SimplePlugin
@@ -198,6 +200,7 @@ class DeepAgentsPlugin(SimplePlugin):
         def workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             if runner is None:
                 raise ValueError("No WorkflowRunner provided to DeepAgentsPlugin.")
+            _sync_calls.run_sync_calls_in_workflows()
             if isinstance(runner, SandboxedWorkflowRunner):
                 # A Worker and a Replayer both come through here before they run
                 # a Workflow, and only the sandbox needs these imported first.

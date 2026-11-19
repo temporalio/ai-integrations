@@ -15,7 +15,7 @@ import type { LanguageModelMiddleware } from 'ai';
 import type { LanguageModelV4StreamPart } from '@ai-sdk/provider';
 import { OpenTelemetry } from '@ai-sdk/otel';
 import { z } from 'zod/v3';
-import { defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';
+import { defineSignal, proxyActivities, setHandler, sleep } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import {
   TemporalEmbeddingModel,
@@ -318,6 +318,36 @@ export async function streamingMetadataWorkflow(): Promise<LanguageModelV4Stream
     if (done) return parts;
     parts.push(value);
   }
+}
+
+// Starts a timer when a reasoning part carries provider metadata, so the commands of
+// the run depend on that metadata.
+export async function reasoningMetadataTimerWorkflow(): Promise<boolean> {
+  const parts = await streamingMetadataWorkflow();
+  const hasMetadata = parts.some(
+    (part) =>
+      (part.type === 'reasoning-start' || part.type === 'reasoning-delta' || part.type === 'reasoning-end') &&
+      part.providerMetadata !== undefined
+  );
+  if (hasMetadata) await sleep('1 millisecond');
+  return hasMetadata;
+}
+
+export async function streamingToolsWorkflow(): Promise<number> {
+  new WorkflowStream();
+  const result = streamText({
+    model: new TemporalLanguageModel('streaming-test-model', { streamingTopic: 'ai-sdk-test-stream' }),
+    prompt: 'What is the weather in Tokyo?',
+    tools: {
+      getWeather: tool({
+        description: 'Get the weather for a given city',
+        inputSchema: z.object({ location: z.string() }),
+        execute: async (input) => getWeather(input),
+      }),
+    },
+    stopWhen: isStepCount(2),
+  });
+  return (await result.steps).length;
 }
 
 export async function slowModelWorkflow(

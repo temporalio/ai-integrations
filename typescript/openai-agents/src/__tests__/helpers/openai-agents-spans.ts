@@ -418,8 +418,7 @@ export interface AgentSdkCollectorInstallation {
  */
 export function installOtelCollector(): OtelCollectorInstallation {
   const collector = new OtelSpanCollector();
-  const provider = createTracerProvider();
-  provider.addSpanProcessor(collector);
+  const provider = createTracerProvider({ spanProcessors: [collector] });
   // Register the AsyncLocalStorage-backed context manager BEFORE setting the
   // global tracer provider so that `tracer.startActiveSpan(...)` propagates
   // context across awaits. Without this, the host-side `test_root`,

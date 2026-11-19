@@ -2,6 +2,7 @@ import contextlib
 import functools
 import importlib.metadata
 import inspect
+import logging
 import sys
 import typing
 from collections.abc import AsyncGenerator
@@ -46,6 +47,51 @@ from temporalio.testing import ActivityEnvironment
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from tests.common import CompressionCodec
 from tests.mock_model import MockModel
+
+
+@pytest.mark.parametrize(
+    ("module_name", "tool_type"),
+    [
+        ("strands.tools.decorator", "DecoratedFunctionTool"),
+        ("strands.tools.tools", "PythonAgentTool"),
+    ],
+)
+@pytest.mark.parametrize("change", ["offload", "source"])
+def test_sync_tool_seam_change(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    module_name: str,
+    tool_type: str,
+    change: str,
+) -> None:
+    if change == "offload":
+
+        async def stream(*_args: typing.Any, **_kwargs: typing.Any) -> typing.Any:
+            yield {"result": "changed"}
+
+        cls = getattr(importlib.import_module(module_name), tool_type)
+        monkeypatch.setattr(cls, "stream", stream)
+        with pytest.raises(RuntimeError, match="no longer runs sync tools"):
+            StrandsPlugin().configure_replayer(
+                {"workflow_runner": SandboxedWorkflowRunner()}
+            )
+    else:
+        getsource = inspect.getsource
+        cls = getattr(importlib.import_module(module_name), tool_type)
+
+        def missing_source(obj: typing.Any) -> str:
+            if obj is cls.stream:
+                raise OSError("source not available")
+            return getsource(obj)
+
+        monkeypatch.setattr(inspect, "getsource", missing_source)
+        with caplog.at_level(logging.WARNING):
+            StrandsPlugin().configure_replayer(
+                {"workflow_runner": SandboxedWorkflowRunner()}
+            )
+        assert (
+            f"Cannot read the source of {module_name}.{tool_type}.stream" in caplog.text
+        )
 
 
 def test_default_bedrock_model_disables_botocore_retries(

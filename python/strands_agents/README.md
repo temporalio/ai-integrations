@@ -126,6 +126,8 @@ A run that continues as new starts with no messages when its model is stateful, 
 
 A model call that fails with a context window overflow raises `ContextWindowOverflowException` in the workflow, so Strands reduces the conversation and calls the model again, as it does natively. Releases before 1.0 let the overflow reach the workflow as an `ActivityError`, and later builds of `main` gated the change with a patch marker, which this version no longer reads. So a run that hit an overflow before you deploy this version fails to replay on it with `[TMPRL1100]`, and a run that hits one on this version fails to replay on an earlier version. Let those runs finish on their original workers before you upgrade, or keep them there with Worker Versioning, and do not roll workers back to an earlier version while runs that hit an overflow on this version are open.
 
+When the model gives no valid structured output, or stops at its token limit, Strands raises `StructuredOutputException` or `MaxTokensReachedException` in the workflow, as it does natively, and workflow code can catch it. If one escapes the workflow's run method or a signal handler, the workflow fails with a retryable `ApplicationError` of that type, so a workflow retry policy can start another run. It doesn't fail the workflow task: the model's answers are in the history, so a retried workflow task would get the same answers and fail again. If one escapes an update handler, only the update fails: the caller gets a `WorkflowUpdateFailedError` whose cause is that `ApplicationError`, and the workflow keeps running, so its retry policy doesn't apply. This is gated by the patch `temporalio.strands_agents.agent-loop-errors-fail-workflow`, checked before an invocation's first activity; runs that started an invocation on an earlier version keep failing the workflow task, so a workflow code fix can still recover them.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. The plugin's default Bedrock model also disables Botocore retries. When supplying your own model factory, disable that provider client's retries as shown in the Bedrock example above.
@@ -448,6 +450,21 @@ error result can fail replay on this version. Keep those runs on their original
 workers with Worker Versioning. To recover a run stuck during tool cancellation,
 reset it to before the affected tool call and run it on upgraded workers.
 
+Other tools run directly in the workflow, so they must be deterministic, like
+workflow code. Sync tools run there too, not in a separate thread as they do
+outside Temporal. They run again on every replay. Their combined work in one
+Workflow Task can trigger deadlock detection (two seconds by default), even if
+each tool takes less than two seconds. Tools from packages the plugin passes
+through the sandbox, such as `strands_tools`, are not checked by it; wrap them
+as activities as described above.
+
+**Breaking change:** a run recorded on an earlier version whose sync tool got
+an error can fail replay on this version: if the workflow then acted on what
+the tool now does, if the tool issues commands itself or takes more than two
+seconds, or if a `Swarm` agent handed off. Let runs that called a sync tool
+finish on their original workers first, or keep them there with Worker
+Versioning.
+
 ## Hooks
 
 Strands' [hook system](https://strandsagents.com/) (`strands.hooks`) lets you subscribe callbacks to events in the agent lifecycle — invocation start/end, model call before/after, tool call before/after, message added. Pass `hooks=[MyHookProvider()]` to `TemporalAgent`: every single-agent hook event fires in workflow context, so deterministic callbacks just work.
@@ -538,20 +555,20 @@ class MyWorkflow:
 
 ### Tool-body interrupts
 
-A `@strands.tool` function can raise `InterruptException(Interrupt(...))` directly. The agent stops with the interrupt, the workflow handles the resume the same way as for hooks.
+A `@strands.tool(context=True)` function can call `tool_context.interrupt(name, reason=...)`. The agent stops with the interrupt, and the workflow handles the resume the same way as for hooks. On resume, Strands runs the tool again, and the call returns the response instead of raising.
 
 ```python
 from strands import tool
-from strands.interrupt import Interrupt, InterruptException
+from strands.types.tools import ToolContext
 
-@tool
-def delete_thing(name: str) -> str:
-    raise InterruptException(
-        Interrupt(id=f"delete:{name}", name="approval", reason=f"delete {name}?")
-    )
+@tool(context=True)
+def delete_thing(name: str, tool_context: ToolContext) -> str:
+    if tool_context.interrupt("approval", reason=f"delete {name}?") != "approve":
+        return f"kept {name}"
+    return f"deleted {name}"
 ```
 
-The same works from an `activity_as_tool`-wrapped activity. The plugin's failure converter preserves the `Interrupt` payload across the activity boundary, so `AgentResult.interrupts` is populated just like the in-workflow case:
+An `activity_as_tool`-wrapped activity has no `tool_context`, so it raises `InterruptException(Interrupt(...))` instead. The plugin's failure converter preserves the `Interrupt` payload across the activity boundary, so `AgentResult.interrupts` is populated just like the in-workflow case:
 
 ```python
 from strands.interrupt import Interrupt, InterruptException

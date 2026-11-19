@@ -3,6 +3,8 @@ package io.temporal.googleadk.activity;
 import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.BaseToolset;
 import com.google.genai.types.FunctionDeclaration;
+import io.modelcontextprotocol.spec.McpError;
+import io.modelcontextprotocol.spec.McpSchema.ErrorCodes;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.core.Single;
 import io.reactivex.rxjava3.processors.PublishProcessor;
@@ -65,10 +67,7 @@ public final class McpActivitiesImpl implements McpActivities, AutoCloseable {
           try {
             created = Objects.requireNonNull(factory.get(), "toolset factory returned null");
           } catch (RuntimeException e) {
-            throw ApplicationFailure.newFailureWithCause(
-                "Creating MCP toolset '" + name + "' failed: " + e.getMessage(),
-                FailureTypes.MCP_ERROR,
-                e);
+            throw failure("Creating MCP toolset '" + name + "' failed: " + e.getMessage(), e);
           }
         }
         return created;
@@ -118,10 +117,7 @@ public final class McpActivitiesImpl implements McpActivities, AutoCloseable {
     } catch (ApplicationFailure | ActivityCompletionException e) {
       throw e;
     } catch (RuntimeException e) {
-      throw ApplicationFailure.newFailureWithCause(
-          "Listing tools of toolset '" + name + "' failed: " + e.getMessage(),
-          FailureTypes.MCP_ERROR,
-          e);
+      throw failure("Listing tools of toolset '" + name + "' failed: " + e.getMessage(), e);
     }
   }
 
@@ -161,16 +157,51 @@ public final class McpActivitiesImpl implements McpActivities, AutoCloseable {
     } catch (ApplicationFailure | ActivityCompletionException e) {
       throw e;
     } catch (RuntimeException e) {
-      throw ApplicationFailure.newFailureWithCause(
+      throw failure(
           "Tool '"
               + input.tool()
               + "' of toolset '"
               + input.toolset()
               + "' failed: "
               + e.getMessage(),
-          FailureTypes.MCP_ERROR,
           e);
     }
+  }
+
+  /**
+   * Builds the failure for an error from an MCP operation. A JSON-RPC protocol error that a retry
+   * of the same request cannot fix (parse error, invalid request, method not found, invalid params)
+   * is non-retryable; every other error, including a lost session, stays retryable.
+   */
+  private static ApplicationFailure failure(String message, RuntimeException e) {
+    McpError protocolError = findMcpError(e);
+    if (protocolError != null && isNonRetryable(protocolError)) {
+      return ApplicationFailure.newNonRetryableFailureWithCause(message, FailureTypes.MCP_ERROR, e);
+    }
+    return ApplicationFailure.newFailureWithCause(message, FailureTypes.MCP_ERROR, e);
+  }
+
+  /** Returns the MCP protocol error behind the throwable, which the call may have wrapped. */
+  private static McpError findMcpError(Throwable error) {
+    Throwable cause = error;
+    for (int depth = 0; cause != null && depth < 16; depth++) {
+      if (cause instanceof McpError mcpError) {
+        return mcpError;
+      }
+      cause = cause.getCause();
+    }
+    return null;
+  }
+
+  private static boolean isNonRetryable(McpError error) {
+    if (error.getJsonRpcError() == null || error.getJsonRpcError().code() == null) {
+      return false;
+    }
+    int code = error.getJsonRpcError().code();
+    return code == ErrorCodes.PARSE_ERROR
+        || code == ErrorCodes.INVALID_REQUEST
+        || code == ErrorCodes.METHOD_NOT_FOUND
+        || code == ErrorCodes.INVALID_PARAMS;
   }
 
   /**

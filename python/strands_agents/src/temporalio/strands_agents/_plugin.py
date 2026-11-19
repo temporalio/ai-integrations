@@ -27,7 +27,9 @@ from ._failure_converter import (
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._sync_calls import refuse_sync_calls_in_workflows
+from ._sync_tools import run_sync_tools_in_workflows
 from ._worker_env_ref import AllowAllWorkerEnvVars
+from ._workflow_failure import AgentLoopErrorInterceptor
 from ._workflow_time import install_workflow_time
 
 if TYPE_CHECKING:
@@ -158,6 +160,9 @@ class StrandsPlugin(SimplePlugin):
             # Strands re-raises this when its conversation manager cannot reduce the
             # context any further; fail the workflow instead of retrying the task forever.
             workflow_failure_exception_types=[ContextWindowOverflowException],
+            # StructuredOutputException and MaxTokensReachedException come from model
+            # answers already in History; fail the Workflow when one escapes it.
+            interceptors=[AgentLoopErrorInterceptor()],
             run_context=mcp_plugin.run_context if mcp_plugin else None,
         )
 
@@ -246,6 +251,7 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
     if not runner:
         raise ValueError("No WorkflowRunner provided to the Strands plugin.")
     install_workflow_time()
+    run_sync_tools_in_workflows()
     if isinstance(runner, SandboxedWorkflowRunner):
         return replace(
             runner,

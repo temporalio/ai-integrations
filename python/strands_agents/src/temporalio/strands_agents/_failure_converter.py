@@ -30,7 +30,11 @@ STRANDS_INTERRUPT_TYPE = "StrandsInterrupt"
 # won't succeed on retry, so they cross the boundary as non-retryable typed
 # ApplicationErrors. Only ContextWindowOverflowException is rebuilt on the workflow
 # side (TemporalModel.stream), because Strands recovers from it by reducing the
-# conversation; the others reach the workflow as an ActivityError.
+# conversation; the others reach the workflow as an ActivityError. Strands' agent
+# loop also raises MaxTokensReachedException and StructuredOutputException in
+# Workflow code. When one escapes the Workflow, AgentLoopErrorInterceptor turns it
+# into a retryable ApplicationError before it gets here, so the Workflow retry
+# policy decides whether another run starts.
 _TERMINAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
     MaxTokensReachedException,
     ContextWindowOverflowException,
