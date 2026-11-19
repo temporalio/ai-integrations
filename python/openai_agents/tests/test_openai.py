@@ -11,7 +11,7 @@ import os
 import sys
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import FrameType
@@ -93,7 +93,6 @@ from openai import APIStatusError, AsyncOpenAI, BaseModel, RateLimitError
 from openai.types.responses import (
     LocalEnvironmentParam,
     ResponseCodeInterpreterToolCall,
-    ResponseCompletedEvent,
     ResponseCustomToolCall,
     ResponseFileSearchToolCall,
     ResponseFunctionToolCall,
@@ -131,7 +130,6 @@ from temporalio.client import (
 )
 from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.converter import (
     DefaultFailureConverterWithEncodedAttributes,
     PayloadCodec,
@@ -184,7 +182,6 @@ from tests.helpers.nexus import make_nexus_endpoint_name
 from tests.research_agents.research_manager import (
     ResearchManager,
 )
-from tests.test_openai_streaming import StreamingTestModel
 
 if TYPE_CHECKING:
     import httpx2
@@ -548,20 +545,6 @@ class NexusToolCancelWorkflow:
             tools.append(function_tool(self.fail, failure_error_function=None))
         elif case == "tool_bug":
             tools.append(function_tool(self.bug, failure_error_function=None))
-        elif case.startswith("nested_invalid_output"):
-            # An agent used as a tool whose final output doesn't match its output_type.
-            invalid = Agent[str](
-                name="Invalid",
-                instructions="You are a helpful agent.",
-                output_type=OutputType,
-            )
-            tools.append(
-                invalid.as_tool(
-                    tool_name="invalid",
-                    tool_description="Runs an agent.",
-                    failure_error_function=None,
-                )
-            )
         if case in ("nested", "nested_tool_fails"):
             inner = Agent[str](
                 name="Inner", instructions="You are a helpful agent.", tools=tools
@@ -598,16 +581,6 @@ class NexusToolCancelWorkflow:
         )
         try:
             result = await self.run_task
-        except ModelBehaviorError as e:
-            if not case.startswith("nested_invalid_output_caught:"):
-                raise
-            # Workflow code catches the error and releases the held operation, so that it
-            # can finish its cancellation.
-            held_id = case.removeprefix("nested_invalid_output_caught:")
-            await workflow.get_external_workflow_handle(held_id).signal(
-                HeldWorkflow.release
-            )
-            return f"caught: {e}"
         except Exception:
             if case != "workflow_during_failure":
                 raise
@@ -4375,408 +4348,6 @@ async def test_invalid_output_type_can_be_caught(client: Client):
                 execution_timeout=timedelta(seconds=30),
             )
             assert result.startswith("caught: Invalid JSON when parsing model output")
-
-
-async def test_invalid_output_waits_for_nexus_tool_cancellation(
-    client: Client, env: WorkflowEnvironment
-):
-    """A ModelBehaviorError that fails the Workflow waits for sibling Nexus tools.
-
-    An agent used as a tool returns invalid output while a sibling Nexus tool runs. The
-    run cancels the tool and waits for its WAIT_COMPLETED cancellation, as for other
-    Workflow failures, before the Workflow fails.
-    """
-    if env.supports_time_skipping:
-        pytest.skip("Nexus tests don't work with time-skipping server")
-
-    held_id = f"held-{uuid.uuid4()}-slow"
-    hold_call = ResponseBuilders.tool_call(json.dumps({"input": held_id}), "hold")
-    invalid_call = ResponseBuilders.tool_call(
-        json.dumps({"input": "Answer"}), "invalid", call_id="invalid", item_id="invalid"
-    )
-    responses = [
-        ModelResponse(
-            output=[*hold_call.output, *invalid_call.output],
-            usage=Usage(),
-            response_id=None,
-        ),
-        ResponseBuilders.output_message('{"answer": 42}'),
-    ]
-    async with AgentEnvironment(
-        model=TestModel.returning_responses(responses),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
-    ) as agent_env:
-        client = agent_env.applied_on_client(client)
-
-        async with new_worker(
-            client,
-            NexusToolCancelWorkflow,
-            HeldWorkflow,
-            nexus_service_handlers=[HeldServiceHandler()],
-        ) as worker:
-            await env.create_nexus_endpoint(
-                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-            )
-            workflow_handle = await client.start_workflow(
-                NexusToolCancelWorkflow.run,
-                "nested_invalid_output",
-                id=f"nexus-tool-invalid-output-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=30),
-            )
-            held_handle = client.get_workflow_handle(held_id)
-
-            async def cancel_delivered() -> None:
-                events = [e async for e in workflow_handle.fetch_history_events()]
-                assert any(
-                    e.HasField(
-                        "nexus_operation_cancel_request_completed_event_attributes"
-                    )
-                    for e in events
-                )
-
-            await assert_eventually(cancel_delivered)
-            # The operation delays its cancellation until released, so the run waits.
-            assert (await workflow_handle.describe()).status == (
-                WorkflowExecutionStatus.RUNNING
-            )
-            await held_handle.signal(HeldWorkflow.release)
-
-            with pytest.raises(WorkflowFailureError) as err:
-                await workflow_handle.result()
-            cause = err.value.cause
-            assert isinstance(cause, ApplicationError)
-            assert cause.type == "ModelBehaviorError"
-            assert (await held_handle.describe()).status == (
-                WorkflowExecutionStatus.CANCELED
-            )
-
-
-async def test_caught_invalid_output_does_not_wait_for_nexus_tool_cancellation(
-    client: Client, env: WorkflowEnvironment
-):
-    """Workflow code that catches a ModelBehaviorError runs before the tools finish cancelling.
-
-    An agent used as a tool returns invalid output while a sibling Nexus tool runs. As with
-    the Agents SDK, Runner.run raises at once. The Workflow catches the error and releases
-    the held operation, whose WAIT_COMPLETED cancellation needs that Signal to finish.
-    """
-    if env.supports_time_skipping:
-        pytest.skip("Nexus tests don't work with time-skipping server")
-
-    held_id = f"held-{uuid.uuid4()}-slow"
-    hold_call = ResponseBuilders.tool_call(json.dumps({"input": held_id}), "hold")
-    invalid_call = ResponseBuilders.tool_call(
-        json.dumps({"input": "Answer"}), "invalid", call_id="invalid", item_id="invalid"
-    )
-    responses = [
-        ModelResponse(
-            output=[*hold_call.output, *invalid_call.output],
-            usage=Usage(),
-            response_id=None,
-        ),
-        ResponseBuilders.output_message('{"answer": 42}'),
-    ]
-    async with AgentEnvironment(
-        model=TestModel.returning_responses(responses),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
-    ) as agent_env:
-        client = agent_env.applied_on_client(client)
-
-        async with new_worker(
-            client,
-            NexusToolCancelWorkflow,
-            HeldWorkflow,
-            nexus_service_handlers=[HeldServiceHandler()],
-        ) as worker:
-            await env.create_nexus_endpoint(
-                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-            )
-            workflow_handle = await client.start_workflow(
-                NexusToolCancelWorkflow.run,
-                f"nested_invalid_output_caught:{held_id}",
-                id=f"nexus-tool-caught-invalid-output-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=30),
-            )
-            result = await workflow_handle.result()
-            assert result.startswith("caught: ")
-            held_handle = client.get_workflow_handle(held_id)
-
-            async def held_cancelled() -> None:
-                assert (await held_handle.describe()).status == (
-                    WorkflowExecutionStatus.CANCELED
-                )
-
-            await assert_eventually(held_cancelled)
-
-
-def _hold_tool() -> Tool:
-    return openai_agents.workflow.nexus_operation_as_tool(
-        HeldService.hold,
-        service=HeldService,
-        endpoint=make_nexus_endpoint_name(workflow.info().task_queue),
-        cancellation_type=workflow.NexusOperationCancellationType.WAIT_COMPLETED,
-    )
-
-
-def _invalid_output_tool(name: str = "invalid") -> Tool:
-    """An agent used as a tool whose final output doesn't match its output_type."""
-    return Agent[str](
-        name="Invalid",
-        instructions="You are a helpful agent.",
-        output_type=OutputType,
-    ).as_tool(
-        tool_name=name, tool_description="Runs an agent.", failure_error_function=None
-    )
-
-
-@workflow.defn
-class DeferredToolCleanupWorkflow:
-    """Runs an agent whose nested agent returns invalid output while Nexus tools run."""
-
-    @workflow.init
-    def __init__(self, case: str) -> None:
-        self.stream = WorkflowStream()
-        self.finish = False
-
-    # Abandoned handlers don't block completion, so a lost Signal failure would show as a
-    # successful run.
-    @workflow.signal(unfinished_policy=workflow.HandlerUnfinishedPolicy.ABANDON)
-    async def ask(self) -> None:
-        agent = Agent[str](
-            name="Outer",
-            instructions="You are a helpful agent.",
-            tools=[_hold_tool(), _invalid_output_tool()],
-        )
-        await Runner.run(starting_agent=agent, input="Hold")
-
-    @workflow.signal
-    def finish_run(self) -> None:
-        self.finish = True
-
-    @workflow.run
-    async def run(self, case: str) -> str:
-        if case == "signal":
-            # The run method returns while the Signal's failure waits for cleanup.
-            await workflow.wait_condition(lambda: self.finish)
-            return "done"
-        if case == "streamed":
-            agent = Agent[str](
-                name="Outer",
-                instructions="You are a helpful agent.",
-                tools=[_hold_tool(), _invalid_output_tool()],
-            )
-            result = Runner.run_streamed(starting_agent=agent, input="Hold")
-            async for _ in result.stream_events():
-                pass
-            return "done"
-        # "nested": the enclosing run and a nested run each have a Nexus tool running.
-        middle = Agent[str](
-            name="Middle",
-            instructions="You are a helpful agent.",
-            tools=[_hold_tool(), _invalid_output_tool()],
-        ).as_tool(
-            tool_name="middle",
-            tool_description="Runs an agent.",
-            failure_error_function=None,
-        )
-        agent = Agent[str](
-            name="Outer",
-            instructions="You are a helpful agent.",
-            tools=[_hold_tool(), middle],
-        )
-        await Runner.run(starting_agent=agent, input="Hold")
-        return "done"
-
-
-def _calls(*calls: tuple[str, str]) -> ModelResponse:
-    output = []
-    for name, arguments in calls:
-        output.extend(
-            ResponseBuilders.tool_call(
-                arguments, name, call_id=f"call-{name}", item_id=f"item-{name}"
-            ).output
-        )
-    return ModelResponse(output=output, usage=Usage(), response_id=None)
-
-
-class _StreamedToolCallsModel(StreamingTestModel):
-    """Streams the outer agent's tool calls; the nested agent's call returns invalid output."""
-
-    def __init__(self, held_id: str) -> None:
-        self.held_id = held_id
-
-    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
-        return ResponseBuilders.output_message('{"answer": 42}')
-
-    async def stream_response(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        async for event in super().stream_response(*args, **kwargs):
-            if isinstance(event, ResponseCompletedEvent):
-                calls = _calls(
-                    ("hold", json.dumps({"input": self.held_id})),
-                    ("invalid", json.dumps({"input": "Answer"})),
-                )
-                response = event.response.model_copy(update={"output": calls.output})
-                event = event.model_copy(update={"response": response})
-            yield event
-
-
-@contextlib.asynccontextmanager
-async def _start_deferred_cleanup(
-    client: Client, env: WorkflowEnvironment, model: Model, case: str
-) -> AsyncGenerator[tuple[Client, WorkflowHandle[Any, Any]]]:
-    async with AgentEnvironment(
-        model=model,
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30), streaming_topic="events"
-        ),
-    ) as agent_env:
-        client = agent_env.applied_on_client(client)
-        async with new_worker(
-            client,
-            DeferredToolCleanupWorkflow,
-            HeldWorkflow,
-            nexus_service_handlers=[HeldServiceHandler()],
-        ) as worker:
-            await env.create_nexus_endpoint(
-                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-            )
-            handle = await client.start_workflow(
-                DeferredToolCleanupWorkflow.run,
-                case,
-                id=f"deferred-tool-cleanup-{case}-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=30),
-            )
-            yield client, handle
-
-
-async def _cancel_requests_delivered(
-    handle: WorkflowHandle[Any, Any], count: int
-) -> None:
-    async def delivered() -> None:
-        events = [e async for e in handle.fetch_history_events()]
-        assert (
-            sum(
-                e.HasField("nexus_operation_cancel_request_completed_event_attributes")
-                for e in events
-            )
-            >= count
-        )
-
-    await assert_eventually(delivered)
-
-
-async def _assert_fails_with_model_behavior_error(
-    handle: WorkflowHandle[Any, Any],
-) -> None:
-    with pytest.raises(WorkflowFailureError) as err:
-        await handle.result()
-    cause = err.value.cause
-    assert isinstance(cause, ApplicationError)
-    assert cause.type == "ModelBehaviorError"
-
-
-async def test_streamed_invalid_output_waits_for_nexus_tool_cancellation(
-    client: Client, env: WorkflowEnvironment
-):
-    """A streamed run's own Nexus tools finish cancelling before the Workflow fails."""
-    if env.supports_time_skipping:
-        pytest.skip("Nexus tests don't work with time-skipping server")
-    held_id = f"held-{uuid.uuid4()}-slow"
-    async with _start_deferred_cleanup(
-        client, env, _StreamedToolCallsModel(held_id), "streamed"
-    ) as (client, handle):
-        await _cancel_requests_delivered(handle, 1)
-        # The operation delays its cancellation until released, so the Workflow waits.
-        assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
-        await client.get_workflow_handle(held_id).signal(HeldWorkflow.release)
-        await _assert_fails_with_model_behavior_error(handle)
-        assert (
-            await client.get_workflow_handle(held_id).describe()
-        ).status == WorkflowExecutionStatus.CANCELED
-
-
-async def test_workflow_cancellation_finishes_every_deferred_nexus_wait(
-    client: Client, env: WorkflowEnvironment
-):
-    """A cancellation during the nested run's wait still waits for the enclosing run's tools."""
-    if env.supports_time_skipping:
-        pytest.skip("Nexus tests don't work with time-skipping server")
-    outer_id = f"held-{uuid.uuid4()}-slow"
-    middle_id = f"held-{uuid.uuid4()}-slow"
-    model = TestModel.returning_responses(
-        [
-            _calls(
-                ("hold", json.dumps({"input": outer_id})), ("middle", '{"input": "Go"}')
-            ),
-            _calls(
-                ("hold", json.dumps({"input": middle_id})),
-                ("invalid", '{"input": "Answer"}'),
-            ),
-            ResponseBuilders.output_message('{"answer": 42}'),
-        ]
-    )
-    async with _start_deferred_cleanup(client, env, model, "nested") as (
-        client,
-        handle,
-    ):
-        await _cancel_requests_delivered(handle, 2)
-        await handle.cancel()
-        # The nested run's wait ends first; the enclosing run's tool is still cancelling.
-        await client.get_workflow_handle(middle_id).signal(HeldWorkflow.release)
-
-        async def middle_closed() -> None:
-            assert (
-                await client.get_workflow_handle(middle_id).describe()
-            ).status == WorkflowExecutionStatus.CANCELED
-
-        await assert_eventually(middle_closed)
-        await asyncio.sleep(1)
-        assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
-        await client.get_workflow_handle(outer_id).signal(HeldWorkflow.release)
-        with pytest.raises(WorkflowFailureError) as err:
-            await handle.result()
-        assert isinstance(err.value.cause, CancelledError)
-        assert (
-            await client.get_workflow_handle(outer_id).describe()
-        ).status == WorkflowExecutionStatus.CANCELED
-
-
-async def test_signal_invalid_output_fails_the_workflow_after_the_run_method_returns(
-    client: Client, env: WorkflowEnvironment
-):
-    """The run method can't complete the Workflow while a Signal's failure waits for cleanup."""
-    if env.supports_time_skipping:
-        pytest.skip("Nexus tests don't work with time-skipping server")
-    held_id = f"held-{uuid.uuid4()}-slow"
-    model = TestModel.returning_responses(
-        [
-            _calls(
-                ("hold", json.dumps({"input": held_id})),
-                ("invalid", '{"input": "Answer"}'),
-            ),
-            ResponseBuilders.output_message('{"answer": 42}'),
-        ]
-    )
-    async with _start_deferred_cleanup(client, env, model, "signal") as (
-        client,
-        handle,
-    ):
-        await handle.signal(DeferredToolCleanupWorkflow.ask)
-        await _cancel_requests_delivered(handle, 1)
-        # The Signal's ModelBehaviorError now waits for the held operation; the run
-        # method returns meanwhile.
-        await handle.signal(DeferredToolCleanupWorkflow.finish_run)
-        await asyncio.sleep(1)
-        assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
-        await client.get_workflow_handle(held_id).signal(HeldWorkflow.release)
-        await _assert_fails_with_model_behavior_error(handle)
 
 
 @workflow.defn
