@@ -17,6 +17,35 @@ async def count_scheduled_activities(handle: WorkflowHandle) -> Counter:
     return counts
 
 
+async def scheduled_attributes(
+    handle: WorkflowHandle, activity_type: str
+) -> ActivityTaskScheduledEventAttributes:
+    """Return the schedule attributes of the first ``activity_type`` scheduled."""
+    async for event in handle.fetch_history_events():
+        if event.event_type != EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            continue
+        attrs = event.activity_task_scheduled_event_attributes
+        if attrs.activity_type.name == activity_type:
+            return attrs
+    raise AssertionError(f"No {activity_type!r} activity was scheduled")
+
+
+async def all_scheduled_attributes(
+    handle: WorkflowHandle, activity_type: str
+) -> list[ActivityTaskScheduledEventAttributes]:
+    """Return the schedule attributes of every ``activity_type`` scheduled, in order."""
+    found: list[ActivityTaskScheduledEventAttributes] = []
+    async for event in handle.fetch_history_events():
+        if event.event_type != EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            continue
+        attrs = event.activity_task_scheduled_event_attributes
+        if attrs.activity_type.name == activity_type:
+            found.append(attrs)
+    if not found:
+        raise AssertionError(f"No {activity_type!r} activity was scheduled")
+    return found
+
+
 async def scheduled_activity_attrs(
     handle: WorkflowHandle, name: str
 ) -> ActivityTaskScheduledEventAttributes | None:
