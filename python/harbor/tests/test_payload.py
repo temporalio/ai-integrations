@@ -28,7 +28,10 @@ from harbor.utils.pass_at_k import compute_pass_at_k_by_evals
 
 from temporalio.api.common.v1 import Payload
 from temporalio.client import Client
-from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.contrib.pydantic import (
+    PydanticPayloadConverter,
+    pydantic_data_converter,
+)
 from temporalio.converter import (
     DataConverter,
     DefaultFailureConverterWithEncodedAttributes,
@@ -271,17 +274,28 @@ async def test_plugin_keeps_a_payload_codec(client: Client, tmp_path: Path) -> N
     assert codec.encoded > 0
 
 
+class _CustomConverter(PydanticPayloadConverter):
+    """A payload converter the application defines."""
+
+
 def test_plugin_leaves_a_custom_payload_converter() -> None:
-    converter = dataclasses.replace(pydantic_data_converter, payload_codec=_Counting())
+    converter = DataConverter(
+        payload_converter_class=_CustomConverter, payload_codec=_Counting()
+    )
     configured = HarborPlugin().configure_client(
         {"data_converter": converter}  # type: ignore[typeddict-item]
     )
     assert configured["data_converter"] is converter
 
 
-def test_plugin_keeps_a_failure_converter() -> None:
+@pytest.mark.parametrize(
+    "base",
+    [DataConverter.default, pydantic_data_converter],
+    ids=["default", "pydantic"],
+)
+def test_plugin_keeps_a_failure_converter(base: DataConverter) -> None:
     converter = dataclasses.replace(
-        DataConverter.default,
+        base,
         failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
     )
     configured = HarborPlugin().configure_client(

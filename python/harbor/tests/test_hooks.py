@@ -531,7 +531,7 @@ async def test_secret_harbor_scrubbed_stays_on_the_worker(
         with pytest.raises(FailureError) as raised:
             await _environment(client).run(run_trial, _input(config))
         assert raised.value.failure is not None
-        text = raised.value.failure.message
+        text = str(raised.value.failure)
     else:
         outcome = await _environment(client).run(run_trial, _input(config))
         assert outcome.result.exception_info is not None

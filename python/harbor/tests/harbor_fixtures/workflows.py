@@ -243,6 +243,7 @@ class TrialArgs(BaseModel):
     start_to_close_timeout: timedelta | None = None
     schedule_to_close_timeout: timedelta | None = None
     maximum_attempts: int | None = None
+    non_retryable_error_types: list[str] | None = None
     data: JsonValue = None
     summary: str | None = None
 
@@ -258,6 +259,7 @@ class RunOneTrial:
             policy = RetryPolicy(
                 initial_interval=timedelta(milliseconds=100),
                 maximum_attempts=args.maximum_attempts,
+                non_retryable_error_types=args.non_retryable_error_types,
             )
         return await execute_trial(
             TrialPlan(config=args.config, timeout=args.timeout),

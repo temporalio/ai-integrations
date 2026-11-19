@@ -9,7 +9,7 @@ from pathlib import PurePath
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from harbor.models.job.config import JobConfig, RetryConfig
@@ -76,6 +76,7 @@ async def plan_job(
     untimed_agent_timeout: timedelta = timedelta(hours=2),
     trial_name: Callable[[TaskConfig, AgentConfig, int], str] | None = None,
     start_to_close_timeout: timedelta = timedelta(minutes=10),
+    heartbeat_timeout: timedelta = timedelta(minutes=2),
     task_queue: str | None = None,
 ) -> TemporalJobPlan:
     """Resolve a harbor job into the trials it will run.
@@ -112,9 +113,12 @@ async def plan_job(
         trial_name: Names each trial from its task, its agent and which of the
             job's ``n_attempts`` it is, counting from 0. A trial's name is its
             directory. Must be deterministic and unique within the job.
-            Defaults to harbor's format, with a random suffix drawn from the
-            workflow's random source.
+            Defaults to harbor's format, with ``:`` replaced by ``_`` and a
+            random suffix drawn from the workflow's random source.
         start_to_close_timeout: Bound on the planning Activity.
+        heartbeat_timeout: How long the planning Activity may go without a
+            heartbeat before Temporal presumes its worker lost and retries
+            planning.
         task_queue: Task queue for the planning Activity. Defaults to the
             workflow's.
 
@@ -132,7 +136,12 @@ async def plan_job(
         plan_input = PlanJobInput(
             config=config, untimed_agent_timeout=untimed_agent_timeout
         )
-        _TIMEOUTS.validate_python({"start_to_close_timeout": start_to_close_timeout})
+        _TIMEOUTS.validate_python(
+            {
+                "start_to_close_timeout": start_to_close_timeout,
+                "heartbeat_timeout": heartbeat_timeout,
+            }
+        )
     except ValidationError as exc:
         raise _invalid("plan_job", exc) from None
     config = plan_input.config
@@ -173,6 +182,7 @@ async def plan_job(
         summary=f"plan {config.job_name}",
         task_queue=task_queue,
         start_to_close_timeout=start_to_close_timeout,
+        heartbeat_timeout=heartbeat_timeout,
         retry_policy=_LIFECYCLE_RETRY,
     )
     job_id = workflow.uuid4()
@@ -193,7 +203,7 @@ async def plan_job(
                     suffix = "".join(
                         random.choice(_SUFFIX_ALPHABET) for _ in range(_SUFFIX_LENGTH)
                     )
-                    name = f"{task_name[:32].rstrip('_-')}__{suffix}"
+                    name = f"{task_name[:32].replace(':', '_').rstrip('_-')}__{suffix}"
                 # Checked before TrialConfig, which replaces an empty name with
                 # a random one. A name that is not a string fails validation.
                 if isinstance(name, str):
@@ -270,12 +280,18 @@ async def execute_trial(
     could not be fetched or its environment check failed, or when harbor's
     result shows it failed before its agent started or records an exception
     harbor's error policy retries, such as a provider's rate limit or
-    outage, except one harbor cannot classify. For
-    a trial harbor ran, the error is an ``ApplicationError`` whose type is
-    harbor's exception class name; after a rate limit, ``ApiRateLimitError``
-    or litellm's ``RateLimitError``, the next attempt waits 2 minutes. The
-    last attempt ``retry_policy`` allows returns harbor's result instead, as
-    harbor does when its own retries run out. A trial whose name is not a
+    outage, except one harbor cannot classify. As in harbor, only the
+    exception the result records for the trial counts, not one it records
+    for a step. For a trial harbor ran, the error is an ``ApplicationError``
+    whose type is harbor's exception class name and whose details hold the
+    attempt's :class:`temporalio.harbor.TrialOutcome`; after a rate limit,
+    ``ApiRateLimitError`` or litellm's ``RateLimitError``, the next attempt
+    waits 2 minutes. When Temporal stops retrying on that error, because
+    ``retry_policy`` allows no more attempts or lists its type in
+    ``non_retryable_error_types``, or ``schedule_to_close_timeout`` leaves
+    no time for another attempt, the attempt's outcome comes back, as harbor
+    returns its last result when its own retries run out. With unlimited
+    attempts, Temporal keeps retrying. A trial whose name is not a
     single path component, or that harbor rejects as misconfigured while
     creating it, for example because an agent option is invalid or a
     ``${VAR}`` its config names is unset on the worker, fails without a
@@ -334,21 +350,31 @@ async def execute_trial(
         )
     except ValidationError as exc:
         raise _invalid("execute_trial", exc) from None
-    return await workflow.execute_activity(
-        RUN_TRIAL,
-        run_input,
-        result_type=TrialOutcome,
-        summary=summary if summary is not None else _summary(trial.config),
-        task_queue=task_queue,
-        start_to_close_timeout=(
-            start_to_close_timeout
-            if start_to_close_timeout is not None
-            else trial.timeout * 1.5 + run_input.extra_time
-        ),
-        schedule_to_close_timeout=schedule_to_close_timeout,
-        heartbeat_timeout=heartbeat_timeout,
-        retry_policy=retry_policy if retry_policy is not None else _TRIAL_RETRY,
-    )
+    try:
+        return await workflow.execute_activity(
+            RUN_TRIAL,
+            run_input,
+            result_type=TrialOutcome,
+            summary=summary if summary is not None else _summary(trial.config),
+            task_queue=task_queue,
+            start_to_close_timeout=(
+                start_to_close_timeout
+                if start_to_close_timeout is not None
+                else trial.timeout * 1.5 + run_input.extra_time
+            ),
+            schedule_to_close_timeout=schedule_to_close_timeout,
+            heartbeat_timeout=heartbeat_timeout,
+            retry_policy=retry_policy if retry_policy is not None else _TRIAL_RETRY,
+        )
+    except ActivityError as exc:
+        error = exc.cause
+        if isinstance(error, ApplicationError) and len(error.details) == 1:
+            # Details decode without type hints.
+            try:
+                return TrialOutcome.model_validate(error.details[0])
+            except ValidationError:
+                pass
+        raise
 
 
 async def aggregate_job(

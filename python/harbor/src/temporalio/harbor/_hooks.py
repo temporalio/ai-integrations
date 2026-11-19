@@ -62,7 +62,7 @@ class TrialHooks:
     It raises instead, and Temporal retries the trial, when the trial could
     not run or failed before its agent started, for a reason other than its
     configuration, or its result records an exception that harbor's error
-    policy classifies and retries, unless this is the trial's last attempt
+    policy classifies and retries
     (see :func:`temporalio.harbor.execute_trial`).
 
     Hooks run on the worker's event loop, beside every other trial the worker

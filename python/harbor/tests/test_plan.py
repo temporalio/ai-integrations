@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
@@ -558,6 +559,26 @@ async def test_harbor_token_lock_works_on_every_loop(
         assert await _on_own_loop(refresh_twice_at_once) == expected
 
 
+async def test_cancelled_planning_cancels_harbor_on_its_loop() -> None:
+    started = threading.Event()
+    stopped = threading.Event()
+
+    async def download() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            stopped.set()
+            raise
+
+    waiting = asyncio.create_task(_on_own_loop(download))
+    assert await asyncio.to_thread(started.wait, 10)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert await asyncio.to_thread(stopped.wait, 10)
+
+
 async def test_missing_package_task_fails_planning(
     harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -580,6 +601,40 @@ async def test_missing_package_task_fails_planning(
     assert isinstance(cause.cause, ApplicationError)
     assert cause.cause.type == "ValueError"
     assert cause.cause.non_retryable
+    assert await history.final_attempts(handle) == [1]
+
+
+async def test_group_with_a_config_error_fails_planning(
+    harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(package, "PackageDatasetClient", _PackageRegistry)
+
+    async def download_tasks(*_args: Any, **_kwargs: Any) -> BatchDownloadResult:
+        raise ExceptionGroup(
+            "downloads",
+            [
+                ConnectionError("the registry did not answer"),
+                ValueError("Task version not found: org/task@sha256:t1"),
+                ExceptionGroup(
+                    "nested", [ValueError("Task version not found: org/next@sha256:t2")]
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(TaskClient, "download_tasks", download_tasks)
+    cause, handle = await _planning_failure(
+        harbor_client, PlanJob, _package_job(tmp_path)
+    )
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.type == "ValueError"
+    assert cause.cause.non_retryable
+    assert cause.cause.message == (
+        "Task version not found: org/task@sha256:t1; "
+        "Task version not found: org/next@sha256:t2"
+    )
+    assert isinstance(cause.cause.cause, ApplicationError)
+    assert cause.cause.cause.type == "ExceptionGroup"
     assert await history.final_attempts(handle) == [1]
 
 

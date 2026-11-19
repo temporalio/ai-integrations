@@ -101,9 +101,11 @@ class HarborPlugin(SimplePlugin):
     :func:`temporalio.harbor.execute_trial` and
     :func:`temporalio.harbor.aggregate_job` schedule, and passes harbor
     through the workflow sandbox. Harbor's configuration and results are
-    pydantic models, so the plugin makes a pydantic payload converter the
-    data converter's payload converter, keeping any payload codec and
-    failure converter. A custom payload converter is left in place.
+    pydantic models, so the plugin replaces the default payload converter,
+    or ``temporalio.contrib.pydantic``'s ``PydanticPayloadConverter``, with
+    its own pydantic payload converter, keeping any payload codec and
+    failure converter. Any other payload converter, including a subclass of
+    either, is left in place.
 
     On each Worker, harbor's logger, which logs at DEBUG, passes only INFO
     and above on to the worker's handlers; each trial's ``trial.log`` keeps
@@ -128,7 +130,10 @@ class HarborPlugin(SimplePlugin):
         def data_converter(converter: DataConverter | None) -> DataConverter:
             if converter is None:
                 return DataConverter(payload_converter_class=_PayloadConverter)
-            if converter.payload_converter_class is DefaultPayloadConverter:
+            if converter.payload_converter_class in (
+                DefaultPayloadConverter,
+                PydanticPayloadConverter,
+            ):
                 return dataclasses.replace(
                     converter, payload_converter_class=_PayloadConverter
                 )

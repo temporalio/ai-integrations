@@ -36,7 +36,8 @@ class PlanJobResult(BaseModel):
 
     ``task_names`` and ``timeouts`` follow ``task_configs``; each task's
     ``timeouts`` follow the job's agents. Each git task in ``task_configs`` is
-    pinned to the commit it was resolved to. ``datasets`` are the job's
+    pinned to the commit it was resolved to, and each package task given no
+    ``ref`` to the content hash it was resolved to. ``datasets`` are the job's
     datasets with each package dataset's ``ref`` pinned to the content hash
     its tasks were resolved from.
     """
@@ -84,9 +85,10 @@ class TemporalJobPlan(BaseModel):
     workflow fans out; the rest is what :func:`temporalio.harbor.aggregate_job`
     needs. ``id`` is the job's id, as harbor records it in each trial's
     ``job_id`` and in the job's result. Each git task is pinned to the commit
-    it was resolved to, as the job's ``lock.json`` records it. In ``config``,
-    each package dataset's ``ref`` is pinned to the content hash its tasks
-    were resolved from, and its ``version`` is cleared.
+    it was resolved to, and each package task given no ``ref`` to the content
+    hash it was resolved to, as the job's ``lock.json`` records them. In
+    ``config``, each package dataset's ``ref`` is pinned to the content hash
+    its tasks were resolved from, and its ``version`` is cleared.
     """
 
     id: UUID

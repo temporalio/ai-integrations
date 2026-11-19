@@ -138,30 +138,25 @@ def _cap(result: TrialResult) -> TrialResult:
 
 
 def _raised(result: TrialResult) -> ExceptionInfo | None:
-    """The recorded exception the attempt raises, if any.
+    """The trial's exception, if the attempt raises it.
 
-    That is the first exception when no agent started, else the first that
-    harbor's error policy retries, unless harbor cannot classify it. Harbor
-    sets ``agent_execution`` as an agent starts: on the result, or on each
-    step's result for a multi-step trial. Temporal runs the trial again
-    unless harbor rejected the trial's configuration as it started
+    As harbor retries a trial, only the trial's own exception counts, not a
+    step's. The attempt raises it when no agent started, or when harbor's
+    error policy retries it, unless harbor cannot classify it. Harbor sets
+    ``agent_execution`` as an agent starts: on the result, or on each step's
+    result for a multi-step trial. Temporal runs the trial again unless
+    harbor rejected the trial's configuration as it started
     (:func:`_rejected`).
     """
+    exc = result.exception_info
+    if exc is None:
+        return None
     steps = result.step_results or []
-    recorded = sorted(
-        filter(None, [result.exception_info, *(s.exception_info for s in steps)]),
-        key=lambda exc: exc.occurred_at,
-    )
     if all(r.agent_execution is None for r in [result, *steps]):
-        return next(iter(recorded), None)
-    return next(
-        (
-            exc
-            for exc in recorded
-            if exc.policy.retry and exc.policy.cause != FailureCause.UNCLASSIFIED
-        ),
-        None,
-    )
+        return exc
+    if exc.policy.retry and exc.policy.cause != FailureCause.UNCLASSIFIED:
+        return exc
+    return None
 
 
 def _rejected(result: TrialResult) -> bool:
@@ -374,19 +369,48 @@ def _not_finite(value: Any, path: tuple[str, ...] = ()) -> Iterator[str]:
 
 
 async def _on_own_loop(make: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
-    """Run harbor's async code on a fresh event loop in a daemon thread."""
+    """Run harbor's async code on a fresh event loop in a daemon thread.
+
+    Cancelling the caller cancels that code at its next ``await``.
+    """
     done: concurrent.futures.Future[_T] = concurrent.futures.Future()
     context = contextvars.copy_context()  # keeps activity.logger and tracing
+    cancelled = threading.Event()
+    inner: list[asyncio.Future[_T]] = []
+
+    async def main() -> _T:
+        task = asyncio.ensure_future(make())
+        inner.append(task)
+        if cancelled.is_set():
+            task.cancel()
+        return await task
 
     def run() -> None:
-        done.set_running_or_notify_cancel()
+        if not done.set_running_or_notify_cancel():
+            return
         try:
-            done.set_result(context.run(asyncio.run, make()))
+            done.set_result(context.run(asyncio.run, main()))
         except BaseException as exc:
             done.set_exception(exc)
 
     threading.Thread(target=run, daemon=True).start()
-    return await asyncio.wrap_future(done)
+    try:
+        return await asyncio.wrap_future(done)
+    except asyncio.CancelledError:
+        cancelled.set()
+        for task in inner:
+            # The loop is closed if harbor's code finished meanwhile.
+            with contextlib.suppress(RuntimeError):
+                task.get_loop().call_soon_threadsafe(task.cancel)
+        raise
+
+
+def _leaves(error: Exception) -> Iterator[Exception]:
+    if isinstance(error, ExceptionGroup):
+        for member in error.exceptions:
+            yield from _leaves(member)
+    else:
+        yield error
 
 
 @contextlib.contextmanager
@@ -395,22 +419,28 @@ def _config_errors(*, lookups: bool = False) -> Generator[None, None, None]:
 
     With ``lookups``, a ``ValueError`` raised while handling another error is
     retried: harbor's registry clients raise one when a lookup fails, and a
-    bare one for a dataset or task that does not exist.
+    bare one for a dataset or task that does not exist. Harbor downloads tasks
+    in a ``TaskGroup``: a group fails without a retry if any error in it,
+    nested groups included, would.
     """
     try:
         yield
     except Exception as exc:
-        error: Exception = exc
-        # Harbor downloads tasks in a TaskGroup.
-        while isinstance(error, ExceptionGroup) and len(error.exceptions) == 1:
-            error = error.exceptions[0]
-        if isinstance(error, (EmptyDatasetError, UnavailableDatasetTasksError)) or (
-            isinstance(error, ValueError)
-            and not (lookups and error.__context__ is not None)
-        ):
+        rejected = [
+            error
+            for error in _leaves(exc)
+            if isinstance(error, (EmptyDatasetError, UnavailableDatasetTasksError))
+            or (
+                isinstance(error, ValueError)
+                and not (lookups and error.__context__ is not None)
+            )
+        ]
+        if rejected:
             raise ApplicationError(
-                str(error), type=type(error).__name__, non_retryable=True
-            ) from error
+                "; ".join(map(str, rejected)),
+                type=type(rejected[0]).__name__,
+                non_retryable=True,
+            ) from exc
         raise
 
 
@@ -449,9 +479,14 @@ def _check_options(agent: AgentConfig) -> None:
 def _pinned(
     task: TaskConfig, downloads: dict[TaskIdType, TaskDownloadResult]
 ) -> TaskConfig:
-    commit = downloads[task.get_task_id()].resolved_git_commit_id
+    download = downloads[task.get_task_id()]
+    commit = download.resolved_git_commit_id
     if task.is_git_task() and commit is not None:
         return task.model_copy(update={"git_commit_id": commit})
+    digest = download.content_hash
+    if task.is_package_task() and task.ref is None and digest is not None:
+        ref = digest if digest.startswith("sha256:") else f"sha256:{digest}"
+        return task.model_copy(update={"ref": ref})
     return task
 
 
@@ -721,6 +756,23 @@ class HarborActivities:
         has a ``config.json`` or ``lock.json`` that differs from this job's,
         as harbor does.
         """
+        timeout = activity.info().heartbeat_timeout
+
+        async def heartbeat(interval: float) -> None:
+            while True:
+                activity.heartbeat()
+                await asyncio.sleep(interval)
+
+        ticker = None
+        if timeout:
+            ticker = asyncio.create_task(heartbeat(timeout.total_seconds() / 4))
+        try:
+            return await self._plan(input)
+        finally:
+            if ticker is not None:
+                ticker.cancel()
+
+    async def _plan(self, input: PlanJobInput) -> PlanJobResult:
         config = input.config.model_copy(deep=True)
         with _config_errors():
             for agent in [*config.agents, *filter(None, [config.user_agent])]:
@@ -739,8 +791,9 @@ class HarborActivities:
 
         with _config_errors(lookups=True):
             task_configs, downloads = await _on_own_loop(resolve)
-        # config.json records each git task's commit, as it records a package
-        # dataset's content hash, so harbor job resume matches the trials.
+        # config.json records each git task's commit and each package task's
+        # content hash, as it records a package dataset's, so harbor job resume
+        # matches the trials.
         config.tasks = [_pinned(task, downloads) for task in config.tasks]
         trials = HarborJobPlan.build_trial_configs(config, task_configs, job_id=uuid4())
 
@@ -878,12 +931,6 @@ class HarborActivities:
             ticker = asyncio.create_task(
                 heartbeat(info.heartbeat_timeout.total_seconds() / 4)
             )
-        policy = info.retry_policy
-        last = (
-            policy is not None
-            and policy.maximum_attempts > 0
-            and info.attempt == policy.maximum_attempts
-        )
         outcome: TrialOutcome | None = None
         try:
             check_trial_name(context.config.trial_name)
@@ -970,18 +1017,18 @@ class HarborActivities:
                             )
                         outcome.output = output
                     raised = _raised(recorded)
-                    # Harbor returns the last attempt's result when its
-                    # retries run out, and a trial it rejected as it started
-                    # gets no retry.
-                    if raised is not None and not (last or _rejected(recorded)):
+                    # A trial harbor rejected as it started gets no retry.
+                    if raised is not None and not _rejected(recorded):
                         try:
                             message = _redact_strings(
                                 raised.exception_message, hooks, context
                             )
                         except _RedactFailed as failed:
                             raise failed.failure from None
+                        # execute_trial returns the outcome if Temporal stops retrying.
                         raise ApplicationError(
                             message[:_TEXT_MAX],
+                            outcome,
                             type=raised.exception_type,
                             next_retry_delay=(
                                 timedelta(minutes=2)

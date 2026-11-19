@@ -163,8 +163,9 @@ Temporal runs a trial again when:
   limit (harbor's `ApiRateLimitError` or litellm's `RateLimitError`), the next attempt waits 2
   minutes.
 
-On the last attempt its retry policy allows, `execute_trial` returns that attempt's result instead,
-as harbor does when its own retries run out. With unlimited attempts, Temporal keeps retrying.
+When Temporal stops retrying after such an attempt, `execute_trial` returns that attempt's result
+instead, as harbor does when its own retries run out. With unlimited attempts, Temporal keeps
+retrying.
 
 A trial harbor rejects as misconfigured is not retried. When the worker creates it, for example
 because a `${VAR}` in its config is unset there, `execute_trial` raises. When harbor rejects it as
@@ -266,6 +267,9 @@ history as harbor recorded it; `TrialHooks.redact` says which.
   at a time by default, so set it to what one machine and your providers can take.
 - Any worker can run any trial, so local task paths and credentials must exist on every worker.
 - Pass every secret in `env` as `${VAR}`, with the variable set on every worker.
+- In `environment.env` and `verifier.env`, a value whose name contains KEY, SECRET, TOKEN, PASSWORD,
+  CREDENTIAL or AUTH reaches the trial masked unless written as `${VAR}`, even a non-secret like
+  `TOKENIZERS_PARALLELISM=false`.
 - Each trial writes its directory on the worker that ran it. `jobs_dir` must be storage that every
   worker shares for harbor's tools (`harbor view`, `harbor upload`, `harbor job resume`) to see the
   whole job.

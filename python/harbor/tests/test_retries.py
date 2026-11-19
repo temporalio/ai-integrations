@@ -209,6 +209,54 @@ def _recorded_types(outcome: TrialOutcome) -> set[str]:
 
 @on_posix
 @pytest.mark.parametrize(
+    ("make", "agent", "error"),
+    [
+        pytest.param(
+            partial(tasks.two_steps, ready=False),
+            AgentConfig(name="oracle"),
+            "HealthcheckError",
+            id="before-the-agent-started",
+        ),
+        pytest.param(
+            tasks.two_steps,
+            _failing("ApiOverloadedError"),
+            "ApiOverloadedError",
+            id="harbor-retries-it",
+        ),
+    ],
+)
+async def test_step_failure_is_returned(
+    harbor_client: Client,
+    tmp_path: Path,
+    make: Callable[[Path], Path],
+    agent: AgentConfig,
+    error: str,
+) -> None:
+    # Harbor retries a trial for the exception it records for the trial only.
+    config = _trial(make(tmp_path / "tasks"), tmp_path / "trials", "trial__0")
+    config.agent = agent
+    outcome, attempts, failures, retried = await _with_two_attempts(
+        harbor_client, config
+    )
+
+    assert outcome.result.exception_info is None
+    assert _recorded_types(outcome) == {error}
+    assert outcome.attempt == 1
+    assert attempts == [1]
+    assert failures == []
+    assert retried == []
+
+
+def _carried_outcome(failure: Failure, error: str) -> TrialOutcome:
+    info = failure.application_failure_info
+    assert info.type == error
+    assert not info.non_retryable
+    [details] = info.details.payloads
+    return TrialOutcome.model_validate_json(details.data)
+
+
+@on_posix
+@pytest.mark.parametrize(
     ("make", "environment", "error"),
     [
         pytest.param(
@@ -216,12 +264,6 @@ def _recorded_types(outcome: TrialOutcome) -> set[str]:
             tasks.UNSTARTABLE_ENV,
             "RuntimeError",
             id="environment-start",
-        ),
-        pytest.param(
-            partial(tasks.two_steps, ready=False),
-            tasks.LOCAL_ENV,
-            "HealthcheckError",
-            id="first-step-healthcheck",
         ),
     ],
 )
@@ -238,12 +280,16 @@ async def test_failure_before_the_agent_started_is_retried(
         harbor_client, config
     )
 
-    # The last attempt Temporal allows returns its result, as harbor does.
+    # The last attempt's outcome comes back, as harbor returns its last result.
     assert outcome.attempt == 2
     assert _recorded_types(outcome) == {error}
     assert attempts == [2]
-    assert failures == []
+    [last] = failures
+    assert _carried_outcome(last, error) == outcome
     [failure] = retried
+    # The server replaces an oversized failure with its own, the original as cause.
+    if failure.HasField("server_failure_info"):
+        failure = failure.cause
     assert failure.application_failure_info.type == error
     assert not failure.application_failure_info.non_retryable
 
@@ -253,7 +299,6 @@ async def test_failure_before_the_agent_started_is_retried(
     ("make", "error"),
     [
         pytest.param(tasks.passing, "ApiOverloadedError", id="ApiOverloadedError"),
-        pytest.param(tasks.two_steps, "ApiOverloadedError", id="steps"),
     ],
 )
 async def test_error_harbor_retries_is_retried(
@@ -268,13 +313,44 @@ async def test_error_harbor_retries_is_retried(
     assert outcome.attempt == 2
     assert _recorded_types(outcome) == {error}
     assert attempts == [2]
-    assert failures == []
+    [last] = failures
+    assert _carried_outcome(last, error) == outcome
+    assert not last.application_failure_info.HasField("next_retry_delay")
     [failure] = retried
+    # The server replaces an oversized failure with its own, the original as cause.
+    if failure.HasField("server_failure_info"):
+        failure = failure.cause
     info = failure.application_failure_info
     assert info.type == error
     assert not info.non_retryable
-    assert not info.HasField("next_retry_delay")
-    assert not failure.application_failure_info.details.payloads
+
+
+@on_posix
+@pytest.mark.parametrize(
+    ("error", "args"),
+    [
+        ("ApiOverloadedError", {"non_retryable_error_types": ["ApiOverloadedError"]}),
+        # The next attempt would wait 2 minutes.
+        ("ApiRateLimitError", {"schedule_to_close_timeout": timedelta(minutes=1)}),
+    ],
+    ids=["non-retryable-type", "schedule-to-close"],
+)
+async def test_outcome_comes_back_when_temporal_stops_retrying(
+    harbor_client: Client, tmp_path: Path, error: str, args: dict[str, object]
+) -> None:
+    config = _trial(
+        tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
+    )
+    config.agent = _failing(error)
+    outcome, attempts = await run_one(
+        harbor_client,
+        TrialArgs.model_validate({"config": config, "maximum_attempts": 3, **args}),
+    )
+
+    assert outcome.attempt == 1
+    assert outcome.result.exception_info is not None
+    assert outcome.result.exception_info.exception_type == error
+    assert attempts == [1]
 
 
 async def _awaiting_retry(handle: WorkflowHandle[Any, Any]) -> PendingActivityInfo:
