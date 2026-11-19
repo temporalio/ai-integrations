@@ -707,6 +707,9 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         it leaves the ``async with`` block: ``cleanup()`` called directly after
         a workflow cancellation raises it.
         """
+        await self._cleanup(cancelling=False)
+
+    async def _cleanup(self, *, cancelling: bool) -> None:
         if self._connect_handle:
             session = self._connect_handle
             coro = session.get_coro()
@@ -719,12 +722,10 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             try:
                 await session
             except asyncio.CancelledError:
-                if (
-                    not started
-                    or not session.cancelled()
-                    or _cancel_requests() > cancels
-                ):
+                if not session.cancelled() or _cancel_requests() > cancels:
                     raise
+                if not started or cancelling:
+                    return
                 # The block's last timer fired in the workflow task that
                 # brought the session's end, ahead of it, and cancelling the
                 # handle dropped the session's result.
@@ -744,6 +745,8 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
                     raise _session_ended_failure(session) from e
                 else:
                     raise
+            finally:
+                self._connect_handle = None
 
     async def __aenter__(self):
         await self.connect()
@@ -756,7 +759,9 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         traceback: TracebackType | None,
     ) -> None:
         try:
-            await self.cleanup()
+            await self._cleanup(
+                cancelling=exc_value is not None and is_cancelled_exception(exc_value)
+            )
         except ApplicationError:
             # A cancellation leaving the block wins over the session's failure.
             if exc_value is not None and is_cancelled_exception(exc_value):

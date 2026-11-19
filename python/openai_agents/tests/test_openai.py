@@ -5770,9 +5770,7 @@ class McpServerStatefulEmptyBlockWorkflow:
 
 
 async def test_stateful_mcp_server_empty_block(client: Client):
-    # The session activity never started, so leaving the block raises the bare
-    # CancelledError that earlier versions raise (#391), not a
-    # DedicatedWorkerFailure for a session that ended.
+    # An empty stateful_mcp_server block completes successfully (#391).
     provider = StatefulMCPServerProvider(
         "HelloServer", lambda _: get_tracking_server("HelloServer")
     )
@@ -5787,9 +5785,134 @@ async def test_stateful_mcp_server_empty_block(client: Client):
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=30),
             )
+            await handle.result()
+
+
+@workflow.defn
+class McpServerStatefulImmediateExceptionWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
+            raise ApplicationError("immediate failure", type="ImmediateError")
+
+
+async def test_stateful_mcp_server_immediate_exception(client: Client):
+    # An immediate exception propagates without being replaced by CancelledError (#391).
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, McpServerStatefulImmediateExceptionWorkflow
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulImmediateExceptionWorkflow.run,
+                id=f"mcp-server-immediate-exception-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
             with pytest.raises(WorkflowFailureError) as err:
                 await handle.result()
-            assert isinstance(err.value.cause, CancelledError)
+            assert isinstance(err.value.cause, ApplicationError)
+            assert err.value.cause.message == "immediate failure"
+            assert err.value.cause.type == "ImmediateError"
+
+
+@workflow.defn
+class McpServerStatefulCaughtExceptionWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        try:
+            async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
+                raise ValueError("immediate value error")
+        except ValueError as e:
+            return str(e)
+
+
+async def test_stateful_mcp_server_caught_exception(client: Client):
+    # A caught standard exception in the block propagates out of __aexit__ to the except handler (#391).
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, McpServerStatefulCaughtExceptionWorkflow
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulCaughtExceptionWorkflow.run,
+                id=f"mcp-server-caught-exception-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            assert await handle.result() == "immediate value error"
+
+
+@workflow.defn
+class McpServerStatefulEmptyThenActiveWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
+            pass
+        async with openai_agents.workflow.stateful_mcp_server("HelloServer") as server:
+            tools = await server.list_tools()
+            return [t.name for t in tools]
+
+
+async def test_stateful_mcp_server_empty_then_active(client: Client):
+    # An empty block completes cleanly and allows a subsequent block to connect (#391).
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, McpServerStatefulEmptyThenActiveWorkflow
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulEmptyThenActiveWorkflow.run,
+                id=f"mcp-server-empty-then-active-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            result = await handle.result()
+            assert "Say-Hello" in result
+
+
+@workflow.defn
+class McpServerStatefulDirectCleanupWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        server = openai_agents.workflow.stateful_mcp_server("HelloServer")
+        assert isinstance(server, _mcp._StatefulMCPServerReference)
+        await server.connect()
+        await server.cleanup()
+
+
+async def test_stateful_mcp_server_direct_cleanup(client: Client):
+    # Direct connect() followed immediately by cleanup() completes cleanly (#391).
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, McpServerStatefulDirectCleanupWorkflow) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulDirectCleanupWorkflow.run,
+                id=f"mcp-server-direct-cleanup-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            await handle.result()
 
 
 def test_sandbox_apply_patch_tool_round_trips_through_activity_input():
