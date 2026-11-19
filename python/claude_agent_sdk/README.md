@@ -69,25 +69,23 @@ each of these end to end.
 
 ## Checkpoint a session between Workers
 
-`SessionCheckpoint` is opt-in. Use it in an Activity on the Worker that owns
-the session after Claude Code has shut down. Give `checkpoint` the dedicated
-`CLAUDE_CONFIG_DIR`, the session ID, its working directory, and a storage
-callback. The callback receives a mapping of relative paths to native files and
-the previous storage key, if any. It returns an immutable key after it has
-saved the files. Persist the returned versioned reference and the native reply
-ID together.
+Call `session_files` in an Activity on the owning Worker after Claude Code has
+shut down. Give it the dedicated `CLAUDE_CONFIG_DIR`, the session ID, and its
+working directory. It returns a mapping of relative paths to native session
+files. Save those files with your storage backend and persist the confirmed
+checkpoint reference with the native session and reply IDs.
 
-On a replacement Worker, await `restore` in an Activity before connecting
-through `TemporalTransport`. Supply the saved reference, session and reply IDs,
-the matching working directory, a fresh staging directory, and a callback that
-materializes and verifies the stored files. Activate staging at the intended
-`CLAUDE_CONFIG_DIR`, then reconnect with `resume` and `resume_session_at`.
-The restore uses a checkpoint-scoped `SessionStore` to load the main and
-subagent transcripts. The native JSONL remains the only persisted transcript.
+On a replacement Worker, unpack and verify the archived files in a fresh staging
+directory. Await `restore_session` there before connecting through
+`TemporalTransport`. The hook reads the main and subagent transcripts through a
+checkpoint-scoped `SessionStore`, checks the saved reply, and removes unselected
+files from staging. The native JSONL bytes stay intact. Activate the confirmed
+staging directory at `CLAUDE_CONFIG_DIR`, then use `resume` and
+`resume_session_at` to reconnect.
 
-Main and subagent transcripts and subagent metadata are required when present.
-A worker-side `include_optional(relative_path, kind, size)` predicate can omit
-`tool-result` files. The policy has no access to authentication, settings,
-skills, diagnostic logs, or locks. Callbacks and file contents stay on the
-Worker. Keep each in-flight restore in a separate staging directory and
-activate only the confirmed attempt.
+The main and subagent transcripts and subagent metadata are required when
+present. Both functions accept a worker-side
+`include_optional(relative_path, kind, size)` predicate for `tool-result` files.
+Authentication, settings, skills, diagnostic logs, and process locks are outside
+the eligible set. Only the reference and resume IDs need to cross into the
+Workflow.
