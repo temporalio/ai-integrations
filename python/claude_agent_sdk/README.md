@@ -66,3 +66,28 @@ covers:
 
 The [samples](https://github.com/temporalio/samples-python/tree/main/claude_agent_sdk_plugin) show
 each of these end to end.
+
+## Checkpoint a session between Workers
+
+`SessionCheckpoint` is opt-in. Use it in an Activity on the Worker that owns
+the session after Claude Code has shut down. Give `checkpoint` the dedicated
+`CLAUDE_CONFIG_DIR`, the session ID, its working directory, and a storage
+callback. The callback receives a mapping of relative paths to native files and
+the previous storage key, if any. It returns an immutable key after it has
+saved the files. Persist the returned versioned reference and the native reply
+ID together.
+
+On a replacement Worker, await `restore` in an Activity before connecting
+through `TemporalTransport`. Supply the saved reference, session and reply IDs,
+the matching working directory, a fresh staging directory, and a callback that
+materializes and verifies the stored files. Activate staging at the intended
+`CLAUDE_CONFIG_DIR`, then reconnect with `resume` and `resume_session_at`.
+The restore uses a checkpoint-scoped `SessionStore` to load the main and
+subagent transcripts. The native JSONL remains the only persisted transcript.
+
+Main and subagent transcripts and subagent metadata are required when present.
+A worker-side `include_optional(relative_path, kind, size)` predicate can omit
+`tool-result` files. The policy has no access to authentication, settings,
+skills, diagnostic logs, or locks. Callbacks and file contents stay on the
+Worker. Keep each in-flight restore in a separate staging directory and
+activate only the confirmed attempt.

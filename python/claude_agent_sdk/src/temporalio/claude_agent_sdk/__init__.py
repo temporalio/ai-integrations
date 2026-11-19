@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from temporalio.claude_agent_sdk._checkpoint import SessionCheckpoint
 from temporalio.claude_agent_sdk._plugin import ClaudeAgentSDKPlugin
 from temporalio.claude_agent_sdk._subprocess import SubprocessConnector
 from temporalio.claude_agent_sdk._transport import TemporalTransport
@@ -14,6 +15,7 @@ from temporalio.claude_agent_sdk._types import (
 )
 
 __all__ = [
+    "SessionCheckpoint",
     "ClaudeAgentSDKPlugin",
     "ClaudeCodeProcess",
     "Connector",
