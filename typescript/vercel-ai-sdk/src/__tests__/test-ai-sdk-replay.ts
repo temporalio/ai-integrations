@@ -1,14 +1,42 @@
-import { helpers } from '@temporalio/test-helpers';
+import path from 'node:path';
+import { helpers, loadHistory } from '@temporalio/test-helpers';
 import { Worker as CoreWorker } from '@temporalio/worker';
 import { AiSdkPlugin } from '..';
 import { getWeather } from './activities/ai-sdk';
 import { makeAiSdkTestFunction } from './helpers/ai-sdk';
 import { createTestMcpClient } from './helpers/mcp';
 import type { ModelResponse } from './stubs/ai-sdk';
-import { TestProvider, textResponse, toolCallResponse, toolsWorkflowGenerator } from './stubs/ai-sdk';
+import {
+  helloWorkflowGenerator,
+  TestProvider,
+  textResponse,
+  toolCallResponse,
+  toolsWorkflowGenerator,
+} from './stubs/ai-sdk';
 import { mcpWorkflow, toolsWorkflow } from './workflows/ai-sdk';
 
 const test = makeAiSdkTestFunction();
+
+// Replay is promised only within a major (see AGENTS.md), so only the histories
+// in the current major's folder replay.
+const REPLAY_MAJOR = 2;
+const histories = path.resolve(__dirname, '../../src/__tests__/histories', `${REPLAY_MAJOR}.x`);
+
+test('A history whose reasoning metadata the Workflow never saw still replays', async (t) => {
+  // Recorded with `reasoningMetadataTimerWorkflow` on main at 624a3d0. The model sent
+  // provider metadata on `reasoning-end`, so the Activity result holds it, but the Workflow
+  // replayed the block with none and started no timer.
+  const history = await loadHistory(path.join(histories, 'reasoning-metadata-on-end-624a3d0.json'));
+  await t.notThrowsAsync(
+    CoreWorker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) })],
+      },
+      history
+    )
+  );
+});
 
 test('Captured multi-step tools history replays deterministically', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);

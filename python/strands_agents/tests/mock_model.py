@@ -5,7 +5,6 @@ from collections.abc import AsyncIterable
 from typing import Any
 
 from strands.models import Model
-from strands.types.event_loop import StopReason
 from strands.types.streaming import StreamEvent
 
 
@@ -16,14 +15,8 @@ class MockModel(Model):
     yields a text turn; a ``dict`` of ``{name, input}`` yields a tool-use turn.
     """
 
-    def __init__(
-        self,
-        responses: list[str | dict[str, Any]],
-        *,
-        stop_reason: StopReason = "end_turn",
-    ) -> None:
+    def __init__(self, responses: list[str | dict[str, Any]]) -> None:
         self._responses = list(responses)
-        self._stop_reason: StopReason = stop_reason
         self._tool_call_index = 0
 
     def update_config(self, **_model_config: Any) -> None:
@@ -45,7 +38,7 @@ class MockModel(Model):
         if isinstance(response, str):
             yield {"contentBlockDelta": {"delta": {"text": response}}}
             yield {"contentBlockStop": {}}
-            yield {"messageStop": {"stopReason": self._stop_reason}}
+            yield {"messageStop": {"stopReason": "end_turn"}}
         else:
             self._tool_call_index += 1
             yield {

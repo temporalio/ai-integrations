@@ -808,3 +808,91 @@ async def test_cancelling_one_mcp_caller_leaves_the_other_waiting() -> None:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         await _mcp._evict_connection(server)
+
+
+async def test_mcp_failure_after_connect_reported_and_creates_fresh_connection() -> (
+    None
+):
+    """A failure after connect is preserved on record, raised by session(), and unhandled task is not logged."""
+    import anyio
+
+    from temporalio.google_genai import _mcp
+
+    server = f"post-connect-err-{uuid4()}"
+    err = RuntimeError("MCP connection lost after handshake")
+    ready = asyncio.Event()
+    trigger_fail = asyncio.Event()
+    session_obj = object()
+    fresh_session = object()
+    owner_task_id: int | None = None
+    opens = 0
+
+    @asynccontextmanager
+    async def controllable_factory() -> AsyncGenerator[Any, None]:
+        nonlocal owner_task_id, opens
+        opens += 1
+        if opens > 1:
+            yield fresh_session
+            return
+        owner_task_id = id(asyncio.current_task())
+        try:
+            async with anyio.create_task_group() as tg:
+
+                async def failer() -> None:
+                    await trigger_fail.wait()
+                    raise err
+
+                tg.start_soon(failer)
+                ready.set()
+                yield session_obj
+        except* RuntimeError:
+            raise err
+
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+
+    def report(_: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if id(context.get("task", context.get("future"))) == owner_task_id:
+            reported.append(context)
+        elif previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(report)
+
+    try:
+        # 1. Create connection and allow it to become ready successfully
+        conn, record = await _mcp.get_connection(
+            server, controllable_factory, timedelta(minutes=5)
+        )
+        assert conn is session_obj
+        record.release()
+
+        # 2. Trigger an exception after the session has been established
+        trigger_fail.set()
+        await asyncio.wait([record._owner])
+        assert record._owner.exception() is None
+
+        # 3. Verify that the existing connection record reports the original exception when session() is called again
+        with pytest.raises(RuntimeError) as exc_info:
+            await record.session()
+        assert exc_info.value is err
+
+        # 4. Verify that a subsequent connection attempt creates a fresh connection
+        fresh_conn, fresh_record = await _mcp.get_connection(
+            server, controllable_factory, timedelta(minutes=5)
+        )
+        assert fresh_conn is fresh_session
+        assert fresh_record is not record
+        fresh_record.release()
+
+        # 5. Verify that no Task exception was never retrieved warning is emitted
+        del exc_info, err, record
+        await asyncio.sleep(0)
+        gc.collect()
+        assert reported == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+        await _mcp._evict_connection(server)

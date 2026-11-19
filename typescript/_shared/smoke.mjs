@@ -13,7 +13,7 @@ const registryVersion = process.env.NPM_REGISTRY_VERSION;
 const dependencies = [registryVersion ? `${pkg.name}@${registryVersion}` : tarball];
 if (existsSync(workflowSmoke)) {
   for (const dependency of ['@temporalio/worker', '@temporalio/testing']) {
-    dependencies.push(`${dependency}@${pkg.devDependencies[dependency]}`);
+    dependencies.push(`${dependency}@${pkg.dependencies[dependency] ?? pkg.devDependencies[dependency]}`);
   }
 }
 const consumer = mkdtempSync(join(tmpdir(), 'temporal-plugin-smoke-'));

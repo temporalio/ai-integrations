@@ -121,6 +121,7 @@ class _ConnectionRecord:
         self._ready: asyncio.Future[ClientSession] = loop.create_future()
         self._idle_handle: asyncio.TimerHandle | None = None
         self._inflight = 0
+        self._failure: BaseException | None = None
         self._owner = asyncio.create_task(self._run(factory))
 
     async def _run(self, factory: McpSessionFactory) -> None:
@@ -145,12 +146,16 @@ class _ConnectionRecord:
             # Only drop our own entry: a newer record may already own the key.
             if _CONNECTIONS.get(self._server) is self:
                 del _CONNECTIONS[self._server]
-            if self._ready.done():
-                raise
-            self._ready.set_exception(err)
-            # The waiting calls get the error through ``_ready``. Nobody awaits
-            # this task once its record is dropped, so raising the error here
-            # too would only make asyncio log it as never retrieved.
+            if self._idle_handle is not None:
+                self._idle_handle.cancel()
+                self._idle_handle = None
+            if not self._ready.done():
+                self._ready.set_exception(err)
+            else:
+                self._failure = err
+            # The waiting calls get the error through ``_ready`` or ``session()``.
+            # Nobody awaits this task once its record is dropped, so raising
+            # the error here too would only make asyncio log it as never retrieved.
             # Cancellation and interpreter exits still propagate.
             if not isinstance(err, Exception):
                 raise
@@ -200,7 +205,10 @@ class _ConnectionRecord:
         The wait is shielded. Cancelling this caller must not cancel the shared
         connect future, or any other caller waiting on the same connection.
         """
-        return await asyncio.shield(self._ready)
+        session = await asyncio.shield(self._ready)
+        if self._failure is not None:
+            raise self._failure
+        return session
 
 
 async def get_connection(

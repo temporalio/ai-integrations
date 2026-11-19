@@ -3,6 +3,7 @@ import type {
   EmbeddingModelV4,
   ImageModelV4,
   LanguageModelV4,
+  LanguageModelV4CallOptions,
   LanguageModelV4GenerateResult,
   LanguageModelV4StreamPart,
   LanguageModelV4StreamResult,
@@ -30,6 +31,7 @@ import {
   helloWorldAgent,
   middlewareWorkflow,
   streamingMetadataWorkflow,
+  streamingToolsWorkflow,
   toolsWorkflow,
 } from './workflows/ai-sdk';
 import EventType = temporal.api.enums.v1.EventType;
@@ -112,6 +114,7 @@ test('Tools workflow can use AI tools', async (t) => {
 
 class StreamingTestProvider implements ProviderV4 {
   readonly specificationVersion = 'v4';
+  readonly calls: LanguageModelV4CallOptions[] = [];
 
   constructor(
     private readonly parts: LanguageModelV4StreamPart[],
@@ -119,7 +122,7 @@ class StreamingTestProvider implements ProviderV4 {
   ) {}
 
   languageModel(_modelId: string): LanguageModelV4 {
-    const { parts, response } = this;
+    const { calls, parts, response } = this;
     return {
       specificationVersion: 'v4',
       provider: 'temporal-test',
@@ -128,7 +131,8 @@ class StreamingTestProvider implements ProviderV4 {
       async doGenerate(): Promise<LanguageModelV4GenerateResult> {
         throw new Error('Generate not supported.');
       },
-      async doStream(): Promise<LanguageModelV4StreamResult> {
+      async doStream(options): Promise<LanguageModelV4StreamResult> {
+        calls.push(options);
         return {
           stream: new ReadableStream({
             start(controller) {
@@ -151,8 +155,9 @@ class StreamingTestProvider implements ProviderV4 {
   }
 }
 
-test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {
+test('Streaming text, reasoning, finish and response metadata survive activity execution and workflow replay', async (t) => {
   const providerMetadata = { test: { source: 'delta' } };
+  const reasoningMetadata = { test: { signature: 'signed' } };
   const finishMetadata = { test: { cachedTokens: 7 } };
   const responseMetadata = { id: 'response-1', modelId: 'test-model', timestamp: new Date('2026-01-01T00:00:00Z') };
   const provider = new StreamingTestProvider([
@@ -161,6 +166,10 @@ test('Streaming text, finish and response metadata survive activity execution an
     { type: 'text-start', id: 'provider-part' },
     { type: 'text-delta', id: 'provider-part', delta: 'hello', providerMetadata },
     { type: 'text-end', id: 'provider-part' },
+    { type: 'reasoning-start', id: 'provider-reasoning' },
+    { type: 'reasoning-delta', id: 'provider-reasoning', delta: 'thinking' },
+    { type: 'reasoning-delta', id: 'provider-reasoning', delta: '', providerMetadata: reasoningMetadata },
+    { type: 'reasoning-end', id: 'provider-reasoning' },
     { type: 'finish', finishReason: createFinishReason('stop'), usage: createUsage(), providerMetadata: finishMetadata },
   ]);
   const { createWorker, executeWorkflow } = helpers(t);
@@ -177,6 +186,9 @@ test('Streaming text, finish and response metadata survive activity execution an
       { type: 'text-start', id: 'part-0', providerMetadata },
       { type: 'text-delta', id: 'part-0', delta: 'hello' },
       { type: 'text-end', id: 'part-0' },
+      { type: 'reasoning-start', id: 'part-1', providerMetadata: reasoningMetadata },
+      { type: 'reasoning-delta', id: 'part-1', delta: 'thinking' },
+      { type: 'reasoning-end', id: 'part-1' },
       {
         type: 'finish',
         providerMetadata: finishMetadata,
@@ -185,6 +197,32 @@ test('Streaming text, finish and response metadata survive activity execution an
       },
     ]);
   });
+});
+
+test('Streaming reasoning metadata reaches the next model call after a tool runs', async (t) => {
+  const reasoningMetadata = { test: { signature: 'signed' } };
+  // The model answers every call with the same reasoning block and tool call.
+  const provider = new StreamingTestProvider([
+    { type: 'stream-start', warnings: [] },
+    { type: 'reasoning-start', id: 'provider-reasoning' },
+    { type: 'reasoning-delta', id: 'provider-reasoning', delta: 'thinking' },
+    { type: 'reasoning-delta', id: 'provider-reasoning', delta: '', providerMetadata: reasoningMetadata },
+    { type: 'reasoning-end', id: 'provider-reasoning' },
+    { type: 'tool-call', toolCallId: 'call-1', toolName: 'getWeather', input: '{"location":"Tokyo"}' },
+    { type: 'finish', finishReason: createFinishReason('tool-calls'), usage: createUsage() },
+  ]);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider })],
+    activities: { getWeather },
+  });
+
+  await worker.runUntil(async () => {
+    t.is(await executeWorkflow(streamingToolsWorkflow, { workflowExecutionTimeout: '10 seconds' }), 2);
+  });
+
+  const assistant = provider.calls[1]?.prompt.find((message) => message.role === 'assistant');
+  t.deepEqual(assistant?.content[0], { type: 'reasoning', text: 'thinking', providerOptions: reasoningMetadata });
 });
 
 test('Streaming drops an invalid timestamp and keeps a response metadata part', async (t) => {

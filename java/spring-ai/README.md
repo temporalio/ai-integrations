@@ -47,6 +47,35 @@ definitions and execute only in the workflow. Retry, per-model Activity options,
 response metadata, and media-size guards retain their behavior. Optional vector-store,
 embedding, and MCP modules are detected through Spring auto-configuration.
 
+## Structured output
+
+`entity(...)` and `responseEntity(...)` convert the model's answer in workflow code,
+after the model Activity has completed. When the answer doesn't match the target
+type, Spring AI's `BeanOutputConverter` throws a Jackson
+`tools.jackson.core.JacksonException`. If the workflow doesn't handle it, the
+workflow task fails and is retried, but the model's answer is already in the
+history, so every retry fails the same way and the workflow stays running.
+
+Catch the exception around the call, for example to ask the model again or return
+a fallback, or make it fail the workflow so a workflow retry policy can start
+another run:
+
+```java
+import io.temporal.worker.WorkflowImplementationOptions;
+import tools.jackson.core.JacksonException;
+
+WorkflowImplementationOptions options =
+    WorkflowImplementationOptions.newBuilder()
+        .setFailWorkflowExceptionTypes(JacksonException.class)
+        .build();
+worker.registerWorkflowImplementationTypes(options, MyWorkflowImpl.class);
+```
+
+This setting also makes an uncaught conversion error fail an Update when it
+occurs in the Update handler. To make a conversion failure non-retryable,
+catch `JacksonException` around the entity call and throw the exception
+returned by `ApplicationFailure.newNonRetryableFailure(...)`.
+
 ## Provider retries
 
 For OpenAI chat Activities, native OpenAI HTTP errors retain their status, error
@@ -78,33 +107,6 @@ on a workflow prompt does not disable retries on an existing client. Keep a
 separate model/client if calls outside Temporal need SDK retries. Without this
 configuration, Spring AI 2.0.1's three internal OpenAI retries can produce twelve
 requests across the default three Activity attempts.
-
-## Structured output failures
-
-Spring AI converts `call().entity(...)` and `call().responseEntity(...)` results
-on the Workflow thread. With the built-in bean converter, invalid JSON or a
-JSON value that cannot be mapped to the target type raises a Jackson 3
-`tools.jackson.core.JacksonException`, which Workflow code can catch.
-
-To make an uncaught conversion error fail the Workflow or Update, register the
-exception type on the affected Workflow implementation. The default Temporal
-policy retries the Workflow Task and reuses the recorded model response.
-
-```java
-import io.temporal.worker.WorkflowImplementationOptions;
-import tools.jackson.core.JacksonException;
-
-worker.registerWorkflowImplementationTypes(
-    WorkflowImplementationOptions.newBuilder()
-        .setFailWorkflowExceptionTypes(JacksonException.class)
-        .build(),
-    AnswerWorkflowImpl.class);
-```
-
-This setting applies to all uncaught Jackson exceptions in that implementation.
-A Workflow retry policy can still retry the entire Workflow. For a non-retryable
-failure, catch `JacksonException` around the entity call and throw the exception
-returned by `ApplicationFailure.newNonRetryableFailure(...)`.
 
 ## Development
 
