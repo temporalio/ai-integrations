@@ -9,6 +9,9 @@ export const MCP_STATELESS_SUFFIX = '-stateless';
 /** Error type for dedicated-Worker scheduling and heartbeat failures. */
 export const DEDICATED_WORKER_FAILURE_TYPE = 'DedicatedWorkerFailure';
 
+/** Error type for a JSON-RPC error response from an MCP server that a retry cannot fix. */
+export const MCP_PROTOCOL_ERROR_TYPE = 'MCPProtocolError';
+
 /** Error type for a callable `toolFilter` on the server the factory returns, which the Worker refuses. */
 export const TOOL_FILTER_UNSUPPORTED_TYPE = 'MCPToolFilterUnsupported';
 
