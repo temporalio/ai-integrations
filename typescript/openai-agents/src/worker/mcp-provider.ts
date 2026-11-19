@@ -34,6 +34,9 @@ export function assertMCPServer(name: string, server: unknown): asserts server i
   // `types.isPromise` excludes proxies and also accepts Promises from another realm. The handler is
   // attached with the built-in `then`, so an overridden `catch` or a throwing `then` getter on a
   // native Promise cannot bypass the non-retryable error either.
+  // Known limit: `then` reads `constructor[Symbol.species]`, so a rejecting Promise subclass with a
+  // throwing `Symbol.species` getter still leaves its original rejection unhandled; the Activity
+  // fails with the non-retryable error, but Node may then exit on that unhandled rejection.
   if (types.isPromise(server)) {
     try {
       void Promise.prototype.then.call(server, undefined, () => undefined);
