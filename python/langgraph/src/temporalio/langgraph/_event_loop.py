@@ -1,11 +1,13 @@
-"""Schedule LangChain's same-loop stream writes without allowing thread hops."""
+"""Adapt LangChain stream scheduling and trace IDs for Workflow replay."""
 
 from __future__ import annotations
 
 import asyncio
 import contextvars
 from collections.abc import Callable
+from random import Random
 from typing import Any
+from uuid import UUID
 
 from temporalio import workflow
 
@@ -40,3 +42,36 @@ def enable_workflow_streams() -> None:
 
     setattr(loop, "call_soon_threadsafe", schedule)
     setattr(loop, "_temporal_langchain_streams", True)
+
+
+_RUN_IDS_PATCH = "langchain-replay-stable-run-ids"
+
+
+def install_workflow_run_ids() -> None:
+    """Give LangChain's root and child trace runs replay-stable IDs in Workflows."""
+    from langchain_core.callbacks import manager
+    from langchain_core.tracers import event_stream
+
+    # The event streamer creates the root ID; callback managers create child IDs.
+    # Both modules import the public UUID helper by value.
+    for module in (manager, event_stream):
+        if not getattr(module.uuid7, "_temporal_langchain_run_ids", False):
+            setattr(module, "uuid7", _workflow_uuid_generator(module.uuid7))
+
+
+def _workflow_uuid_generator(
+    original: Callable[[int | None], UUID],
+) -> Callable[[int | None], UUID]:
+    def generate(nanoseconds: int | None = None) -> UUID:
+        if not workflow.in_workflow() or not workflow.patched(_RUN_IDS_PATCH):
+            return original(nanoseconds)
+        loop = asyncio.get_running_loop()
+        random: Random | None = getattr(loop, "_temporal_langchain_run_id_random", None)
+        if random is None:
+            # A separate named stream does not consume application randomness.
+            random = workflow.new_random("langchain-stream-run-ids")
+            setattr(loop, "_temporal_langchain_run_id_random", random)
+        return UUID(int=random.getrandbits(128), version=4)
+
+    setattr(generate, "_temporal_langchain_run_ids", True)
+    return generate

@@ -556,6 +556,12 @@ The plugin schedules stream callbacks only from the same Workflow event loop;
 cross-thread callbacks remain unsupported. Existing histories retain their
 previous behavior through the `langchain-same-loop-streams` patch.
 
+The shim is also installed before Signal-With-Start and Update-With-Start handlers
+run. Generated event `run_id` and `parent_ids` are replay-stable in Workflows;
+Activities and ordinary clients retain LangChain's native IDs. This uses the
+separate `langchain-replay-stable-run-ids` patch, so existing histories retain
+their original ID generation. Explicitly supplied run IDs are preserved.
+
 Subscribers read the topic with `WorkflowStreamClient`; each item is an
 `AIMessageChunk` in `langchain_core.load.dumpd` form:
 

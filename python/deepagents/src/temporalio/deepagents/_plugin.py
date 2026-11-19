@@ -226,8 +226,8 @@ class DeepAgentsPlugin(SimplePlugin):
         rewrites ``model=`` strings when running inside a workflow, so it is inert
         on plain clients / activity workers. Determinism itself
         rides on the same mechanism ``temporalio.langgraph`` uses — the loop is
-        in-workflow and every nondeterministic call is an activity — so no
-        speculative time/uuid shims are installed here.
+        in-workflow and model/tool calls are activities. The streaming interceptor
+        separately makes LangChain's trace IDs deterministic for Workflow replay.
 
         One shim *is* required: LangChain's ``create_agent`` factory wraps every
         model node with LangSmith's ``@traceable``, whose async path hops onto a

@@ -4,11 +4,15 @@ import asyncio
 import contextvars
 import threading
 from typing import Any
+from uuid import UUID
 
 import pytest
 
 from temporalio import workflow
-from temporalio.langgraph._event_loop import enable_workflow_streams
+from temporalio.langgraph._event_loop import (
+    _workflow_uuid_generator,
+    enable_workflow_streams,
+)
 
 
 async def test_stream_callbacks_stay_on_the_workflow_loop(
@@ -50,3 +54,20 @@ async def test_stream_callbacks_stay_on_the_workflow_loop(
         monkeypatch.undo()
         if hasattr(loop, "_temporal_langchain_streams"):
             delattr(loop, "_temporal_langchain_streams")
+
+
+@pytest.mark.parametrize("in_workflow", [False, True])
+def test_run_ids_preserve_native_behavior_without_patch(
+    monkeypatch: pytest.MonkeyPatch, in_workflow: bool
+) -> None:
+    monkeypatch.setattr(workflow, "in_workflow", lambda: in_workflow)
+    monkeypatch.setattr(workflow, "patched", lambda _: False)
+    calls: list[int | None] = []
+
+    def original(nanoseconds: int | None = None) -> UUID:
+        calls.append(nanoseconds)
+        return UUID(int=17)
+
+    generate = _workflow_uuid_generator(original)
+    assert generate(123) == UUID(int=17)
+    assert calls == [123]
