@@ -32,20 +32,22 @@ from contextvars import ContextVar
 from datetime import timedelta
 from typing import Any
 
-from langchain_core.callbacks import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
-)
-from langchain_core.exceptions import ContextOverflowError
-from langchain_core.language_models import BaseChatModel, LanguageModelInput
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import RunnableConfig
-from langchain_core.runnables.config import ensure_config
-
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
 from temporalio.exceptions import ActivityError, ApplicationError
+
+with workflow.unsafe.imports_passed_through():
+    from langchain_core.callbacks import (
+        AsyncCallbackManagerForLLMRun,
+        CallbackManagerForLLMRun,
+    )
+    from langchain_core.exceptions import ContextOverflowError
+    from langchain_core.language_models import BaseChatModel, LanguageModelInput
+    from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+    from langchain_core.runnables import RunnableConfig
+    from langchain_core.runnables.config import ensure_config
+
 
 # BaseChatModel consumes RunnableConfig before its generation hooks run. Keep
 # only the portable subset for this invocation, including concurrent calls.

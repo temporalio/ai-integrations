@@ -464,8 +464,9 @@ async def test_identical_op_reruns_across_continue_as_new(
 # also keeps the agent's files in graph state.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-from langchain.agents.middleware import TodoListMiddleware
-from langchain_core.messages import AIMessage
+with workflow.unsafe.imports_passed_through():
+    from langchain.agents.middleware import TodoListMiddleware
+    from langchain_core.messages import AIMessage
 
 from temporalio.deepagents.testing import mock_model_provider
 
@@ -501,9 +502,7 @@ class RealAgentCanWorkflow:
     ) -> list[list[Any]]:
         # deepagents 0.7 leaves todos out of the default stack; add them so the
         # driver sees pending work.
-        agent = create_deep_agent(
-            name="test-agent", model="fake:model", middleware=[TodoListMiddleware()]
-        )
+        agent = create_deep_agent(model="fake:model", middleware=[TodoListMiddleware()])
         result = await run_deep_agent(
             agent,
             input,
@@ -637,9 +636,7 @@ FILES_RESPONSES: list[Any] = [
 class FilesCanWorkflow:
     @workflow.run
     async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
-        agent = create_deep_agent(
-            name="test-agent", model="fake:model", middleware=[TodoListMiddleware()]
-        )
+        agent = create_deep_agent(model="fake:model", middleware=[TodoListMiddleware()])
         result = await run_deep_agent(
             agent,
             input,

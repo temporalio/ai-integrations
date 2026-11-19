@@ -502,10 +502,11 @@ def create_temporal_deep_agent(
     ``model_activity_options``); use this wrapper to scope activity options
     to one agent instead of configuring them plugin-wide.
     """
-    # importlib keeps this resolution absolute: a static
-    # `import deepagents` from inside this same-named package directory
-    # is flagged as implicitly relative.
-    deepagents_mod: Any = importlib.import_module("deepagents")
+    with workflow.unsafe.imports_passed_through():
+        # importlib keeps this resolution absolute: a static
+        # `import deepagents` from inside this same-named package directory
+        # is flagged as implicitly relative.
+        deepagents_mod: Any = importlib.import_module("deepagents")
 
     from temporalio.deepagents._model import TemporalModel
 

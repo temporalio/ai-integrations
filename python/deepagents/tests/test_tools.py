@@ -28,14 +28,6 @@ pytest.importorskip("langchain_core")
 from temporalio import activity, workflow  # noqa: E402
 from temporalio.client import WorkflowHistory  # noqa: E402
 from temporalio.common import RetryPolicy  # noqa: E402
-from temporalio.deepagents import (  # noqa: E402
-    DeepAgentsPlugin,
-    activity_as_tool,
-    run_deep_agent,
-    tool_as_activity,
-)
-from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
-from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
 from temporalio.worker import Replayer, Worker  # noqa: E402
 from temporalio.workflow import ActivityConfig  # noqa: E402
 from tests.helpers.deepagents import (  # noqa: E402
@@ -44,6 +36,14 @@ from tests.helpers.deepagents import (  # noqa: E402
 )
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio.deepagents import (  # noqa: E402
+        DeepAgentsPlugin,
+        activity_as_tool,
+        run_deep_agent,
+        tool_as_activity,
+    )
+    from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
+    from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
     from temporalio.worker.workflow_sandbox import (  # noqa: E402
         RestrictedWorkflowAccessError,
     )
@@ -678,8 +678,9 @@ class RepeatedToolCallWorkflow:
 class InjectedStateToolWorkflow:
     @workflow.run
     async def run(self, question: str) -> list[str]:
-        from langchain_core.documents import Document
-        from langchain_core.messages import AIMessage, ChatMessage, FunctionMessage
+        with workflow.unsafe.imports_passed_through():
+            from langchain_core.documents import Document
+            from langchain_core.messages import AIMessage, ChatMessage, FunctionMessage
 
         wrapped = (
             last_user_message,

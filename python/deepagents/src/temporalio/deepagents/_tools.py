@@ -414,7 +414,8 @@ def activity_as_tool(
             ``args``; or if it sets neither a start-to-close nor a
             schedule-to-close timeout.
     """
-    from langchain_core.tools import StructuredTool
+    with workflow.unsafe.imports_passed_through():
+        from langchain_core.tools import StructuredTool
 
     defn = activity_mod._Definition.from_callable(activity)
     if defn is None:
@@ -517,8 +518,9 @@ def tool_as_activity(
     restrictions. Registration inside a workflow alone does not make the tool
     available in another worker process.
     """
-    from langchain_core.runnables.config import ensure_config
-    from langchain_core.tools import BaseTool, StructuredTool
+    with workflow.unsafe.imports_passed_through():
+        from langchain_core.runnables.config import ensure_config
+        from langchain_core.tools import BaseTool, StructuredTool
 
     base_tool: BaseTool
     if isinstance(tool, BaseTool):
@@ -563,7 +565,8 @@ def tool_as_activity(
             **opts,
         )
         message = _serde.load_object(output.message)
-        from langchain_core.messages import ToolMessage
+        with workflow.unsafe.imports_passed_through():
+            from langchain_core.messages import ToolMessage
 
         if isinstance(message, ToolMessage) and call_id is None:
             # Native calls with bare arguments return content, while calls
