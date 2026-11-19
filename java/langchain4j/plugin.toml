@@ -6,7 +6,7 @@ language = "java"
 coordinate = "io.temporal:langchain4j"
 registry = "maven"
 root-api = "io.temporal.langchain4j"
-maturity = "public-preview"
+maturity = "pre-release"
 docs = "https://github.com/temporalio/ai-integrations/tree/main/java/langchain4j"
 
 [ci]

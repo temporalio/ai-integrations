@@ -4,7 +4,7 @@ plugins {
     id 'com.diffplug.spotless' version '7.0.2'
 }
 
-description = 'Temporal LangChain4j integration (Public Preview)'
+description = 'Temporal LangChain4j integration (Pre-release)'
 def latestDependencies = providers.gradleProperty('dependencyMode').getOrElse('locked') == 'latest'
 ext {
     javaRelease = 17

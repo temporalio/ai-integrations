@@ -3,9 +3,13 @@ package io.temporal.langchain4j.internal;
 import dev.langchain4j.exception.NonRetriableException;
 import io.temporal.failure.ApplicationFailure;
 import javax.annotation.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Classifies chat model failures for the activity's retry policy. */
 public final class Failures {
+
+  private static final Logger log = LoggerFactory.getLogger(Failures.class);
 
   /** The failure type of a chat model error. */
   public static final String MODEL_ERROR = "LangChain4jModelError";
@@ -21,12 +25,16 @@ public final class Failures {
    * retry policy decides for everything else.
    */
   public static ApplicationFailure modelFailure(String model, Throwable cause) {
-    String detail = cause.getMessage() != null ? cause.getMessage() : cause.toString();
-    String message = "Chat model " + model + " failed: " + detail;
+    // The provider's message, stack trace and causes can hold request data, such as the prompt or
+    // an
+    // API key in a URL, so they stay in the worker log; the history records only the exception
+    // type.
+    log.warn("Chat model {} failed", model, cause);
+    String message = "Chat model " + model + " failed with " + cause.getClass().getName();
     if (findNonRetriable(cause) != null) {
-      return ApplicationFailure.newNonRetryableFailureWithCause(message, MODEL_ERROR, cause);
+      return ApplicationFailure.newNonRetryableFailure(message, MODEL_ERROR);
     }
-    return ApplicationFailure.newFailureWithCause(message, MODEL_ERROR, cause);
+    return ApplicationFailure.newFailure(message, MODEL_ERROR);
   }
 
   @Nullable

@@ -2,8 +2,10 @@ package io.temporal.langchain4j;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -323,6 +325,10 @@ class ChatWorkflowTest {
     assertEquals(Failures.MODEL_ERROR, cause.getType());
     assertTrue(cause.isNonRetryable());
     assertEquals(1, calls.get());
+    // The provider's message stays out of the workflow history.
+    assertTrue(cause.getOriginalMessage().contains(AuthenticationException.class.getName()));
+    assertFalse(cause.getOriginalMessage().contains("Invalid API key"));
+    assertNull(cause.getCause());
   }
 
   @Test

@@ -1,6 +1,6 @@
 # Temporal LangChain4j
 
-Public Preview integration between [LangChain4j](https://github.com/langchain4j/langchain4j) and
+Pre-release integration between [LangChain4j](https://github.com/langchain4j/langchain4j) and
 Temporal. A LangChain4j AI Service built inside a Temporal workflow runs every model call as a
 Temporal Activity, so a run survives worker restarts, retries failed calls, and replays
 deterministically instead of calling the model again.
@@ -18,7 +18,7 @@ Java 17.
   it in; your application supplies it.
 
 ```groovy
-implementation 'io.temporal:langchain4j:0.1.0'
+implementation 'io.temporal:langchain4j:0.0.1'
 implementation 'io.temporal:temporal-sdk:1.40.0'
 implementation 'dev.langchain4j:langchain4j:1.23.0'
 ```
@@ -127,7 +127,7 @@ Temporal's payload size limit. Prefer image URLs over base64 data, and bound the
 A provider error that LangChain4j marks as final (a `NonRetriableException`, such as
 `AuthenticationException` or `InvalidRequestException`) fails the Activity without retries. The
 Activity's retry policy decides for every other error, such as `RateLimitException`. The failure
-type is `LangChain4jModelError`. A workflow that names a model the worker doesn't serve fails with
+type is `LangChain4jModelError`. Its message names only the model and the exception class: the provider's message, stack trace and causes can hold request data, so they're logged on the worker and kept out of the workflow history. A workflow that names a model the worker doesn't serve fails with
 the non-retryable type `LangChain4jUnknownModel`.
 
 When the Activity has a heartbeat timeout, it heartbeats every third of that timeout while the
@@ -135,6 +135,11 @@ model call runs, so a dead worker is detected early.
 
 ## Limitations
 
+- LangChain4j's AI Services give each call an `InvocationContext` whose `invocationId()` is a random UUID and
+  whose `timestamp()` is the wall-clock time, and offer no way to supply them. Inside a workflow they differ on
+  replay. Model calls and tools don't depend on them, so replay stays deterministic, but workflow code, tools and
+  listeners must not branch on them or pass them to Temporal APIs. Use `Workflow.randomUUID()` and
+  `Workflow.currentTimeMillis()` instead.
 - Provider-specific request parameters, such as `OpenAiChatRequestParameters`, are refused with a
   clear error: only the provider's model understands them, and it runs on the worker. Set them on
   the registered model instead. The workflow receives the provider-independent response metadata
