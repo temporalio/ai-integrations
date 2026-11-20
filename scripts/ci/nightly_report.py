@@ -4,7 +4,8 @@
 Reads the jobs of the current workflow run through `gh api`, maps reusable
 workflow job names such as `Python (openai_agents) / ...`, `Go (googleadk) / ...`
 and `.NET (microsoft-agent-framework) / ...` to a plugin, and keeps exactly one open issue
-per failing plugin labelled `nightly`.
+per failing plugin labelled `nightly`. The lowest-dependency lane (`Python lowest (...)`,
+`TypeScript lowest (...)`) reports to the same issue, so a wrong floor also holds a release.
 Passing plugins with an open issue get a comment and are closed.
 
 With --dependabot, also track Dependabot update jobs separately. Security-update
@@ -27,9 +28,10 @@ from pathlib import Path, PurePosixPath
 
 from _common import discover_plugins, repo_root
 
-# Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`, `name: TypeScript`, `name: .NET`)
-# joined with the reusable workflow's job name; test_nightly_report.py asserts the two stay in step.
-JOB_RE = re.compile(r"^(?P<language>Python|Java|Go|TypeScript|\.NET) \((?P<plugin>[^)]+)\) / ")
+# Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`, `name: TypeScript`, `name: .NET`,
+# plus `name: Python lowest` and `name: TypeScript lowest`) joined with the reusable workflow's job name;
+# test_nightly_report.py asserts the two stay in step.
+JOB_RE = re.compile(r"^(?P<language>Python|Java|Go|TypeScript|\.NET)(?: lowest)? \((?P<plugin>[^)]+)\) / ")
 # Issue keys are `<language root folder>/<plugin>`: `.lower()` of the job's language, except `.NET`, whose root is `dotnet`.
 KEY_PREFIX = {".NET": "dotnet"}
 LABEL = "nightly"
@@ -277,13 +279,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     subprocess.run(["gh", "label", "create", LABEL, "--repo", args.repo, "--force", "--color", "B60205",
-                    "--description", "Nightly checks with latest allowed dependencies failing"], check=False, capture_output=True)
+                    "--description", "Nightly checks with newest or lowest allowed dependencies failing"], check=False, capture_output=True)
     open_issues = json.loads(_gh("issue", "list", "--repo", args.repo, "--label", LABEL, "--state", "open", "--limit", "200", "--json", "number,title") or "[]")
     by_title = {i["title"]: i["number"] for i in open_issues}
 
     for plugin in sorted(failing):
         title = title_for(plugin)
-        body = (f"The nightly check with latest allowed dependencies is failing for `{plugin}`.\n\n"
+        body = (f"The nightly check with the newest or lowest allowed dependencies is failing for `{plugin}`.\n\n"
                 f"Latest run: {run_url}\n\nThis issue is updated automatically by `scripts/ci/nightly_report.py`; "
                 "it closes itself when the plugin is green again.")
         if title in by_title:

@@ -32,11 +32,14 @@ def test_classify_aggregates_results_by_plugin() -> None:
             _job("Python (mcp) / mcp (macos-latest, py3.15)", "success"),
             _job("Python (mcp) / matrix", "success"),
             _job("Python (mcp) / mcp (windows-latest, py3.15)", None),
+            # A failing lowest-dependency job fails the plugin even when its latest jobs pass.
+            _job("Python (langsmith) / langsmith (ubuntu-latest, py3.11)", "success"),
+            _job("Python lowest (langsmith) / langsmith (ubuntu-latest, py3.11)", "failure"),
             _job("Conventions and tooling tests", "failure"),
             _job("ci-status", "failure"),
         ]
     )
-    assert failing == {"python/openai_agents"}
+    assert failing == {"python/openai_agents", "python/langsmith"}
     assert passing == {"python/mcp"}
 
 
@@ -44,12 +47,12 @@ def test_report_matches_ci_workflow_job_names() -> None:
     workflow = yaml.safe_load(
         (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     )
-    for language, expected_name in (
-        ("python", "Python"),
-        ("java", "Java"),
-        ("go", "Go"),
-        ("typescript", "TypeScript"),
-        ("dotnet", ".NET"),
+    for language, expected_name, lanes in (
+        ("python", "Python", ("", " lowest")),
+        ("java", "Java", ("",)),
+        ("go", "Go", ("",)),
+        ("typescript", "TypeScript", ("", " lowest")),
+        ("dotnet", ".NET", ("",)),
     ):
         names = {
             job["name"]
@@ -57,16 +60,17 @@ def test_report_matches_ci_workflow_job_names() -> None:
             if isinstance(job, dict)
             and str(job.get("uses", "")).endswith(f"_{language}-plugin.yml")
         }
-        assert names == {expected_name}, (
+        assert names == {expected_name + lane for lane in lanes}, (
             f"ci.yml renamed a {language} job; update JOB_RE in scripts/ci/nightly_report.py"
         )
-        match = nightly_report.JOB_RE.match(f"{expected_name} (fakeplug) / matrix")
-        assert match is not None and match.group("plugin") == "fakeplug"
-        assert match.group("language") == expected_name
-        # The release workflows' check-nightly looks the issue up by the title this report gives it.
-        (key,), _ = nightly_report.classify([_job(f"{expected_name} (fakeplug) / matrix", "failure")])
-        assert nightly_report.title_for(key) == release_tool.nightly_issue_title(language, "fakeplug")
-    assert {"python", "java", "go", "typescript", "dotnet"}.issubset(
+        for lane in lanes:
+            match = nightly_report.JOB_RE.match(f"{expected_name}{lane} (fakeplug) / matrix")
+            assert match is not None and match.group("plugin") == "fakeplug"
+            assert match.group("language") == expected_name
+            # The release workflows' check-nightly looks the issue up by the title this report gives it.
+            (key,), _ = nightly_report.classify([_job(f"{expected_name}{lane} (fakeplug) / matrix", "failure")])
+            assert nightly_report.title_for(key) == release_tool.nightly_issue_title(language, "fakeplug")
+    assert {"python", "java", "go", "typescript", "dotnet", "python-lowest", "typescript-lowest"}.issubset(
         workflow["jobs"]["nightly-report"]["needs"]
     )
     report = workflow["jobs"]["nightly-report"]

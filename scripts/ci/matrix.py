@@ -7,6 +7,10 @@ pull requests included:
 
   ubuntu-latest x {min, max}, macos-latest and windows-latest at max
 
+The lowest-dependency lane (`--deps lowest`) runs one cell, ubuntu-latest at min: a
+floor older than the newest runtime may not install there (no wheels for it), while
+users on that runtime resolve a newer version anyway.
+
 `dist` marks the ubuntu/max cell: Python builds and uploads distributions there,
 and Go runs race detection there. For .NET the entries are runtimes such as `8.0`
 and `10.0`: each cell installs its runtime next to the SDK that the plugin's
@@ -23,11 +27,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import compact_json, load_toml, write_github_output  # noqa: E402
 
-def build_matrix(runtime_versions: list[str], spring_boot_versions: list[str] | None = None) -> dict[str, list[dict[str, object]]]:
+def build_matrix(runtime_versions: list[str], spring_boot_versions: list[str] | None = None,
+                 deps: str = "locked") -> dict[str, list[dict[str, object]]]:
     if not runtime_versions:
         raise ValueError("[ci] runtime-versions must list at least one version")
     versions = [str(v) for v in runtime_versions]
     lo, hi = versions[0], versions[-1]
+    if deps == "lowest":
+        return {"include": [{"os": "ubuntu-latest", "runtime": lo, "dist": False}]}
     include: list[dict[str, object]] = []
     if lo != hi:
         include.append({"os": "ubuntu-latest", "runtime": lo, "dist": False})
@@ -44,11 +51,12 @@ def main(argv: list[str] | None = None) -> dict[str, list[dict[str, object]]]:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--plugin-dir", type=Path, required=True)
     parser.add_argument("--github-output", default=None)
+    parser.add_argument("--deps", default="locked", help="the dependency mode the matrix tests")
     args = parser.parse_args(argv)
 
     meta = load_toml(args.plugin_dir / "plugin.toml")
     versions = meta.get("ci", {}).get("runtime-versions", [])
-    matrix = build_matrix(versions, meta.get("ci", {}).get("spring-boot-versions"))
+    matrix = build_matrix(versions, meta.get("ci", {}).get("spring-boot-versions"), args.deps)
     text = compact_json(matrix)
     print(f"matrix={text}")
     write_github_output(args.github_output or os.environ.get("GITHUB_OUTPUT"), {"matrix": text})
