@@ -203,9 +203,16 @@ async def test_other_bad_request_keeps_its_type() -> None:
     assert raised.value.non_retryable
 
 
-def test_unrecoverable_overflow_fails_the_workflow_not_its_task() -> None:
+async def test_unrecoverable_overflow_fails_the_workflow_not_its_task(
+    env: WorkflowEnvironment,
+) -> None:
+    # A Worker always passes its client; the plugin's interceptors read it.
     config: Any = DeepAgentsPlugin().configure_worker(
-        {"task_queue": "q", "workflow_runner": SandboxedWorkflowRunner()}
+        {
+            "client": env.client,
+            "task_queue": "q",
+            "workflow_runner": SandboxedWorkflowRunner(),
+        }
     )
     assert ContextOverflowError in config["workflow_failure_exception_types"]
 
