@@ -752,6 +752,21 @@ worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
 
+In workflow code, `TemporalModel` doesn't use LangChain's LLM cache, even one you
+set with `set_llm_cache(...)`. A cache hit there would skip the model Activity,
+and the run would then fail to replay. The model your `model_provider` returns
+still uses the cache inside the Activity.
+
+That Activity-side cache doesn't work for a model that reports no token usage.
+On a cache hit, LangChain sets the message's `usage_metadata` to
+`{"total_cost": 0}`, which fails LangChain's own `UsageMetadata` schema when the
+Workflow loads the message. The model Activity completes, but every Workflow
+Task after it fails with `3 validation errors for AIMessage`, so the run stops
+making progress. LangChain's own `dumpd`/`load` round trip fails the same way
+([langchain-ai/langchain#41915](https://github.com/langchain-ai/langchain/issues/41915)).
+Until that's fixed, if you set a global LLM cache and your model doesn't report
+usage, have your `model_provider` return the model with `cache=False`.
+
 Each plugin instance registers five Activities: `deepagents.invoke_model`,
 `deepagents.invoke_model_streaming`, `deepagents.invoke_tool`,
 `deepagents.backend_op` and `deepagents.get_model_profile`. Use one

@@ -37,6 +37,7 @@ from temporalio.deepagents import _activity, _serde
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from langchain_core.caches import BaseCache
     from langchain_core.callbacks import (
         AsyncCallbackManagerForLLMRun,
         CallbackManagerForLLMRun,
@@ -47,6 +48,7 @@ with workflow.unsafe.imports_passed_through():
     from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
     from langchain_core.runnables import RunnableConfig
     from langchain_core.runnables.config import ensure_config
+    from pydantic import Field
 
 
 # BaseChatModel consumes RunnableConfig before its generation hooks run. Keep
@@ -166,6 +168,10 @@ class TemporalModel(BaseChatModel):
 
     model: str
     activity_options: dict[str, Any] | None = None
+    # No LangChain LLM cache in workflow code, not even the global one: a hit
+    # skips the model activity, so the run fails replay without it. The model
+    # the worker resolves still uses the cache in the activity.
+    cache: BaseCache | bool | None = Field(default=False, exclude=True)
 
     # ``protected_namespaces=()`` silences pydantic's warning about the ``model``
     # field colliding with its ``model_`` namespace.
