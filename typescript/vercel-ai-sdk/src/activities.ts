@@ -13,7 +13,7 @@ import type {
   SharedV4Warning,
   ProviderV4,
 } from '@ai-sdk/provider';
-import { APICallError, getErrorMessage } from '@ai-sdk/provider';
+import { AISDKError, APICallError, getErrorMessage } from '@ai-sdk/provider';
 import { detectMediaType, isFullMediaType, isUrlSupported } from '@ai-sdk/provider-utils';
 import { asSchema, createDownload, type Schema, type ToolExecutionOptions } from 'ai';
 import type { MCPClient } from '@ai-sdk/mcp';
@@ -55,6 +55,36 @@ async function callProvider<T>(call: () => PromiseLike<T>): Promise<T> {
         // The type the Worker gives a thrown error, so that failure handlers and
         // `nonRetryableErrorTypes` in use today continue to match.
         type: error.constructor.name,
+        nonRetryable: true,
+        cause: error,
+      });
+    }
+    throw error;
+  }
+}
+
+// JSON-RPC errors that a retry of the same request cannot fix: parse error, invalid request,
+// method not found and invalid params. Internal errors, transport errors, timeouts and unknown
+// codes stay retryable.
+const NON_RETRYABLE_MCP_ERROR_CODES = new Set([-32700, -32600, -32601, -32602]);
+
+// An MCP request that fails the same way on retry becomes a non-retryable failure instead of an
+// error that the Activity retry policy would retry until it gives up.
+async function failNonRetryableMcpError<T>(request: () => Promise<T>): Promise<T> {
+  try {
+    return await request();
+  } catch (error) {
+    // `@ai-sdk/mcp` does not export `MCPClientError`, so it is recognised by name. It carries the
+    // `code` of a JSON-RPC error response.
+    if (
+      AISDKError.isInstance(error) &&
+      error.name === 'MCPClientError' &&
+      NON_RETRYABLE_MCP_ERROR_CODES.has((error as AISDKError & { code?: number }).code as number)
+    ) {
+      throw ApplicationFailure.create({
+        message: error.message,
+        // The type the other MCP integrations give to the same failure.
+        type: 'MCPProtocolError',
         nonRetryable: true,
         cause: error,
       });
@@ -615,7 +645,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
       // Opt-out: restore the original create-then-close-per-call behavior.
       const mcpClient = await resolveMcpClient(name, mcpClientFactory, args.clientArgs);
       try {
-        return await extractTools(mcpClient);
+        return await failNonRetryableMcpError(() => extractTools(mcpClient));
       } finally {
         await mcpClient.close();
       }
@@ -624,7 +654,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
     let broken = false;
     try {
       const mcpClient = await client;
-      return await extractTools(mcpClient);
+      return await failNonRetryableMcpError(() => extractTools(mcpClient));
     } catch (err) {
       // The session may be broken (e.g. the server was restarted); mark it so it's dropped once no
       // concurrent call is still using it, instead of tearing down a connection siblings depend on.
@@ -639,7 +669,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
       // Opt-out: restore the original create-then-close-per-call behavior.
       const mcpClient = await resolveMcpClient(name, mcpClientFactory, args.clientArgs);
       try {
-        return await callTool(mcpClient, args);
+        return await failNonRetryableMcpError(() => callTool(mcpClient, args));
       } finally {
         await mcpClient.close();
       }
@@ -648,7 +678,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
     let broken = false;
     try {
       const mcpClient = await client;
-      return await callTool(mcpClient, args);
+      return await failNonRetryableMcpError(() => callTool(mcpClient, args));
     } catch (err) {
       // The session may be broken; mark it so it's dropped once no concurrent call is still using it,
       // instead of tearing down a connection siblings depend on.

@@ -1,8 +1,9 @@
 import { jsonSchema } from 'ai';
-import type { MCPClient } from '@ai-sdk/mcp';
+import { createMCPClient, type MCPClient } from '@ai-sdk/mcp';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import test from 'ava';
 import { ApplicationFailure } from '@temporalio/common';
 import { assertEventually } from '@temporalio/test-helpers';
@@ -421,3 +422,48 @@ test('mcpConnectionIdleTimeout: 0 opts out of connection reuse (create-then-clos
   t.is(factoryCalls, 2, 'a fresh client should be created for every call when reuse is disabled');
   t.deepEqual(closeCalls, ['client-1', 'client-2'], 'each client should be closed immediately after its call');
 });
+
+for (const idleMs of [0, 60_000]) {
+  for (const operation of ['listTools', 'callTool']) {
+    test(`${operation} fails non-retryably on unfixable JSON-RPC errors (idle timeout ${idleMs})`, async (t) => {
+      let rpcCode = 0;
+      const fail = async () => {
+        throw new McpError(rpcCode, `rpc error ${rpcCode}`);
+      };
+      const name = `protocol-${operation}-${idleMs}`;
+      const activities = createActivities(
+        new TestProvider(helloWorkflowGenerator()),
+        {
+          [name]: async () => {
+            // eslint-disable-next-line @typescript-eslint/no-deprecated
+            const server = new Server({ name: 'test-server', version: '1.0.0' }, { capabilities: { tools: {} } });
+            server.setRequestHandler(ListToolsRequestSchema, async () => {
+              if (operation === 'listTools') return fail();
+              return { tools: [{ name: 'testTool', inputSchema: { type: 'object' as const } }] };
+            });
+            server.setRequestHandler(CallToolRequestSchema, fail);
+            const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+            await server.connect(serverTransport);
+            return createMCPClient({ transport: clientTransport });
+          },
+        },
+        { mcpConnectionIdleTimeout: idleMs }
+      ) as Record<string, (args: unknown) => Promise<unknown>>;
+      const run = () => activities[`${name}-${operation}`]!({ name: 'testTool', input: {}, options: {} });
+
+      // Parse error, invalid request, method not found and invalid params.
+      for (const code of [-32700, -32600, -32601, -32602]) {
+        rpcCode = code;
+        const error = await t.throwsAsync(run(), { instanceOf: ApplicationFailure });
+        t.true(error!.nonRetryable, `code ${code} is non-retryable`);
+        t.is(error!.type, 'MCPProtocolError');
+        t.is(error!.message, `MCP error ${code}: rpc error ${code}`);
+      }
+
+      // An internal error may succeed on retry.
+      rpcCode = -32603;
+      const error = await t.throwsAsync(run());
+      t.false(error instanceof ApplicationFailure && error.nonRetryable);
+    });
+  }
+}
