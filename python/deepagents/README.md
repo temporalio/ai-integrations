@@ -752,6 +752,24 @@ worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
 
+A model call made while another model call of the same run is in flight (for
+example two sub-agents running in parallel) gets an Activity id named after the
+call it answers: the agent or sub-agent and the messages it has so far (minus
+their ids, which do not replay identically). A call whose transcript holds
+content that Deep Agents' middleware generates keeps the SDK's sequence id
+instead, because on replay that content differs: an offload pointer or preview,
+a summary message, the output of a tool call that read from
+`/conversation_history/` or `/large_tool_results/`, or a `grep` or `glob`
+without a path. Such a call is not checked for a swap. Activity
+inputs are not compared on replay, but Activity ids are, so a change that makes
+parallel sub-agents schedule their model calls in a different order (a library
+upgrade, an `await` added in middleware) fails replay with a nondeterminism
+error instead of handing each sub-agent the other's recorded answer. Ship such a
+change with Worker Versioning. Sequential model calls keep the SDK's sequence
+ids, and so do the calls already in the history of a run started before this
+behavior. Calls with the same agent and the same messages are named by order, so
+a swap between two of them is not caught.
+
 Each plugin instance registers five Activities: `deepagents.invoke_model`,
 `deepagents.invoke_model_streaming`, `deepagents.invoke_tool`,
 `deepagents.backend_op` and `deepagents.get_model_profile`. Use one
