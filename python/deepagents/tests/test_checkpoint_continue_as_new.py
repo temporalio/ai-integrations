@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 from unittest.mock import patch
 
 import pytest
-from typing_extensions import NotRequired
+from typing_extensions import NotRequired, TypedDict
 
 from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError, WorkflowHistory
@@ -165,6 +165,7 @@ async def _run(
     responses: list[Any] | None = None,
     provider: Callable[[str], Any] | None = None,
     replay: bool = True,
+    start_signal: str | None = None,
 ) -> tuple[Any, list[WorkflowHistory]]:
     """Run with cache eviction and collect and replay every run in the chain."""
     plugin = DeepAgentsPlugin(
@@ -182,6 +183,7 @@ async def _run(
             args=[] if input is None else [input],
             id=task_queue,
             task_queue=task_queue,
+            start_signal=start_signal,
         )
         result = await handle.result()
     histories = await _histories(client, handle.id, handle.first_execution_run_id)
@@ -521,6 +523,42 @@ class InvalidSignatureWorkflow:
         )
 
 
+class TranscriptSnapshot(TypedDict):
+    messages: list[dict[str, str]]
+
+
+@workflow.defn
+class TranscriptSnapshotWorkflow:
+    @workflow.run
+    async def run(
+        self, input: dict, state_snapshot: TranscriptSnapshot | None = None
+    ) -> Any:
+        return await run_deep_agent(
+            create_deep_agent(name="test-agent", model="fake:model"),
+            input,
+            state_snapshot=state_snapshot,
+            continue_as_new_after=1,
+        )
+
+
+async def test_snapshot_annotation_must_preserve_the_checkpoint(
+    env: WorkflowEnvironment,
+) -> None:
+    with pytest.raises(WorkflowFailureError) as caught:
+        await _run(
+            env,
+            TranscriptSnapshotWorkflow,
+            {"messages": [{"role": "user", "content": "Go."}]},
+            responses=[_call("ls", {"path": "/"}, "ls"), "Done."],
+        )
+    cause = caught.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == DeepAgentsWorkflowError.TYPE
+    assert "state_snapshot parameter must decode the Deep Agents checkpoint" in str(
+        cause
+    )
+
+
 @workflow.defn
 class InvalidConfigurationWorkflow:
     @workflow.run
@@ -621,6 +659,61 @@ async def test_signal_and_update_turns_finish_without_rolling_over(
     histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
     assert len(histories) == 1
     await _replay(HandlerAgentWorkflow, histories)
+
+
+class WaitForSignalMiddleware(AgentMiddleware):
+    def __init__(self, finish_handler: Callable[[], Awaitable[None]]) -> None:
+        self.finish_handler = finish_handler
+
+    async def abefore_agent(self, state: Any, runtime: Any) -> None:
+        await self.finish_handler()
+
+
+@workflow.defn
+class ActiveSignalWorkflow:
+    def __init__(self) -> None:
+        self.signal_started = False
+        self.agent_started = False
+
+    @workflow.signal
+    async def wait_for_agent(self) -> None:
+        self.signal_started = True
+        await workflow.wait_condition(lambda: self.agent_started)
+
+    async def finish_handler(self) -> None:
+        self.agent_started = True
+        await workflow.wait_condition(workflow.all_handlers_finished)
+
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> str:
+        if state_snapshot is None:
+            await workflow.wait_condition(lambda: self.signal_started)
+            assert not workflow.all_handlers_finished()
+        result = await run_deep_agent(
+            create_deep_agent(
+                name="test-agent",
+                model="fake:model",
+                middleware=[WaitForSignalMiddleware(self.finish_handler)],
+            ),
+            input,
+            state_snapshot=state_snapshot,
+            continue_as_new_after=1,
+        )
+        return result["messages"][-1].content
+
+
+async def test_rollover_resumes_after_active_signal_handler_finishes(
+    env: WorkflowEnvironment,
+) -> None:
+    result, histories = await _run(
+        env,
+        ActiveSignalWorkflow,
+        {"messages": [{"role": "user", "content": "Go."}]},
+        responses=[_call("ls", {"path": "/"}, "ls"), "Done."],
+        start_signal="wait_for_agent",
+    )
+    assert result == "Done."
+    assert len(histories) == 2
 
 
 @workflow.defn

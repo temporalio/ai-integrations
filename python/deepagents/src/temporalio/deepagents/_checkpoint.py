@@ -13,6 +13,7 @@ import copy
 import dataclasses
 import hashlib
 import inspect
+import math
 import warnings
 import zlib
 from collections.abc import AsyncIterator, Mapping
@@ -22,9 +23,10 @@ from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.runnables import RunnableConfig
 from langgraph.channels.base import BaseChannel
 from langgraph.channels.untracked_value import UntrackedValue
-from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
+from langgraph.checkpoint.base import ChannelVersions, Checkpoint, CheckpointMetadata
 from langgraph.checkpoint.base.id import uuid6
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
@@ -74,8 +76,6 @@ class _DriverSaver(InMemorySaver):
     ) -> None:
         super().__init__(serde=serde)
         self.backend = backend
-        if backend is not None:
-            backend.serde = serde
 
     def _record_limit(self, config: RunnableConfig) -> None:
         if "recursion_limit" in config and not config.get("configurable", {}).get(
@@ -193,6 +193,8 @@ def _check_restored_types(original: Any, restored: Any) -> None:
     seen: set[tuple[int, int]] = set()
     while pending:
         value, decoded = pending.pop()
+        if value is decoded:
+            continue
         pair = (id(value), id(decoded))
         if pair in seen:
             continue
@@ -239,7 +241,12 @@ def _check_restored_types(original: Any, restored: Any) -> None:
                         cast(BaseModel, decoded).__pydantic_private__,
                     )
                 )
-        elif value != decoded:
+        elif value != decoded and not (
+            isinstance(value, float)
+            and isinstance(decoded, float)
+            and math.isnan(value)
+            and math.isnan(decoded)
+        ):
             raise DeepAgentsWorkflowError(
                 "Checkpoint state loses a value during serialization."
             )
@@ -269,23 +276,25 @@ def _carry_input(input: Any) -> Any:
     return input
 
 
-def _validate_workflow_signature(input: Any) -> None:
-    """Validate both arity and payload decoding before scheduling paid work."""
+def _validate_workflow_signature(input: Any) -> list[type] | None:
+    """Verify arity and the first argument, and return the effective type hints."""
     if not workflow.in_workflow():
-        return
+        return None
     instance = workflow.instance()
     definition = workflow._Definition.must_from_class(type(instance))
+    arg_types = definition.arg_types
     try:
         inspect.signature(definition.run_fn).bind(instance, input, None)
-        if definition.arg_types:
-            _converter().from_payloads(
-                _converter().to_payloads([input]), [definition.arg_types[0]]
-            )
+        # The SDK only applies argument types when their count matches the payloads.
+        if arg_types and len(arg_types) == 2:
+            _converter().from_payloads(_converter().to_payloads([input]), arg_types[:1])
+            return arg_types
     except (TypeError, ValueError) as exc:
         raise DeepAgentsWorkflowError(
             "run_deep_agent requires a workflow run method accepting (input, state_snapshot=None). "
             "Pass continue_as_new_input matching the workflow's first argument."
         ) from exc
+    return None
 
 
 def _can_resume_interrupts(agent: Any) -> bool:
@@ -295,11 +304,8 @@ def _can_resume_interrupts(agent: Any) -> bool:
 
 
 def _rollover_allowed() -> bool:
-    # Signal and Update handlers must finish their current turn. Also wait for
-    # other handlers before rolling over from the main workflow coroutine.
-    return not workflow.in_workflow() or (
-        workflow.current_update_info() is None and workflow.all_handlers_finished()
-    )
+    # Both the main workflow and signal handlers can reach this boundary.
+    return not workflow.in_workflow() or workflow.all_handlers_finished()
 
 
 def _requires_interrupts(agent: Any) -> bool:
@@ -328,6 +334,27 @@ def _round_trip(serde: JsonPlusSerializer, value: Any) -> bytes:
             raise DeepAgentsWorkflowError("Unsupported graph checkpoint encoding.")
         _check_restored_types(value, serde.loads_typed((kind, data)))
         return data
+    except DeepAgentsWorkflowError:
+        raise
+    except Exception as exc:
+        raise DeepAgentsWorkflowError(
+            "Graph checkpoint state cannot be restored losslessly."
+        ) from exc
+
+
+def _validate_channel(
+    serde: SerializerProtocol, key: str, value: Any, restored: Mapping[str, Any]
+) -> None:
+    if key in restored:
+        try:
+            _check_restored_types(value, restored[key])
+            return
+        except DeepAgentsWorkflowError:
+            # Delta reducers can reconstruct parallel writes in a different order.
+            # Test the encoder directly to distinguish that from serialization loss.
+            pass
+    try:
+        _check_restored_types(value, serde.loads_typed(serde.dumps_typed(value)))
     except DeepAgentsWorkflowError:
         raise
     except Exception as exc:
@@ -404,27 +431,32 @@ async def run(
         )
         return await agent.ainvoke(input)
 
-    automatic = (
-        not agent.interrupt_before_nodes
-        and not agent.interrupt_after_nodes
-        and _rollover_allowed()
-    )
+    automatic = not agent.interrupt_before_nodes and not agent.interrupt_after_nodes
+    if workflow.in_workflow() and workflow.current_update_info() is not None:
+        automatic = False
+    name = agent.get_name()
     carry_input = (
         _carry_input(input)
         if continue_as_new_input is _UNSET
         else continue_as_new_input
     )
-    if automatic:
-        if isinstance(input, Command) and continue_as_new_input is _UNSET:
+    needs_explicit_input = (
+        isinstance(input, Command) and continue_as_new_input is _UNSET
+    )
+
+    def validate_rollover() -> list[type] | None:
+        if needs_explicit_input:
             raise DeepAgentsWorkflowError(
                 "Command resumes require continue_as_new_input matching the workflow's first argument."
             )
-        _validate_workflow_signature(carry_input)
-    name = agent.get_name()
-    if automatic and name == "LangGraph":
-        raise DeepAgentsWorkflowError(
-            "run_deep_agent requires a unique, stable agent name; pass name= to create_deep_agent or compile."
-        )
+        if name == "LangGraph":
+            raise DeepAgentsWorkflowError(
+                "run_deep_agent requires a unique, stable agent name; pass name= to create_deep_agent or compile."
+            )
+        return _validate_workflow_signature(carry_input)
+
+    rollover_validated = automatic and _rollover_allowed()
+    arg_types = validate_rollover() if rollover_validated else None
     try:
         input = copy.deepcopy(input)
     except Exception as exc:
@@ -437,10 +469,11 @@ async def run(
         raise DeepAgentsWorkflowError(
             "run_deep_agent requires an InMemorySaver or no checkpointer."
         )
-    # Use schema-declared types even with LangGraph's strict-msgpack default.
+    # The carry uses schema-declared types. A supplied saver retains its serializer.
     saver = _DriverSaver(
         serde=serde, backend=cast(InMemorySaver | None, agent.checkpointer)
     )
+    saver_serde = saver.serde if saver.backend is None else saver.backend.serde
     config: RunnableConfig = agent.config.copy() if agent.config is not None else {}
     configurable = dict(config.get("configurable") or {})
     if configurable.get("checkpoint_ns"):
@@ -477,6 +510,7 @@ async def run(
                 )
             thread_id = str(restored["thread_id"])
             configurable.setdefault("thread_id", thread_id)
+            configurable.pop("checkpoint_id", None)
             config["configurable"] = configurable
             if await saver.aget_tuple(config) is not None:
                 raise DeepAgentsWorkflowError(
@@ -529,7 +563,6 @@ async def run(
             raise DeepAgentsWorkflowError(
                 "Invalid Deep Agents checkpoint snapshot."
             ) from exc
-        configurable.pop("checkpoint_id", None)
         checkpoint["id"] = str(uuid6(clock_seq=step))
         await saver.aput(
             {
@@ -586,6 +619,8 @@ async def run(
         else list(graph.stream_channels or keys)
     )
     output_keys = list(dict.fromkeys([*state_keys, *untracked_keys]))
+    tracked_keys = [key for key in state_keys if key not in untracked_keys]
+    checked_versions: ChannelVersions = {}
     while True:
         if budget is not None and hasattr(saver, "recursion_limit"):
             managed_offset["steps"] = saver.recursion_limit - budget + 1
@@ -649,33 +684,45 @@ async def run(
             }
         if not state.next:
             return result
-        # Materialize tracked state and validate before the first paid model
-        # call, even when this execution never needs a rollover.
-        checkpoint = {
-            **saved.checkpoint,
-            "channel_values": {
-                **saved.checkpoint["channel_values"],
-                **{
-                    key: value
-                    for key, value in values.items()
-                    if key not in untracked_keys
-                },
-            },
-        }
-        data = _round_trip(serde, checkpoint)
+        # Validate changed state against what the saver actually restored.
+        restored_values = (
+            {state_keys[0]: state.values}
+            if isinstance(graph.stream_channels_asis, str)
+            else state.values
+        )
+        versions = saved.checkpoint["channel_versions"]
+        for key in tracked_keys:
+            if key in values and versions.get(key) != checked_versions.get(key):
+                _validate_channel(saver_serde, key, values[key], restored_values)
+        checked_versions = versions
         at_model = state.next == ("model",)
         if at_model:
-            past_limit = (
-                workflow.info().is_continue_as_new_suggested()
-                if continue_as_new_after is None
-                else workflow.info().get_current_history_length()
-                >= continue_as_new_after
-            )
-            if progressed and past_limit and _rollover_allowed():
+            allowed = _rollover_allowed()
+            if allowed and not rollover_validated:
+                arg_types = validate_rollover()
+                rollover_validated = True
+            if (
+                allowed
+                and progressed
+                and (
+                    workflow.info().is_continue_as_new_suggested()
+                    if continue_as_new_after is None
+                    else workflow.info().get_current_history_length()
+                    >= continue_as_new_after
+                )
+            ):
                 if saved.pending_writes:
                     raise DeepAgentsWorkflowError(
                         "Cannot carry an unsettled graph checkpoint."
                     )
+                checkpoint = {
+                    **saved.checkpoint,
+                    "channel_values": {
+                        **saved.checkpoint["channel_values"],
+                        **{key: values[key] for key in tracked_keys if key in values},
+                    },
+                }
+                data = _round_trip(serde, checkpoint)
                 snapshot = {
                     SNAPSHOT_KEY: {
                         "version": 1,
@@ -704,8 +751,9 @@ async def run(
                         }
                     ],
                 }
+                converter = _converter()
                 try:
-                    payloads = _converter().to_payloads([carry_input, snapshot])
+                    payloads = converter.to_payloads([carry_input, snapshot])
                 except Exception as exc:
                     raise DeepAgentsWorkflowError(
                         "Continue-as-new input is not serializable."
@@ -714,6 +762,16 @@ async def run(
                     raise DeepAgentsWorkflowError(
                         "Deep Agents checkpoint exceeds the continue-as-new payload limit. Reduce state or store large files in TemporalBackend."
                     )
+                try:
+                    _, decoded = converter.from_payloads(payloads, arg_types)
+                    if not isinstance(decoded, Mapping):
+                        raise TypeError("The decoded snapshot must be a mapping.")
+                    _check_restored_types(snapshot[SNAPSHOT_KEY], decoded[SNAPSHOT_KEY])
+                except Exception:
+                    raise DeepAgentsWorkflowError(
+                        "The workflow's state_snapshot parameter must decode the Deep Agents checkpoint. "
+                        "Use an annotation such as dict[str, Any] | None."
+                    ) from None
                 workflow.continue_as_new(args=[carry_input, snapshot])
             progressed = True
         # Keep every invocation-local value within this run. Only small,

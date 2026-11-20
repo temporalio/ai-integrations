@@ -628,14 +628,15 @@ count.
   so earlier checkpoint history is unnecessary. Message classes and types
   declared in the graph's state schema are preserved, including nested types.
   Types used in a snapshot must be importable from their defining module;
-  classes defined inside a workflow method cannot be restored. Unsupported
-  state fails with `DeepAgentsWorkflowError` before the first model call when
-  present at startup. Later state changes are checked at subsequent breakpoints.
+  classes defined inside a workflow method cannot be restored. If the saver
+  cannot round-trip the initial state, the driver raises
+  `DeepAgentsWorkflowError` before the first model call. It checks changed
+  channels at subsequent breakpoints and validates the full snapshot on rollover.
   Tuples follow native msgpack semantics and restore as lists. Mapping keys,
   excluded Pydantic fields and private attributes are checked for data loss.
 - **Checkpoint storage:** the driver uses an in-workflow `InMemorySaver`, creating
-  one when the agent has none. An existing saver must also be an `InMemorySaver`
-  (subclasses are accepted) and requires a configured `thread_id`.
+  one when the agent has none. A caller-supplied `InMemorySaver` retains its
+  serializer and requires a configured `thread_id`. Subclasses are accepted.
   Temporal replay reconstructs it within a run; the checkpoint snapshot crosses
   continue-as-new as compressed input. The driver checks the configured payload
   converter output and fails explicitly if the combined inputs exceed 1.9 MB.
@@ -657,8 +658,8 @@ count.
   For these flows, supply `checkpointer=InMemorySaver()` and configure a stable
   `thread_id` with `agent.with_config(...)` so the caller can resume the agent.
   Explicit static debugging breakpoints disable the driver's automatic rollover.
-  Signal and Update handlers also finish without automatic rollover; the main
-  workflow owns their queues and rolls over after handlers finish.
+  Signal and Update handlers finish without automatic rollover. The main
+  workflow can roll over at a model boundary once those handlers finish.
   Sub-agent tool calls and a parallel batch of tools finish before a boundary;
   they are not split. The snapshot covers the parent graph's channels, including
   completed sub-agent results in its transcript. Sub-agent-local checkpoint
@@ -683,8 +684,10 @@ count.
   through `ainvoke`; they cannot honor `continue_as_new_after`. If agent input
   differs from workflow input, pass `continue_as_new_input` with the workflow's
   first argument, and use `None` as agent input when restoring the checkpoint.
-  This argument is required for every `Command` resume. The driver validates
-  that the carried input can decode as the workflow's first parameter type.
+  This argument is required for every `Command` resume. The carried input
+  must decode as the first workflow parameter. The second parameter's
+  annotation must preserve the checkpoint fields, for example
+  `dict[str, Any] | None`.
 - **Replay compatibility:** histories predating
   `deepagents.checkpoint-continue-as-new` keep the original transcript/todo-based
   behavior during replay. **Breaking across continued runs:** a legacy chain

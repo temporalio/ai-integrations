@@ -25,6 +25,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.managed import RemainingSteps
@@ -323,6 +324,35 @@ async def test_nested_schema_types_survive_rollover(
     assert result["report"].authors[0].name == "Ada"
 
 
+async def test_driver_preserves_the_supplied_savers_serializer() -> None:
+    serde = JsonPlusSerializer(allowed_msgpack_modules=[Report, Author])
+    saver = InMemorySaver(serde=serde)
+    report_agent = create_deep_agent(
+        name="report-agent",
+        model=FakeModel(["Report."]),
+        middleware=[ReportMiddleware()],
+        checkpointer=saver,
+    ).with_config({"configurable": {"thread_id": "report"}})
+    await report_agent.ainvoke({"messages": [HumanMessage(content="Write.")]})
+
+    model = FakeModel([_tool_reply(0), "Done."])
+
+    def factory() -> Any:
+        return create_deep_agent(
+            name="test-agent", model=model, checkpointer=saver
+        ).with_config({"configurable": {"thread_id": f"other-{model._cursor}"}})
+
+    result, carries = await _drive(factory, rollover=True)
+    assert result["messages"][-1].content == "Done."
+    assert len(carries) == 1
+    assert saver.serde is serde
+    saved = await saver.aget_tuple({"configurable": {"thread_id": "report"}})
+    assert saved is not None
+    assert saved.checkpoint["channel_values"]["report"] == Report(
+        authors=[Author(name="Ada")]
+    )
+
+
 class ManagedState(TypedDict):
     remaining: RemainingSteps
     value: int
@@ -529,13 +559,17 @@ async def test_snapshot_metadata_drops_configuration_secrets() -> None:
     assert result["messages"][-1].content == "Done."
 
 
-@pytest.mark.parametrize("reuse", [False, True])
-async def test_snapshot_rejects_new_input_or_an_existing_thread(reuse: bool) -> None:
+@pytest.mark.parametrize("case", ["new-input", "existing", "stale-checkpoint-id"])
+async def test_snapshot_rejects_new_input_or_an_existing_thread(case: str) -> None:
     model = FakeModel([_tool_reply(0), "Done."])
     carry = await _snapshot(create_deep_agent(name="test-agent", model=model))
+    configurable = {"thread_id": "resume"}
+    if case == "stale-checkpoint-id":
+        configurable["checkpoint_id"] = "missing"
     agent = create_deep_agent(
         name="test-agent", model=model, checkpointer=InMemorySaver()
-    ).with_config({"configurable": {"thread_id": "resume"}})
+    ).with_config({"configurable": configurable})
+    reuse = case != "new-input"
     if reuse:
         await _checkpoint.run(
             agent,
@@ -687,11 +721,33 @@ def test_lossy_mapping_keys_fail_explicitly(key: Any) -> None:
         _checkpoint._round_trip(serde, {key: "value"})
 
 
-def test_tuple_state_uses_native_msgpack_array_semantics() -> None:
+def test_checkpoint_serialization_accepts_tuples_and_nan() -> None:
     serde = _checkpoint._serializer(
         create_deep_agent(name="test-agent", model=FakeModel(["Unused."]))
     )
-    _checkpoint._round_trip(serde, {"tuple": (1, "two", (3,))})
+    _checkpoint._round_trip(serde, {"tuple": (1, "two", (3, float("nan")))})
+
+
+@pytest.mark.parametrize("rollover", [False, True])
+async def test_full_checkpoint_is_serialized_only_for_rollover(
+    monkeypatch: pytest.MonkeyPatch, rollover: bool
+) -> None:
+    checkpoint_count = 0
+    round_trip = _checkpoint._round_trip
+
+    def observe(serde: JsonPlusSerializer, value: Any) -> bytes:
+        nonlocal checkpoint_count
+        if isinstance(value, dict) and "channel_versions" in value:
+            checkpoint_count += 1
+        return round_trip(serde, value)
+
+    monkeypatch.setattr(_checkpoint, "_round_trip", observe)
+    model = FakeModel([_tool_reply(0), _tool_reply(1), "Done."])
+    result, carries = await _drive(
+        lambda: create_deep_agent(name="test-agent", model=model), rollover=rollover
+    )
+    assert result["messages"][-1].content == "Done."
+    assert checkpoint_count == len(carries) == (2 if rollover else 0)
 
 
 async def test_breakpoint_rollover_does_not_report_callback_errors() -> None:
