@@ -29,6 +29,10 @@ from temporalio.openai_agents._errors import (
     AgentsWorkflowError,
     NonRetryableAgentsWorkflowError,
 )
+from temporalio.openai_agents._failure_interceptor import (
+    AGENT_WORKFLOW_ERRORS,
+    AGENT_WORKFLOW_FAILURE_PATCH,
+)
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
     _TemporalModelProvider,
@@ -428,12 +432,21 @@ class TemporalOpenAIRunner(AgentRunner):
                 raise
             except AgentsException as e:
                 # When a tool fails, the Agents SDK also cancels the run's other tools. Wait
-                # only when the error fails the Workflow: an error that fails the Workflow
-                # Task must leave no new commands, so that a fixed Worker can replay it.
+                # for errors that will fail the Workflow if they escape, including those
+                # classified at the Workflow boundary. Workflow Task failures must leave
+                # no new commands so that a fixed Worker can replay them.
                 if (
-                    e.__cause__ is not None
-                    and workflow.is_failure_exception(e.__cause__)
-                ) or workflow.is_failure_exception(e):
+                    (
+                        e.__cause__ is not None
+                        and workflow.is_failure_exception(e.__cause__)
+                    )
+                    or workflow.is_failure_exception(e)
+                    or (
+                        isinstance(e, AGENT_WORKFLOW_ERRORS)
+                        and run.pending(all_nested=True)
+                        and workflow.patched(AGENT_WORKFLOW_FAILURE_PATCH)
+                    )
+                ):
                     if await _wait_for_tool_operations(run):
                         # The Workflow was cancelled during the wait.
                         raise asyncio.CancelledError() from e

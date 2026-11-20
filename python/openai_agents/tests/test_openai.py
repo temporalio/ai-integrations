@@ -521,6 +521,10 @@ class NexusToolCancelWorkflow:
         await workflow.wait_condition(lambda: self.tool_fails)
         raise RuntimeError("Tool bug")
 
+    async def wait_for_answer(self) -> str:
+        await workflow.wait_condition(lambda: self.tool_fails)
+        return "Answer now"
+
     @workflow.run
     async def run(self, case: str) -> str:
         tools: list[Tool] = [
@@ -539,6 +543,19 @@ class NexusToolCancelWorkflow:
             tools.append(function_tool(self.fail, failure_error_function=None))
         elif case == "tool_bug":
             tools.append(function_tool(self.bug, failure_error_function=None))
+        if case == "nested_invalid_output":
+            inner = Agent[str](
+                name="Inner",
+                output_type=Weather,
+                tools=[function_tool(self.wait_for_answer)],
+            )
+            tools.append(
+                inner.as_tool(
+                    tool_name="inner",
+                    tool_description="Runs an agent.",
+                    failure_error_function=None,
+                )
+            )
         if case in ("nested", "nested_tool_fails"):
             inner = Agent[str](
                 name="Inner", instructions="You are a helpful agent.", tools=tools
@@ -1416,6 +1433,7 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
         "workflow_during_start",
         "nested",
         "nested_tool_fails",
+        "nested_invalid_output",
         "spawned",
         "tool_fails",
         "workflow_during_failure",
@@ -1445,7 +1463,12 @@ async def test_nexus_tool_cancel_workflow(
     # fails the Workflow Task. With external_cancel, a client cancels the operation. With
     # wait_requested, the tool cancels with WAIT_REQUESTED and the operation delays its
     # cancellation until released.
-    slow = case in ("run_first", "workflow_during_failure", "wait_requested")
+    slow = case in (
+        "run_first",
+        "workflow_during_failure",
+        "wait_requested",
+        "nested_invalid_output",
+    )
     during_start = case in ("run_during_start", "workflow_during_start")
     held_id = f"held-{uuid.uuid4()}" + ("-slow" if slow else "")
     handler = HeldServiceHandler()
@@ -1476,6 +1499,19 @@ async def test_nexus_tool_cancel_workflow(
         responses.insert(
             0, ResponseBuilders.tool_call(json.dumps({"input": "Hold"}), "inner")
         )
+    elif case == "nested_invalid_output":
+        inner_call = ResponseBuilders.tool_call(
+            '{"input": "Answer"}', "inner", call_id="inner", item_id="inner"
+        )
+        responses = [
+            ModelResponse(
+                output=[*hold_call.output, *inner_call.output],
+                usage=Usage(),
+                response_id=None,
+            ),
+            ResponseBuilders.tool_call("{}", "wait_for_answer"),
+            ResponseBuilders.output_message("This answer is not JSON."),
+        ]
     elif case == "spawned":
         responses.insert(0, ResponseBuilders.tool_call("{}", "spawn"))
     async with AgentEnvironment(
@@ -1554,6 +1590,17 @@ async def test_nexus_tool_cancel_workflow(
                     await workflow_handle.cancel()
                 elif case in ("tool_fails", "nested_tool_fails"):
                     await workflow_handle.signal(NexusToolCancelWorkflow.fail_tool)
+                elif case == "nested_invalid_output":
+                    await workflow_handle.signal(NexusToolCancelWorkflow.fail_tool)
+                    await assert_eventually(
+                        lambda: history_has(
+                            "nexus_operation_cancel_request_completed_event_attributes"
+                        )
+                    )
+                    assert (await workflow_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                    await held_handle.signal(HeldWorkflow.release)
                 elif case == "external_cancel":
                     await held_handle.cancel()
                 elif case == "tool_bug":
@@ -1612,6 +1659,14 @@ async def test_nexus_tool_cancel_workflow(
                     await workflow_handle.result()
                 if case in ("tool_fails", "nested_tool_fails"):
                     assert "Tool failed" in str(err.value.cause)
+                elif case == "nested_invalid_output":
+                    assert isinstance(err.value.cause, ApplicationError)
+                    assert err.value.cause.type == "ModelBehaviorError"
+                    assert not err.value.cause.non_retryable
+                    await Replayer(
+                        workflows=[NexusToolCancelWorkflow],
+                        plugins=[agent_env.openai_agents_plugin],
+                    ).replay_workflow(await workflow_handle.fetch_history())
                 elif case == "external_cancel":
                     # The tool's error fails the run, as on main.
                     assert "Error running tool hold" in str(err.value.cause)

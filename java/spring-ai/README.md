@@ -52,29 +52,14 @@ embedding, and MCP modules are detected through Spring auto-configuration.
 `entity(...)` and `responseEntity(...)` convert the model's answer in workflow code,
 after the model Activity has completed. When the answer doesn't match the target
 type, Spring AI's `BeanOutputConverter` throws a Jackson
-`tools.jackson.core.JacksonException`. If the workflow doesn't handle it, the
-workflow task fails and is retried, but the model's answer is already in the
-history, so every retry fails the same way and the workflow stays running.
+`tools.jackson.core.JacksonException`. Catch the original exception around
+the call to recover, for example by asking the model again or returning a fallback.
 
-Catch the exception around the call, for example to ask the model again or return
-a fallback, or make it fail the workflow so a workflow retry policy can start
-another run:
-
-```java
-import io.temporal.worker.WorkflowImplementationOptions;
-import tools.jackson.core.JacksonException;
-
-WorkflowImplementationOptions options =
-    WorkflowImplementationOptions.newBuilder()
-        .setFailWorkflowExceptionTypes(JacksonException.class)
-        .build();
-worker.registerWorkflowImplementationTypes(options, MyWorkflowImpl.class);
-```
-
-This setting also makes an uncaught conversion error fail an Update when it
-occurs in the Update handler. To make a conversion failure non-retryable,
-catch `JacksonException` around the entity call and throw the exception
-returned by `ApplicationFailure.newNonRetryableFailure(...)`.
+With `SpringAiPlugin` installed, an uncaught conversion error fails the Workflow
+or the Update where it occurred. The failure type is the fully qualified name of
+the Jackson exception. A Workflow retry policy can start another run, which calls
+the model again. Use Spring Boot auto-configuration or register `SpringAiPlugin`
+with `WorkerFactoryOptions.Builder.setPlugins(...)` for a manual setup.
 
 ## Provider retries
 

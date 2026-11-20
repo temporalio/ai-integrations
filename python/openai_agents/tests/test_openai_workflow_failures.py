@@ -107,11 +107,11 @@ async def test_agent_workflow_failure(
                         cause = workflow_failed.value.cause
                     assert isinstance(cause, ApplicationError)
                     assert cause.type == failure_type
-                    assert cause.non_retryable
+                    assert not cause.non_retryable
         await Replayer(
             workflows=[AgentFailureWorkflow], plugins=[agents_env.openai_agents_plugin]
         ).replay_workflow(await handle.fetch_history())
-    assert model_calls == 1
+    assert model_calls == (2 if mode == "fail" else 1)
 
 
 async def test_upgrade_fails_workflow_stuck_on_invalid_output(
@@ -162,4 +162,4 @@ async def test_upgrade_fails_workflow_stuck_on_invalid_output(
             cause = raised.value.cause
             assert isinstance(cause, ApplicationError)
             assert cause.type == "ModelBehaviorError"
-            assert cause.non_retryable
+            assert not cause.non_retryable

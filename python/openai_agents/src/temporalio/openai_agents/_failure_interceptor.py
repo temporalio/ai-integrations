@@ -1,4 +1,4 @@
-"""Classify terminal agent errors that escape workflow code."""
+"""Classify agent errors that escape workflow code."""
 
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -17,19 +17,20 @@ from temporalio.worker import (
     WorkflowInterceptorClassInput,
 )
 
+AGENT_WORKFLOW_ERRORS = (ModelBehaviorError, MaxTurnsExceeded)
+AGENT_WORKFLOW_FAILURE_PATCH = "temporalio-openai-agents-terminal-workflow-errors"
+
 
 @contextmanager
 def _classify_agent_failure() -> Generator[None, None, None]:
     try:
         yield
-    except (ModelBehaviorError, MaxTurnsExceeded) as err:
+    except AGENT_WORKFLOW_ERRORS as err:
         # Keep existing failure policies and histories that already recorded a failure.
         if not workflow.is_failure_exception(err) and workflow.patched(
-            "temporalio-openai-agents-terminal-workflow-errors"
+            AGENT_WORKFLOW_FAILURE_PATCH
         ):
-            raise ApplicationError(
-                str(err), type=type(err).__name__, non_retryable=True
-            ) from err
+            raise ApplicationError(str(err), type=type(err).__name__) from err
         raise
 
 
