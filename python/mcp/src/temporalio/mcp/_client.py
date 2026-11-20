@@ -1,6 +1,7 @@
 # pyright: reportUnusedClass=false, reportUnusedFunction=false
 
 from collections.abc import Callable
+from inspect import iscoroutine
 from types import TracebackType
 from typing import Any, TypeVar
 
@@ -147,16 +148,27 @@ def _mcp_client_backend_factory(
     name: str, factory: _MCPClientFactory
 ) -> _MCPBackendFactory:
     """Adapt a public MCP client factory to the shared Activity backend."""
+    # Fail when the Worker is built, not in every MCP Activity.
+    if not callable(factory):
+        kind = type(factory)  # type: ignore[reportUnreachable]
+        raise TypeError(
+            f"MCP server factory {name!r} is "
+            f"{kind.__module__}.{kind.__qualname__}, not callable"
+        )
     invoke = _FactoryInvoker(name, factory)
 
     def create(argument: Any = _NOT_SUPPLIED) -> _MCPClientBackend:
         client = invoke(argument)
         if not isinstance(client, Client):
-            # Retryable, so a run waits for the worker to be fixed instead of failing.
             kind = type(client)
+            if iscoroutine(client):
+                # An async factory; close it so Python doesn't warn it was never awaited.
+                client.close()
             raise ApplicationError(
                 f"MCP server factory {name!r} returned "
-                f"{kind.__module__}.{kind.__qualname__}, not mcp.Client"
+                f"{kind.__module__}.{kind.__qualname__}, not mcp.Client",
+                type="MCPServerFactoryTypeError",
+                non_retryable=True,
             )
         return _MCPClientBackend(client)
 

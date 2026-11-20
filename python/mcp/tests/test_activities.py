@@ -1,7 +1,9 @@
 import asyncio
 import dataclasses
+import inspect
 import json
 import sys
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, cast
 
@@ -39,7 +41,7 @@ from pydantic import BaseModel
 from temporalio import activity
 from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
-from temporalio.mcp import _activities
+from temporalio.mcp import MCPPlugin, _activities
 from temporalio.mcp._activities import _MCPActivities
 from temporalio.mcp._client import _mcp_client_backend_factory, _MCPClientBackend
 from temporalio.testing import ActivityEnvironment
@@ -722,13 +724,26 @@ async def test_rejected_tool_result_fails_without_retry(
     assert err.value.non_retryable is True
 
 
-async def test_factory_that_does_not_return_a_client_fails_with_retry() -> None:
+async def _coroutine() -> None:
+    pass
+
+
+@pytest.mark.parametrize("make_value", [object, _coroutine])
+async def test_factory_that_does_not_return_a_client_fails_without_retry(
+    make_value: Callable[[], Any],
+) -> None:
+    value = make_value()
+    kind = type(value)
+    # Passed in place of the factory, the value fails when the Worker is built.
+    with pytest.raises(TypeError) as type_error:
+        MCPPlugin({"weather": value})
+    assert str(type_error.value) == (
+        "MCP server factory 'weather' is "
+        f"{kind.__module__}.{kind.__qualname__}, not callable"
+    )
+
     support = _MCPActivities(
-        {
-            "weather": _mcp_client_backend_factory(
-                "weather", lambda: cast(Client, object())
-            )
-        }
+        {"weather": _mcp_client_backend_factory("weather", lambda: value)}
     )
     list_tools = _activity_by_name(support, "temporalio.mcp.weather.list-tools")
     try:
@@ -738,9 +753,14 @@ async def test_factory_that_does_not_return_a_client_fails_with_retry() -> None:
         await support._pool.close()
 
     assert err.value.message == (
-        "MCP server factory 'weather' returned builtins.object, not mcp.Client"
+        "MCP server factory 'weather' returned "
+        f"{kind.__module__}.{kind.__qualname__}, not mcp.Client"
     )
-    assert err.value.non_retryable is False
+    assert err.value.type == "MCPServerFactoryTypeError"
+    assert err.value.non_retryable is True
+    if inspect.iscoroutine(value):
+        # Closed, so Python doesn't warn that it was never awaited.
+        assert inspect.getcoroutinestate(value) == inspect.CORO_CLOSED
 
 
 async def test_worker_reentry_before_close_starts_keeps_connection_open() -> None:
