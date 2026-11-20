@@ -89,7 +89,9 @@ public class SpringAiPlugin extends SimplePlugin {
       Map<String, ChatModel> chatModels,
       @Nullable ChatModel primaryChatModel,
       Map<String, ActivityOptions> perModelOptions) {
-    super("io.temporal.spring-ai");
+    super(
+        SimplePlugin.newBuilder("io.temporal.spring-ai")
+            .addWorkerInterceptors(new StructuredOutputFailureInterceptor()));
 
     if (chatModels == null || chatModels.isEmpty()) {
       throw new IllegalArgumentException("At least one ChatModel bean is required");
