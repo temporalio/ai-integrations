@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+from agents.sandbox import Manifest
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.pty_types import PtyExecUpdate
 from agents.sandbox.session.sandbox_session_state import SandboxSessionState
@@ -49,6 +50,21 @@ def _session_activity_config(
     return routed
 
 
+def _sent_trusted_manifest(
+    state: SandboxSessionState, trusted_manifest: Manifest | None
+) -> Manifest | None:
+    """The trusted manifest to send with an operation on ``state``.
+
+    The data converter drops a state's mount credentials and marks it
+    ``mount_authority_redacted``. A Worker that rebuilds the session then needs
+    them, so only such a state sends the manifest. An on-host sandbox's Worker
+    rebuilds a session only on resume, so its operations send none.
+    """
+    if isinstance(state, OnHostSandboxSessionState):
+        return None
+    return trusted_manifest if state.mount_authority_redacted else None
+
+
 class TemporalSandboxSession(BaseSandboxSession):
     """A BaseSandboxSession that routes all I/O through Temporal activities.
 
@@ -64,6 +80,10 @@ class TemporalSandboxSession(BaseSandboxSession):
     Each activity receives a single Pydantic model instance. Because the Temporal
     client is configured with ``pydantic_data_converter``, all fields are
     serialized and deserialized automatically.
+
+    ``trusted_manifest`` is the session's manifest with its mount credentials,
+    which the state loses in serialization. Operations on a hosted sandbox send
+    it so that a Worker that doesn't hold the session can rebuild it.
     """
 
     def __init__(
@@ -72,12 +92,14 @@ class TemporalSandboxSession(BaseSandboxSession):
         config: ActivityConfig,
         state: SandboxSessionState,
         supports_pty_flag: bool = True,
+        trusted_manifest: Manifest | None = None,
     ) -> None:
         """Initialize the session."""
         self._name = name
         self._config = config
         self._state = state
         self._supports_pty = supports_pty_flag
+        self._trusted_manifest = trusted_manifest
 
     @property
     def state(self) -> SandboxSessionState:
@@ -104,6 +126,7 @@ class TemporalSandboxSession(BaseSandboxSession):
                 timeout=timeout,
                 shell=shell,
                 user=user,
+                trusted_manifest=self._sent_trusted_manifest(),
             ),
             result_type=ExecResultModel,
             **_session_activity_config(self._config, self._state),
@@ -123,7 +146,11 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Read a file from the sandbox via activity."""
         result: ReadResult = await workflow.execute_activity(
             f"{self._name}-sandbox_session_read",
-            arg=ReadArgs(state=self.state, path=str(path)),
+            arg=ReadArgs(
+                state=self.state,
+                path=str(path),
+                trusted_manifest=self._sent_trusted_manifest(),
+            ),
             result_type=ReadResult,
             **_session_activity_config(self._config, self._state),
         )
@@ -135,7 +162,12 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Write a file to the sandbox via activity."""
         await workflow.execute_activity(
             f"{self._name}-sandbox_session_write",
-            arg=WriteArgs(state=self.state, path=str(path), data=data.read()),
+            arg=WriteArgs(
+                state=self.state,
+                path=str(path),
+                data=data.read(),
+                trusted_manifest=self._sent_trusted_manifest(),
+            ),
             **_session_activity_config(self._config, self._state),
         )
 
@@ -143,7 +175,9 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Check if the sandbox is running via activity."""
         result: RunningResult = await workflow.execute_activity(
             f"{self._name}-sandbox_session_running",
-            arg=RunningArgs(state=self.state),
+            arg=RunningArgs(
+                state=self.state, trusted_manifest=self._sent_trusted_manifest()
+            ),
             result_type=RunningResult,
             **_session_activity_config(self._config, self._state),
         )
@@ -153,7 +187,9 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Shut down the sandbox via activity."""
         await workflow.execute_activity(
             f"{self._name}-sandbox_session_shutdown",
-            arg=StopArgs(state=self.state),
+            arg=StopArgs(
+                state=self.state, trusted_manifest=self._sent_trusted_manifest()
+            ),
             **_session_activity_config(self._config, self._state),
         )
 
@@ -161,7 +197,9 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Persist the workspace via activity."""
         result: PersistWorkspaceResult = await workflow.execute_activity(
             f"{self._name}-sandbox_session_persist_workspace",
-            arg=PersistWorkspaceArgs(state=self.state),
+            arg=PersistWorkspaceArgs(
+                state=self.state, trusted_manifest=self._sent_trusted_manifest()
+            ),
             result_type=PersistWorkspaceResult,
             **_session_activity_config(self._config, self._state),
         )
@@ -171,9 +209,16 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Hydrate the workspace via activity."""
         await workflow.execute_activity(
             f"{self._name}-sandbox_session_hydrate_workspace",
-            arg=HydrateWorkspaceArgs(state=self.state, data=data.read()),
+            arg=HydrateWorkspaceArgs(
+                state=self.state,
+                data=data.read(),
+                trusted_manifest=self._sent_trusted_manifest(),
+            ),
             **_session_activity_config(self._config, self._state),
         )
+
+    def _sent_trusted_manifest(self) -> Manifest | None:
+        return _sent_trusted_manifest(self._state, self._trusted_manifest)
 
     def supports_pty(self) -> bool:
         """Whether this session supports PTY operations."""
@@ -201,6 +246,7 @@ class TemporalSandboxSession(BaseSandboxSession):
                 tty=tty,
                 yield_time_s=yield_time_s,
                 max_output_tokens=max_output_tokens,
+                trusted_manifest=self._sent_trusted_manifest(),
             ),
             result_type=PtyExecUpdateResult,
             **_session_activity_config(self._config, self._state),
@@ -229,6 +275,7 @@ class TemporalSandboxSession(BaseSandboxSession):
                 chars=chars,
                 yield_time_s=yield_time_s,
                 max_output_tokens=max_output_tokens,
+                trusted_manifest=self._sent_trusted_manifest(),
             ),
             result_type=PtyExecUpdateResult,
             **_session_activity_config(self._config, self._state),
@@ -244,7 +291,9 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Start the sandbox session via activity."""
         result: SessionResult = await workflow.execute_activity(
             f"{self._name}-sandbox_session_start",
-            arg=StartArgs(state=self.state),
+            arg=StartArgs(
+                state=self.state, trusted_manifest=self._sent_trusted_manifest()
+            ),
             result_type=SessionResult,
             **_session_activity_config(self._config, self._state),
         )
@@ -254,7 +303,9 @@ class TemporalSandboxSession(BaseSandboxSession):
         """Stop the sandbox session via activity."""
         result: SessionResult = await workflow.execute_activity(
             f"{self._name}-sandbox_session_stop",
-            arg=StopArgs(state=self.state),
+            arg=StopArgs(
+                state=self.state, trusted_manifest=self._sent_trusted_manifest()
+            ),
             result_type=SessionResult,
             **_session_activity_config(self._config, self._state),
         )
