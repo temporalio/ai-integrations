@@ -44,6 +44,7 @@ def workflow_runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[ThreadPoolExec
     """Install native hooks and bind a deterministic workflow runtime."""
     _run_tree.install_run_tree_overrides()
     monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    monkeypatch.setattr(workflow, "extern_functions", lambda: {})
     monkeypatch.setattr(workflow, "now", lambda: NOW)
     monkeypatch.setattr(
         workflow.unsafe,

@@ -51,7 +51,7 @@ class LangGraphInterceptor(Interceptor):
         self, input: WorkflowInterceptorClassInput
     ) -> type[WorkflowInboundInterceptor]:
         """Return the inbound interceptor class used to scope graphs per run."""
-        install_workflow_run_ids()
+        install_workflow_run_ids(input)
         graphs = self._graphs
         entrypoints = self._entrypoints
         streaming_topic = self._streaming_topic

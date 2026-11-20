@@ -59,7 +59,7 @@ class StreamingInterceptor(Interceptor):
         self, input: WorkflowInterceptorClassInput
     ) -> type[WorkflowInboundInterceptor]:
         """Wrap each Workflow before its event stream starts."""
-        install_workflow_run_ids()
+        install_workflow_run_ids(input)
 
         class Inbound(WorkflowInboundInterceptor):
             async def handle_signal(self, input: HandleSignalInput) -> None:
@@ -80,10 +80,12 @@ class StreamingInterceptor(Interceptor):
 _RUN_IDS_PATCH = "langchain-replay-stable-run-ids"
 
 
-def install_workflow_run_ids() -> None:
+def install_workflow_run_ids(input: WorkflowInterceptorClassInput) -> None:
     """Give LangChain's root and child trace runs replay-stable IDs in Workflows."""
     from langchain_core.callbacks import manager
     from langchain_core.tracers import event_stream
+
+    input.unsafe_extern_functions["temporalio.langchain.run_id"] = _workflow_run_id
 
     # The event streamer creates the root ID; callback managers create child IDs.
     # Both modules import the public UUID helper by value.
@@ -92,19 +94,26 @@ def install_workflow_run_ids() -> None:
             setattr(module, "uuid7", _workflow_uuid_generator(module.uuid7))
 
 
-def _workflow_uuid_generator(
-    original: Callable[[int | None], UUID],
-) -> Callable[[int | None], UUID]:
-    def generate(nanoseconds: int | None = None) -> UUID:
-        if not workflow.in_workflow() or not workflow.patched(_RUN_IDS_PATCH):
-            return original(nanoseconds)
-        loop = asyncio.get_running_loop()
-        random: Random | None = getattr(loop, "_temporal_langchain_run_id_random", None)
-        if random is None:
-            # A separate named stream does not consume application randomness.
-            random = workflow.new_random("langchain-stream-run-ids")
-            setattr(loop, "_temporal_langchain_run_id_random", random)
-        return UUID(int=random.getrandbits(128), version=4)
+def _workflow_uuid_generator(original: Callable[..., UUID]) -> Callable[..., UUID]:
+    def generate(*args: Any, **kwargs: Any) -> UUID:
+        if workflow.in_workflow():
+            provider = workflow.extern_functions().get("temporalio.langchain.run_id")
+            if provider is not None and (run_id := provider()) is not None:
+                return run_id
+        return original(*args, **kwargs)
 
     setattr(generate, "_temporal_langchain_run_ids", True)
     return generate
+
+
+def _workflow_run_id() -> UUID | None:
+    """Supply IDs only for this plugin's writable, patch-enabled Workflows."""
+    if workflow.unsafe.is_read_only() or not workflow.patched(_RUN_IDS_PATCH):
+        return None
+    loop = asyncio.get_running_loop()
+    random: Random | None = getattr(loop, "_temporal_langchain_run_id_random", None)
+    if random is None:
+        # A separate named stream does not consume application randomness.
+        random = workflow.new_random("langchain-stream-run-ids")
+        setattr(loop, "_temporal_langchain_run_id_random", random)
+    return UUID(int=random.getrandbits(128), version=4)

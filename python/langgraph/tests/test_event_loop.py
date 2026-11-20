@@ -10,6 +10,7 @@ import pytest
 
 from temporalio import workflow
 from temporalio.langgraph._event_loop import (
+    _workflow_run_id,
     _workflow_uuid_generator,
     enable_workflow_streams,
 )
@@ -62,6 +63,12 @@ def test_run_ids_preserve_native_behavior_without_patch(
 ) -> None:
     monkeypatch.setattr(workflow, "in_workflow", lambda: in_workflow)
     monkeypatch.setattr(workflow, "patched", lambda _: False)
+    monkeypatch.setattr(workflow.unsafe, "is_read_only", lambda: False)
+    monkeypatch.setattr(
+        workflow,
+        "extern_functions",
+        lambda: {"temporalio.langchain.run_id": _workflow_run_id},
+    )
     calls: list[int | None] = []
 
     def original(nanoseconds: int | None = None) -> UUID:
@@ -71,3 +78,31 @@ def test_run_ids_preserve_native_behavior_without_patch(
     generate = _workflow_uuid_generator(original)
     assert generate(123) == UUID(int=17)
     assert calls == [123]
+
+
+@pytest.mark.parametrize("read_only", [True, False])
+async def test_run_ids_do_not_patch_read_only_or_unconfigured_workflows(
+    monkeypatch: pytest.MonkeyPatch, read_only: bool
+) -> None:
+    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    monkeypatch.setattr(workflow.unsafe, "is_read_only", lambda: read_only)
+    monkeypatch.setattr(
+        workflow,
+        "extern_functions",
+        lambda: {"temporalio.langchain.run_id": _workflow_run_id} if read_only else {},
+    )
+
+    def patched(_name: str) -> bool:
+        pytest.fail("must not record a patch in this workflow")
+
+    monkeypatch.setattr(workflow, "patched", patched)
+    generate = _workflow_uuid_generator(lambda: UUID(int=17))
+    assert generate() == UUID(int=17)
+
+
+def test_run_ids_delegate_without_adding_an_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow, "in_workflow", lambda: False)
+    generate = _workflow_uuid_generator(lambda: UUID(int=17))
+    assert generate() == UUID(int=17)

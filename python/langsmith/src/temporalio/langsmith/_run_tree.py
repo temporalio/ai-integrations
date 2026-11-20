@@ -90,6 +90,17 @@ def run_id() -> uuid.UUID:
     )
 
 
+def _langchain_run_id() -> uuid.UUID:
+    """Honor the current streaming plugin's ID provider in either install order."""
+    if temporalio.workflow.in_workflow():
+        provider = temporalio.workflow.extern_functions().get(
+            "temporalio.langchain.run_id"
+        )
+        if provider is not None and (value := provider()) is not None:
+            return value
+    return run_id()
+
+
 def worker_or_server_time(tz: tzinfo | None = timezone.utc) -> datetime:
     """Worker clock live, and the Server's clock during replays."""
     if (
@@ -208,7 +219,7 @@ def install_run_tree_overrides() -> None:
     # from the workflow where LangChain makes them.
     manager: Any = langchain_core.callbacks.manager
     if hasattr(manager, "uuid7"):  # langchain-core 0.3.83+ and 1.1.1+
-        manager.uuid7 = run_id
+        manager.uuid7 = _langchain_run_id
     else:  # Older releases call uuid.uuid4() through the module.
         manager.uuid = types.SimpleNamespace(uuid4=run_id)
 

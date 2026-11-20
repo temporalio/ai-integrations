@@ -560,7 +560,15 @@ The shim is also installed before Signal-With-Start and Update-With-Start handle
 run. Generated event `run_id` and `parent_ids` are replay-stable in Workflows;
 Activities and ordinary clients retain LangChain's native IDs. This uses the
 separate `langchain-replay-stable-run-ids` patch, so existing histories retain
-their original ID generation. Explicitly supplied run IDs are preserved.
+their original ID generation. Explicitly supplied run IDs are preserved. Read-only
+Queries and Update validators retain native ID generation.
+
+This guarantee covers event trace IDs, not every ID inside a message payload.
+In particular, LangGraph can generate a new `ToolMessage.id` when a tool returns
+a string. Do not use that generated message ID to acknowledge or deduplicate
+across Workflow replay. Use `ToolMessage.tool_call_id` to correlate a result with
+its originating tool call (for model calls executed in Activities, that call ID
+is recorded in the Activity result), or assign your own replay-stable message ID.
 
 Subscribers read the topic with `WorkflowStreamClient`; each item is an
 `AIMessageChunk` in `langchain_core.load.dumpd` form:
