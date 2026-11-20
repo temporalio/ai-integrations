@@ -23,10 +23,9 @@ from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.runnables import RunnableConfig
 from langgraph.channels.base import BaseChannel
 from langgraph.channels.untracked_value import UntrackedValue
-from langgraph.checkpoint.base import ChannelVersions, Checkpoint, CheckpointMetadata
+from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
 from langgraph.checkpoint.base.id import uuid6
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
@@ -193,8 +192,6 @@ def _check_restored_types(original: Any, restored: Any) -> None:
     seen: set[tuple[int, int]] = set()
     while pending:
         value, decoded = pending.pop()
-        if value is decoded:
-            continue
         pair = (id(value), id(decoded))
         if pair in seen:
             continue
@@ -342,27 +339,6 @@ def _round_trip(serde: JsonPlusSerializer, value: Any) -> bytes:
         ) from exc
 
 
-def _validate_channel(
-    serde: SerializerProtocol, key: str, value: Any, restored: Mapping[str, Any]
-) -> None:
-    if key in restored:
-        try:
-            _check_restored_types(value, restored[key])
-            return
-        except DeepAgentsWorkflowError:
-            # Delta reducers can reconstruct parallel writes in a different order.
-            # Test the encoder directly to distinguish that from serialization loss.
-            pass
-    try:
-        _check_restored_types(value, serde.loads_typed(serde.dumps_typed(value)))
-    except DeepAgentsWorkflowError:
-        raise
-    except Exception as exc:
-        raise DeepAgentsWorkflowError(
-            "Graph checkpoint state cannot be restored losslessly."
-        ) from exc
-
-
 def _untracked_values(
     graph: Any, values: Mapping[str, Any], serde: JsonPlusSerializer
 ) -> dict[str, Any]:
@@ -473,7 +449,6 @@ async def run(
     saver = _DriverSaver(
         serde=serde, backend=cast(InMemorySaver | None, agent.checkpointer)
     )
-    saver_serde = saver.serde if saver.backend is None else saver.backend.serde
     config: RunnableConfig = agent.config.copy() if agent.config is not None else {}
     configurable = dict(config.get("configurable") or {})
     if configurable.get("checkpoint_ns"):
@@ -619,8 +594,6 @@ async def run(
         else list(graph.stream_channels or keys)
     )
     output_keys = list(dict.fromkeys([*state_keys, *untracked_keys]))
-    tracked_keys = [key for key in state_keys if key not in untracked_keys]
-    checked_versions: ChannelVersions = {}
     while True:
         if budget is not None and hasattr(saver, "recursion_limit"):
             managed_offset["steps"] = saver.recursion_limit - budget + 1
@@ -684,17 +657,20 @@ async def run(
             }
         if not state.next:
             return result
-        # Validate changed state against what the saver actually restored.
-        restored_values = (
-            {state_keys[0]: state.values}
-            if isinstance(graph.stream_channels_asis, str)
-            else state.values
-        )
-        versions = saved.checkpoint["channel_versions"]
-        for key in tracked_keys:
-            if key in values and versions.get(key) != checked_versions.get(key):
-                _validate_channel(saver_serde, key, values[key], restored_values)
-        checked_versions = versions
+        # Materialize tracked state and validate before the first paid model
+        # call, even when this execution never needs a rollover.
+        checkpoint = {
+            **saved.checkpoint,
+            "channel_values": {
+                **saved.checkpoint["channel_values"],
+                **{
+                    key: value
+                    for key, value in values.items()
+                    if key not in untracked_keys
+                },
+            },
+        }
+        data = _round_trip(serde, checkpoint)
         at_model = state.next == ("model",)
         if at_model:
             allowed = _rollover_allowed()
@@ -715,14 +691,6 @@ async def run(
                     raise DeepAgentsWorkflowError(
                         "Cannot carry an unsettled graph checkpoint."
                     )
-                checkpoint = {
-                    **saved.checkpoint,
-                    "channel_values": {
-                        **saved.checkpoint["channel_values"],
-                        **{key: values[key] for key in tracked_keys if key in values},
-                    },
-                }
-                data = _round_trip(serde, checkpoint)
                 snapshot = {
                     SNAPSHOT_KEY: {
                         "version": 1,

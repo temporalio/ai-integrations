@@ -728,28 +728,6 @@ def test_checkpoint_serialization_accepts_tuples_and_nan() -> None:
     _checkpoint._round_trip(serde, {"tuple": (1, "two", (3, float("nan")))})
 
 
-@pytest.mark.parametrize("rollover", [False, True])
-async def test_full_checkpoint_is_serialized_only_for_rollover(
-    monkeypatch: pytest.MonkeyPatch, rollover: bool
-) -> None:
-    checkpoint_count = 0
-    round_trip = _checkpoint._round_trip
-
-    def observe(serde: JsonPlusSerializer, value: Any) -> bytes:
-        nonlocal checkpoint_count
-        if isinstance(value, dict) and "channel_versions" in value:
-            checkpoint_count += 1
-        return round_trip(serde, value)
-
-    monkeypatch.setattr(_checkpoint, "_round_trip", observe)
-    model = FakeModel([_tool_reply(0), _tool_reply(1), "Done."])
-    result, carries = await _drive(
-        lambda: create_deep_agent(name="test-agent", model=model), rollover=rollover
-    )
-    assert result["messages"][-1].content == "Done."
-    assert checkpoint_count == len(carries) == (2 if rollover else 0)
-
-
 async def test_breakpoint_rollover_does_not_report_callback_errors() -> None:
     from langchain_core.callbacks import AsyncCallbackHandler
 

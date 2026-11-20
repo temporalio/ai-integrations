@@ -628,10 +628,9 @@ count.
   so earlier checkpoint history is unnecessary. Message classes and types
   declared in the graph's state schema are preserved, including nested types.
   Types used in a snapshot must be importable from their defining module;
-  classes defined inside a workflow method cannot be restored. If the saver
-  cannot round-trip the initial state, the driver raises
-  `DeepAgentsWorkflowError` before the first model call. It checks changed
-  channels at subsequent breakpoints and validates the full snapshot on rollover.
+  classes defined inside a workflow method cannot be restored. Unsupported
+  state fails with `DeepAgentsWorkflowError` before the first model call when
+  present at startup. Later state changes are checked at subsequent breakpoints.
   Tuples follow native msgpack semantics and restore as lists. Mapping keys,
   excluded Pydantic fields and private attributes are checked for data loss.
 - **Checkpoint storage:** the driver uses an in-workflow `InMemorySaver`, creating
