@@ -64,8 +64,9 @@ class CancelledRunWorkflow:
 
 @pytest.mark.parametrize("old_behavior", [False, True])
 @pytest.mark.parametrize("cleanup", [False, True])
+@pytest.mark.parametrize("checkpoint_driver", [False, True])
 async def test_run_cancellation_and_replay(
-    env: WorkflowEnvironment, old_behavior: bool, cleanup: bool
+    env: WorkflowEnvironment, old_behavior: bool, cleanup: bool, checkpoint_driver: bool
 ) -> None:
     call = {"name": "cancellation_wait", "args": {"value": "go"}, "id": "wait-1"}
     responses = [AIMessage(content="", tool_calls=[call]), AIMessage(content="done")]
@@ -74,6 +75,11 @@ async def test_run_cancellation_and_replay(
     original_patched = workflow.patched
 
     def selected_behavior(patch_id: str) -> bool:
+        if (
+            not checkpoint_driver
+            and patch_id == "deepagents.checkpoint-continue-as-new"
+        ):
+            return False
         if old_behavior and patch_id == "deepagents.raise-cancellation":
             return False
         return original_patched(patch_id)
