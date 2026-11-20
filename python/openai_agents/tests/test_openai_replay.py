@@ -19,6 +19,8 @@ from tests.test_openai import (
     HelloWorldAgent,
     InputGuardrailWorkflow,
     OutputGuardrailWorkflow,
+    OutputTypeWorkflow,
+    RefusalFallbackWorkflow,
     ResearchWorkflow,
     RunModelProviderWorkflow,
     ToolsWorkflow,
@@ -35,6 +37,12 @@ HISTORIES = Path(__file__).with_name("histories") / f"{REPLAY_MAJOR}.x"
     [
         # The run gets its own agent back, so it starts a timer.
         "caller-agent-workflow-history.json",
+        # The final output didn't match output_type, so the run failed the Workflow
+        # after recording the patch marker.
+        "invalid-output-type-workflow-history.json",
+        # Recorded before the patch: the run recovers from a UserError whose cause is
+        # a ModelBehaviorError, so Runner.run must keep raising the UserError.
+        "refusal-fallback-workflow-history.json",
         # Recorded with the workflow worker stopped, so that one activation
         # resolves a stateful MCP call together with another activity (gather)
         # or with a workflow cancel (cancel).
@@ -61,6 +69,8 @@ async def test_replay(file_name: str) -> None:
                 HelloWorldAgent,
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,
+                OutputTypeWorkflow,
+                RefusalFallbackWorkflow,
                 RunModelProviderWorkflow,
                 StatefulMcpGatherWorkflow,
                 StatefulMcpGatherWaitWorkflow,
