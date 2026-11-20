@@ -121,25 +121,39 @@ public final class TemporalAdk {
     List<T> items = new ArrayList<>();
     AtomicReference<Throwable> failure = new AtomicReference<>();
     AtomicBoolean done = new AtomicBoolean();
-    Disposable subscription =
-        flowable.subscribe(
-            items::add,
-            error -> {
-              failure.set(error);
-              done.set(true);
-            },
-            () -> done.set(true));
+    GoogleAdkTracing.Turn turn = GoogleAdkTracing.beginTurn();
     try {
-      Workflow.await(done::get);
+      Disposable subscription =
+          flowable.subscribe(
+              items::add,
+              error -> {
+                failure.set(error);
+                done.set(true);
+              },
+              () -> done.set(true));
+      try {
+        Workflow.await(done::get);
+      } catch (RuntimeException canceled) {
+        // ADK's open spans end on dispose below and keep this failure as their status.
+        turn.fail(canceled);
+        throw canceled;
+      } finally {
+        subscription.dispose();
+      }
+      // RxJava delivers a non-fatal Error, such as a workflow thread's destruction, as a failure.
+      if (failure.get() instanceof Error error) {
+        throw error;
+      }
+    } catch (Error error) {
+      // The thread is being destroyed; a later replay rebuilds and exports the turn.
+      turn.discard();
+      throw error;
     } finally {
-      subscription.dispose();
+      turn.close();
     }
     Throwable error = failure.get();
-    if (error instanceof RuntimeException) {
-      throw (RuntimeException) error;
-    }
-    if (error instanceof Error) {
-      throw (Error) error;
+    if (error instanceof RuntimeException runtime) {
+      throw runtime;
     }
     if (error != null) {
       throw new IllegalStateException("ADK run failed", error);
