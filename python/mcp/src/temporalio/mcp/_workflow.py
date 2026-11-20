@@ -37,10 +37,11 @@ class TemporalMCPClient:
     ``start_to_close_timeout`` is added when the config sets neither
     ``start_to_close_timeout`` nor ``schedule_to_close_timeout``, and a
     10-second ``heartbeat_timeout`` when the config leaves it out. Set
-    ``heartbeat_timeout`` to ``None`` to turn heartbeats off. Tool discovery
-    is cached for the lifetime of this object by default. A non-None ``factory_argument`` selects
-    a fresh worker-side client for every Activity. The argument is recorded in
-    workflow history and must not contain secrets.
+    ``heartbeat_timeout`` to ``None`` or ``timedelta(0)`` to turn heartbeats
+    off. Tool discovery is cached for the lifetime of this object by default.
+    A non-None ``factory_argument`` selects a fresh worker-side client for every
+    Activity. The argument is recorded in workflow history and must not contain
+    secrets.
 
     This class intentionally does not inherit from ``mcp.Client`` or
     ``mcp.ClientSession``. It exposes the request/response operations that can
