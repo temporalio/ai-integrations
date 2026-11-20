@@ -1,0 +1,17 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "langchain4j"
+language = "java"
+coordinate = "io.temporal:langchain4j"
+registry = "maven"
+root-api = "io.temporal.langchain4j"
+maturity = "pre-release"
+docs = "https://github.com/temporalio/ai-integrations/tree/main/java/langchain4j"
+
+[ci]
+runtime-versions = ["17", "25"]
+
+[smoke]
+dependencies = ["io.temporal:temporal-sdk:1.40.0"]
+imports = ["io.temporal.langchain4j.LangChain4jPlugin", "io.temporal.langchain4j.model.TemporalChatModel"]
