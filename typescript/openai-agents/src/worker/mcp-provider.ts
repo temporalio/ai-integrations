@@ -3,6 +3,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import {
   MCP_CALL_TOOL_SUFFIX,
   MCP_LIST_TOOLS_SUFFIX,
+  MCP_PROTOCOL_ERROR_TYPE,
   MCP_STATELESS_SUFFIX,
   TOOL_FILTER_UNSUPPORTED_TYPE,
   TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
@@ -93,6 +94,46 @@ export async function callToolWithMeta(
   return meta === undefined ? server.callTool(toolName, args) : server.callTool(toolName, args, meta);
 }
 
+// JSON-RPC errors that a retry of the same request cannot fix: parse error, invalid request,
+// method not found and invalid params. INTERNAL_ERROR, transport errors, timeouts and unknown
+// codes stay retryable.
+const NON_RETRYABLE_PROTOCOL_ERROR_CODES = new Set([-32700, -32600, -32601, -32602]);
+
+// The MCP SDK raises `McpError` (v1) or `ProtocolError` (v2) for a JSON-RPC error response.
+function protocolErrorOf(err: unknown): { code: number; message: string; data?: unknown } | undefined {
+  for (let current = err, depth = 0; current instanceof Error && depth < 8; current = current.cause, depth++) {
+    const { name, code } = current as Error & { code?: unknown };
+    if ((name === 'ProtocolError' || name === 'McpError') && typeof code === 'number') {
+      return current as Error & { code: number; data?: unknown };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Runs an MCP request. A JSON-RPC error a retry cannot fix (invalid params, invalid request,
+ * method not found, parse error) becomes a non-retryable `MCPProtocolError` failure instead of
+ * a plain error that the Activity retry policy would retry until it gives up. Any other error
+ * is rethrown unchanged.
+ */
+export async function failNonRetryableProtocolError<T>(request: () => Promise<T>): Promise<T> {
+  try {
+    return await request();
+  } catch (err) {
+    const protocolError = protocolErrorOf(err);
+    if (protocolError && NON_RETRYABLE_PROTOCOL_ERROR_CODES.has(protocolError.code)) {
+      throw ApplicationFailure.create({
+        message: protocolError.message,
+        type: MCP_PROTOCOL_ERROR_TYPE,
+        nonRetryable: true,
+        details: protocolError.data === undefined ? [protocolError.code] : [protocolError.code, protocolError.data],
+        cause: err instanceof Error ? err : undefined,
+      });
+    }
+    throw err;
+  }
+}
+
 export class StatelessMCPServerProvider {
   private readonly _name: string;
 
@@ -113,7 +154,7 @@ export class StatelessMCPServerProvider {
         rejectToolMetaResolver(s);
         try {
           await s.connect();
-          return filterListedTools(s, await s.listTools());
+          return filterListedTools(s, await failNonRetryableProtocolError(() => s.listTools()));
         } finally {
           await s.close();
         }
@@ -130,7 +171,7 @@ export class StatelessMCPServerProvider {
         rejectToolMetaResolver(s);
         try {
           await s.connect();
-          return await callToolWithMeta(s, input.toolName, input.args, input.meta);
+          return await failNonRetryableProtocolError(() => callToolWithMeta(s, input.toolName, input.args, input.meta));
         } finally {
           await s.close();
         }

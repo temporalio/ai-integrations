@@ -470,6 +470,8 @@ The integration supports stateless and stateful [Model Context Protocol](https:/
 
 Both providers require a factory function, and refuse anything else with a `TypeError` when you create them, so the Worker doesn't start. They also require factories to return a server with callable `connect`, `close`, `listTools` and `callTool` methods. An invalid result fails the Activity with a non-retryable `ApplicationFailure` of type `MCPServerFactoryTypeError` before the server is connected or registered. Plain objects implementing these methods are accepted. A partial server that previously worked for one operation must now provide all four methods. Other invalid results previously failed with ordinary runtime errors that could be retried. Fix these factories before upgrading: deploying a corrected Worker will not automatically resume an Activity that has already failed.
 
+The stateless provider's list-tools and call-tool Activities fail a JSON-RPC error that a retry cannot fix (parse error, invalid request, method not found, invalid params) with a non-retryable `ApplicationFailure` of type `MCPProtocolError`; its details hold the error code and data. Internal errors, transport errors, timeouts and unknown codes stay retryable.
+
 ### Stateless MCP servers
 
 Use stateless servers when each tool call is independent. Register a provider on the Worker:
