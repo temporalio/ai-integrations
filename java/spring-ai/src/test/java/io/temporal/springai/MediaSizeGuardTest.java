@@ -82,8 +82,7 @@ class MediaSizeGuardTest {
 
   @Test
   void inboundPath_oversizedUserMessageMedia_failsTheWorkflow() {
-    // Workflow → activity direction: the workflow builds a Prompt with a huge byte[] media,
-    // ActivityChatModel.createActivityInput calls toMediaContent → checkMediaSize throws.
+    // The workflow encodes the prompt before scheduling the Activity.
     Worker worker = testEnv.newWorker(TASK_QUEUE);
     worker.registerWorkflowImplementationTypes(BigInboundMediaWorkflowImpl.class);
     worker.registerActivitiesImplementations(new ChatModelActivityImpl(new StubChatModel()));
@@ -129,8 +128,7 @@ class MediaSizeGuardTest {
 
   @Test
   void outboundPath_assistantEchoesOversizedMedia_failsTheActivity() {
-    // Activity → workflow direction: the stub ChatModel returns an assistant message with a
-    // huge byte[] media, ChatModelActivityImpl.fromMedia → checkMediaSize throws.
+    // The Activity encodes the oversized model response before returning it to the workflow.
     Worker worker = testEnv.newWorker(TASK_QUEUE);
     worker.registerWorkflowImplementationTypes(EchoMediaWorkflowImpl.class);
     worker.registerActivitiesImplementations(

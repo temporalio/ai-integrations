@@ -1,31 +1,25 @@
 package io.temporal.springai.activity;
 
 import io.temporal.springai.model.ChatModelTypes;
-import io.temporal.springai.model.ChatModelTypes.Message;
 import io.temporal.springai.util.ChatOptionsCodec;
+import io.temporal.springai.util.MessagePartsCodec;
 import io.temporal.springai.util.OpenAiFailureSupport;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.messages.*;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.DefaultChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
-import org.springframework.ai.content.Media;
 import org.springframework.ai.model.tool.DefaultToolCallingChatOptions;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
-import org.springframework.core.io.ByteArrayResource;
 import org.springframework.util.CollectionUtils;
-import org.springframework.util.MimeType;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -98,8 +92,7 @@ public class ChatModelActivityImpl implements ChatModelActivity {
   }
 
   private Prompt createPrompt(ChatModelTypes.ChatModelActivityInput input, ChatOptions defaults) {
-    List<org.springframework.ai.chat.messages.Message> messages =
-        input.messages().stream().map(this::toSpringMessage).collect(Collectors.toList());
+    List<Message> messages = input.messages().stream().map(MessagePartsCodec::decode).toList();
 
     ChatOptions.Builder<?> callerOptions = tryRehydrateChatOptions(input.modelOptions());
     if (callerOptions == null) {
@@ -206,109 +199,13 @@ public class ChatModelActivityImpl implements ChatModelActivity {
     }
   }
 
-  private org.springframework.ai.chat.messages.Message toSpringMessage(Message message) {
-    return switch (message.role()) {
-      case SYSTEM -> new SystemMessage(message.rawContent());
-      case USER -> {
-        UserMessage.Builder builder = UserMessage.builder().text(message.rawContent());
-        if (!CollectionUtils.isEmpty(message.mediaContents())) {
-          builder.media(
-              message.mediaContents().stream().map(this::toMedia).collect(Collectors.toList()));
-        }
-        yield builder.build();
-      }
-      case ASSISTANT ->
-          AssistantMessage.builder()
-              .content(message.rawContent())
-              .properties(assistantMetadata(message))
-              .toolCalls(
-                  message.toolCalls() != null
-                      ? message.toolCalls().stream()
-                          .map(
-                              tc ->
-                                  new AssistantMessage.ToolCall(
-                                      tc.id(),
-                                      tc.type(),
-                                      tc.function().name(),
-                                      tc.function().arguments()))
-                          .collect(Collectors.toList())
-                      : List.of())
-              .media(
-                  message.mediaContents() != null
-                      ? message.mediaContents().stream()
-                          .map(this::toMedia)
-                          .collect(Collectors.toList())
-                      : List.of())
-              .build();
-      case TOOL ->
-          ToolResponseMessage.builder()
-              .responses(
-                  List.of(
-                      new ToolResponseMessage.ToolResponse(
-                          message.toolCallId(), message.name(), message.rawContent())))
-              .build();
-    };
-  }
-
-  private Map<String, Object> assistantMetadata(Message message) {
-    if (message.metadata() == null) {
-      return Map.of();
-    }
-    Map<String, Object> metadata = new HashMap<>(message.metadata());
-    Object signatures = metadata.get("thoughtSignatures");
-    if (signatures instanceof List<?>) {
-      // Gemini expects byte arrays, including null entries for unsigned parts. Temporal's
-      // untyped metadata map decodes the binary values as base64 strings instead.
-      metadata.put(
-          "thoughtSignatures",
-          OPTIONS_MAPPER.convertValue(
-              signatures,
-              OPTIONS_MAPPER.getTypeFactory().constructCollectionType(List.class, byte[].class)));
-    }
-    Object thinking = metadata.get("anthropicThinkingContents");
-    if (thinking instanceof List<?> blocks && !blocks.isEmpty()) {
-      // Temporal decodes metadata as JSON maps. Anthropic expects its typed records in
-      // this property, even on a plain AssistantMessage. Restore them only on the worker
-      // so the plugin and workflow remain independent of the optional provider module.
-      try {
-        Class<?> contentType =
-            Class.forName(
-                "org.springframework.ai.anthropic.AnthropicChatModel$AnthropicThinkingContent",
-                true,
-                Thread.currentThread().getContextClassLoader());
-        metadata.put(
-            "anthropicThinkingContents",
-            OPTIONS_MAPPER.convertValue(
-                blocks,
-                OPTIONS_MAPPER.getTypeFactory().constructCollectionType(List.class, contentType)));
-      } catch (ClassNotFoundException | JacksonException e) {
-        throw new IllegalArgumentException("Could not restore Anthropic thinking continuation", e);
-      }
-    }
-    return metadata;
-  }
-
-  private Media toMedia(ChatModelTypes.MediaContent mediaContent) {
-    MimeType mimeType = MimeType.valueOf(mediaContent.mimeType());
-    if (mediaContent.uri() != null) {
-      try {
-        return new Media(mimeType, new URI(mediaContent.uri()));
-      } catch (URISyntaxException e) {
-        throw new RuntimeException("Invalid media URI: " + mediaContent.uri(), e);
-      }
-    } else if (mediaContent.data() != null) {
-      return new Media(mimeType, new ByteArrayResource(mediaContent.data()));
-    }
-    throw new IllegalArgumentException("Media content must have either uri or data");
-  }
-
   private ChatModelTypes.ChatModelActivityOutput toOutput(ChatResponse response) {
     List<ChatModelTypes.ChatModelActivityOutput.Generation> generations =
         response.getResults().stream()
             .map(
                 gen ->
                     new ChatModelTypes.ChatModelActivityOutput.Generation(
-                        fromAssistantMessage(gen.getOutput()),
+                        MessagePartsCodec.encode(gen.getOutput()),
                         gen.getMetadata() != null ? gen.getMetadata().getFinishReason() : null))
             .collect(Collectors.toList());
 
@@ -340,48 +237,6 @@ public class ChatModelActivityImpl implements ChatModelActivity {
     }
 
     return new ChatModelTypes.ChatModelActivityOutput(generations, metadata);
-  }
-
-  private Message fromAssistantMessage(AssistantMessage assistantMessage) {
-    List<Message.ToolCall> toolCalls = null;
-    if (!CollectionUtils.isEmpty(assistantMessage.getToolCalls())) {
-      toolCalls =
-          assistantMessage.getToolCalls().stream()
-              .map(
-                  tc ->
-                      new Message.ToolCall(
-                          tc.id(),
-                          tc.type(),
-                          new Message.ChatCompletionFunction(tc.name(), tc.arguments())))
-              .collect(Collectors.toList());
-    }
-
-    List<ChatModelTypes.MediaContent> mediaContents = null;
-    if (!CollectionUtils.isEmpty(assistantMessage.getMedia())) {
-      mediaContents =
-          assistantMessage.getMedia().stream().map(this::fromMedia).collect(Collectors.toList());
-    }
-
-    return new Message(
-        assistantMessage.getText(),
-        Message.Role.ASSISTANT,
-        null,
-        null,
-        toolCalls,
-        mediaContents,
-        assistantMessage.getMetadata());
-  }
-
-  private ChatModelTypes.MediaContent fromMedia(Media media) {
-    String mimeType = media.getMimeType().toString();
-    if (media.getData() instanceof String uri) {
-      return new ChatModelTypes.MediaContent(mimeType, uri);
-    } else if (media.getData() instanceof byte[] data) {
-      ChatModelTypes.checkMediaSize(data);
-      return new ChatModelTypes.MediaContent(mimeType, data);
-    }
-    throw new IllegalArgumentException(
-        "Unsupported media data type: " + media.getData().getClass());
   }
 
   /**

@@ -6,15 +6,13 @@ import io.temporal.springai.activity.ChatModelActivity;
 import io.temporal.springai.plugin.SpringAiPlugin;
 import io.temporal.springai.plugin.SpringAiPluginOptions;
 import io.temporal.springai.util.ChatOptionsCodec;
+import io.temporal.springai.util.MessagePartsCodec;
 import io.temporal.workflow.Workflow;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.time.Duration;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-import org.springframework.ai.chat.messages.*;
+import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.metadata.ChatGenerationMetadata;
 import org.springframework.ai.chat.metadata.ChatResponseMetadata;
 import org.springframework.ai.chat.metadata.DefaultUsage;
@@ -25,12 +23,9 @@ import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
-import org.springframework.ai.content.Media;
 import org.springframework.ai.model.tool.*;
 import org.springframework.ai.tool.definition.ToolDefinition;
-import org.springframework.core.io.ByteArrayResource;
 import org.springframework.util.CollectionUtils;
-import org.springframework.util.MimeType;
 import reactor.core.publisher.Flux;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
@@ -292,11 +287,8 @@ public class ActivityChatModel implements ChatModel {
   }
 
   private ChatModelTypes.ChatModelActivityInput createActivityInput(Prompt prompt) {
-    // Convert messages
     List<ChatModelTypes.Message> messages =
-        prompt.getInstructions().stream()
-            .flatMap(msg -> toActivityMessages(msg).stream())
-            .collect(Collectors.toList());
+        prompt.getInstructions().stream().map(MessagePartsCodec::encode).toList();
 
     // Convert options — carry both the common scalars (fallback path) and a serialized blob of
     // the caller's exact ChatOptions subclass (primary path on the activity side, which
@@ -353,91 +345,13 @@ public class ActivityChatModel implements ChatModel {
     return new ChatModelTypes.ChatModelActivityInput(modelName, messages, modelOptions, tools);
   }
 
-  private List<ChatModelTypes.Message> toActivityMessages(Message message) {
-    return switch (message.getMessageType()) {
-      case SYSTEM ->
-          List.of(
-              new ChatModelTypes.Message(message.getText(), ChatModelTypes.Message.Role.SYSTEM));
-      case USER -> {
-        List<ChatModelTypes.MediaContent> mediaContents = null;
-        if (message instanceof UserMessage userMessage
-            && !CollectionUtils.isEmpty(userMessage.getMedia())) {
-          mediaContents =
-              userMessage.getMedia().stream()
-                  .map(this::toMediaContent)
-                  .collect(Collectors.toList());
-        }
-        yield List.of(
-            new ChatModelTypes.Message(
-                message.getText(), mediaContents, ChatModelTypes.Message.Role.USER));
-      }
-      case ASSISTANT -> {
-        AssistantMessage assistantMessage = (AssistantMessage) message;
-        List<ChatModelTypes.Message.ToolCall> toolCalls = null;
-        if (!CollectionUtils.isEmpty(assistantMessage.getToolCalls())) {
-          toolCalls =
-              assistantMessage.getToolCalls().stream()
-                  .map(
-                      tc ->
-                          new ChatModelTypes.Message.ToolCall(
-                              tc.id(),
-                              tc.type(),
-                              new ChatModelTypes.Message.ChatCompletionFunction(
-                                  tc.name(), tc.arguments())))
-                  .collect(Collectors.toList());
-        }
-        List<ChatModelTypes.MediaContent> mediaContents = null;
-        if (!CollectionUtils.isEmpty(assistantMessage.getMedia())) {
-          mediaContents =
-              assistantMessage.getMedia().stream()
-                  .map(this::toMediaContent)
-                  .collect(Collectors.toList());
-        }
-        yield List.of(
-            new ChatModelTypes.Message(
-                assistantMessage.getText(),
-                ChatModelTypes.Message.Role.ASSISTANT,
-                null,
-                null,
-                toolCalls,
-                mediaContents,
-                assistantMessage.getMetadata()));
-      }
-      case TOOL -> {
-        ToolResponseMessage toolMessage = (ToolResponseMessage) message;
-        yield toolMessage.getResponses().stream()
-            .map(
-                tr ->
-                    new ChatModelTypes.Message(
-                        tr.responseData(),
-                        ChatModelTypes.Message.Role.TOOL,
-                        tr.name(),
-                        tr.id(),
-                        null,
-                        null))
-            .collect(Collectors.toList());
-      }
-    };
-  }
-
-  private ChatModelTypes.MediaContent toMediaContent(Media media) {
-    String mimeType = media.getMimeType().toString();
-    if (media.getData() instanceof String uri) {
-      return new ChatModelTypes.MediaContent(mimeType, uri);
-    } else if (media.getData() instanceof byte[] data) {
-      ChatModelTypes.checkMediaSize(data);
-      return new ChatModelTypes.MediaContent(mimeType, data);
-    }
-    throw new IllegalArgumentException(
-        "Unsupported media data type: " + media.getData().getClass());
-  }
-
   private ChatResponse toResponse(ChatModelTypes.ChatModelActivityOutput output) {
     List<Generation> generations =
         output.generations().stream()
             .map(
                 gen -> {
-                  AssistantMessage message = toAssistantMessage(gen.message());
+                  AssistantMessage message =
+                      (AssistantMessage) MessagePartsCodec.decode(gen.message());
                   return gen.finishReason() != null
                       ? new Generation(
                           message,
@@ -510,44 +424,5 @@ public class ActivityChatModel implements ChatModel {
         return r.tokenReset();
       }
     };
-  }
-
-  private AssistantMessage toAssistantMessage(ChatModelTypes.Message message) {
-    List<AssistantMessage.ToolCall> toolCalls = List.of();
-    if (!CollectionUtils.isEmpty(message.toolCalls())) {
-      toolCalls =
-          message.toolCalls().stream()
-              .map(
-                  tc ->
-                      new AssistantMessage.ToolCall(
-                          tc.id(), tc.type(), tc.function().name(), tc.function().arguments()))
-              .collect(Collectors.toList());
-    }
-
-    List<Media> media = List.of();
-    if (!CollectionUtils.isEmpty(message.mediaContents())) {
-      media = message.mediaContents().stream().map(this::toMedia).collect(Collectors.toList());
-    }
-
-    return AssistantMessage.builder()
-        .content(message.rawContent())
-        .properties(message.metadata() != null ? message.metadata() : Map.of())
-        .toolCalls(toolCalls)
-        .media(media)
-        .build();
-  }
-
-  private Media toMedia(ChatModelTypes.MediaContent mediaContent) {
-    MimeType mimeType = MimeType.valueOf(mediaContent.mimeType());
-    if (mediaContent.uri() != null) {
-      try {
-        return new Media(mimeType, new URI(mediaContent.uri()));
-      } catch (URISyntaxException e) {
-        throw new RuntimeException("Invalid media URI: " + mediaContent.uri(), e);
-      }
-    } else if (mediaContent.data() != null) {
-      return new Media(mimeType, new ByteArrayResource(mediaContent.data()));
-    }
-    throw new IllegalArgumentException("Media content must have either uri or data");
   }
 }

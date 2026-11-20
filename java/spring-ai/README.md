@@ -1,6 +1,6 @@
 # Temporal Spring AI
 
-Public Preview integration for Spring AI 2.0.x and Spring Boot 4. Model calls
+Public Preview integration for Spring AI 2.1 and Spring Boot 4.2. Model calls
 execute as Temporal Activities; Activity, Nexus, side-effect, and deterministic
 tools execute through the ChatClient tool-calling advisor on the workflow thread.
 
@@ -11,14 +11,15 @@ CI tests Java 17 and 25; published bytecode targets Java 17.
 ## Requirements and installation
 
 - Java 17 or later.
-- Spring AI 2.0.1 and Spring Boot 4.0.8; Boot 4.1.1 is also tested.
+- Spring AI 2.1.0 or later in the 2.x series on both the Workflow and Activity workers.
+- Spring Boot 4.2.0 or later in the 4.x series.
 - Temporal Java SDK and `temporal-spring-boot-starter` 1.40.0 or later.
 - A Spring AI provider starter for your chosen model. This integration supplies no provider.
 
-Install the standalone integration:
+Install the standalone integration and import the matching Spring AI BOM in your application.
 
 ```groovy
-implementation 'io.temporal:spring-ai:0.1.0'
+implementation 'io.temporal:spring-ai:<version>'
 implementation 'io.temporal:temporal-spring-boot-starter:1.40.0'
 implementation 'io.temporal:temporal-sdk:1.40.0'
 ```
@@ -28,24 +29,37 @@ and register tools with `defaultTools(...)`. The entry points `TemporalChatClien
 `ActivityChatModel`, and Temporal tool annotations retain their names and packages.
 Model calls run as Activities; tool calls remain durable Temporal operations.
 
-## Moving from Spring AI 1
+## Upgrading from earlier releases
 
-`io.temporal:spring-ai:0.1.0` targets Spring AI 2 / Boot 4 exclusively. Spring AI 1 /
-Boot 3 applications remain on `io.temporal:temporal-spring-ai:1.40.x`. Align your application with the Spring AI 2
-and Boot 4 BOMs; Spring AI 2 uses immutable options and Jackson 3. Pass option builders
+Spring AI 2.0 applications can use `io.temporal:spring-ai:0.1.1`. Spring AI 1 and
+Boot 3 applications can use `io.temporal:temporal-spring-ai:1.40.x`. Spring AI 2
+uses immutable options and Jackson 3. Pass option builders
 to ChatClient, for example `.defaultOptions(OpenAiChatOptions.builder().reasoningEffort("high"))`.
 `ActivityChatModel.call(...)` returns a raw model response; use ChatClient's advisor
 loop to execute tools. The removed `internalToolExecutionEnabled` flag is unnecessary.
 
-Do not move in-flight Spring AI 1 workflows onto these workers: the upgrade does not
-provide replay compatibility with Spring AI 1 histories. Use separate worker deployments
-or complete the existing executions before switching versions.
+This release changes the chat Activity payload format. Keep in-flight workflows on
+their original workers until they finish. Route new workflows to a separate Worker
+Deployment Version running this release.
 
 Streaming and tool context remain unsupported. Provider-specific options survive
 Activity serialization through their public builders; callbacks are transported as
 definitions and execute only in the workflow. Retry, per-model Activity options,
 response metadata, and media-size guards retain their behavior. Optional vector-store,
 embedding, and MCP modules are detected through Spring auto-configuration.
+
+## Ordered chat content
+
+With Spring AI 2.1, the chat Activity preserves the order of message parts and
+their provider-owned payloads through tool continuations. For example, Anthropic
+thinking signatures and redacted thinking survive the round trip alongside text
+and tool calls.
+
+Large chat prompts and model responses, including ordered parts and tool results,
+can exceed Temporal's payload limit. Pass references for large media. Supply media
+as bytes or URI strings. Spring AI 2.1's media codec converts `java.net.URL` objects
+to strings, so the integration refuses that input type. Use a deterministic name
+for media that needs a caller-specified label in Workflow code.
 
 ## Structured output
 
@@ -94,11 +108,8 @@ For Spring Boot's OpenAI chat model:
 spring.ai.openai.chat.max-retries=0
 ```
 
-These options configure the provider client at construction time; setting them
-on a workflow prompt does not disable retries on an existing client. Keep a
-separate model/client if calls outside Temporal need SDK retries. Without this
-configuration, Spring AI 2.0.1's three internal OpenAI retries can produce twelve
-requests across the default three Activity attempts.
+Set these options when constructing the provider client. Use a separate client
+for calls outside Temporal that need SDK retries.
 
 ## Development
 
@@ -106,12 +117,12 @@ requests across the default three Activity attempts.
 ./gradlew spotlessCheck test stageDist
 ```
 
-The full Java/OS matrix runs for each supported Boot version, using committed locks.
-Deliberately update locks with `./gradlew resolveAndLockAll --write-locks`
-(and `-PspringBootVersion=4.1.1` for that compatibility lane).
+The Java/OS matrix uses the committed dependency lock. Update it with
+`./gradlew resolveAndLockAll --write-locks`.
 
 Nightly CI and manual runs with `latest-deps=true` test stable releases in Temporal
-1.x, Spring AI 2.x, and Spring Boot 4.x.
+1.x, Spring AI 2.1 through the latest 2.x release, and Spring Boot 4.2 through
+the latest 4.x release.
 To run that check locally:
 
 ```bash

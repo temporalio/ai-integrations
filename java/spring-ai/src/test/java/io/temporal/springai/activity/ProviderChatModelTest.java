@@ -19,6 +19,7 @@ import io.temporal.springai.chat.TemporalChatClient;
 import io.temporal.springai.model.ActivityChatModel;
 import io.temporal.springai.model.ChatModelTypes.*;
 import io.temporal.springai.util.ChatOptionsCodec;
+import io.temporal.springai.util.MessagePartsCodec;
 import io.temporal.testing.TestWorkflowEnvironment;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
@@ -30,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
@@ -98,7 +100,7 @@ class ProviderChatModelTest {
     ChatModelActivityOutput output =
         activity.callChatModel(new ChatModelActivityInput("selected", messages(), null, List.of()));
 
-    assertEquals("pong", output.generations().get(0).message().rawContent());
+    assertEquals("pong", MessagePartsCodec.decode(output.generations().get(0).message()).getText());
     ChatCompletionCreateParams request = request();
     assertEquals("selected-model", request.model().asString());
     assertEquals(0.4, request.temperature().orElseThrow());
@@ -262,6 +264,6 @@ class ProviderChatModelTest {
   }
 
   private List<Message> messages() {
-    return List.of(new Message("ping", Message.Role.USER));
+    return List.of(MessagePartsCodec.encode(new UserMessage("ping")));
   }
 }
