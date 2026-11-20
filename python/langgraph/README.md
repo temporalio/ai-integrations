@@ -144,7 +144,7 @@ plugin = LangGraphPlugin(
 )
 ```
 
-Routing functions given to `add_conditional_edges` always run in the Workflow, so they must be deterministic. They can be `def` or `async def`. The same holds for sync LangChain callables that Workflow code awaits: a `def` tool or a sync-only model called with `ainvoke` in an `execute_in="workflow"` node runs in the Workflow, and runs again on replay. Keep model and tool calls in Activity nodes.
+Routing functions given to `add_conditional_edges` always run in the Workflow, so they must be deterministic. They can be `def` or `async def`. The same holds for sync LangChain tools, output parsers and runnables that Workflow code awaits: a `def` tool called with `ainvoke` in an `execute_in="workflow"` node runs in the Workflow, and runs again on replay. Other sync LangChain calls that LangChain runs in a thread, such as a sync-only model, cache, retriever or vector store, fail in the Workflow with `NotImplementedError`. Keep model and tool calls in Activity nodes.
 
 A `@task` that is not listed in `tasks=[...]` also runs in the Workflow. Write entrypoints as `async def` and `await` their tasks: a `def` entrypoint that calls `.result()` on a task fails the Workflow Task with `Result is not set.`
 
