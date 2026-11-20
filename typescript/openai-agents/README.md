@@ -25,7 +25,6 @@ export async function haikuAgentWorkflow(prompt: string): Promise<string> {
   const agent = new Agent({
     name: 'Assistant',
     instructions: 'You only respond in haikus.',
-    model: 'gpt-6-luna',
   });
 
   const runner = new TemporalOpenAIRunner();
