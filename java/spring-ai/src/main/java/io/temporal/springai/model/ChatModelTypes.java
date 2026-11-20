@@ -1,6 +1,5 @@
 package io.temporal.springai.model;
 
-import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -9,6 +8,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
+import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.content.Media;
 
 /**
  * Serializable types for chat model activity requests and responses.
@@ -27,10 +28,10 @@ public final class ChatModelTypes {
   public static final String DEFAULT_MODEL_NAME = "default";
 
   /**
-   * Maximum size, in bytes, of a single {@link MediaContent#data()} byte array carried across the
-   * chat activity boundary. Bytes above this threshold land inside workflow history events, which
-   * have a fixed 2 MiB per-event limit on the Temporal server. 1 MiB leaves headroom for the rest
-   * of a chat payload (messages, tool definitions, options).
+   * Maximum size, in bytes, of a single {@link Media} byte array carried across the chat activity
+   * boundary. Bytes above this threshold land inside workflow history events, which have a fixed 2
+   * MiB per-event limit on the Temporal server. 1 MiB leaves headroom for the rest of a chat
+   * payload (messages, tool definitions, options).
    *
    * <p>Users who want to raise or lower the cap can set the system property {@code
    * io.temporal.springai.maxMediaBytes} to a positive integer before the chat activity runs; values
@@ -52,14 +53,18 @@ public final class ChatModelTypes {
    * message points the caller at the URI-based {@code Media} constructor. Pass-through otherwise.
    */
   public static void checkMediaSize(byte[] data) {
-    if (data == null) {
-      return;
+    if (data != null) {
+      checkMediaSize(data.length);
     }
+  }
+
+  /** Applies the inline media limit to a decoded byte count. */
+  public static void checkMediaSize(int size) {
     long limit = MAX_MEDIA_BYTES_IN_HISTORY;
-    if (limit > 0 && data.length > limit) {
+    if (limit > 0 && size > limit) {
       throw ApplicationFailure.newNonRetryableFailure(
           "Media byte[] is "
-              + data.length
+              + size
               + " bytes, which exceeds the "
               + limit
               + "-byte limit for inline media in Temporal workflow history. Pass the media by "
@@ -142,98 +147,11 @@ public final class ChatModelTypes {
     }
   }
 
-  /**
-   * A message in the conversation.
-   *
-   * @param rawContent the message text content
-   * @param role the role of the message author
-   * @param name optional name for the participant
-   * @param toolCallId tool call ID this message responds to (for TOOL role)
-   * @param toolCalls tool calls requested by the model (for ASSISTANT role)
-   * @param mediaContents optional media attachments
-   * @param metadata optional assistant metadata, including provider continuation state
-   */
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  @JsonIgnoreProperties(ignoreUnknown = true)
+  /** A message with Spring AI's ordered parts serialized using its own JSON codec. */
   public record Message(
-      @JsonProperty("content") String rawContent,
-      @JsonProperty("role") Role role,
-      @JsonProperty("name") String name,
-      @JsonProperty("tool_call_id") String toolCallId,
-      @JsonProperty("tool_calls")
-          @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
-          List<ToolCall> toolCalls,
-      @JsonProperty("media") @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
-          List<MediaContent> mediaContents,
-      @JsonProperty("metadata") Map<String, Object> metadata) {
-    public Message(
-        String content,
-        Role role,
-        String name,
-        String toolCallId,
-        List<ToolCall> toolCalls,
-        List<MediaContent> mediaContents) {
-      this(content, role, name, toolCallId, toolCalls, mediaContents, null);
-    }
-
-    public Message(String content, Role role) {
-      this(content, role, null, null, null, null);
-    }
-
-    public Message(String content, List<MediaContent> mediaContents, Role role) {
-      this(content, role, null, null, null, mediaContents);
-    }
-
-    public enum Role {
-      @JsonProperty("system")
-      SYSTEM,
-      @JsonProperty("user")
-      USER,
-      @JsonProperty("assistant")
-      ASSISTANT,
-      @JsonProperty("tool")
-      TOOL
-    }
-
-    @JsonInclude(JsonInclude.Include.NON_NULL)
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public record ToolCall(
-        @JsonProperty("index") Integer index,
-        @JsonProperty("id") String id,
-        @JsonProperty("type") String type,
-        @JsonProperty("function") ChatCompletionFunction function) {
-      public ToolCall(String id, String type, ChatCompletionFunction function) {
-        this(null, id, type, function);
-      }
-    }
-
-    @JsonInclude(JsonInclude.Include.NON_NULL)
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public record ChatCompletionFunction(
-        @JsonProperty("name") String name, @JsonProperty("arguments") String arguments) {}
-  }
-
-  /**
-   * Media content within a message.
-   *
-   * @param mimeType the MIME type (e.g., "image/png")
-   * @param uri optional URI to the content
-   * @param data optional raw data bytes
-   */
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  @JsonIgnoreProperties(ignoreUnknown = true)
-  public record MediaContent(
-      @JsonProperty("mime_type") String mimeType,
-      @JsonProperty("uri") String uri,
-      @JsonProperty("data") byte[] data) {
-    public MediaContent(String mimeType, String uri) {
-      this(mimeType, uri, null);
-    }
-
-    public MediaContent(String mimeType, byte[] data) {
-      this(mimeType, null, data);
-    }
-  }
+      @JsonProperty("role") MessageType role,
+      @JsonProperty("parts_json") String partsJson,
+      @JsonProperty("metadata") Map<String, Object> metadata) {}
 
   /** A tool the model may call. */
   @JsonInclude(JsonInclude.Include.NON_NULL)
