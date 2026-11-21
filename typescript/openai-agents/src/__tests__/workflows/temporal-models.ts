@@ -1,5 +1,13 @@
 import { Agent, RunState, tool } from '@openai/agents-core';
-import { ApplicationFailure, continueAsNew, executeChild, sleep, workflowInfo } from '@temporalio/workflow';
+import {
+  ActivityFailure,
+  ApplicationFailure,
+  TimeoutFailure,
+  continueAsNew,
+  executeChild,
+  sleep,
+  workflowInfo,
+} from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalModel, TemporalOpenAIRunner, type TemporalModelOptions } from '../../workflow';
 
@@ -209,5 +217,59 @@ export async function temporalModelApprovalWorkflow(): Promise<string> {
   const state = await RunState.fromString(agent, first.state.toString());
   for (const interruption of state.getInterruptions()) state.approve(interruption);
   const resumed = await runner.run(agent, state, { activityOptions: { startToCloseTimeout: '44s' } });
+  return resumed.finalOutput ?? '';
+}
+
+export async function temporalModelLocalQueueWorkflow(legacy: boolean): Promise<string[]> {
+  const scheduleToStartTimeout = '1s';
+  const runner = new TemporalOpenAIRunner(
+    legacy
+      ? { defaultModelParams: { useLocalActivity: true, scheduleToStartTimeout } }
+      : { useLocalActivity: true, activityOptions: { scheduleToStartTimeout } }
+  );
+  const agent = new Agent({ name: 'Local', model: 'local' });
+  return Promise.all(
+    ['First', 'Second'].map(async (prompt) => {
+      try {
+        return (await runner.run(agent, prompt)).finalOutput ?? '';
+      } catch (error) {
+        // The SDK can replay a queued local timeout without its ActivityFailure wrapper.
+        const failure = error instanceof ActivityFailure ? error.cause : error;
+        if (failure instanceof TimeoutFailure) {
+          return failure.timeoutType ?? '';
+        }
+        throw error;
+      }
+    })
+  );
+}
+
+export async function temporalModelStreamedHandoffResumeWorkflow(): Promise<string> {
+  new WorkflowStream();
+  const confirm = tool({
+    name: 'confirm',
+    description: 'Confirm the action.',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    needsApproval: true,
+    execute: async () => 'confirmed',
+  });
+  const target = new Agent({
+    name: 'Target',
+    model: new TemporalModel('target', { streamingTopic: 'target-events' }),
+    tools: [confirm],
+  });
+  const start = new Agent({ name: 'Start', model: 'start', handoffs: [target] });
+  const runner = new TemporalOpenAIRunner();
+  const first = await runner.run(start, 'Confirm');
+  const state = await RunState.fromString(start, first.state.toString());
+  const interruptions = state.getInterruptions();
+  if (state.currentAgent !== target || interruptions.length !== 1) {
+    throw ApplicationFailure.nonRetryable('Expected the handoff target to be waiting for approval');
+  }
+  state.approve(interruptions[0]!);
+  const resumed = await runner.run(start, state, { stream: true });
+  for await (const _event of resumed) {
+    /* Consume the streamed model result. */
+  }
   return resumed.finalOutput ?? '';
 }

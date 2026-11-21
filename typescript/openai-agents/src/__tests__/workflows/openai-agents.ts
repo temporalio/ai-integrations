@@ -1232,4 +1232,6 @@ export {
   temporalModelValidationWorkflow,
   temporalModelStreamingWorkflow,
   temporalModelApprovalWorkflow,
+  temporalModelLocalQueueWorkflow,
+  temporalModelStreamedHandoffResumeWorkflow,
 } from './temporal-models';

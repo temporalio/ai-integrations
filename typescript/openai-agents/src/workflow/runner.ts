@@ -202,7 +202,6 @@ export class TemporalOpenAIRunner {
     try {
       validateSandboxRunConfig(agent, options?.runConfig?.sandbox);
       checkAgent(agent);
-      provider.validateAgent(agent, options?.runConfig?.model, options?.stream === true);
     } catch (error) {
       throw normalizeAgentsRunError(error);
     }

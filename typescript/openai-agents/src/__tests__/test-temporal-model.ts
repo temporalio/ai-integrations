@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Client, WorkflowClient } from '@temporalio/client';
 import { defaultPayloadConverter } from '@temporalio/common';
 import { historyFromJSON, historyToJSON } from '@temporalio/common/lib/proto-utils';
@@ -20,6 +21,8 @@ import {
   temporalModelValidationWorkflow,
   temporalModelStreamingWorkflow,
   temporalModelApprovalWorkflow,
+  temporalModelLocalQueueWorkflow,
+  temporalModelStreamedHandoffResumeWorkflow,
 } from './workflows/openai-agents';
 
 const test = makeOpenAIAgentsTestFunction();
@@ -267,6 +270,63 @@ test('a TemporalModel survives approval state serialization and resumes with new
       ['approval', 'approval']
     );
     t.deepEqual(events.map(summary), ['Approval', 'Approval']);
+    await replay(t, handle);
+  });
+});
+
+for (const legacy of [true, false]) {
+  test(`${legacy ? 'legacy ignores' : 'SDK options honor'} the local schedule-to-start timeout`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const model = new FakeModelProvider([textResponse('done'), textResponse('done')]).getModel();
+    const worker = await createWorker({
+      maxConcurrentLocalActivityExecutions: 1,
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: {
+            getModel: () => ({
+              async getResponse(request) {
+                await delay(1500);
+                return model.getResponse(request);
+              },
+              getStreamedResponse: model.getStreamedResponse.bind(model),
+            }),
+          },
+        }),
+      ],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(temporalModelLocalQueueWorkflow, { args: [legacy] });
+      const results = await handle.result();
+      t.deepEqual(results.sort(), legacy ? ['done', 'done'] : ['SCHEDULE_TO_START', 'done']);
+      await replay(t, handle);
+    });
+  });
+}
+
+test('streaming after handoff and approval uses the active agent’s topic', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const regular = new FakeModelProvider([handoffResponse('transfer_to_Target'), toolCallResponse('confirm', {})]).getModel();
+  const streaming = new StreamingFakeModelProvider(streamingTextEvents('done')).getModel();
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: {
+          getModel: () => ({
+            getResponse: regular.getResponse.bind(regular),
+            getStreamedResponse: streaming.getStreamedResponse.bind(streaming),
+          }),
+        },
+      }),
+    ],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(temporalModelStreamedHandoffResumeWorkflow, {});
+    t.is(await handle.result(), 'done');
+    const events = scheduled(await handle.fetchHistory());
+    t.deepEqual(events.map((event) => input(event).modelName), ['start', 'target', 'target']);
+    const streamed = events[2]!;
+    t.is(streamed.activityTaskScheduledEventAttributes?.activityType?.name, 'invokeModelStreamActivity');
+    t.is(input(streamed).streamingTopic, 'target-events');
     await replay(t, handle);
   });
 });

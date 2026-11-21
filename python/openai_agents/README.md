@@ -1112,10 +1112,10 @@ agents-SDK `StreamEvent` union (so raw model events arrive as
 External consumers (UIs, tracing pipelines, etc.) observe events as
 they arrive by hosting a [`WorkflowStream`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/workflow_streams/README.md)
 in the workflow and subscribing with `WorkflowStreamClient`. The
-streaming activity publishes each event to the topic configured on
-`TemporalAgent.streaming_topic` or `TemporalModel.streaming_topic`. The topic is required
-when using `Runner.run_streamed`; calling it without a configured topic
-raises before any activity is scheduled.
+streaming activity publishes each event to the effective topic for the active
+agent. `Runner.run_streamed` requires a topic before scheduling each agent's
+model Activity, including after handoffs or when resuming a run. Configure it on
+the agent, model, or Worker.
 
 Example workflow consuming events via `stream_events()` while the
 streaming activity publishes to the `"events"` topic:

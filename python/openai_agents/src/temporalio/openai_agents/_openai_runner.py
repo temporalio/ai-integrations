@@ -277,6 +277,7 @@ class TemporalOpenAIRunner(AgentRunner):
         starting_agent: Agent[TContext],
         kwargs: RunOptions[TContext],
         *,
+        resuming: bool = False,
         streaming: bool = False,
     ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
@@ -356,14 +357,15 @@ class TemporalOpenAIRunner(AgentRunner):
         if run_config.tracing is not None:
             _refuse_tracing_key(run_config.tracing.get("api_key"))
 
-        # Resolve validation in this run's own scope, including a fresh nested RunConfig.
-        with capture_scope(
-            run_config.model_settings,
-            defaults=self._model_options,
-            run_model=run_config.model,
-        ):
-            for agent in agents:
-                effective_model_options(agent).config(streaming=streaming)
+        # For fresh runs, validate the starting agent before running the SDK. The model
+        # input filter validates the active agent on resumes and after handoffs.
+        if not resuming:
+            with capture_scope(
+                run_config.model_settings,
+                defaults=self._model_options,
+                run_model=run_config.model,
+            ):
+                effective_model_options(starting_agent).config(streaming=streaming)
         run_config = install_model_provider(run_config, streaming=streaming)
 
         # run_config.sandbox is global for the entire run — configure it if any agent needs it.
@@ -425,7 +427,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        starting_agent, run_config = self._prepare_workflow_run(
+            starting_agent, kwargs, resuming=isinstance(input, RunState)
+        )
 
         run = _AgentRun()
         parent = _current_agent_run.get()
@@ -510,7 +514,7 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         starting_agent, run_config = self._prepare_workflow_run(
-            starting_agent, kwargs, streaming=True
+            starting_agent, kwargs, resuming=isinstance(input, RunState), streaming=True
         )
 
         # The streaming loop runs in a task created inside run_streamed, which copies

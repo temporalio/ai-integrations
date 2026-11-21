@@ -79,6 +79,7 @@ from temporalio.converter import (
     SerializationContext,
     WithSerializationContext,
 )
+from temporalio.exceptions import ApplicationError
 from temporalio.openai_agents import (
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
@@ -86,7 +87,7 @@ from temporalio.openai_agents import (
     TemporalModel,
     _heartbeat_decorator,
 )
-from temporalio.openai_agents.testing import AgentEnvironment
+from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
 from temporalio.worker import Replayer
 from temporalio.workflow import ActivityCancellationType, ActivityConfig
 from tests.helpers import assert_eventually, new_worker
@@ -209,6 +210,67 @@ class StreamingTestModel(Model):
         yield ResponseCompletedEvent(
             response=response, sequence_number=2, type="response.completed"
         )
+
+
+class HandoffStreamingModel(StreamingTestModel):
+    """Stream a handoff call to the unconfigured target."""
+
+    async def stream_response(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        async for event in super().stream_response(*args, **kwargs):
+            if isinstance(event, ResponseCompletedEvent):
+                handoff = ResponseBuilders.tool_call("{}", "transfer_to_target")
+                response = event.response.model_copy(update={"output": handoff.output})
+                event = event.model_copy(update={"response": response})
+            yield event
+
+
+@workflow.defn
+class StreamingHandoffConfigWorkflow:
+    def __init__(self) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self) -> str:
+        target = TemporalAgent[None](name="Target")
+        start = TemporalAgent[None](
+            name="Start", streaming_topic="events", handoffs=[target]
+        )
+        result = Runner.run_streamed(start, "Hello")
+        async for _ in result.stream_events():
+            pass
+        return str(result.final_output)
+
+
+@pytest.mark.parametrize("take_handoff", [False, True])
+async def test_streaming_checks_handoff_options_when_reached(
+    client: Client, take_handoff: bool
+):
+    model = HandoffStreamingModel() if take_handoff else StreamingTestModel()
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, StreamingHandoffConfigWorkflow) as worker:
+            handle = await client.start_workflow(
+                StreamingHandoffConfigWorkflow.run,
+                id=str(uuid.uuid4()),
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=15),
+            )
+            if take_handoff:
+                with pytest.raises(WorkflowFailureError) as error:
+                    await handle.result()
+                assert isinstance(error.value.cause, ApplicationError)
+                assert error.value.cause.type == "AgentsWorkflowError"
+                assert "streaming_topic" in str(error.value.cause)
+            else:
+                assert await handle.result() == "Hello world!"
+            history = await handle.fetch_history()
+            assert [
+                e.activity_task_scheduled_event_attributes.activity_type.name
+                for e in history.events
+                if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+            ] == ["invoke_model_activity_streaming"]
 
 
 class DriftedStreamingTestModel(StreamingTestModel):

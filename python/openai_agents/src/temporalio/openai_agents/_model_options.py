@@ -45,14 +45,14 @@ class _ModelOptions:
     def __post_init__(self) -> None:
         self.activity_config = self.activity_config.copy()
         self.legacy_fields = self.legacy_fields.copy()
-        self._validate_summary()
+        self._validate_summary(ValueError)
 
-    def _validate_summary(self) -> None:
+    def _validate_summary(self, error_type: type[Exception]) -> None:
         if (
             self.activity_config.get("summary") is not None
             and self.summary_provider is not None
         ):
-            raise ValueError(
+            raise error_type(
                 "Cannot combine activity_config['summary'] with summary_provider"
             )
 
@@ -73,7 +73,7 @@ class _ModelOptions:
                 value = getattr(layer, name)
                 if value is not None:
                     setattr(result, name, value)
-        result._validate_summary()
+        result._validate_summary(AgentsWorkflowError)
         return result
 
     def config(self, *, streaming: bool = False) -> ActivityConfig:

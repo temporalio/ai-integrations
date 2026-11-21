@@ -53,9 +53,9 @@ export interface RunnerModelOptions extends TemporalModelOptions {
 
 export type ResolvedModelOptions = TemporalModelOptions & { activityOptions: ActivityOptions };
 
-// Workflow-only provenance: deprecated local settings ignore regular-only fields.
-// Keep the fields until the call chooses its execution mode, so switching back to
-// regular Activities retains the caller's explicit heartbeat and task queue.
+// Workflow-only provenance: local calls forward the fields supported by the old API.
+// Keep the other fields until the call chooses its execution mode, so a switch to
+// regular Activities retains them.
 const legacyActivityFields = Symbol('legacyActivityFields');
 type ModelOptionsLayer = TemporalModelOptions & { [legacyActivityFields]?: ReadonlySet<string> };
 
@@ -118,13 +118,17 @@ export function modelOptionsFromLegacy(options: ModelActivityOptions | undefined
   };
 }
 
-export const LOCAL_MODEL_ACTIVITY_OPTIONS = new Set([
+const legacyLocalModelActivityOptions = new Set([
   'summary',
   'startToCloseTimeout',
   'scheduleToCloseTimeout',
-  'scheduleToStartTimeout',
   'retry',
   'cancellationType',
+]);
+
+export const LOCAL_MODEL_ACTIVITY_OPTIONS = new Set([
+  ...legacyLocalModelActivityOptions,
+  'scheduleToStartTimeout',
   'eventGroups',
 ]);
 
@@ -146,7 +150,7 @@ export function activityOptionsForModel(options: ResolvedModelOptions): Activity
   const result = { ...options.activityOptions };
   if (!options.useLocalActivity) return result;
   for (const key of (options as ModelOptionsLayer)[legacyActivityFields] ?? []) {
-    if (!LOCAL_MODEL_ACTIVITY_OPTIONS.has(key)) delete result[key as keyof ActivityOptions];
+    if (!legacyLocalModelActivityOptions.has(key)) delete result[key as keyof ActivityOptions];
   }
   return result;
 }

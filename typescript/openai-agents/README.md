@@ -372,9 +372,13 @@ through child Workflows and continue-as-new. Migrate scheduling fields to
 `streamingBatchInterval` alongside it, and replace an object-valued `summary` with
 `summaryProvider` in Workflow code. Static summaries use `activityOptions.summary`.
 When both spellings occur in one layer, defined new fields take precedence per
-field; Client settings still override runner defaults. Deprecated local
-configuration retains its handling of ignored regular-only options; newly
-supplied `activityOptions` receive strict validation.
+field; Client settings still override runner defaults. Local model calls ignore
+`scheduleToStartTimeout` supplied through `defaultModelParams` or `modelParams`.
+Set it through `activityOptions` to apply a schedule-to-start timeout to local
+model calls. With the Temporal TypeScript SDK 1.24.0, a local schedule-to-start
+timeout can surface as an `ActivityFailure` with a `TimeoutFailure` cause during
+execution and as a `TimeoutFailure` directly during replay. Handle both forms when
+catching this timeout in a Workflow.
 
 Existing 2.x histories continue to replay. Changing effective Activity options,
 especially switching between local and regular Activities, can change recorded

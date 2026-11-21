@@ -175,7 +175,8 @@ export function installRunnerCheck(): void {
     }
     // Upstream emits `agent_start` on a resumed state only if no agent run is active, so start from
     // the state's current agent.
-    state.runningAgents.set(this, input instanceof RunState ? input._currentAgent : agent);
+    const currentAgent = input instanceof RunState ? input.currentAgent : agent;
+    state.runningAgents.set(this, currentAgent);
     const config = this.config as unknown as {
       modelProvider: ActivityBackedModelProvider;
       modelSettings?: ModelSettings;
@@ -189,7 +190,7 @@ export function installRunnerCheck(): void {
     const sandbox = options?.sandbox ?? this.config.sandbox;
     const invoke = (runOptions: RunOptionsLike | undefined) =>
       config.modelProvider.withContext(() => state.original.call(this, agent, input, runOptions), options?.stream === true);
-    config.modelProvider.validateAgent(state.runningAgents.get(this)!, this.config.model, options?.stream === true);
+    config.modelProvider.validateAgent(currentAgent, this.config.model, options?.stream === true);
     if (sandbox === undefined) return invoke(options);
     validateTemporalSandboxClient(
       sandbox,

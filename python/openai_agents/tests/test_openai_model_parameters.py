@@ -13,9 +13,10 @@ from agents.models import get_default_model_settings
 
 from temporalio import workflow
 from temporalio.api.enums.v1 import EventType
-from temporalio.client import Client, WorkflowHistory
+from temporalio.client import Client, WorkflowFailureError, WorkflowHistory
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.exceptions import ApplicationError
 from temporalio.openai_agents import (
     AgentsWorkflowError,
     ModelActivityParameters,
@@ -377,6 +378,37 @@ async def test_static_and_dynamic_summaries(client: Client):
         b'"Agent"',
         b'"Calling Dynamic"',
     ]
+
+
+@workflow.defn
+class ConflictingSummaryWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        agent = TemporalAgent[None](
+            name="Static", activity_config=ActivityConfig(summary="static")
+        )
+        await Runner.run(agent, "Hello")
+
+
+async def test_conflicting_effective_summary_fails_workflow(client: Client):
+    async with AgentEnvironment(
+        model=TestModel(lambda: ResponseBuilders.output_message("done")),
+        summary_provider=SummaryProvider(),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, ConflictingSummaryWorkflow) as worker:
+            handle = await client.start_workflow(
+                ConflictingSummaryWorkflow.run,
+                id=str(uuid.uuid4()),
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=10),
+            )
+            with pytest.raises(WorkflowFailureError) as error:
+                await handle.result()
+            assert isinstance(error.value.cause, ApplicationError)
+            assert error.value.cause.type == "AgentsWorkflowError"
+            assert "summary_provider" in str(error.value.cause)
+            assert not scheduled(await handle.fetch_history())
 
 
 @workflow.defn
