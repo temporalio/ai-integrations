@@ -1276,6 +1276,8 @@ class TemporalStatefulMcpToolSet(BaseToolset):
                 ) from None
             except Exception as e:
                 if is_cancelled_exception(e):
+                    if current and current.cancelling() > cancels:
+                        raise asyncio.CancelledError() from e
                     return
                 if isinstance(e, ActivityError):
                     raise _session_ended_failure(session) from e
