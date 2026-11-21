@@ -563,6 +563,14 @@ separate `langchain-replay-stable-run-ids` patch, so existing histories retain
 their original ID generation. Explicitly supplied run IDs are preserved. Read-only
 Queries and Update validators retain native ID generation.
 
+When installing this plugin alongside `temporalio-langsmith`, upgrade both packages together.
+Older LangSmith plugins (including 1.0.0) lack the workflow-local streaming-ID
+capability and are rejected before Worker initialization or Replayer history processing, in either
+registration order, including plugins inherited from a Client. The check also
+applies when the older package is installed but configured on a different Worker,
+because its UUID hooks are process-wide. This prevents
+recording histories whose child IDs would change after upgrading LangSmith.
+
 This guarantee covers event trace IDs, not every ID inside a message payload.
 In particular, LangGraph can generate a new `ToolMessage.id` when a tool returns
 a string. Do not use that generated message ID to acknowledge or deduplicate

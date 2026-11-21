@@ -40,20 +40,24 @@ import importlib.metadata
 import inspect
 import sys
 import warnings
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Callable
 
 from temporalio import activity as activity_mod
+from temporalio.client import WorkflowHistory
 from temporalio.converter import DataConverter
 from temporalio.deepagents import _serde, _sync_calls, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
-from temporalio.deepagents._event_loop import StreamingInterceptor
+from temporalio.deepagents._event_loop import (
+    StreamingInterceptor,
+    validate_stream_id_plugins,
+)
 from temporalio.deepagents.workflow import DeepAgentsWorkflowError
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkflowRunner
+from temporalio.worker import Replayer, WorkflowReplayResult, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 # Runtime floor for the Deep Agents control loop. Kept in a constant so
@@ -277,6 +281,18 @@ class DeepAgentsPlugin(SimplePlugin):
 
     # -- worker config -------------------------------------------------------
 
+    @asynccontextmanager
+    async def run_replayer(
+        self,
+        replayer: Replayer,
+        histories: AsyncIterator[WorkflowHistory],
+        next: Callable[..., Any],
+    ) -> AsyncGenerator[AsyncIterator[WorkflowReplayResult], None]:
+        """Refuse incompatible tracing hooks before replay processes history."""
+        validate_stream_id_plugins(replayer.plugins)
+        async with super().run_replayer(replayer, histories, next) as results:
+            yield results
+
     def configure_worker(self, config: Any) -> Any:
         """Refuse a second instance; skip activities the Client's one registered."""
         client_instance = self._client_instance(config)
@@ -285,6 +301,9 @@ class DeepAgentsPlugin(SimplePlugin):
             # A new list: the caller may pass a one-shot iterable, and a callable
             # ``activities`` setting may append to the list it gets.
             config["activities"] = list(before)
+        validate_stream_id_plugins(config.get("plugins", ()))
+        if client := config.get("client"):
+            validate_stream_id_plugins(client.config()["plugins"])
         config = super().configure_worker(config)
         if client_instance is not None:
             # A list: an ``activities`` callable may return a one-shot iterable.

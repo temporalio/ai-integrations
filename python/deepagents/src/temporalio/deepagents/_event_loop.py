@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-from collections.abc import Callable
+import importlib
+import importlib.util
+from collections.abc import Callable, Iterable
 from random import Random
 from typing import Any
 from uuid import UUID
@@ -117,3 +119,25 @@ def _workflow_run_id() -> UUID | None:
         random = workflow.new_random("langchain-stream-run-ids")
         setattr(loop, "_temporal_langchain_run_id_random", random)
     return UUID(int=random.getrandbits(128), version=4)
+
+
+def validate_stream_id_plugins(plugins: Iterable[Any]) -> None:
+    """Refuse older LangSmith hooks before a Worker/Replayer processes history."""
+    message = (
+        "LangSmithPlugin is incompatible with replay-stable streaming IDs; "
+        "upgrade temporalio-langsmith together with the streaming plugin."
+    )
+    for plugin in plugins:
+        if plugin.name() == "langchain.LangSmithPlugin" and not getattr(
+            plugin, "_temporal_langchain_stream_ids", False
+        ):
+            raise ValueError(message)
+    # Its hooks are process-wide: an older LangSmith on a different Worker can
+    # overwrite these generators too. Reject an incompatible installed package
+    # even when this particular Worker/Replayer does not configure it.
+    if importlib.util.find_spec("temporalio.langsmith") is not None:
+        tracing = importlib.import_module("temporalio.langsmith")
+        if not getattr(
+            tracing.LangSmithPlugin, "_temporal_langchain_stream_ids", False
+        ):
+            raise ValueError(message)
