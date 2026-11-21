@@ -548,11 +548,35 @@ class StreamingAgent:
         return final["messages"][-1].content
 ```
 
-In the Workflow, read the final state from `"values"`. The `"messages"` items
-do not arrive there: LangGraph hands them over with
-`loop.call_soon_threadsafe`, which the Workflow event loop does not implement,
-so LangChain logs `NotImplementedError` warnings from `StreamMessagesHandler`
-and the tokens go to the topic only.
+In the Workflow, read the final state from `"values"`. Local `"messages"`
+items represent the model Activity's completed result, not live provider tokens.
+Use the topic for live token delivery. `agent.astream_events(..., version="v2")`
+also yields local lifecycle events and finishes when the agent finishes.
+The plugin schedules stream callbacks only from the same Workflow event loop;
+cross-thread callbacks remain unsupported. Existing histories retain their
+previous behavior through the `langchain-same-loop-streams` patch.
+
+The shim is also installed before Signal-With-Start and Update-With-Start handlers
+run. Generated event `run_id` and `parent_ids` are replay-stable in Workflows;
+Activities and ordinary clients retain LangChain's native IDs. This uses the
+separate `langchain-replay-stable-run-ids` patch, so existing histories retain
+their original ID generation. Explicitly supplied run IDs are preserved. Read-only
+Queries and Update validators retain native ID generation.
+
+When installing this plugin alongside `temporalio-langsmith`, upgrade both packages together.
+Older LangSmith plugins (including 1.0.0) lack the workflow-local streaming-ID
+capability and are rejected before Worker initialization or Replayer history processing, in either
+registration order, including plugins inherited from a Client. The check also
+applies when the older package is installed but configured on a different Worker,
+because its UUID hooks are process-wide. This prevents
+recording histories whose child IDs would change after upgrading LangSmith.
+
+This guarantee covers event trace IDs, not every ID inside a message payload.
+In particular, LangGraph can generate a new `ToolMessage.id` when a tool returns
+a string. Do not use that generated message ID to acknowledge or deduplicate
+across Workflow replay. Use `ToolMessage.tool_call_id` to correlate a result with
+its originating tool call (for model calls executed in Activities, that call ID
+is recorded in the Activity result), or assign your own replay-stable message ID.
 
 Subscribers read the topic with `WorkflowStreamClient`; each item is an
 `AIMessageChunk` in `langchain_core.load.dumpd` form:
