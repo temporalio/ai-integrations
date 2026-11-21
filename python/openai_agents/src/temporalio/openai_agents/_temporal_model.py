@@ -1,12 +1,14 @@
+"""Durable OpenAI Agents model execution and streaming."""
+
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextvars import ContextVar
+from datetime import timedelta
 from typing import Any, get_type_hints
 
 from agents import (
-    Agent,
     AgentOutputSchema,
     AgentOutputSchemaBase,
     CodeInterpreterTool,
@@ -56,7 +58,8 @@ from temporalio.openai_agents._invoke_model_activity import (
     StreamingActivityModelInput,
     ToolInput,
 )
-from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._model_options import ModelSummaryProvider, _ModelOptions
+from temporalio.workflow import ActivityConfig
 
 # The SDK reads an Activity's return type with typing.get_type_hints, which drops
 # the type discriminator that TResponseStreamEvent carries in Annotated. When an
@@ -101,23 +104,67 @@ def _triggered_input_guardrail(
     return getattr(result, "_triggered_input_guardrail_result", None)
 
 
-class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
-    """A stub that allows invoking models as Temporal activities."""
+class TemporalModel(Model):
+    """Execute model calls in Activities using the provider configured on the Worker.
+
+    May be used on TemporalAgent, upstream Agent (including SandboxAgent), or
+    RunConfig.model. No provider clients or credentials belong on this object.
+    """
 
     def __init__(
         self,
-        model_name: str | None,
+        model_name: str | None = None,
         *,
-        model_params: ModelActivityParameters,
-        agent: Agent[Any] | None,
-        current_agent: Callable[[], Agent[Any] | None] | None = None,
-        current_run_model_settings: Callable[[], ModelSettings | None] | None = None,
+        activity_config: ActivityConfig | None = None,
+        use_local_activity: bool | None = None,
+        streaming_topic: str | None = None,
+        streaming_batch_interval: timedelta | None = None,
+        summary_provider: ModelSummaryProvider | None = None,
     ) -> None:
+        """Configure durable model calls.
+
+        Args:
+            model_name: Name resolved by the Worker's model provider; None uses
+                that provider's default model.
+            activity_config: Per-field Activity overrides. Explicit None values
+                override inherited fields. Static summaries use the summary key.
+            use_local_activity: Whether to use local Activities; None inherits.
+                Explicit options unsupported by local Activities are refused.
+            streaming_topic: Workflow Stream topic, required for streaming
+                (experimental). Streaming cannot use local Activities.
+            streaming_batch_interval: Publishing interval (experimental);
+                defaults to 100 milliseconds.
+            summary_provider: Deterministic dynamic summary provider. Cannot be
+                combined with a non-None static summary in effective configuration.
+        """
         self.model_name = model_name
-        self.model_params = model_params
-        self.agent = agent
-        self._current_agent = current_agent
-        self._current_run_model_settings = current_run_model_settings
+        # Only provider-created default models need their implicit settings aligned
+        # on the Worker. Explicit Model objects retain the settings resolved upstream.
+        self._is_provider_default = False
+        self._options = _ModelOptions(
+            activity_config=activity_config or ActivityConfig(),
+            use_local_activity=use_local_activity,
+            streaming_topic=streaming_topic,
+            streaming_batch_interval=streaming_batch_interval,
+            summary_provider=summary_provider,
+        )
+
+    @property
+    def model(self) -> str | None:
+        """Expose the model identifier used by upstream sandbox capabilities."""
+        return self.model_name
+
+    def get_default_model_settings(self) -> ModelSettings | None:
+        """Expose upstream model-name defaults without constructing a provider client."""
+        return get_default_model_settings(self.model_name)
+
+    def _effective_model_options(self) -> _ModelOptions:
+        from temporalio.openai_agents._temporal_model_provider import (
+            _current_agent,
+            effective_model_options,
+        )
+
+        return effective_model_options(_current_agent.get(), self)
 
     def _build_activity_input(
         self,
@@ -228,39 +275,32 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             prompt=prompt,
         )
 
-        agent = self.agent
-        if agent is None and self._current_agent is not None:
-            agent = self._current_agent()
+        from temporalio.openai_agents._temporal_model_provider import (
+            _current_agent,
+            _current_run_model_settings,
+        )
 
-        if self.model_name is None and agent is not None:
-            # Neither the agent nor the run named a model, so the activity's provider
-            # will choose one. Record here, against this worker's environment, whether
-            # the agent's settings are the SDK's implicit defaults for an unnamed model,
-            # plus the run-level overrides, so the activity can align the defaults with
-            # the model it resolves and then re-apply the overrides.
+        agent = _current_agent.get()
+
+        if self._is_provider_default and agent is not None:
+            # The provider is choosing an implicit model, rather than executing an
+            # explicit Model object. Record the Workflow's verdict on implicit defaults
+            # and the run overrides so the Activity can align them with its own model.
             activity_input["implicit_model_settings"] = (
                 agent.model_settings == get_default_model_settings()
             )
-            activity_input["run_model_settings"] = (
-                self._current_run_model_settings()
-                if self._current_run_model_settings is not None
-                else None
-            )
+            activity_input["run_model_settings"] = _current_run_model_settings.get()
 
-        if self.model_params.summary_override:
-            summary = (
-                self.model_params.summary_override
-                if isinstance(self.model_params.summary_override, str)
-                else (
-                    self.model_params.summary_override.provide(
-                        agent, system_instructions, input
-                    )
-                )
+        options = self._effective_model_options()
+        summary: str | None
+        if options.summary_provider is not None:
+            summary = options.summary_provider.provide(
+                agent, system_instructions, input
             )
-        elif agent:
-            summary = agent.name
+        elif "summary" in options.activity_config:
+            summary = options.activity_config["summary"]
         else:
-            summary = None
+            summary = agent.name if agent else None
 
         return activity_input, summary
 
@@ -278,6 +318,7 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> ModelResponse:
+        """Invoke the Worker's model through a Temporal Activity."""
         activity_input, summary = self._build_activity_input(
             system_instructions=system_instructions,
             input=input,
@@ -291,30 +332,19 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             prompt=prompt,
         )
 
-        if self.model_params.use_local_activity:
+        options = self._effective_model_options()
+        config = options.config()
+        config["summary"] = summary
+        if options.use_local_activity:
             return await workflow.execute_local_activity_method(
                 ModelActivity.invoke_model_activity,
                 activity_input,
-                summary=summary,
-                schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
-                schedule_to_start_timeout=self.model_params.schedule_to_start_timeout,
-                start_to_close_timeout=self.model_params.start_to_close_timeout,
-                retry_policy=self.model_params.retry_policy,
-                cancellation_type=self.model_params.cancellation_type,
+                **options.local_config(config),
             )
         return await workflow.execute_activity_method(
             ModelActivity.invoke_model_activity,
             activity_input,
-            summary=summary,
-            task_queue=self.model_params.task_queue,
-            schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
-            schedule_to_start_timeout=self.model_params.schedule_to_start_timeout,
-            start_to_close_timeout=self.model_params.start_to_close_timeout,
-            heartbeat_timeout=self.model_params.heartbeat_timeout,
-            retry_policy=self.model_params.retry_policy,
-            cancellation_type=self.model_params.cancellation_type,
-            versioning_intent=self.model_params.versioning_intent,
-            priority=self.model_params.priority,
+            **config,
         )
 
     def get_retry_advice(
@@ -344,25 +374,14 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        # Streaming relies on activity heartbeats to hear a cancel and notice a
-        # lost worker, and on WorkflowStreamClient.from_within_activity() to
-        # signal partial results back to the workflow. Local activities support
-        # neither: their result commits with the workflow task, so there
-        # is no independent task to heartbeat against or to send signals
-        # from.
-        if self.model_params.use_local_activity:
-            raise ValueError(
-                "Streaming is incompatible with use_local_activity "
-                "(local activities do not support heartbeats or the "
-                "workflow stream signal channel)."
-            )
+        """Invoke the streaming model Activity and yield its recorded events.
 
-        topic = self.model_params.streaming_topic
-        if topic is None:
-            raise ValueError(
-                "Runner.run_streamed requires "
-                "ModelActivityParameters.streaming_topic to be set."
-            )
+        Streaming support is experimental and may change in future versions.
+        """
+        options = self._effective_model_options()
+        config = options.config(streaming=True)
+        topic = options.streaming_topic
+        assert topic is not None
 
         base_input, summary = self._build_activity_input(
             system_instructions=system_instructions,
@@ -379,7 +398,9 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         streaming_input: StreamingActivityModelInput = {
             **base_input,
             "streaming_topic": topic,
-            "streaming_batch_interval": self.model_params.streaming_batch_interval,
+            "streaming_batch_interval": options.streaming_batch_interval
+            if options.streaming_batch_interval is not None
+            else timedelta(milliseconds=100),
         }
 
         # The activity publishes each event to the topic as the model sends it, but the
@@ -396,20 +417,12 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
 
         # Scheduled by name, so that result_type applies (a callable's declared
         # return type would replace it).
+        config["summary"] = summary
         handle = workflow.start_activity(
             ModelActivity.invoke_model_activity_streaming.__name__,
             streaming_input,
             result_type=_STREAM_EVENTS_TYPE,
-            summary=summary,
-            task_queue=self.model_params.task_queue,
-            schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
-            schedule_to_start_timeout=self.model_params.schedule_to_start_timeout,
-            start_to_close_timeout=self.model_params.start_to_close_timeout,
-            heartbeat_timeout=self.model_params.heartbeat_timeout,
-            retry_policy=self.model_params.retry_policy,
-            cancellation_type=self.model_params.cancellation_type,
-            versioning_intent=self.model_params.versioning_intent,
-            priority=self.model_params.priority,
+            **config,
         )
 
         cancelled_for: list[InputGuardrailResult] = []

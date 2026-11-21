@@ -37,7 +37,7 @@ from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
-from temporalio.openai_agents import AgentsWorkflowError, ModelActivityParameters
+from temporalio.openai_agents import AgentsWorkflowError, TemporalAgent
 from temporalio.openai_agents.testing import (
     AgentEnvironment,
     ResponseBuilders,
@@ -48,6 +48,7 @@ from temporalio.openai_agents.workflow import (
     _tool_argument_error,  # type: ignore[reportPrivateUsage]
 )
 from temporalio.testing import WorkflowEnvironment
+from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
 from tests.helpers.nexus import make_nexus_endpoint_name
 
@@ -125,7 +126,9 @@ class ArgumentErrorsWorkflow:
                 )
             ]
         result = await Runner.run(
-            Agent[None](name="Weather", instructions="Be helpful.", tools=tools),
+            TemporalAgent[None](
+                name="Weather", instructions="Be helpful.", tools=tools
+            ),
             "What is the weather?",
         )
         outputs = [
@@ -164,7 +167,9 @@ class NexusArgumentErrorsWorkflow:
             schedule_to_close_timeout=timedelta(seconds=10),
         )
         result = await Runner.run(
-            Agent[None](name="Weather", instructions="Be helpful.", tools=[tool]),
+            TemporalAgent[None](
+                name="Weather", instructions="Be helpful.", tools=[tool]
+            ),
             "What is the weather?",
         )
         outputs = [
@@ -195,9 +200,7 @@ async def _run_workflow(
 ) -> list[str]:
     async with AgentEnvironment(
         model=_scripted_model(arguments, tool_name),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
         async with new_worker(client, wf, **worker_kwargs) as worker:
@@ -556,7 +559,9 @@ class ToolArgumentModesWorkflow:
                 failure_error_function=failure_error_function,
             )
         result = await Runner.run(
-            Agent[RunInfo](name="Weather", instructions="Be helpful.", tools=[tool]),
+            TemporalAgent[RunInfo](
+                name="Weather", instructions="Be helpful.", tools=[tool]
+            ),
             "What is the weather?",
             context=run_info,
         )
@@ -643,9 +648,7 @@ async def _run_mode(
     model = RecordingModel(responses)
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
         async with new_worker(

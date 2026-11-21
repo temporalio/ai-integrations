@@ -22,22 +22,21 @@ import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox
 import { ApplicationFailure } from '@temporalio/common';
 import { CancellationScope } from '@temporalio/workflow';
 import {
-  DEFAULT_MODEL_ACTIVITY_OPTIONS,
-  STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
-  STREAMING_TOPIC_NOT_CONFIGURED,
-  type ModelActivityOptions,
-  type SerializableModelActivityOptions,
-} from '../common/model-activity-options';
+  mergeRunnerModelOptions,
+  type TemporalModelOptions,
+  type ResolvedModelOptions,
+} from '../common/model-options';
+import type { ModelActivityOptions } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
 import { refuseTracingApiKey } from '../common/headers';
-import { ActivityBackedModelProvider } from './activity-backed-model';
+import { ActivityBackedModelProvider, type TemporalModel } from './temporal-model';
 import { checkAgent } from './check-agent';
 import { validateTemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
-export interface TemporalRunOptions<TContext = undefined> {
+export interface TemporalRunOptions<TContext = undefined> extends TemporalModelOptions {
   /** Run context passed to agents and tools */
   context?: TContext;
   /** Maximum agent loop turns before aborting */
@@ -56,7 +55,7 @@ export interface TemporalRunOptions<TContext = undefined> {
   tracing?: TracingConfig;
   /**
    * Stream incremental events as the model responds. Requires a `streamingTopic`
-   * (set via the plugin's `modelParams` or the runner's `defaultModelParams`) and a
+   * (set on the Client plugin, runner, model, or run options) and a
    * hosted `WorkflowStream` in the Workflow.
    *
    * @experimental Streaming support is experimental and may change without notice.
@@ -67,10 +66,10 @@ export interface TemporalRunOptions<TContext = undefined> {
   /** Runner-level config overrides */
   runConfig?: {
     /**
-     * Model name for agents that set no model of their own, as upstream's code does (string only —
-     * Model objects can't cross the Workflow/Activity boundary)
+     * Model for agents that set no model of their own, matching the upstream JS SDK.
+     * TemporalModel carries per-model Activity options; other Model objects are refused.
      */
-    model?: string;
+    model?: string | TemporalModel;
     /** Global model settings (temperature, topP, etc.). An agent's own `modelSettings` override them, as upstream. */
     modelSettings?: ModelSettings;
     /** Global handoff input filter. Agent-level inputFilter takes precedence. */
@@ -101,42 +100,13 @@ export interface TemporalRunOptions<TContext = undefined> {
   };
 }
 
-export interface TemporalOpenAIRunnerOptions {
-  /**
-   * Workflow-authored default Model Activity options, layered UNDER the client's
-   * `modelParams` header: a client-set field wins, otherwise this default applies.
-   * Because these options are constructed in the Workflow (not JSON-propagated),
-   * they can carry the function form of `summary`. Use this to configure Workflows
-   * started without the client interceptor, e.g. by a Schedule or the Temporal UI/CLI.
-   */
+/** Workflow-authored defaults; fields supplied by the Client override them. */
+export interface TemporalOpenAIRunnerOptions extends TemporalModelOptions {
+  /** @deprecated Use activityOptions and separate execution options instead. */
   defaultModelParams?: ModelActivityOptions;
 }
 
-/**
- * Layers Model Activity options least→most significant:
- * package `DEFAULT_MODEL_ACTIVITY_OPTIONS` < constructor `defaultModelParams` <
- * client header `modelParams`. Undefined field values are dropped at each layer so
- * an absent option never clobbers a value set by a lower layer.
- */
-export function layerModelParams(
-  defaultModelParams: ModelActivityOptions | undefined,
-  headerModelParams: SerializableModelActivityOptions | undefined
-): ModelActivityOptions {
-  return {
-    ...DEFAULT_MODEL_ACTIVITY_OPTIONS,
-    ...definedFields(defaultModelParams),
-    ...definedFields(headerModelParams),
-  };
-}
-
-function definedFields<T extends object>(obj: T | undefined): Partial<T> {
-  if (obj === undefined) return {};
-  const result: Partial<T> = {};
-  for (const key of Object.keys(obj) as (keyof T)[]) {
-    if (obj[key] !== undefined) result[key] = obj[key];
-  }
-  return result;
-}
+export { layerModelParams } from '../common/model-options';
 
 /** Whether a `SandboxAgent` is reachable from `agent` through its handoff graph. */
 function hasSandboxAgent(agent: Agent<any, any>, seen: Set<Agent<any, any>> = new Set()): boolean {
@@ -172,16 +142,16 @@ function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunCon
  * Use `run(agent, input)` for request-response runs. Pass `{ stream: true }` to
  * stream incremental events as the model responds — the returned
  * `StreamedRunResult` is async-iterable. Streaming requires a `streamingTopic`
- * (set via the plugin's `modelParams` or the runner's `defaultModelParams`) and a
+ * (set on the Client plugin, runner, model, or run options) and a
  * hosted `WorkflowStream` in the Workflow.
  */
 export class TemporalOpenAIRunner {
-  private readonly modelParams: ModelActivityOptions;
+  private readonly modelOptions: ResolvedModelOptions;
 
   constructor(options?: TemporalOpenAIRunnerOptions) {
     ensureTracingProcessorRegistered();
     const fromHeader = getCurrentPluginConfig();
-    this.modelParams = layerModelParams(options?.defaultModelParams, fromHeader?.modelParams);
+    this.modelOptions = mergeRunnerModelOptions(options, fromHeader);
   }
 
   /**
@@ -220,23 +190,13 @@ export class TemporalOpenAIRunner {
       });
     }
 
-    // Fail fast before the upstream streaming runner starts, so a missing topic
-    // surfaces as a clean error rather than being captured into the streamed result.
-    if (options?.stream === true && this.modelParams.streamingTopic === undefined) {
-      throw ApplicationFailure.create({
-        message: STREAMING_TOPIC_NOT_CONFIGURED.message,
-        type: STREAMING_TOPIC_NOT_CONFIGURED.type,
-        nonRetryable: true,
-      });
-    }
-
-    if (options?.stream === true && this.modelParams.useLocalActivity === true) {
-      throw ApplicationFailure.create({
-        message: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.message,
-        type: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.type,
-        nonRetryable: true,
-      });
-    }
+    const provider = new ActivityBackedModelProvider(this.modelOptions, {
+      activityOptions: { ...options?.activityOptions },
+      useLocalActivity: options?.useLocalActivity,
+      streamingTopic: options?.streamingTopic,
+      streamingBatchInterval: options?.streamingBatchInterval,
+      summaryProvider: options?.summaryProvider,
+    });
 
     // Normalized, so a malformed agent graph, such as an `undefined` tool, fails the run.
     try {
@@ -255,7 +215,7 @@ export class TemporalOpenAIRunner {
     const innerRunner = new Runner({
       ...runnerConfigOverrides,
       model: modelOverride,
-      modelProvider: new ActivityBackedModelProvider(this.modelParams),
+      modelProvider: provider,
     });
 
     const sharedRunOptions = {

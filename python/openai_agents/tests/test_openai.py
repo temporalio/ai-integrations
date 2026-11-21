@@ -155,8 +155,8 @@ from temporalio.openai_agents._invoke_model_activity import (
 from temporalio.openai_agents._openai_runner import (
     _coerce_run_config,
 )
-from temporalio.openai_agents._temporal_model_stub import (
-    _TemporalModelStub,
+from temporalio.openai_agents._temporal_model import (
+    TemporalModel,
 )
 from temporalio.openai_agents._temporal_worker_env_ref import (
     _WorkerEnvRefResolver,
@@ -5798,11 +5798,7 @@ def test_sandbox_apply_patch_tool_round_trips_through_activity_input():
 
     tool = SandboxApplyPatchTool(session=FakeSandboxSession())  # type: ignore[arg-type]
 
-    stub = _TemporalModelStub(
-        model_name="gpt-5",
-        model_params=ModelActivityParameters(),
-        agent=None,
-    )
+    stub = TemporalModel("gpt-5")
 
     activity_input, _summary = stub._build_activity_input(
         system_instructions=None,
@@ -5838,11 +5834,7 @@ def test_custom_tool_with_defer_loading_round_trips_through_activity_input():
         defer_loading=True,
     )
 
-    stub_model = _TemporalModelStub(
-        model_name="gpt-5",
-        model_params=ModelActivityParameters(),
-        agent=None,
-    )
+    stub_model = TemporalModel("gpt-5")
 
     activity_input, _summary = stub_model._build_activity_input(
         system_instructions=None,
@@ -6277,3 +6269,36 @@ def test_plugin_reports_package_version() -> None:
     assert openai_agents.OpenAIAgentsPlugin().version() == importlib.metadata.version(
         "temporalio-openai-agents"
     )
+
+
+@workflow.defn
+class RunUnnamedModelAgent:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent(name="Assistant", instructions="Reply briefly.")
+        for settings in (None, ModelSettings(temperature=0.2)):
+            await Runner.run(
+                agent,
+                input=prompt,
+                run_config=RunConfig(model=TemporalModel(), model_settings=settings),
+            )
+        return "done"
+
+
+@pytest.mark.parametrize("default_model", ["gpt-5", "gpt-4o"])
+async def test_unnamed_model_override_preserves_upstream_settings(
+    client: Client, monkeypatch: pytest.MonkeyPatch, default_model: str
+):
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", default_model)
+    native_model = RecordingNamedModel("gpt-5")
+    for settings in (None, ModelSettings(temperature=0.2)):
+        await Runner.run(
+            Agent(name="Native"),
+            input="Hello",
+            run_config=RunConfig(model=native_model, model_settings=settings),
+        )
+    assert native_model.settings == [ModelSettings(), ModelSettings(temperature=0.2)]
+
+    model = RecordingNamedModel("gpt-5")
+    await _run_with_model(client, model, RunUnnamedModelAgent)
+    assert model.settings == native_model.settings

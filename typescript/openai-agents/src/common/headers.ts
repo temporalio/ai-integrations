@@ -1,7 +1,7 @@
 import * as otel from '@opentelemetry/api';
 import { getCurrentTraceContext, type Trace } from '@openai/agents-core';
 import { defaultPayloadConverter, type Headers } from '@temporalio/common';
-import type { SerializableModelActivityOptions } from './model-activity-options';
+import type { SerializableModelOptions } from './model-options';
 
 export const AGENTS_TRACE_HEADER_KEY = '__openai_span';
 
@@ -88,10 +88,9 @@ export function currentAgentsSpanHeader(): AgentsSpanHeader {
 
 export const AGENTS_CONFIG_HEADER_KEY = '__openai_agents_config';
 
-export interface AgentsConfigHeader {
+export interface AgentsConfigHeader extends SerializableModelOptions {
   addTemporalSpans?: boolean;
   useOtelInstrumentation?: boolean;
-  modelParams?: SerializableModelActivityOptions;
 }
 
 export function injectAgentsConfigHeader(headers: Headers, config: AgentsConfigHeader): Headers {

@@ -29,12 +29,17 @@ from temporalio.openai_agents._mcp import (
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
 )
+from temporalio.openai_agents._model_options import (
+    ModelSummaryProvider,
+    resolve_model_options,
+)
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_openai_agents import OpenAIAgentsPlugin
 from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _snapshot_resolvable_env_vars,
 )
+from temporalio.workflow import ActivityConfig
 
 __all__ = [
     "AgentEnvironment",
@@ -195,14 +200,25 @@ class AgentEnvironment:
         use_otel_instrumentation: bool = False,
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
         *,
+        activity_config: ActivityConfig | None = None,
+        use_local_activity: bool | None = None,
+        streaming_topic: str | None = None,
+        streaming_batch_interval: timedelta | None = None,
+        summary_provider: ModelSummaryProvider | None = None,
         mcp_servers: Mapping[str, Callable[..., MCPServer]] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
     ) -> None:
         """Initialize the AgentEnvironment.
 
         Args:
-            model_params: Configuration parameters for Temporal activity execution
-                of model calls. If None, default parameters will be used.
+            model_params: Deprecated configuration for model Activities. Use
+                activity_config and separate execution options instead.
+            activity_config: Per-field Activity defaults; explicit None clears an
+                inherited field. Cannot be combined with model_params.
+            use_local_activity: Use local model Activities by default.
+            streaming_topic: Default Workflow Stream topic (experimental).
+            streaming_batch_interval: Default publishing interval (experimental).
+            summary_provider: Deterministic dynamic Activity summary provider.
             model_provider: Optional model provider for custom model implementations.
                 Only one of model_provider or model should be provided.
                 If both are provided, model_provider will be used.
@@ -229,6 +245,15 @@ class AgentEnvironment:
                 Warning: resolvable_worker_env_vars is experimental and behavior may change in future versions.
                 Use with caution in production environments.
         """
+        self._model_options = resolve_model_options(
+            model_params,
+            activity_config=activity_config,
+            use_local_activity=use_local_activity,
+            streaming_topic=streaming_topic,
+            streaming_batch_interval=streaming_batch_interval,
+            summary_provider=summary_provider,
+            custom_provider=model_provider is not None or model is not None,
+        )
         self._model_params = model_params
         self._model_provider = None
         if model_provider is not None:
@@ -249,8 +274,19 @@ class AgentEnvironment:
     async def __aenter__(self) -> "AgentEnvironment":
         """Enter the async context manager."""
         # Create the plugin with the provided configuration
+        model_options: dict[str, Any] = (
+            {"model_params": self._model_params}
+            if self._model_params is not None
+            else {
+                "activity_config": self._model_options.activity_config,
+                "use_local_activity": self._model_options.use_local_activity,
+                "streaming_topic": self._model_options.streaming_topic,
+                "streaming_batch_interval": self._model_options.streaming_batch_interval,
+                "summary_provider": self._model_options.summary_provider,
+            }
+        )
         self._plugin = OpenAIAgentsPlugin(
-            model_params=self._model_params,
+            **model_options,
             model_provider=self._model_provider,
             mcp_server_providers=self._mcp_server_providers,
             mcp_servers=self._mcp_servers,

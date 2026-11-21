@@ -223,8 +223,8 @@ class ActivityModelInput(TypedDict, total=False):
     previous_response_id: str | None
     conversation_id: str | None
     prompt: Any | None
-    # Set by the workflow when neither the agent nor the run named a model: whether
-    # the agent's settings are the SDK's implicit defaults, and the run-level overrides.
+    # Set only for provider-selected implicit models, rather than explicit Model
+    # objects: whether the agent's settings are implicit, and the run-level overrides.
     implicit_model_settings: bool
     run_model_settings: ModelSettings | None
 
@@ -354,8 +354,8 @@ def _align_implicit_model_settings(
     the model, so the same swap happens here. The workflow records whether the agent's
     settings were those implicit defaults, judged in its own environment, and the
     run-level overrides, which are re-applied after the swap. Explicit agent settings,
-    inputs from older workflow workers, and models that do not expose a ``model`` name
-    pass through unchanged.
+    settings for explicit Model objects, and models that do not expose a ``model``
+    name pass through unchanged.
     """
     model_settings = input["model_settings"]
     if input.get("model_name") is not None or not input.get("implicit_model_settings"):
