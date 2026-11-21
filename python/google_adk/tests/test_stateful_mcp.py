@@ -1971,3 +1971,141 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
     # Both blocks' operations use the queue that sessions of every version
     # poll, so a session recorded by an earlier version keeps serving them.
     assert operation_queues == {f"stateful_state-stateful@{handle.result_run_id}"}
+
+
+@workflow.defn
+class StatefulMcpTaskGroupSiblingFailureWorkflow:
+    def __init__(self) -> None:
+        self.code_after_block_ran = False
+        self.mcp_block_done = False
+
+    @workflow.run
+    async def run(self, host_task_queue: str) -> None:
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self.mcp_task(host_task_queue))
+                tg.create_task(self.failing_task())
+        except* ApplicationError as eg:
+            raise eg.exceptions[0]
+
+    async def mcp_task(self, host_task_queue: str) -> None:
+        async with TemporalStatefulMcpToolSet(
+            "stateful_server",
+            config=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=20),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            ),
+            server_session_config=ActivityConfig(
+                task_queue=host_task_queue,
+                start_to_close_timeout=timedelta(hours=1),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            ),
+        ) as toolset:
+            await toolset.get_tools()
+            self.mcp_block_done = True
+        self.code_after_block_ran = True
+
+    async def failing_task(self) -> None:
+        await workflow.wait_condition(lambda: self.mcp_block_done)
+        raise ApplicationError("sibling failure", type="SiblingFailure")
+
+    @workflow.query
+    def after_block_ran(self) -> bool:
+        return self.code_after_block_ran
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_block_cancelled_during_cleanup_in_task_group(
+    client: Client,
+):
+    provider = TemporalStatefulMcpToolSetProvider(
+        "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
+    )
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-tg-cancel-{uuid.uuid4()}"
+    host_task_queue = f"{task_queue}-host"
+
+    async with Worker(client, task_queue=host_task_queue):
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[StatefulMcpTaskGroupSiblingFailureWorkflow],
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                StatefulMcpTaskGroupSiblingFailureWorkflow.run,
+                args=[host_task_queue],
+                id=f"stateful-mcp-tg-cancel-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            assert isinstance(err.value.cause, ApplicationError)
+            assert err.value.cause.type == "SiblingFailure"
+            assert not await handle.query(
+                StatefulMcpTaskGroupSiblingFailureWorkflow.after_block_ran
+            )
+
+
+@workflow.defn
+class StatefulMcpTaskGroupNormalExitWorkflow:
+    def __init__(self) -> None:
+        self.code_after_block_ran = False
+
+    @workflow.run
+    async def run(self, host_task_queue: str) -> str:
+        async with asyncio.TaskGroup() as tg:
+            t1 = tg.create_task(self.mcp_task(host_task_queue))
+            t2 = tg.create_task(self.sibling_task())
+        return f"{t1.result()}-{t2.result()}"
+
+    async def mcp_task(self, host_task_queue: str) -> str:
+        async with TemporalStatefulMcpToolSet(
+            "stateful_server",
+            config=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=20),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            ),
+            server_session_config=ActivityConfig(
+                task_queue=host_task_queue,
+                start_to_close_timeout=timedelta(hours=1),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            ),
+        ) as toolset:
+            await toolset.get_tools()
+        self.code_after_block_ran = True
+        return "mcp_ok"
+
+    async def sibling_task(self) -> str:
+        await workflow.wait_condition(lambda: self.code_after_block_ran)
+        return "sibling_ok"
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_block_normal_exit_in_task_group(
+    client: Client,
+):
+    provider = TemporalStatefulMcpToolSetProvider(
+        "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
+    )
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-tg-normal-{uuid.uuid4()}"
+    host_task_queue = f"{task_queue}-host"
+
+    async with Worker(client, task_queue=host_task_queue):
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[StatefulMcpTaskGroupNormalExitWorkflow],
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                StatefulMcpTaskGroupNormalExitWorkflow.run,
+                args=[host_task_queue],
+                id=f"stateful-mcp-tg-normal-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            result = await handle.result()
+            assert result == "mcp_ok-sibling_ok"
