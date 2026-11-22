@@ -360,6 +360,22 @@ export function callToolActivityName(server: string): string {
   return `${server}-callTool`;
 }
 
+// JSON-RPC codes that make a cached connection unsafe to reuse. Every other
+// McpError is an error response, proof that the transport still works. -32001
+// (request timeout) is retired because the peer may be stuck, and -32022
+// (unsupported protocol version) invalidates the protocol this connection
+// negotiated. Same set as the Python MCP connection pool.
+const UNUSABLE_CONNECTION_ERROR_CODES: ReadonlySet<number> = new Set([-32000, -32001, -32022]);
+
+function connectionUnusable(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return true;
+  const error = err as { name?: unknown; code?: unknown };
+  // Strands' client rejects a JSON-RPC error with the MCP SDK's McpError, whose
+  // name stays `McpError` on subclasses such as URL elicitation.
+  if (error.name !== 'McpError' || typeof error.code !== 'number') return true;
+  return UNUSABLE_CONNECTION_ERROR_CODES.has(error.code);
+}
+
 /**
  * Builds the per-server `{server}-listTools` activity. Enumerates the server's
  * tools live over the plugin's connection on every call, so the agent sees the
@@ -384,10 +400,11 @@ export function buildListToolsActivity(
         inputSchema: t.toolSpec.inputSchema,
       }));
     } catch (err) {
-      // The session may be broken (e.g. the server was redeployed); stop handing
-      // it out so the next call reconnects to the current deployment. It is
-      // closed once the calls still using it have finished.
-      connections.retire(server, record);
+      // A JSON-RPC error response (a mistyped tool name, invalid params) arrives
+      // over a healthy connection. Retiring it would reconnect every workflow
+      // sharing it. A dead transport, a timeout or an unsupported protocol still
+      // drops the connection; it is closed once the calls still using it finish.
+      if (connectionUnusable(err)) connections.retire(server, record);
       throw err;
     } finally {
       // Closes the connection if it was retired and this was the last in-flight
@@ -620,9 +637,9 @@ export function buildCallToolActivity(
       const client = await record.client;
       return await client.callTool(tool, input.args);
     } catch (err) {
-      // The session may be broken; stop handing it out so the next call
-      // reconnects. It is closed once the calls still using it have finished.
-      connections.retire(server, record);
+      // Same rule as listTools: an error response leaves the connection in
+      // place, and only a failure that makes the transport unusable retires it.
+      if (connectionUnusable(err)) connections.retire(server, record);
       throw err;
     } finally {
       // Closes the connection if it was retired and this was the last in-flight
