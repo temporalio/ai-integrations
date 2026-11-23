@@ -415,6 +415,17 @@ Gemini API for a model named `fast`.
 > goroutines. Anything that isn't belongs in an `ActivityAsTool` (or an MCP tool),
 > where it runs worker-side under Temporal's retry/timeout policy.
 
+> **`workflowcheck`.** `workflowcheck` v0.6.0 reports every Workflow that calls
+> `NewContext` as non-deterministic. `NewContext` calls
+> `net/http/httptrace.WithClientTrace`, which uses reflection that the checker
+> can't prove safe. The call only adds a hook to the context, so mark it
+> deterministic in your `workflowcheck` config:
+>
+> ```yaml
+> decls:
+>   "net/http/httptrace.WithClientTrace": false
+> ```
+
 ## Heartbeats
 
 The plugin's own Activities heartbeat while they run: `InvokeModel`,
