@@ -57,6 +57,7 @@ from tests.harbor_fixtures.workflows import (
     PlanTwoUnnamedJobs,
     PlanWithInvalidTimeout,
     PlanWithSecondsOfTimeout,
+    PlanWithZeroTimeout,
     QueuedJob,
     RunJob,
     RunJobOnQueue,
@@ -850,10 +851,11 @@ async def test_invalid_arguments_fail_the_workflow(
             "aggregate_job",
             "start_to_close_timeout",
         ),
+        (PlanWithZeroTimeout, _config, "plan_job", "start_to_close_timeout"),
     ],
-    ids=["plan_job", "execute_trial", "aggregate_job"],
+    ids=["plan_job", "execute_trial", "aggregate_job", "zero"],
 )
-async def test_timeout_that_is_not_a_timedelta_fails_the_workflow(
+async def test_timeout_that_is_not_a_positive_timedelta_fails_the_workflow(
     harbor_client: Client,
     tmp_path: Path,
     workflow_class: type[Any],

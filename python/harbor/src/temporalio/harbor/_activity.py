@@ -490,6 +490,16 @@ def _pinned(
     return task
 
 
+def _write_atomically(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(text)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 async def _check_environment(config: TrialConfig) -> None:
     try:
         await asyncio.to_thread(
@@ -872,10 +882,12 @@ class HarborActivities:
                     )
                 lock.created_at = existing_lock.created_at
                 lock.harbor = existing_lock.harbor
-            config_path.write_text(
-                config.model_dump_json(indent=4, exclude_defaults=True)
+            _write_atomically(
+                config_path, config.model_dump_json(indent=4, exclude_defaults=True)
             )
-            lock_path.write_text(lock.model_dump_json(indent=4, exclude_none=True))
+            _write_atomically(
+                lock_path, lock.model_dump_json(indent=4, exclude_none=True)
+            )
 
         await asyncio.to_thread(write)
         return PlanJobResult(
@@ -1085,8 +1097,9 @@ class HarborActivities:
         def write() -> None:
             job_dir = input.config.jobs_dir / input.config.job_name
             job_dir.mkdir(parents=True, exist_ok=True)
-            (job_dir / "result.json").write_text(
-                result.model_dump_json(indent=4, exclude={"trial_results"})
+            _write_atomically(
+                job_dir / "result.json",
+                result.model_dump_json(indent=4, exclude={"trial_results"}),
             )
 
         await asyncio.to_thread(write)

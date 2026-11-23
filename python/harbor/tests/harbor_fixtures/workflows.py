@@ -306,6 +306,15 @@ class PlanWithSecondsOfTimeout:
 
 
 @workflow.defn
+class PlanWithZeroTimeout:
+    """Plan the job with a ``start_to_close_timeout`` of zero."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> TemporalJobPlan:
+        return await plan_job(config, start_to_close_timeout=timedelta(0))
+
+
+@workflow.defn
 class RunTrialWithSecondsOfHeartbeat:
     """Run a trial with a ``heartbeat_timeout`` given in seconds."""
 

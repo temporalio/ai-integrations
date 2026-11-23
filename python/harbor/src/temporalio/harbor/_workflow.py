@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from datetime import timedelta
 from pathlib import PurePath
+from typing import Annotated
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -16,7 +17,7 @@ with workflow.unsafe.imports_passed_through():
     from harbor.models.job.result import JobResult, JobStats
     from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
     from harbor.utils.pass_at_k import compute_pass_at_k_by_evals
-    from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError
+    from pydantic import ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
     from temporalio.harbor._types import (
         AGGREGATE_JOB,
@@ -55,9 +56,12 @@ _SUFFIX_LENGTH = 7
 
 _OUTCOMES = TypeAdapter(list[TrialOutcome])
 
-# Strict: the SDK takes only a timedelta, and a number of seconds would fail
-# the workflow task instead of the workflow.
-_TIMEOUTS = TypeAdapter(dict[str, timedelta | None], config=ConfigDict(strict=True))
+# Strict and positive: a number of seconds, or a timeout of zero or less,
+# would fail the workflow task instead of the workflow, or go unenforced.
+_TIMEOUTS = TypeAdapter(
+    dict[str, Annotated[timedelta, Field(gt=timedelta(0))] | None],
+    config=ConfigDict(strict=True),
+)
 
 
 def _invalid(function: str, exc: ValidationError) -> ApplicationError:
