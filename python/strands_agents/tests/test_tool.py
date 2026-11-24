@@ -13,9 +13,6 @@ from strands.multiagent import Swarm
 from strands.multiagent.graph import GraphBuilder
 from strands.tools.tools import PythonAgentTool
 from strands.types.tools import ToolResult, ToolUse
-from strands_tools.calculator import (
-    calculator,  # pyright: ignore[reportMissingTypeStubs]
-)
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
@@ -75,10 +72,9 @@ async def read_file_activity(path: str) -> str:
     return Path(path).read_text()
 
 
-@activity.defn(name="calculator")
-async def calculator_activity(expression: str) -> str:
-    result = calculator(expression=expression)  # pyright: ignore[reportDeprecated]
-    return str(result["content"][0]["text"])
+@activity.defn(name="divide")
+async def divide_activity(dividend: int, divisor: int) -> float:
+    return dividend / divisor
 
 
 @activity.defn(name="track_parcel")
@@ -183,7 +179,7 @@ class ToolWorkflow:
             start_to_close_timeout=timedelta(seconds=15),
             tools=[
                 activity_as_tool(
-                    calculator_activity,
+                    divide_activity,
                     start_to_close_timeout=timedelta(seconds=15),
                 ),
                 activity_as_tool(
@@ -224,8 +220,8 @@ async def test_tool(client: Client, tmp_path: Path):
                 [
                     {"name": "read_file", "input": {"path": str(fixture)}},
                     {
-                        "name": "calculator",
-                        "input": {"expression": "3111696 / 74088"},
+                        "name": "divide",
+                        "input": {"dividend": 3111696, "divisor": 74088},
                     },
                     {
                         "name": "letter_counter",
@@ -253,7 +249,7 @@ async def test_tool(client: Client, tmp_path: Path):
         workflows=[ToolWorkflow],
         activities=[
             read_file_activity,
-            calculator_activity,
+            divide_activity,
             TrackParcel("acme-post"),
             Shipping("acme-post").quote,
             ShipParcel("unused"),
@@ -280,7 +276,7 @@ async def test_tool(client: Client, tmp_path: Path):
         "invoke_model",
         "read_file",
         "invoke_model",
-        "calculator",
+        "divide",
         "invoke_model",
         # letter_counter (in-workflow)
         "invoke_model",
@@ -305,7 +301,7 @@ async def test_tool(client: Client, tmp_path: Path):
         [{"text": "3"}],
         [{"text": "STRAWBERRY"}],
     ]
-    assert get_tool_results(history)[1] == [{"text": "Result: 42"}]
+    assert get_tool_results(history)[1] == [{"text": "42.0"}]
     # Outside a workflow, Strands still runs a sync tool on a thread.
     tool_use: ToolUse = {"toolUseId": "t", "name": "record_thread", "input": {}}
     async for _ in record_thread.stream(tool_use, {}):
