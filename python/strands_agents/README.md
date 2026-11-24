@@ -401,33 +401,28 @@ variable available to that worker.
 
 ## Tools
 
-Decorate non-deterministic tools with `@activity.defn`, or if you're importing tools from `strands_tools`, wrap them in a thin async function. Then, register the activity on the worker via `Worker(activities=[...])` and pass it to the agent with `workflow.activity_as_tool(activity, **options)` along with any activity options (e.g. `start_to_close_timeout`):
+Run non-deterministic tools in Activities. For an imported tool, call it from a thin async function decorated with `@activity.defn`. Register the Activity on the worker and pass it to the agent with `workflow.activity_as_tool`, along with any Activity options such as `start_to_close_timeout`.
 
 ```python
-from strands_tools import shell
+from temporalio import activity
 from temporalio.strands_agents import workflow as strands_workflow
 
 @activity.defn
 async def fetch_user(user_id: str) -> dict:
     ...
 
-@activity.defn(name="shell")
-async def shell_activity(command: str) -> dict:
-    return shell.shell(command=command, non_interactive=True)
-
 # workflow
 agent = TemporalAgent(
     start_to_close_timeout=timedelta(seconds=60),
     tools=[
         strands_workflow.activity_as_tool(fetch_user, start_to_close_timeout=timedelta(seconds=30)),
-        strands_workflow.activity_as_tool(shell_activity, start_to_close_timeout=timedelta(seconds=15)),
     ],
 )
 
 # worker
 Worker(
     ...,
-    activities=[fetch_user, shell_activity],
+    activities=[fetch_user],
     plugins=[StrandsPlugin(models=MODELS)],
 )
 ```
