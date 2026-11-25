@@ -17,11 +17,12 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import date, time, timedelta
+from decimal import Decimal
 from enum import Enum
+from fractions import Fraction
 from hashlib import sha256
 from heapq import heapify, heappop, heappush
 from json import dumps
-from numbers import Number
 from pathlib import PurePath
 from typing import Any
 from uuid import UUID
@@ -55,21 +56,20 @@ _returned: ContextVar[list[str] | None] = ContextVar(
 # Cache entries written in this run by calls made in a node or task call that
 # then failed (see call_scope()). Not part of the cache either.
 _stale: ContextVar[set[str] | None] = ContextVar("_temporal_task_stale", default=None)
-# Per scope whose last call failed: the LangGraph task that call ran as, and
-# the keys the calls made in it took, those of earlier attempts resumed from
-# the checkpoint included (see call_scope()). Not part of the cache either.
-_failed: ContextVar[dict[str, tuple[str | None, list[str]]] | None] = ContextVar(
+# Per scope whose last call failed or was interrupted: the LangGraph task that
+# call ran as, the keys the calls made in it took, those of earlier attempts
+# resumed from the checkpoint included, and whether it failed (see
+# call_scope()). Not part of the cache either.
+_failed: ContextVar[dict[str, tuple[str | None, list[str], bool]] | None] = ContextVar(
     "_temporal_task_failed", default=None
 )
-# Per LangGraph task of an entrypoint invocation that failed or was cancelled:
-# the places its finished calls held, which it gave back, and the keys its
-# calls took (see invocation_scope()). Not part of the cache either.
-_failed_invocations: ContextVar[dict[str, tuple[list[str], list[str]]] | None] = (
+# Per LangGraph task of an entrypoint invocation that failed, was cancelled or
+# was interrupted: its place in the enclosing scope if it is nested, and the
+# places its finished calls held, which it gave back unless it was
+# interrupted (see invocation_scope()). Not part of the cache either.
+_failed_invocations: ContextVar[dict[str, tuple[str | None, list[str]]] | None] = (
     ContextVar("_temporal_task_failed_invocations", default=None)
 )
-# Keyword arguments LangGraph injects into a node function: the plugin keeps
-# these two (see _plugin.py). They are not the caller's input.
-_INJECTED_KWARGS = frozenset({"config", "runtime"})
 
 
 def set_task_cache(cache: dict[str, Any] | None) -> None:
@@ -88,7 +88,8 @@ def occurrence_key(key: str) -> str:
     Calls are counted per scope (see :func:`call_scope`). The first call with
     ``key`` from the entrypoint or a top-level node keeps it, so caches
     written by earlier versions still match; calls made in a workflow-side
-    node or task get ``"<key>@<scope>"``. The n-th repeat adds ``"#<n>"``, so
+    node or task, or in an entrypoint invoked inside one or inside another
+    entrypoint, get ``"<key>@<scope>"``. The n-th repeat adds ``"#<n>"``, so
     it does not find an earlier call's result and runs again, while the same
     calls made in the same order after continue-as-new find theirs. A call
     takes the first place that a failed or interrupted call gave back (see
@@ -139,8 +140,10 @@ def _abandoned(err: BaseException) -> bool:
 
 
 @contextmanager
-def invocation_scope() -> Generator[None, None, None]:
-    """Track the calls made by one invocation of an entrypoint.
+def invocation_scope(
+    name: str, args: tuple[Any, ...] = ()
+) -> Generator[None, None, None]:
+    """Track the calls made by one invocation of the entrypoint ``name``.
 
     Calls made directly by an entrypoint keep their keys (see
     :func:`occurrence_key`). Without this, a Workflow that invokes the
@@ -152,23 +155,39 @@ def invocation_scope() -> Generator[None, None, None]:
     them under the same keys, runs them again and replaces their results.
 
     When LangGraph resumes the invocation from its checkpoint instead, as the
-    same task, the calls it restores are not made again, so they take their
-    places back and keep their results for the next run, and the call that
-    failed takes the place it gave back. If that attempt fails too, the
-    restored calls still count as the invocation's own.
+    same task, after a failure or an interrupt, the calls it restores are not
+    made again, so they keep or take back their places and their results for
+    the next run, and the call that failed takes the place it gave back. If
+    the resumed attempt fails, the restored calls still count as the
+    invocation's own.
 
     An entrypoint invoked inside another invocation, or inside a
     workflow-side node or task, is tracked the same way, so a failure the
     enclosing code catches is cleaned up too; its calls also count as the
-    enclosing call's.
+    enclosing call's. It counts them per invocation with its input ``args``,
+    as a workflow-side task does (see :func:`call_scope`), so parallel
+    invocations keep their own results. Resumed from its checkpoint, it keeps
+    the place it had, since the input LangGraph restores can differ, such as
+    a list for a tuple.
     """
     task = _langgraph_task()
     failed = _failed_invocations.get()
+    earlier_key: str | None = None
     restored: list[str] = []
     if failed is not None and task is not None and task in failed:
-        held, restored = failed.pop(task)
-        _reclaim(held)
+        earlier_key, restored = failed.pop(task)
     outer_taken, outer_returned = _taken.get(), _returned.get()
+    key: str | None = None
+    scope = _scope.get()
+    if outer_taken is not None:
+        if earlier_key is not None:
+            key = earlier_key
+            _reclaim([key])
+        else:
+            key = occurrence_key(_scope_key(name, args, {}))
+        scope = sha256(key.encode()).hexdigest()[:16]
+    scope_token = _scope.set(scope)
+    _reclaim(restored)
     taken: list[str] = list(restored)
     returned: list[str] = []
     taken_token = _taken.set(taken)
@@ -176,19 +195,22 @@ def invocation_scope() -> Generator[None, None, None]:
     try:
         yield
     except BaseException as err:
+        # A place given back may have been taken again since, by this
+        # invocation or another, so only the places still held count.
+        held = list((Counter(taken) - Counter(returned)).elements())
         if _abandoned(err):
             _retire(taken)
-            # A place given back may have been taken again since, by this
-            # invocation or another, so only the places still held go back.
-            held = list((Counter(taken) - Counter(returned)).elements())
-            for key in held:
-                release(key)
-            if failed is not None and task is not None:
-                failed[task] = (held, taken)
+            for taken_key in held:
+                release(taken_key)
+        if failed is not None and task is not None:
+            failed[task] = (key, held)
+        if key is not None:
+            release(key)
         raise
     finally:
         _returned.reset(returned_token)
         _taken.reset(taken_token)
+        _scope.reset(scope_token)
         if outer_taken is not None:
             # The enclosing call has the restored keys from the earlier attempt.
             outer_taken.extend(taken[len(restored) :])
@@ -214,26 +236,26 @@ def call_scope(
 
     If it fails or is cancelled, rather than interrupted, the results of the
     calls made in it become stale. When LangGraph runs it again from its
-    checkpoint, as the same task, those calls keep their places: one
-    LangGraph restores from the checkpoint is not made again and keeps its
-    result for the next run, and the one that failed takes the place it gave
-    back. If that attempt fails too, the restored calls still count as the
-    call's own. When it is called again as another task, such as by a retry,
-    its calls count from the first place again, so they are made under the
-    same keys, run again and replace their results.
+    checkpoint, as the same task, after a failure or an interrupt, those
+    calls keep their places: one LangGraph restores from the checkpoint is
+    not made again and keeps its result for the next run, and the one that
+    failed takes the place it gave back. If the resumed attempt fails, the
+    restored calls still count as the call's own. When a failed call is
+    called again as another task, such as by a retry, its calls count from
+    the first place again, so they are made under the same keys, run again
+    and replace their results.
     """
-    caller = {k: v for k, v in (kwargs or {}).items() if k not in _INJECTED_KWARGS}
-    key = occurrence_key(_scope_key(name, args, caller))
+    key = occurrence_key(_scope_key(name, args, kwargs or {}))
     scope = sha256(key.encode()).hexdigest()[:16]
     task = _langgraph_task()
     failed = _failed.get()
     restored: list[str] = []
     if failed is not None and scope in failed:
-        failed_task, failed_keys = failed.pop(scope)
-        if task is None or task != failed_task:
-            _restart(failed_keys)
-        else:
+        failed_task, failed_keys, abandoned = failed.pop(scope)
+        if task is not None and task == failed_task:
             restored = failed_keys
+        elif abandoned:
+            _restart(failed_keys)
     taken: list[str] = list(restored)
     token = _scope.set(scope)
     taken_token = _taken.set(taken)
@@ -242,8 +264,8 @@ def call_scope(
     except BaseException as err:
         if _abandoned(err):
             _retire(taken)
-            if failed is not None:
-                failed[scope] = (task, taken)
+        if failed is not None:
+            failed[scope] = (task, taken, _abandoned(err))
         release(key)
         raise
     finally:
@@ -283,8 +305,9 @@ def _reclaim(keys: list[str]) -> None:
 
     LangGraph restores those calls from a checkpoint without making them,
     so they keep their places, and their results stay for the next run.
+    The enclosing call holds those places again too.
     """
-    free = _free_places.get()
+    free, taken = _free_places.get(), _taken.get()
     if free is None:
         return
     for key in keys:
@@ -294,6 +317,8 @@ def _reclaim(keys: list[str]) -> None:
         if places and place in places:
             places.remove(place)
             heapify(places)
+            if taken is not None:
+                taken.append(key)
 
 
 def _restart(keys: list[str]) -> None:
@@ -370,12 +395,13 @@ def _stable(value: Any, enclosing: frozenset[int] = frozenset()) -> Any:
     """Return a JSON form of ``value`` that is the same in every process.
 
     Containers, enums, dataclasses and Pydantic models give their class and
-    contents; numbers, dates, UUIDs and paths their class and string form;
-    functions and classes their qualified name. Any other object gives its
-    class alone, since its ``str()`` can show its address, which differs on
-    another Worker: calls that differ only in such values are told apart by
-    their order. Unlike :func:`cache_key`, which keeps the form earlier
-    versions wrote, this never falls back to ``str()``.
+    contents; the standard library's numbers, dates, UUIDs and paths their
+    class and string form; functions and classes their qualified name. Any
+    other object, a number type of its own included, gives its class alone,
+    since its ``str()`` can show its address, which differs on another
+    Worker: calls that differ only in such values are told apart by their
+    order. Unlike :func:`cache_key`, which keeps the form earlier versions
+    wrote, this never falls back to ``str()``.
     """
     if value is None or (
         isinstance(value, (bool, int, float, str)) and not isinstance(value, Enum)
@@ -387,7 +413,9 @@ def _stable(value: Any, enclosing: frozenset[int] = frozenset()) -> Any:
         return [name, _stable(value.value, enclosing)]
     if isinstance(value, (bytes, bytearray)):
         return [name, value.hex()]
-    if isinstance(value, (Number, date, time, timedelta, UUID, PurePath)):
+    if isinstance(
+        value, (complex, Decimal, Fraction, date, time, timedelta, UUID, PurePath)
+    ):
         return [name, str(value)]
     if callable(value) and hasattr(value, "__qualname__"):
         return [name, f"{getattr(value, '__module__', None)}.{value.__qualname__}"]

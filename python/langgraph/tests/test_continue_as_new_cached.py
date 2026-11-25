@@ -12,6 +12,8 @@ import sys
 from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal
+from numbers import Number
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -45,7 +47,7 @@ from temporalio.langgraph._task_cache import (
     release,
     set_task_cache,
 )
-from temporalio.langgraph._workflow import scope_router
+from temporalio.langgraph._workflow import scope_router, wrap_workflow
 from temporalio.worker import Worker
 
 # Track execution counts to verify caching
@@ -431,6 +433,14 @@ class Tags:
     names: set[str]
 
 
+@Number.register
+class Meters:
+    """A number type whose ``str()`` shows its address."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+
 def test_cache_key_reads_values():
     # str() of these depends on object identity and set order, which differ
     # between processes.
@@ -523,14 +533,10 @@ def _occurrence_keys() -> None:
     set_task_cache(get_task_cache())
     assert cache_lookup(done[0]) == (True, "finished")
     # Calls with other input count apart, so a failed call never shares a
-    # scope with a call that has other input. The config and runtime that
-    # LangGraph injects are not input.
+    # scope with a call that has other input.
     set_task_cache({})
-    with call_scope("node", ("a",), {"config": {"run_id": 1}}):
+    with call_scope("node", ("a",)):
         first = [occurrence_key(key)]
-    set_task_cache({})
-    with call_scope("node", ("a",), {"config": {"run_id": 2}, "runtime": object()}):
-        assert occurrence_key(key) == first[0]
     with call_scope("node", ("b",)):
         assert occurrence_key(key) != first[0]
     # A scope's place is not a place of an Activity call with the same name
@@ -543,6 +549,29 @@ def _occurrence_keys() -> None:
 
 def test_repeated_calls_get_their_own_keys():
     copy_context().run(_occurrence_keys)
+
+
+async def _wrapped_scope(injected: frozenset[str], **kwargs: Any) -> str:
+    """Return the key of a call made in a workflow-side function given ``kwargs``."""
+    keys: list[str] = []
+
+    async def body(*args: Any, **kwargs: Any) -> None:  # pyright: ignore[reportUnusedParameter]
+        keys.append(occurrence_key("key"))
+
+    set_task_cache({})
+    await wrap_workflow("node", body, injected=injected)("a", **kwargs)
+    return keys[0]
+
+
+def test_injected_keywords_are_not_input():
+    """The config LangGraph passes a node is not input; a config given to a task is."""
+    node = frozenset({"config", "runtime"})
+    assert asyncio.run(_wrapped_scope(node, config={"run_id": 1})) == asyncio.run(
+        _wrapped_scope(node, config={"run_id": 2}, runtime=object())
+    )
+    assert asyncio.run(_wrapped_scope(frozenset(), config="bad")) != asyncio.run(
+        _wrapped_scope(frozenset(), config="good")
+    )
 
 
 def _scope(*args: Any) -> str:
@@ -558,6 +587,9 @@ def _scopes_read_values() -> None:
     # alive, so their addresses differ, as on two Workers.
     helpers = [object(), object()]
     assert _scope(helpers[0], {"a", "b"}) == _scope(helpers[1], {"b", "a"})
+    meters = [Meters(1), Meters(1)]
+    assert _scope(meters[0]) == _scope(meters[1])
+    assert _scope(Decimal("1.5")) != _scope(Decimal("2.5"))
     assert _scope({(1, 2): Tags({"a", "b"}), "n": 1}) == _scope(
         {"n": 1, (1, 2): Tags({"b", "a"})}
     )

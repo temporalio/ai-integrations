@@ -24,6 +24,7 @@ def wrap_workflow(
     name: str,
     func: Callable[..., Any],
     *,
+    injected: frozenset[str] = frozenset(),
     streaming_topic: str | None = None,
     summary_fn: Callable[[tuple[Any, ...], dict[str, Any]], str | None] | None = None,
 ) -> Callable[..., Awaitable[Any]]:
@@ -41,7 +42,8 @@ def wrap_workflow(
     an empty result clears it.
 
     The calls it makes are counted per call of ``name`` with its input (see
-    :func:`call_scope`).
+    :func:`call_scope`): its arguments, without the keyword arguments named
+    in ``injected``, which LangGraph passes to a node.
     """
 
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -63,8 +65,9 @@ def wrap_workflow(
                     token = var_child_runnable_config.set(
                         {**config, "configurable": configurable}
                     )
+            caller = {k: v for k, v in kwargs.items() if k not in injected}
             try:
-                with call_scope(name, args, kwargs):
+                with call_scope(name, args, caller):
                     if iscoroutinefunction(func):
                         return await func(*args, **kwargs)
                     return func(*args, **kwargs)
@@ -115,22 +118,23 @@ def track_invocations(runnable: RunnableCallable) -> None:
     """Run an entrypoint's function in an invocation scope, in place.
 
     Each invocation then tracks its calls (see :func:`invocation_scope`).
-    Wraps a function once, however many plugins are built with it.
+    Its input is the positional argument; LangGraph injects the keyword
+    arguments. Wraps a function once, however many plugins are built with it.
     """
     if runnable in _tracked:
         return
-    func, afunc = runnable.func, runnable.afunc
+    name, func, afunc = runnable.get_name(), runnable.func, runnable.afunc
     if func is not None:
 
         def tracked(*args: Any, **kwargs: Any) -> Any:
-            with invocation_scope():
+            with invocation_scope(name, args):
                 return func(*args, **kwargs)
 
         runnable.func = tracked
     if afunc is not None:
 
         async def atracked(*args: Any, **kwargs: Any) -> Any:
-            with invocation_scope():
+            with invocation_scope(name, args):
                 return await afunc(*args, **kwargs)
 
         runnable.afunc = atracked

@@ -310,6 +310,7 @@ class LangGraphPlugin(SimplePlugin):
                         user_func,
                         opts,
                         context_schema=graph.context_schema,
+                        injected=frozenset(runnable.func_accepts),
                     )
                     runnable.func = None
                 # Routers run in the workflow and can call tasks too.
@@ -393,6 +394,7 @@ class LangGraphPlugin(SimplePlugin):
         kwargs: dict[str, Any] | None = None,
         *,
         context_schema: type[Any] | None = None,
+        injected: frozenset[str] = frozenset(),
     ) -> Callable:
         """Prepare a node or task to execute as an activity or inline in the workflow."""
         opts = kwargs or {}
@@ -433,6 +435,7 @@ class LangGraphPlugin(SimplePlugin):
             return wrap_workflow(
                 activity_name,
                 func,
+                injected=injected,
                 streaming_topic=self._streaming_topic,
                 summary_fn=summary_fn,
             )

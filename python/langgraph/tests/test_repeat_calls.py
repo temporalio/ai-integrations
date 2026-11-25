@@ -172,6 +172,14 @@ def fail_second_call(job_id: str) -> str:
     return value
 
 
+def fail_twice(job_id: str) -> str:
+    """Fail the first two calls for ``job_id``; later calls return a new value."""
+    value = next_value(job_id)
+    if value.endswith((":1", ":2")):
+        raise ApplicationError("call fails", non_retryable=True)
+    return value
+
+
 # Calls of slow_first_call per job ID, counted where the Activities run.
 _slow_calls: dict[str, int] = {}
 
@@ -190,6 +198,7 @@ _next = task(next_value)
 _fail_first = task(fail_first_call)
 _fail_second = task(fail_second_call)
 _slow_first = task(slow_first_call)
+_fail_twice = task(fail_twice)
 
 
 @task
@@ -224,6 +233,15 @@ async def take_unless(job_id: str, fail: bool) -> str:
     """Take a new value, then raise if ``fail``."""
     value = await _next(job_id)
     if fail:
+        raise ValueError(f"failed after {value}")
+    return value
+
+
+@task
+async def take_unless_bad(job_id: str, config: str) -> str:
+    """Take a new value, then raise if ``config`` is "bad"."""
+    value = await _next(job_id)
+    if config == "bad":
         raise ValueError(f"failed after {value}")
     return value
 
@@ -420,10 +438,85 @@ def _callers_plugin() -> LangGraphPlugin:
 
     @lg_entrypoint()
     async def retry_inner_entrypoint(request: dict[str, Any]) -> Any:
+        inner = {"job_id": request["job_id"]}
         try:
-            return await take_then_fail_entry.ainvoke(request)
+            return await take_then_fail_entry.ainvoke(inner)
         except ActivityError:
-            return await take_then_fail_entry.ainvoke(request)
+            return await take_then_fail_entry.ainvoke(inner)
+
+    @lg_entrypoint()
+    async def other_config_after_failure(request: dict[str, Any]) -> str:
+        try:
+            return await take_unless_bad(request["job_id"], config="bad")
+        except ValueError:
+            return await take_unless_bad(request["job_id"], config="good")
+
+    @lg_entrypoint()
+    async def wait_then_take(request: dict[str, Any]) -> str:
+        await _wait(request["job_id"], request["wait"])
+        return await _next(request["job_id"])
+
+    @lg_entrypoint()
+    async def two_inner_entrypoints(request: dict[str, Any]) -> list[Any]:
+        job_id = request["job_id"]
+        return list(
+            await asyncio.gather(
+                wait_then_take.ainvoke({"job_id": job_id, "wait": True}),
+                wait_then_take.ainvoke({"job_id": job_id, "wait": False}),
+            )
+        )
+
+    @lg_entrypoint()
+    async def take_ask_then_fail(request: dict[str, Any]) -> list[str]:
+        job_id = request["job_id"]
+        first = await _next(job_id)
+        interrupt("continue?")
+        return [first, await _fail_first(f"{job_id}-f")]
+
+    @lg_entrypoint(checkpointer=InMemorySaver())
+    async def take_then_fail_saved(request: dict[str, Any]) -> list[str]:
+        job_id = request["job_id"]
+        return [await _next(job_id), await _fail_first(f"{job_id}-f")]
+
+    @lg_entrypoint()
+    async def recover_inner(request: dict[str, Any]) -> Any:
+        job_id = request["job_id"]
+        config = RunnableConfig({"configurable": {"thread_id": job_id}})
+        try:
+            inner = {"job_id": job_id, "pair": (1, 2)}
+            return await take_then_fail_saved.ainvoke(inner, config)
+        except ActivityError:
+            return await take_then_fail_saved.ainvoke(None, config)
+
+    @lg_entrypoint()
+    async def recover_inner_then_fail(request: dict[str, Any]) -> list[str]:
+        job_id = request["job_id"]
+        config = RunnableConfig({"configurable": {"thread_id": job_id}})
+        try:
+            values = await take_then_fail_saved.ainvoke({"job_id": job_id}, config)
+        except ActivityError:
+            values = await take_then_fail_saved.ainvoke(None, config)
+        return [*values, await _fail_first(f"{job_id}-o")]
+
+    @lg_entrypoint(checkpointer=InMemorySaver())
+    async def take_then_fail_twice(request: dict[str, Any]) -> list[str]:
+        job_id = request["job_id"]
+        values = [await _next(job_id)]
+        for _ in range(2):
+            values.append(await _fail_twice(f"{job_id}-f"))
+        return values
+
+    @lg_entrypoint()
+    async def recover_inner_twice(request: dict[str, Any]) -> Any:
+        job_id = request["job_id"]
+        config = RunnableConfig({"configurable": {"thread_id": f"{job_id}-1"}})
+        for attempt in ({"job_id": job_id}, None):
+            try:
+                return await take_then_fail_twice.ainvoke(attempt, config)
+            except ActivityError:
+                pass
+        config = RunnableConfig({"configurable": {"thread_id": f"{job_id}-2"}})
+        return await take_then_fail_twice.ainvoke({"job_id": job_id}, config)
 
     return LangGraphPlugin(
         graphs={
@@ -433,6 +526,7 @@ def _callers_plugin() -> LangGraphPlugin:
             "recover-thrice": _recover_thrice_graph,
             "cancel": _cancel_graph,
             "routes": _routes_graph,
+            "approve-then-fail": _approve_then_fail_graph,
         },
         entrypoints={
             "two-branches": two_branches,
@@ -445,6 +539,15 @@ def _callers_plugin() -> LangGraphPlugin:
             "take-then-fail": take_then_fail_entry,
             "fail-second-of-two": fail_second_of_two,
             "retry-inner-entrypoint": retry_inner_entrypoint,
+            "other-config-after-failure": other_config_after_failure,
+            "wait-then-take": wait_then_take,
+            "two-inner-entrypoints": two_inner_entrypoints,
+            "take-ask-then-fail": take_ask_then_fail,
+            "take-then-fail-saved": take_then_fail_saved,
+            "recover-inner": recover_inner,
+            "recover-inner-then-fail": recover_inner_then_fail,
+            "take-then-fail-twice": take_then_fail_twice,
+            "recover-inner-twice": recover_inner_twice,
         },
         tasks=[
             _wait,
@@ -452,9 +555,11 @@ def _callers_plugin() -> LangGraphPlugin:
             _fail_first,
             _fail_second,
             _slow_first,
+            _fail_twice,
             wait_then_call,
             take_then_fail,
             take_unless,
+            take_unless_bad,
             wait_then_subgraph,
             fetch_with,
         ],
@@ -464,9 +569,11 @@ def _callers_plugin() -> LangGraphPlugin:
             "fail_first_call": {"execute_in": "activity"},
             "fail_second_call": {"execute_in": "activity"},
             "slow_first_call": {"execute_in": "activity"},
+            "fail_twice": {"execute_in": "activity"},
             "wait_then_call": {"execute_in": "workflow"},
             "take_then_fail": {"execute_in": "workflow"},
             "take_unless": {"execute_in": "workflow"},
+            "take_unless_bad": {"execute_in": "workflow"},
             "wait_then_subgraph": {"execute_in": "workflow"},
             "fetch_with": {"execute_in": "workflow"},
         },
@@ -513,18 +620,26 @@ class RepeatAcrossContinueAsNewWorkflow:
 class ApproveAcrossContinueAsNewWorkflow:
     """Runs graph ``name``, resuming it with "yes" if it interrupts.
 
-    Then continues-as-new with the cache until it has run ``runs`` times.
+    If the resumed run fails, runs the graph again on a new thread. Then
+    continues-as-new with the cache until it has run ``runs`` times.
     Returns whether each run was interrupted, and its answer.
     """
 
     @workflow.run
     async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
         app = graph(input.name, cache=input.cache).compile(checkpointer=InMemorySaver())
-        config = RunnableConfig({"configurable": {"thread_id": "1"}})
-        result = await app.ainvoke({"job_id": input.job_id}, config)
-        interrupted = "__interrupt__" in result
-        if interrupted:
-            result = await app.ainvoke(Command(resume="yes"), config)
+        result: Any = None
+        interrupted = False
+        for thread in ("1", "2"):
+            config = RunnableConfig({"configurable": {"thread_id": thread}})
+            result = await app.ainvoke({"job_id": input.job_id}, config)
+            interrupted = "__interrupt__" in result
+            try:
+                if interrupted:
+                    result = await app.ainvoke(Command(resume="yes"), config)
+                break
+            except ActivityError:
+                pass
         seen = [*input.seen, [interrupted, result["answer"]]]
         if len(seen) < input.runs:
             workflow.continue_as_new(
@@ -657,6 +772,42 @@ class RecoverInvocationAcrossContinueAsNewWorkflow:
             result = await app.ainvoke({"job_id": input.job_id}, config)
         except ActivityError:
             result = await app.ainvoke(None, config)
+        seen = [*input.seen, result]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    name=input.name,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+@workflow.defn
+class ApproveInvocationAcrossContinueAsNewWorkflow:
+    """Like ``ApproveAcrossContinueAsNewWorkflow``, for entrypoint ``name``.
+
+    Returns each run's result.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        app = entrypoint(input.name, cache=input.cache).copy(
+            {"checkpointer": InMemorySaver()}
+        )
+        result: Any = None
+        for thread in ("1", "2"):
+            config = RunnableConfig({"configurable": {"thread_id": thread}})
+            result = await app.ainvoke({"job_id": input.job_id}, config)
+            try:
+                if "__interrupt__" in result:
+                    result = await app.ainvoke(Command(resume="yes"), config)
+                break
+            except ActivityError:
+                pass
         seen = [*input.seen, result]
         if len(seen) < input.runs:
             workflow.continue_as_new(
@@ -1277,6 +1428,158 @@ async def test_task_given_a_helper_keeps_results_after_continue_as_new(
     assert [len(_scheduled(h)) for h in histories] == [1, 0]
 
 
+@_needs_functional_api
+async def test_failed_task_with_other_config_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """A task's own ``config`` argument is input, like any other.
+
+    As in ``test_failed_task_with_other_input_keeps_results_after_continue_as_new``,
+    with the two calls told apart only by ``config="bad"`` and ``config="good"``.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "other-config-after-failure",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+    )
+
+    assert seen == [f"{job_id}:2", f"{job_id}:2"]
+    assert [len(_scheduled(h)) for h in histories] == [2, 0]
+
+
+@_needs_functional_api
+async def test_parallel_nested_invocations_keep_their_results_after_continue_as_new(
+    client: Client,
+):
+    """Two parallel invocations of an inner entrypoint keep their own results.
+
+    As in ``test_parallel_callers_keep_their_results_after_continue_as_new``,
+    the first invocation makes the shared call second in the first run and
+    first after continue-as-new.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "two-inner-entrypoints", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    first = [f"{job_id}:2", f"{job_id}:1"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_invocation_failing_after_interrupt_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """An entrypoint that fails after resuming from an interrupt is retried in full.
+
+    LangGraph restores the call made before the interrupt, the resumed
+    invocation fails, and the workflow invokes the entrypoint again on a new
+    thread. After continue-as-new the first call gets the retry's result.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "take-ask-then-fail",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=ApproveInvocationAcrossContinueAsNewWorkflow,
+    )
+
+    first = [f"{job_id}:2", f"{job_id}-f:2"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_node_failing_after_interrupt_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """A workflow-side node that fails after resuming from an interrupt is retried in full."""
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "approve-then-fail",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=ApproveAcrossContinueAsNewWorkflow,
+    )
+
+    first = [True, f"yes {job_id}:2 {job_id}-f:2"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_nested_invocation_resumed_from_checkpoint_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """An entrypoint resumed by an enclosing one keeps the restored call's result.
+
+    Its input holds a tuple, which LangGraph gives back from the checkpoint
+    as a list when it resumes the invocation.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "recover-inner", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    first = [f"{job_id}:1", f"{job_id}-f:2"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [3, 0]
+
+
+@_needs_functional_api
+async def test_invocation_failing_after_nested_recovery_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """An entrypoint that fails after an inner one resumed from its checkpoint.
+
+    The inner entrypoint's second call fails, and it resumes from its
+    checkpoint, which restores its first call. Then the outer entrypoint's
+    own call fails, and the workflow invokes it again. After continue-as-new
+    the inner first call gets the retry's result.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "recover-inner-then-fail",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=RetryInvocationAcrossContinueAsNewWorkflow,
+    )
+
+    first = [f"{job_id}:2", f"{job_id}-f:3", f"{job_id}-o:2"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [7, 0]
+
+
+@_needs_functional_api
+async def test_invocation_failing_again_after_resuming_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """Identical calls keep their own places after an invocation fails twice.
+
+    The inner entrypoint fails in the same call before and after resuming
+    from its checkpoint, so it is invoked again on a new thread, where that
+    call and an identical one after it both run.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "recover-inner-twice", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    first = [f"{job_id}:2", f"{job_id}-f:3", f"{job_id}-f:4"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [6, 0]
+
+
 class ApproveState(TypedDict):
     job_id: str
     answer: NotRequired[str]
@@ -1286,6 +1589,20 @@ def approve(state: ApproveState) -> dict[str, str]:
     """Take a new value, then ask for approval."""
     value = next_value(state["job_id"])
     return {"answer": f"{interrupt('approve?')} {value}"}
+
+
+async def approve_then_fail(state: ApproveState) -> dict[str, str]:
+    """Take a new value, ask for approval, then make a call that fails the first time."""
+    first = await _next(state["job_id"])
+    answer = interrupt("approve?")
+    return {"answer": f"{answer} {first} {await _fail_first(state['job_id'] + '-f')}"}
+
+
+_approve_then_fail_graph = StateGraph(ApproveState)
+_approve_then_fail_graph.add_node(
+    "approve", approve_then_fail, metadata={"execute_in": "workflow"}
+)
+_approve_then_fail_graph.add_edge(START, "approve")
 
 
 @pytest.mark.skipif(
