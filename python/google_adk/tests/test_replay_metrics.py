@@ -15,6 +15,7 @@ import uuid
 import warnings
 from collections.abc import AsyncGenerator
 from datetime import timedelta
+from importlib import import_module
 
 import google.adk.telemetry.tracing
 import opentelemetry._logs
@@ -37,8 +38,14 @@ from opentelemetry.sdk._logs.export import (
     InMemoryLogRecordExporter,
     SimpleLogRecordProcessor,
 )
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.metrics import Counter, MeterProvider
+from opentelemetry.sdk.metrics import Histogram as HistogramInstrument
+from opentelemetry.sdk.metrics.export import (
+    AggregationTemporality,
+    Histogram,
+    InMemoryMetricReader,
+    Sum,
+)
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.trace import TracerProvider as ApiTracerProvider
 from opentelemetry.trace import get_tracer_provider, set_tracer_provider
@@ -47,7 +54,7 @@ from opentelemetry.util.types import Attributes
 import temporalio.google_adk.workflow
 from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHistory
 from temporalio.contrib.opentelemetry import (
     ReplaySafeLoggerProvider,
     ReplaySafeMeterProvider,
@@ -60,9 +67,13 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 MODEL_NAME = "replay-metrics-model"
 ADK_METER_SCOPE = "gcp.vertex.agent"
 
+# ADK creates its instruments lazily. Load them while the global provider
+# is still a proxy so the meter fixture can rebind them between tests.
+import_module("google.adk.telemetry._metrics")
+
 # One agent invocation, one tool call, two model calls (tool call + final
 # answer), token usage recorded twice per model call (input + output).
-EXPECTED_BASELINE = {
+EXPECTED_HISTOGRAM_COUNTS = {
     "gen_ai.invoke_agent.duration": 1,
     "gen_ai.invoke_agent.inference_calls": 1,
     "gen_ai.invoke_agent.tool_calls": 1,
@@ -71,7 +82,7 @@ EXPECTED_BASELINE = {
     "gen_ai.client.token.usage": 4,
 }
 if resolve_schema_version() >= 2:
-    EXPECTED_BASELINE["gen_ai.invoke_workflow.duration"] = 1
+    EXPECTED_HISTOGRAM_COUNTS["gen_ai.invoke_workflow.duration"] = 1
 
 # Legacy telemetry emits separate system, user, and choice events. The
 # experimental GenAI format consolidates them into one event per model call.
@@ -214,22 +225,40 @@ class ReplayMetricsAgent:
         return last_text
 
 
-def adk_metric_counts(reader: InMemoryMetricReader) -> dict[str, int]:
-    """Total observation count per ADK instrument (sum of data-point counts)."""
-    counts: dict[str, int] = {}
+def _adk_metric_totals(reader: InMemoryMetricReader) -> dict[str, int | float]:
+    """Collect ADK histogram observation counts and counter totals."""
+    totals: dict[str, int | float] = {}
     data = reader.get_metrics_data()
     if data is None:
-        return counts
+        return totals
     for rm in data.resource_metrics:
         for sm in rm.scope_metrics:
             if sm.scope.name != ADK_METER_SCOPE:
                 continue
             for metric in sm.metrics:
-                for dp in getattr(metric.data, "data_points", []):
-                    counts[metric.name] = counts.get(metric.name, 0) + getattr(
-                        dp, "count", 1
+                total: int | float
+                if isinstance(metric.data, Histogram):
+                    total = sum(point.count for point in metric.data.data_points)
+                elif isinstance(metric.data, Sum):
+                    total = sum(point.value for point in metric.data.data_points)
+                else:
+                    raise AssertionError(
+                        f"Unexpected aggregation for ADK metric {metric.name}: "
+                        f"{type(metric.data).__name__}"
                     )
-    return counts
+                totals[metric.name] = totals.get(metric.name, 0) + total
+    return totals
+
+
+def _delta_metric_reader() -> InMemoryMetricReader:
+    # Collect the live run and replays independently. Delta collection can
+    # detect a replayed counter recording even when its value is zero.
+    return InMemoryMetricReader(
+        preferred_temporality={
+            Counter: AggregationTemporality.DELTA,
+            HistogramInstrument: AggregationTemporality.DELTA,
+        }
+    )
 
 
 def adk_log_event_counts(exporter: InMemoryLogRecordExporter) -> dict[str, int]:
@@ -266,10 +295,9 @@ def reset_adk_proxy_logger():
     clear()
 
 
-async def _run_once_and_replay(client: Client, num_replays: int) -> int:
-    """Run the agent workflow once for real, then replay it num_replays times.
+async def _run_once(client: Client) -> WorkflowHistory:
+    """Run the agent workflow once and return its history.
 
-    Returns the number of real activity executions observed for this run.
     Skips the calling test if the live run's history shows a workflow task
     retry: a retried task legitimately re-records live telemetry
     (at-least-once semantics), which would break the exact-count assertions
@@ -315,30 +343,35 @@ async def _run_once_and_replay(client: Client, num_replays: int) -> int:
             "counts require a retry-free history"
         )
 
+    assert activity_executions - activity_executions_before == 1
+    return history
+
+
+async def _replay(history: WorkflowHistory, num_replays: int) -> None:
+    activity_executions_before = activity_executions
     for _ in range(num_replays):
         await Replayer(
             workflows=[ReplayMetricsAgent],
             plugins=[GoogleAdkPlugin()],
         ).replay_workflow(history)
-
-    return activity_executions - activity_executions_before
+    assert activity_executions == activity_executions_before
 
 
 async def test_replay_safe_meter_provider_suppresses_replay_metrics(
     client: Client,
     reset_otel_meter_provider,  # type: ignore[reportUnusedParameter]
 ):
-    reader = InMemoryMetricReader()
+    reader = _delta_metric_reader()
     _install_global_meter_provider(
         ReplaySafeMeterProvider(MeterProvider(metric_readers=[reader]))
     )
 
-    real_executions = await _run_once_and_replay(client, num_replays=3)
+    history = await _run_once(client)
+    live_totals = _adk_metric_totals(reader)
+    assert EXPECTED_HISTOGRAM_COUNTS.items() <= live_totals.items()
 
-    # First execution recorded exactly once (not suppressed), replays added
-    # zero observations, and the activity never re-executed.
-    assert real_executions == 1
-    assert adk_metric_counts(reader) == EXPECTED_BASELINE
+    await _replay(history, num_replays=3)
+    assert not _adk_metric_totals(reader)
 
 
 async def test_replay_metrics_duplicate_without_replay_safe_meter_provider(
@@ -347,14 +380,17 @@ async def test_replay_metrics_duplicate_without_replay_safe_meter_provider(
 ):
     # Control: without the wrapper, every replay re-records every
     # workflow-side ADK metric even though nothing really re-executed.
-    reader = InMemoryMetricReader()
+    reader = _delta_metric_reader()
     _install_global_meter_provider(MeterProvider(metric_readers=[reader]))
 
-    real_executions = await _run_once_and_replay(client, num_replays=3)
+    history = await _run_once(client)
+    live_totals = _adk_metric_totals(reader)
+    assert EXPECTED_HISTOGRAM_COUNTS.items() <= live_totals.items()
 
-    assert real_executions == 1
-    assert adk_metric_counts(reader) == {
-        name: count * (1 + 3) for name, count in EXPECTED_BASELINE.items()
+    num_replays = 3
+    await _replay(history, num_replays=num_replays)
+    assert _adk_metric_totals(reader) == {
+        name: total * num_replays for name, total in live_totals.items()
     }
 
 
@@ -373,11 +409,9 @@ async def test_replay_safe_logger_provider_suppresses_replay_log_events(
     provider, exporter = _in_memory_logger_provider()
     _install_global_logger_provider(ReplaySafeLoggerProvider(provider))
 
-    real_executions = await _run_once_and_replay(client, num_replays=3)
+    await _replay(await _run_once(client), num_replays=3)
 
-    # First execution emitted exactly once (not suppressed), replays added
-    # zero log events, and the activity never re-executed.
-    assert real_executions == 1
+    # The live run emitted exactly once and replays added zero log events.
     assert adk_log_event_counts(exporter) == EXPECTED_LOG_BASELINE
 
 
@@ -391,9 +425,8 @@ async def test_replay_log_events_duplicate_without_replay_safe_logger_provider(
     provider, exporter = _in_memory_logger_provider()
     _install_global_logger_provider(provider)
 
-    real_executions = await _run_once_and_replay(client, num_replays=3)
+    await _replay(await _run_once(client), num_replays=3)
 
-    assert real_executions == 1
     assert adk_log_event_counts(exporter) == {
         name: count * (1 + 3) for name, count in EXPECTED_LOG_BASELINE.items()
     }
