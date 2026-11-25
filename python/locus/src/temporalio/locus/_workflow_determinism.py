@@ -30,6 +30,7 @@ from temporalio import workflow
 _MODULES = (
     "locus.core.state",
     "locus.core.events",
+    "locus.core.interrupt",
     "locus.core.messages",
     "locus.core.termination",
     "locus.agent.agent",

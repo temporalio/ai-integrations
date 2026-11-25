@@ -107,7 +107,7 @@ pipeline = SequentialPipeline(agents=[researcher, writer])
 result = await pipeline.run("Summarise the incident.")
 ```
 
-Tested: `SequentialPipeline`, `ParallelPipeline` (its agents' model Activities run concurrently) and `StateGraph` with agent nodes. Other shapes, and `interrupt()` in a graph, are not tested yet.
+Tested: `SequentialPipeline`, `ParallelPipeline` (its agents' model Activities run concurrently), `StateGraph` with agent nodes, `Orchestrator` with specialists, `Swarm` and a `Handoff` chain.
 
 ## Streaming
 
@@ -148,7 +148,45 @@ async for item in stream.subscribe(["tokens"], result_type=ModelChunkEvent):
 
 ## Waiting on a person
 
-A tool that runs in the Workflow can wait on a Signal or Update for as long as it takes, across Worker restarts, and then run an Activity:
+A Workflow can wait on a Signal or Update for as long as it takes, across Worker restarts. Locus's own pauses fit that: the run stops, the Workflow waits, and the answer resumes the run.
+
+`ask_user`, which an agent has with `completion_mode="explicit"`, ends the run with an `InterruptEvent`. Wait for the answer and pass it to `agent.resume`:
+
+```python
+events = agent.run(prompt)
+while True:
+    question = None
+    async for event in events:
+        if isinstance(event, InterruptEvent):
+            question = event.question
+    if question is None:
+        break
+    self.question = question  # expose it with a Query
+    await workflow.wait_condition(lambda: self.answer is not None)
+    events = agent.resume(self.answer)
+```
+
+`interrupt()` in a `StateGraph` node returns a result with `interrupt` set. Resume with the paused state; no checkpointer is needed, because the Workflow holds it:
+
+```python
+paused = await graph.execute(state)
+if paused.interrupt is not None:
+    await workflow.wait_condition(lambda: self.answer is not None)
+    result = await graph.execute(Command(resume=self.answer, update=paused.final_state))
+```
+
+`admit()` raises `AdmissionError` for an action that needs a person. Wait for the approver and call it again with `approved_by`; the side effect in `perform` can be an Activity. Give an `AuditTrail` the Workflow's clock, so a replayed run rebuilds the same hash chain:
+
+```python
+trail = AuditTrail(clock=lambda: workflow.now().isoformat())
+try:
+    await admit(action, perform, policy=policy, trail=trail)
+except AdmissionError:
+    await workflow.wait_condition(lambda: self.approver is not None)
+    await admit(action, perform, policy=policy, trail=trail, approved_by=self.approver)
+```
+
+A tool that runs in the Workflow can also wait directly:
 
 ```python
 @tool
@@ -162,7 +200,7 @@ async def refund_with_approval(order_id: str) -> str:
 
 Inside a Workflow, Locus's time budgets, `TimeLimit`, timestamps, run ids, tool-call ids and retry jitter use the Workflow's clock, `workflow.uuid4()` and `workflow.random()`, so a replayed run takes the same path. Activities and plain Locus code in the same process keep the real clock.
 
-Locus has no clock or id seam, so the plugin replaces the `time`, `datetime`, `uuid4` and `random` names in the Locus modules the loop and the shapes run (`locus.core.state`, `locus.core.events`, `locus.core.messages`, `locus.core.termination`, `locus.agent.agent`, `locus.agent.runtime_loop`, `locus.agent.model_retry`, `locus.tools.executor` and the `locus.multiagent` modules). Two reads stay on the system's clock and random generator, because Locus imports them inside the function: a `StateGraph` node cache's `ttl_seconds` check and the jitter of a node's `RetryPolicy`. Avoid a node cache with a ttl in Workflow code.
+Locus has no clock or id seam, so the plugin replaces the `time`, `datetime`, `uuid4` and `random` names in the Locus modules the loop and the shapes run (`locus.core.state`, `locus.core.events`, `locus.core.interrupt`, `locus.core.messages`, `locus.core.termination`, `locus.agent.agent`, `locus.agent.runtime_loop`, `locus.agent.model_retry`, `locus.tools.executor` and the `locus.multiagent` modules). Two reads stay on the system's clock and random generator, because Locus imports them inside the function: a `StateGraph` node cache's `ttl_seconds` check and the jitter of a node's `RetryPolicy`. Avoid a node cache with a ttl in Workflow code.
 
 ## Not supported in Workflow code
 

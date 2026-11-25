@@ -13,6 +13,10 @@ from locus.core.events import ModelChunkEvent
 from locus.core.messages import Message, Role
 from locus.models.base import ModelResponse
 from locus.multiagent.graph import END, START, StateGraph
+from locus.multiagent.handoff import create_handoff_agent, create_handoff_manager
+from locus.multiagent.orchestrator import create_orchestrator
+from locus.multiagent.specialist import Specialist
+from locus.multiagent.swarm import create_swarm, create_swarm_agent
 
 from temporalio import activity, workflow
 from temporalio.client import Client
@@ -32,6 +36,15 @@ class RoleModel:
         del tools, kwargs
         system = next((m.content for m in messages if m.role == Role.SYSTEM), "")
         user = [m.content for m in messages if m.role == Role.USER][-1] or ""
+        if "## Available Specialists" in user:
+            # An Orchestrator asking which specialists to route to.
+            return ModelResponse(
+                message=Message.assistant(
+                    content='{"specialists": ["logs", "metrics"], "reasoning": "both",'
+                    ' "subtasks": {"logs": "read the logs", "metrics": "read the metrics"}}'
+                ),
+                stop_reason="stop",
+            )
         return ModelResponse(
             message=Message.assistant(content=f"[{system}] {user[-18:]}"),
             stop_reason="stop",
@@ -108,6 +121,71 @@ class GraphWorkflow:
         }
 
 
+def _model() -> TemporalModel:
+    return TemporalModel("m", start_to_close_timeout=timedelta(seconds=30))
+
+
+@workflow.defn
+class OrchestratorWorkflow:
+    @workflow.run
+    async def run(self, task: str) -> dict[str, Any]:
+        specialists = [
+            Specialist(
+                id=name,
+                name=name,
+                specialist_type=name,
+                description=f"reads {name}",
+                system_prompt=name,
+                model=_model(),
+            )
+            for name in ("logs", "metrics")
+        ]
+        orchestrator = create_orchestrator(specialists=specialists, model=_model())
+        result = await orchestrator.execute(task)
+        return {
+            "success": result.success,
+            "error": result.error,
+            "specialists": sorted(result.specialist_results),
+            "has_summary": bool(result.summary),
+        }
+
+
+@workflow.defn
+class SwarmWorkflow:
+    @workflow.run
+    async def run(self, task: str) -> dict[str, Any]:
+        swarm = create_swarm(
+            agents=[create_swarm_agent("one"), create_swarm_agent("two")],
+            model=_model(),
+        )
+        swarm.add_task(f"{task}: part one")
+        swarm.add_task(f"{task}: part two")
+        result = await swarm.execute(decompose_tasks=False)
+        return {
+            "success": result.success,
+            "error": result.error,
+            "completed": len(result.completed_tasks),
+            "failed": len(result.failed_tasks),
+        }
+
+
+@workflow.defn
+class HandoffWorkflow:
+    @workflow.run
+    async def run(self, task: str) -> dict[str, Any]:
+        agents = [
+            create_handoff_agent(name, system_prompt=name, model=_model())
+            for name in ("triage", "billing")
+        ]
+        manager = create_handoff_manager(agents)
+        results = await manager.chain_handoff([agent.id for agent in agents], task)
+        return {
+            "success": [result.success for result in results],
+            "errors": [result.error for result in results],
+            "outputs": [bool(result.output) for result in results],
+        }
+
+
 async def _run(client: Client, workflow_class: Any) -> tuple[Any, list[str]]:
     plugin = LocusPlugin(models={"m": RoleModel})
     config = client.config()
@@ -166,3 +244,29 @@ async def test_state_graph_with_agent_nodes(client: Client) -> None:
     assert result["review"] == {"review": "[review] t] ship the report"}
     assert result["replayed_agree"] is True
     assert scheduled == ["locus_model_complete", "locus_model_complete", "echo_values"]
+
+
+async def test_orchestrator_routes_to_specialists(client: Client) -> None:
+    result, scheduled = await _run(client, OrchestratorWorkflow)
+    assert result == {
+        "success": True,
+        "error": None,
+        "specialists": ["logs", "metrics"],
+        "has_summary": True,
+    }
+    # Routing, the two specialists, correlation and the summary.
+    assert scheduled == ["locus_model_complete"] * 5
+
+
+async def test_swarm_works_its_task_queue(client: Client) -> None:
+    result, scheduled = await _run(client, SwarmWorkflow)
+    assert result == {"success": True, "error": None, "completed": 2, "failed": 0}
+    # The two tasks and the swarm's summary.
+    assert scheduled == ["locus_model_complete"] * 3
+
+
+async def test_handoff_chain(client: Client) -> None:
+    result, scheduled = await _run(client, HandoffWorkflow)
+    # One handoff, triage to billing, answered by billing's model.
+    assert result == {"success": [True], "errors": [None], "outputs": [True]}
+    assert scheduled == ["locus_model_complete"]
