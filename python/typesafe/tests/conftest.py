@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncGenerator
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,6 @@ from typesafe_sdk import Choice, JSONContent, Noul, Score
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.typesafe._workflow import _questions_payload
-from tests import DEV_SERVER_DOWNLOAD_VERSION
 from tests.helpers.environment import create_test_environment
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
@@ -56,14 +54,8 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 @pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
-    """Connect to the shared Temporal server or start it for direct pytest runs."""
-    environment = await create_test_environment(
-        partial(
-            WorkflowEnvironment.start_local,
-            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-            ip=os.environ.get("TEMPORAL_TEST_IP") or "127.0.0.1",
-        )
-    )
+    """Connect to the shared Temporal development server."""
+    environment = await create_test_environment()
     yield environment
     await environment.shutdown()
 

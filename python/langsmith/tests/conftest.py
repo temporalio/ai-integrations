@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncGenerator
-from functools import partial
 from pathlib import Path
 
 import pytest
@@ -12,7 +11,6 @@ import pytest_asyncio
 
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
-from tests import DEV_SERVER_DOWNLOAD_VERSION
 from tests.helpers.environment import create_test_environment
 from tests.helpers.langsmith import (
     clear_langsmith_env_cache as clear_langsmith_env_cache,
@@ -48,13 +46,8 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 @pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
-    """Start the pinned local Temporal development server."""
-    environment = await create_test_environment(
-        partial(
-            WorkflowEnvironment.start_local,
-            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-        )
-    )
+    """Connect to the shared Temporal development server."""
+    environment = await create_test_environment()
     yield environment
     await environment.shutdown()
 

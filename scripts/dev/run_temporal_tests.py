@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -33,6 +34,18 @@ CLI_DIGESTS = {
 TEST_ADDRESS = "TEMPORAL_TEST_ADDRESS"
 STARTUP_TIMEOUT = 30
 POLL_INTERVAL = 0.2
+_termination_signal = 0
+
+
+def cancel_on_sigterm(signum: int, _frame: object) -> None:
+    # Defer cancellation until the launcher has registered its child processes.
+    global _termination_signal
+    _termination_signal = signum
+
+
+def check_cancellation() -> None:
+    if _termination_signal:
+        raise SystemExit(128 + _termination_signal)
 
 
 def download_cli() -> Path:
@@ -42,7 +55,10 @@ def download_cli() -> Path:
     target = f"{platform.system().lower()}_{arch}"
     digest = CLI_DIGESTS.get(target)
     if digest is None:
-        raise ValueError(f"No pinned Temporal CLI {CLI_VERSION} for {target}. Set TEMPORAL_TEST_ADDRESS to use a running server.")
+        raise ValueError(
+            f"No pinned Temporal CLI {CLI_VERSION} for {target}. "
+            "Run the test runner directly with TEMPORAL_TEST_ADDRESS to use a running server."
+        )
     cache_base = os.environ.get("LOCALAPPDATA" if os.name == "nt" else "XDG_CACHE_HOME")
     cache = Path(cache_base or Path.home() / ".cache") / "ai-integrations" / "temporal-cli" / digest
     executable = "temporal.exe" if os.name == "nt" else "temporal"
@@ -56,11 +72,15 @@ def download_cli() -> Path:
     with tempfile.TemporaryDirectory(dir=cache) as directory:
         archive = Path(directory) / filename
         for attempt in range(1, 4):
+            check_cancellation()
             try:
                 with urllib.request.urlopen(url, timeout=30) as response, archive.open("wb") as output:
-                    shutil.copyfileobj(response, output)
+                    while chunk := response.read(64 * 1024):
+                        check_cancellation()
+                        output.write(chunk)
                 break
-            except (urllib.error.URLError, TimeoutError) as error:
+            except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead) as error:
+                check_cancellation()
                 if attempt == 3 or (
                     isinstance(error, urllib.error.HTTPError)
                     and error.code not in (408, 429) and error.code < 500
@@ -99,12 +119,15 @@ def server_healthy(cli: Path, address: str) -> bool:
         )
     except subprocess.TimeoutExpired:
         return False
+    finally:
+        check_cancellation()
     return result.returncode == 0 and result.stdout.strip() == b"SERVING"
 
 
 def ready(cli: Path, server: subprocess.Popen, host: str, port: int, address: str) -> bool:
     deadline = time.monotonic() + STARTUP_TIMEOUT
     while server.poll() is None and time.monotonic() < deadline:
+        check_cancellation()
         try:
             with socket.create_connection((host, port), timeout=POLL_INTERVAL):
                 pass
@@ -145,9 +168,11 @@ def run_tests(cli: Path, server: subprocess.Popen, address: str, command: list[s
     with subprocess.Popen(command, env=env, start_new_session=os.name != "nt") as tests:
         try:
             while (status := tests.poll()) is None:
+                check_cancellation()
                 if (server_status := server.poll()) is not None:
                     return 1, f"Temporal dev server exited with status {server_status} during tests"
                 time.sleep(POLL_INTERVAL)
+            check_cancellation()
             if status > 0 and status not in (130, 0xC000013A) and not server_healthy(cli, address):
                 time.sleep(1)
                 if not server_healthy(cli, address):
@@ -159,6 +184,7 @@ def run_tests(cli: Path, server: subprocess.Popen, address: str, command: list[s
 
 def test_attempt(cli: Path, host: str, flags: list[str], command: list[str], log: Path) -> tuple[int, str | None]:
     for startup_attempt in range(1, 4):
+        check_cancellation()
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         with socket.create_server((host, 0), family=family) as listener:
             port = listener.getsockname()[1]
@@ -169,7 +195,9 @@ def test_attempt(cli: Path, host: str, flags: list[str], command: list[str], log
             stdout=output, stderr=subprocess.STDOUT,
         ) as server:
             try:
-                if ready(cli, server, host, port, address):
+                server_ready = ready(cli, server, host, port, address)
+                check_cancellation()
+                if server_ready:
                     print(f"Temporal dev server ready at {address} (PID {server.pid})", flush=True)
                     return run_tests(cli, server, address, command)
                 timed_out = server.poll() is None
@@ -181,6 +209,7 @@ def test_attempt(cli: Path, host: str, flags: list[str], command: list[str], log
                         server.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         server.kill()
+        check_cancellation()
         log_text = log.read_text(encoding="utf-8", errors="replace")
         print(f"Temporal dev server {reason} (startup attempt {startup_attempt}/3)", file=sys.stderr)
         bind_collision = "address already in use" in log_text or "Only one usage of each socket address" in log_text
@@ -200,10 +229,6 @@ def main() -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("provide the test command after --")
-    typescript_config = args.typescript_helper_args is not None
-    env_config = os.environ.get("TEMPORAL_TEST_ENV_CONFIG_SERVER", "").lower() in ("1", "t", "true")
-    if os.environ.get(TEST_ADDRESS) or (typescript_config and (env_config or os.environ.get("TEMPORAL_SERVICE_ADDRESS"))):
-        return subprocess.call(command)
 
     cli = download_cli()
     host = os.environ.get("TEMPORAL_TEST_IP") or "127.0.0.1"
@@ -212,6 +237,7 @@ def main() -> int:
         for attempt in (1, 2):
             log = Path(directory) / f"server-{attempt}.log"
             status, outage = test_attempt(cli, host, flags, command, log)
+            check_cancellation()
             if status == 0:
                 return 0
             if outage:
@@ -224,9 +250,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if os.name == "posix":
+        signal.signal(signal.SIGTERM, cancel_on_sigterm)
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
-    except (OSError, tarfile.TarError, ValueError) as exc:
+    except (OSError, http.client.IncompleteRead, tarfile.TarError, ValueError) as exc:
         sys.exit(f"Temporal test launcher: {exc}")

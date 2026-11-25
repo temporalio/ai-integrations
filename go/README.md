@@ -29,8 +29,8 @@ failures are tracked in a `nightly` issue for the plugin.
 
 Tests must not require provider credentials. Use deterministic local models,
 mock transports or in-process servers. `make test` starts one local Temporal dev
-server. `testClient(t)` shares a client within the package's test process and can
-provision a server for direct `go test` runs.
+server. `testClient(t)` shares a client within the package's test process and
+connects to the server at `TEMPORAL_TEST_ADDRESS`.
 
 Repository conventions are in
 [`AGENTS.md`](../AGENTS.md).

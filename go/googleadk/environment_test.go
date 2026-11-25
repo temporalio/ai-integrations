@@ -3,10 +3,7 @@ package googleadk_test
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,76 +12,37 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/testsuite"
 )
 
-// Start the server only when an integration test needs it. Remember failures
-// too, so later tests fail fast instead of repeating a failed CLI download.
-var devServerState struct {
+// Connect when the first integration test needs the launcher-owned server.
+var testClientState struct {
 	once   sync.Once
 	client client.Client
-	server *testsuite.DevServer
 	err    error
 }
 
 func TestMain(m *testing.M) {
 	code := m.Run()
-	if c := devServerState.client; c != nil {
+	if c := testClientState.client; c != nil {
 		c.Close()
-	}
-	if srv := devServerState.server; srv != nil {
-		if err := srv.Stop(); err != nil {
-			// The SDK's console interrupt can fail on Windows CI. Keep shutdown
-			// best effort, as it was when every test owned a separate server.
-			fmt.Fprintf(os.Stderr, "failed stopping Temporal dev server: %v\n", err)
-		}
 	}
 	os.Exit(code)
 }
 
-// Only initial provisioning uses retries. The SDK loses the process handle
-// after a readiness failure, so retrying that path would leak another server.
-func startDevServerWithRetry(start func() (*testsuite.DevServer, error)) (*testsuite.DevServer, error) {
-	var startupErr error
-	for attempt := 1; ; attempt++ {
-		srv, err := start()
-		if err == nil {
-			return srv, nil
-		}
-		startupErr = errors.Join(startupErr, fmt.Errorf("attempt %d: %w", attempt, err))
-		if attempt >= 2 || errors.Is(err, context.Canceled) || strings.HasPrefix(err.Error(), "failed connecting after timeout,") {
-			return nil, startupErr
-		}
-	}
-}
-
-// testClient shares one client for the package. Direct go test runs can start
-// their own server when the test launcher has not supplied an address.
+// testClient shares one client for the package.
 func testClient(t *testing.T) client.Client {
 	t.Helper()
-	devServerState.once.Do(func() {
-		if address := os.Getenv("TEMPORAL_TEST_ADDRESS"); address != "" {
-			devServerState.client, devServerState.err = client.Dial(client.Options{HostPort: address})
-			return
-		}
-		// On Windows the SDK may fail to stop a server without an attached
-		// console. Detached stdio keeps that process from holding go test's
-		// output pipes open; the CI runner reaps it when the job exits.
-		opts := testsuite.DevServerOptions{Stdout: io.Discard, Stderr: io.Discard}
-		devServerState.server, devServerState.err = startDevServerWithRetry(func() (*testsuite.DevServer, error) {
-			// The first use may need to download the CLI on a slow runner.
-			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			defer cancel()
-			return testsuite.StartDevServer(ctx, opts)
-		})
-		if devServerState.err == nil {
-			devServerState.client = devServerState.server.Client()
-		}
-	})
-	if devServerState.err != nil {
-		t.Fatalf("Temporal test server unavailable: %v", devServerState.err)
+	address := os.Getenv("TEMPORAL_TEST_ADDRESS")
+	if address == "" {
+		t.Fatal("Run live Temporal tests with `make test` or set TEMPORAL_TEST_ADDRESS to a running server.")
 	}
-	return devServerState.client
+	testClientState.once.Do(func() {
+		testClientState.client, testClientState.err = client.Dial(client.Options{HostPort: address})
+	})
+	if testClientState.err != nil {
+		t.Fatalf("Temporal test server unavailable: %v", testClientState.err)
+	}
+	return testClientState.client
 }
 
 func testTaskQueue(t *testing.T) string {

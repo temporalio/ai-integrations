@@ -1,50 +1,28 @@
-using System.Text.RegularExpressions;
 using Temporalio.Client;
 using Temporalio.Extensions.MicrosoftAgentFramework.Tests.Workflows;
-using Temporalio.Testing;
 using Temporalio.Worker;
 
 namespace Temporalio.Extensions.MicrosoftAgentFramework.Tests;
 
 /// <summary>
-/// Use the test launcher's server, or start one for a direct dotnet test run.
+/// Connect to the server shared by the integration tests.
 /// </summary>
-public sealed partial class DevServerFixture : IAsyncLifetime
+public sealed class DevServerFixture : IAsyncLifetime
 {
-    private WorkflowEnvironment? localEnvironment;
+    private ITemporalClient? client;
 
-    public ITemporalClient Client { get; private set; } = null!;
+    public ITemporalClient Client => client ?? throw new InvalidOperationException(
+        "Run live Temporal tests with `make test` or set TEMPORAL_TEST_ADDRESS to a running server.");
 
     public async ValueTask InitializeAsync()
     {
         if (Environment.GetEnvironmentVariable("TEMPORAL_TEST_ADDRESS") is { Length: > 0 } address)
         {
-            Client = await TemporalClient.ConnectAsync(new(address));
-            return;
-        }
-
-        for (var attempt = 1; ; attempt++)
-        {
-            try
-            {
-                localEnvironment = await WorkflowEnvironment.StartLocalAsync();
-                Client = localEnvironment.Client;
-                return;
-            }
-            catch (InvalidOperationException exception) when (attempt < 3 && IsRetryable(exception.Message))
-            {
-                await Task.Delay(TimeSpan.FromSeconds(1));
-            }
+            client = await TemporalClient.ConnectAsync(new(address));
         }
     }
 
-    public async ValueTask DisposeAsync()
-    {
-        if (localEnvironment is not null)
-        {
-            await localEnvironment.ShutdownAsync();
-        }
-    }
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
     // Creates a worker on a fresh task queue with every test Workflow, the test Activities and the given plugin.
     public TemporalWorker NewWorker(MicrosoftAgentFrameworkPlugin? plugin, Action<TemporalWorkerOptions>? configure = null, ITemporalClient? client = null)
@@ -73,12 +51,4 @@ public sealed partial class DevServerFixture : IAsyncLifetime
         {
             RunTimeout = runTimeout ?? TimeSpan.FromMinutes(2),
         };
-
-    internal static bool IsRetryable(string message) => RetryableStartupError().IsMatch(message);
-
-    // The three startup failures as Temporal's core words them, anchored to the start of the
-    // message after an optional "<context>: " prefix. A client error that merely mentions a timeout
-    // is not one of them. dotnet/_template/DevServerFixture.cs carries the same pattern.
-    [GeneratedRegex(@"^(?:[^:]*: )?(?:ephemeral server at \S+ did not start within |failed to download ephemeral server executable:|invalid ephemeral server download: could not (?:read|extract) )", RegexOptions.CultureInvariant)]
-    private static partial Regex RetryableStartupError();
 }

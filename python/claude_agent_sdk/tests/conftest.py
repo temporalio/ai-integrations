@@ -8,7 +8,6 @@ import os
 import subprocess
 import threading
 from collections.abc import AsyncGenerator
-from functools import partial
 from pathlib import Path
 
 import pytest
@@ -16,7 +15,6 @@ import pytest_asyncio
 import pytest_timeout  # pyright: ignore[reportMissingTypeStubs]
 
 from temporalio.testing import WorkflowEnvironment
-from tests import DEV_SERVER_DOWNLOAD_VERSION
 from tests.helpers.environment import create_test_environment
 from tests.helpers.harness import Harness
 from tests.helpers.plugin_meta import load_plugin_meta
@@ -85,12 +83,7 @@ def pytest_timeout_set_timer(
 @pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     global _server_started
-    environment = await create_test_environment(
-        partial(
-            WorkflowEnvironment.start_local,
-            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-        )
-    )
+    environment = await create_test_environment()
     _server_started = True
     yield environment
     await environment.shutdown()
