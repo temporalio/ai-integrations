@@ -5764,15 +5764,30 @@ async def test_stateful_mcp_server_session_end_with_other_events(
 @workflow.defn
 class McpServerStatefulEmptyBlockWorkflow:
     @workflow.run
-    async def run(self) -> None:
-        async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
-            pass
+    async def run(self, body: str) -> str:
+        async with openai_agents.workflow.stateful_mcp_server("HelloServer") as server:
+            if body == "raise":
+                raise ApplicationError("body failed")
+            if body == "cancel":
+                task = asyncio.current_task()
+                assert task
+                task.cancel()
+            if body == "cleanup":
+                await server.cleanup()
+                try:
+                    await server.list_tools()
+                except ApplicationError as e:
+                    return e.message
+        return "left"
 
 
-async def test_stateful_mcp_server_empty_block(client: Client):
-    # The session activity never started, so leaving the block raises the bare
-    # CancelledError that earlier versions raise (#391), not a
-    # DedicatedWorkerFailure for a session that ended.
+@pytest.mark.parametrize("body", ["empty", "raise", "cancel", "cleanup"])
+async def test_stateful_mcp_server_empty_block(client: Client, body: str):
+    # The block ends before its session activity starts (#391). An empty block
+    # completes and a body's exception leaves the block unchanged, not replaced
+    # by a CancelledError. A cancellation of the workflow's task requested in
+    # the block still leaves it. After an explicit cleanup the server is
+    # disconnected: operations fail at once and leaving the block does nothing.
     provider = StatefulMCPServerProvider(
         "HelloServer", lambda _: get_tracking_server("HelloServer")
     )
@@ -5783,13 +5798,31 @@ async def test_stateful_mcp_server_empty_block(client: Client):
         async with new_worker(client, McpServerStatefulEmptyBlockWorkflow) as worker:
             handle = await client.start_workflow(
                 McpServerStatefulEmptyBlockWorkflow.run,
+                body,
                 id=f"mcp-server-empty-block-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=30),
             )
-            with pytest.raises(WorkflowFailureError) as err:
-                await handle.result()
-            assert isinstance(err.value.cause, CancelledError)
+            if body == "raise":
+                with pytest.raises(WorkflowFailureError) as err:
+                    await handle.result()
+                assert isinstance(err.value.cause, ApplicationError)
+                assert err.value.cause.message == "body failed"
+            elif body == "cancel":
+                with pytest.raises(WorkflowFailureError) as err:
+                    await handle.result()
+                assert isinstance(err.value.cause, CancelledError)
+            elif body == "cleanup":
+                assert await handle.result() == (
+                    "Stateful MCP Server not connected. Call connect first."
+                )
+            else:
+                assert await handle.result() == "left"
+            events = [e async for e in handle.fetch_history_events()]
+            assert not any(
+                e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+                for e in events
+            )
 
 
 def test_sandbox_apply_patch_tool_round_trips_through_activity_input():
