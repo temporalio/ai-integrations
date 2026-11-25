@@ -166,7 +166,13 @@ class MediaSizeGuardTest {
       UserMessage userMessage =
           UserMessage.builder()
               .text(message)
-              .media(List.of(new Media(MimeTypeUtils.IMAGE_PNG, new ByteArrayResource(big))))
+              .media(
+                  List.of(
+                      Media.builder()
+                          .mimeType(MimeTypeUtils.IMAGE_PNG)
+                          .name("large")
+                          .data(big)
+                          .build()))
               .build();
       ActivityChatModel chatModel = ActivityChatModel.forDefault();
       return chatModel.call(new Prompt(List.of(userMessage))).getResult().getOutput().getText();
@@ -180,7 +186,13 @@ class MediaSizeGuardTest {
       UserMessage userMessage =
           UserMessage.builder()
               .text(message)
-              .media(List.of(new Media(MimeTypeUtils.IMAGE_PNG, new ByteArrayResource(small))))
+              .media(
+                  List.of(
+                      Media.builder()
+                          .mimeType(MimeTypeUtils.IMAGE_PNG)
+                          .name("small")
+                          .data(small)
+                          .build()))
               .build();
       ActivityChatModel chatModel = ActivityChatModel.forDefault();
       return chatModel.call(new Prompt(List.of(userMessage))).getResult().getOutput().getText();
@@ -195,8 +207,11 @@ class MediaSizeGuardTest {
               .text(message)
               .media(
                   List.of(
-                      new Media(
-                          MimeTypeUtils.IMAGE_PNG, URI.create("https://cdn.example.com/huge.png"))))
+                      Media.builder()
+                          .mimeType(MimeTypeUtils.IMAGE_PNG)
+                          .name("linked")
+                          .data(URI.create("https://cdn.example.com/huge.png"))
+                          .build()))
               .build();
       ActivityChatModel chatModel = ActivityChatModel.forDefault();
       return chatModel.call(new Prompt(List.of(userMessage))).getResult().getOutput().getText();

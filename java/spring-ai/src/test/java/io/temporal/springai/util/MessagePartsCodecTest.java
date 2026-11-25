@@ -4,11 +4,16 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.temporal.common.converter.DefaultDataConverter;
 import io.temporal.failure.ApplicationFailure;
-import io.temporal.springai.model.ChatModelTypes.Message;
+import io.temporal.springai.model.ChatModelTypes;
 import java.net.URI;
+import java.time.LocalDate;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.messages.part.MediaPart;
@@ -22,9 +27,10 @@ class MessagePartsCodecTest {
   void nestedToolMediaAndUriRoundTripThroughTheTemporalConverter() {
     byte[] bytes = {0, 1, -1};
     String uri = "https://example.test/image.png";
+    String label = "media-png-00000000-0000-4000-8000-000000000001";
     var inlineImage = Media.builder().mimeType(MimeTypeUtils.IMAGE_PNG).data(bytes).build();
     var linkedImage =
-        Media.builder().mimeType(MimeTypeUtils.IMAGE_PNG).name("image reference").data(uri).build();
+        Media.builder().mimeType(MimeTypeUtils.IMAGE_PNG).name(label).data(uri).build();
     var tool =
         ToolResponseMessage.builder()
             .result(
@@ -40,23 +46,74 @@ class MessagePartsCodecTest {
                     Map.of()))
             .build();
 
-    var encoded = MessagePartsCodec.encode(tool);
-    var converter = DefaultDataConverter.STANDARD_INSTANCE;
-    var payload = converter.toPayload(encoded).orElseThrow();
-    var decoded =
-        assertInstanceOf(
-            ToolResponseMessage.class,
-            MessagePartsCodec.decode(converter.fromPayload(payload, Message.class, Message.class)));
+    var decoded = assertInstanceOf(ToolResponseMessage.class, roundTrip(tool));
 
-    assertEquals(encoded, MessagePartsCodec.encode(decoded));
+    assertEquals(MessagePartsCodec.encode(tool), MessagePartsCodec.encode(decoded));
     var content = decoded.getResults().get(0).content();
     var restoredInline = assertInstanceOf(MediaPart.class, content.get(0)).media();
     assertArrayEquals(bytes, restoredInline.getDataAsByteArray());
-    assertEquals("media-png-0-0", restoredInline.getName());
+    assertEquals(inlineImage.getName(), restoredInline.getName());
     assertEquals(TextPart.of("image result"), content.get(1));
     var restoredLink = assertInstanceOf(MediaPart.class, content.get(2)).media();
-    assertEquals("image reference", restoredLink.getName());
+    assertEquals(label, restoredLink.getName());
     assertEquals(uri, restoredLink.getData());
+  }
+
+  @Test
+  void rejectsOversizedNestedMediaBeforeSpringAiSerializesIt() {
+    // The base64 form exceeds Jackson's string limit if the bytes are serialized first.
+    var media =
+        Media.builder()
+            .mimeType(MimeTypeUtils.IMAGE_PNG)
+            .name("oversized image")
+            .data(new byte[80 * 1024 * 1024])
+            .build();
+    var message =
+        ToolResponseMessage.builder()
+            .result(
+                new ToolResultPart(
+                    "call", "image", List.of(MediaPart.of(media)), false, null, Map.of()))
+            .build();
+
+    var failure = assertThrows(ApplicationFailure.class, () -> MessagePartsCodec.encode(message));
+    assertTrue(failure.isNonRetryable());
+    assertEquals(ChatModelTypes.MEDIA_SIZE_EXCEEDED_FAILURE_TYPE, failure.getType());
+  }
+
+  @Test
+  void preservesJsonMetadataThroughTheTemporalConverter() {
+    var values = Arrays.asList("text", true, 5, 1.25, null);
+    var metadata = new HashMap<String, Object>();
+    metadata.put("nested", Map.of("values", values));
+    metadata.put("empty", null);
+    for (var message :
+        List.of(
+            UserMessage.builder().text("hi").metadata(metadata).build(),
+            SystemMessage.builder().text("hi").metadata(metadata).build(),
+            ToolResponseMessage.builder().metadata(metadata).build())) {
+      assertEquals(message.getMetadata(), roundTrip(message).getMetadata());
+    }
+  }
+
+  @Test
+  void rejectsMetadataValuesThatWouldChangeTypeThroughTheTemporalConverter() throws Exception {
+    var user = UserMessage.builder().text("hi").metadata(Map.of("bytes", new byte[] {42})).build();
+    var system =
+        SystemMessage.builder()
+            .text("hi")
+            .metadata(Map.of("date", LocalDate.of(2026, 11, 25)))
+            .build();
+    var tool =
+        ToolResponseMessage.builder()
+            .metadata(
+                Map.of(
+                    "nested", List.of(Map.of("url", URI.create("https://example.test").toURL()))))
+            .build();
+    for (var message : List.of(user, system, tool)) {
+      var failure = assertThrows(ApplicationFailure.class, () -> MessagePartsCodec.encode(message));
+      assertTrue(failure.isNonRetryable());
+      assertEquals("UnsupportedSpringAiMessageMetadata", failure.getType());
+    }
   }
 
   @Test
@@ -71,5 +128,12 @@ class MessagePartsCodecTest {
     var failure = assertThrows(ApplicationFailure.class, () -> MessagePartsCodec.encode(message));
     assertTrue(failure.isNonRetryable());
     assertTrue(failure.getOriginalMessage().contains("URI as a string"));
+  }
+
+  private static Message roundTrip(Message message) {
+    var converter = DefaultDataConverter.STANDARD_INSTANCE;
+    var payload = converter.toPayload(MessagePartsCodec.encode(message)).orElseThrow();
+    return MessagePartsCodec.decode(
+        converter.fromPayload(payload, ChatModelTypes.Message.class, ChatModelTypes.Message.class));
   }
 }

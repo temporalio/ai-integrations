@@ -2,30 +2,33 @@ package io.temporal.springai.util;
 
 import io.temporal.failure.ApplicationFailure;
 import io.temporal.springai.model.ChatModelTypes;
+import java.net.URL;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
+import java.util.Set;
 import org.springframework.ai.chat.messages.AbstractMessage;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.messages.part.MediaPart;
 import org.springframework.ai.chat.messages.part.MessagePart;
 import org.springframework.ai.chat.messages.part.TextPart;
+import org.springframework.ai.chat.messages.part.ToolResultPart;
 import org.springframework.ai.util.JacksonUtils;
 import tools.jackson.databind.JavaType;
-import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectReader;
 import tools.jackson.databind.ObjectWriter;
 import tools.jackson.databind.SerializationFeature;
 import tools.jackson.databind.json.JsonMapper;
-import tools.jackson.databind.node.ObjectNode;
 
 /** Transports ordered content through the public Spring AI 2.1 message and Jackson APIs. */
 public final class MessagePartsCodec {
-  private static final Pattern GENERATED_MEDIA_NAME =
-      Pattern.compile("(media-.+-)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}");
   private static final JsonMapper MAPPER =
       JacksonUtils.getDefaultJsonMapper()
           .rebuild()
@@ -43,44 +46,69 @@ public final class MessagePartsCodec {
         message instanceof AbstractMessage springMessage
             ? springMessage.getParts()
             : List.of(TextPart.of(message.getText()));
-    JsonNode tree = MAPPER.readTree(PARTS_WRITER.writeValueAsString(parts));
-    prepareMedia(tree, "");
+    validateMedia(parts);
+    Map<String, Object> metadata = new LinkedHashMap<>(message.getMetadata());
+    // Spring AI reconstructs this entry from the message role when decoding.
+    metadata.remove(AbstractMessage.MESSAGE_TYPE);
+    if (message.getMessageType() != MessageType.ASSISTANT
+        && !isJsonMetadata(metadata, Collections.newSetFromMap(new IdentityHashMap<>()))) {
+      throw ApplicationFailure.newNonRetryableFailure(
+          "Spring AI user, system, and tool message metadata requires string keys and values of"
+              + " type String, Boolean, Integer, or finite Double, or lists and maps of these"
+              + " values. Null values are supported. Convert other values to one of these types"
+              + " and remove any cyclic references before calling the chat model.",
+          "UnsupportedSpringAiMessageMetadata");
+    }
     return new ChatModelTypes.Message(
-        message.getMessageType(), MAPPER.writeValueAsString(tree), message.getMetadata());
+        message.getMessageType(), PARTS_WRITER.writeValueAsString(parts), metadata);
   }
 
-  private static void prepareMedia(JsonNode parts, String parent) {
-    for (int index = 0; index < parts.size(); index++) {
-      JsonNode part = parts.get(index);
-      String position = parent + index;
-      switch (part.path("type").asString()) {
-        case "media" -> {
-          ObjectNode media = (ObjectNode) part.get("media");
-          String kind = media.path("dataKind").asString();
-          if ("url".equals(kind)) {
-            // Spring AI's media deserializer turns URL objects into strings.
-            throw ApplicationFailure.newNonRetryableFailure(
-                "Spring AI ordered media parts require a URI string or byte array."
-                    + " Pass the URI as a string instead of a java.net.URL object.",
-                "UnsupportedSpringAiMedia");
-          }
-          if ("bytes".equals(kind)) {
-            String data = media.get("data").asString();
-            int padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-            ChatModelTypes.checkMediaSize(data.length() / 4 * 3 - padding);
-          }
-          // Spring AI generates these names with a random UUID. Keep caller-provided names.
-          var generatedName = GENERATED_MEDIA_NAME.matcher(media.get("name").asString());
-          if (generatedName.matches()) {
-            media.put("name", generatedName.group(1) + position);
-          }
+  private static void validateMedia(List<MessagePart> parts) {
+    for (MessagePart part : parts) {
+      if (part instanceof MediaPart mediaPart) {
+        Object data = mediaPart.media().getData();
+        if (data instanceof byte[] bytes) {
+          ChatModelTypes.checkMediaSize(bytes);
+        } else if (data instanceof URL) {
+          // Spring AI's media deserializer turns URL objects into strings.
+          throw ApplicationFailure.newNonRetryableFailure(
+              "Spring AI ordered media parts require a URI string or byte array."
+                  + " Pass the URI as a string instead of a java.net.URL object.",
+              "UnsupportedSpringAiMedia");
         }
-        case "tool_result" -> prepareMedia(part.get("content"), position + "-");
-        default -> {
-          // Other parts have no inline media.
-        }
+      } else if (part instanceof ToolResultPart toolResult) {
+        validateMedia(toolResult.content());
       }
     }
+  }
+
+  private static boolean isJsonMetadata(Object value, Set<Object> ancestors) {
+    if (value instanceof List<?> list) {
+      if (!ancestors.add(list)) {
+        return false;
+      }
+      boolean supported = list.stream().allMatch(item -> isJsonMetadata(item, ancestors));
+      ancestors.remove(list);
+      return supported;
+    }
+    if (value instanceof Map<?, ?> map) {
+      if (!ancestors.add(map)) {
+        return false;
+      }
+      boolean supported =
+          map.entrySet().stream()
+              .allMatch(
+                  entry ->
+                      entry.getKey() instanceof String
+                          && isJsonMetadata(entry.getValue(), ancestors));
+      ancestors.remove(map);
+      return supported;
+    }
+    return value == null
+        || value instanceof String
+        || value instanceof Boolean
+        || value instanceof Integer
+        || (value instanceof Double number && Double.isFinite(number));
   }
 
   public static Message decode(ChatModelTypes.Message message) {

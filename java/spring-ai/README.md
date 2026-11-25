@@ -58,8 +58,17 @@ and tool calls.
 Large chat prompts and model responses, including ordered parts and tool results,
 can exceed Temporal's payload limit. Pass references for large media. Supply media
 as bytes or URI strings. Spring AI 2.1's media codec converts `java.net.URL` objects
-to strings, so the integration refuses that input type. Use a deterministic name
-for media that needs a caller-specified label in Workflow code.
+to strings, so the integration refuses that input type. When creating media in
+Workflow code, set a deterministic name with `Media.builder().name(...)`. Spring AI
+otherwise generates a name with a random UUID. The integration preserves media names
+verbatim, including names returned by a model Activity. For a unique name in a
+Workflow, build it with `Workflow.randomUUID()`.
+
+User, system, and tool message metadata supports string keys with strings, booleans,
+`Integer` values, finite `Double` values, nulls, and nested lists and maps of those
+types. The chat call fails before scheduling the Activity if this metadata contains
+an unsupported value. Convert bytes, URLs, and dates to strings before attaching
+them as metadata. Provider-owned continuation data travels in the message parts.
 
 ## Structured output
 

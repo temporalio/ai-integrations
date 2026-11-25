@@ -50,26 +50,19 @@ public final class ChatModelTypes {
    * — retrying the same oversized payload will never succeed, and using a plain {@link
    * RuntimeException} here would cause the workflow task to be retried forever (or the activity to
    * churn through its {@code maxAttempts}) rather than surfacing the real problem. The failure
-   * message points the caller at the URI-based {@code Media} constructor. Pass-through otherwise.
+   * message points the caller at URI-based {@code Media}. Pass-through otherwise.
    */
   public static void checkMediaSize(byte[] data) {
-    if (data != null) {
-      checkMediaSize(data.length);
-    }
-  }
-
-  /** Applies the inline media limit to a decoded byte count. */
-  public static void checkMediaSize(int size) {
     long limit = MAX_MEDIA_BYTES_IN_HISTORY;
-    if (limit > 0 && size > limit) {
+    if (data != null && limit > 0 && data.length > limit) {
       throw ApplicationFailure.newNonRetryableFailure(
           "Media byte[] is "
-              + size
+              + data.length
               + " bytes, which exceeds the "
               + limit
               + "-byte limit for inline media in Temporal workflow history. Pass the media by "
               + "URI instead: store the bytes outside the workflow (e.g. S3) and construct "
-              + "Media(mimeType, URI). Set the system property "
+              + "Media with a URI and an explicit deterministic name. Set the system property "
               + "'io.temporal.springai.maxMediaBytes' to override this limit (or 0 to disable).",
           MEDIA_SIZE_EXCEEDED_FAILURE_TYPE);
     }
