@@ -6,9 +6,12 @@ delays. Those modules pass through the workflow sandbox, so on replay they
 would read new values and a run could take a different branch than History
 records.
 
-Locus has no clock or id seam to hook, so this replaces the module-local
-``time``, ``datetime``, ``uuid4`` and ``random`` names in the Locus modules the
-loop runs. Every read checks where it runs: inside a workflow it uses the
+Where Locus has ``locus.core.sources``, the seam its loop reads these from,
+the plugin installs sources that use the workflow's. Older Locus releases have
+no seam, so there the plugin replaces the module-local ``time``, ``datetime``,
+``uuid4`` and ``random`` names in the Locus modules the loop runs.
+
+Either way every read checks where it runs: inside a workflow it uses the
 workflow's deterministic source; in activities and in plain Locus code in the
 same process it uses the real one.
 """
@@ -122,9 +125,47 @@ _REPLACEMENTS: dict[str, tuple[Any, Any]] = {
 _lock = threading.Lock()
 
 
+class _WorkflowSources:
+    """Locus runtime sources: the workflow's inside a workflow, else the previous ones."""
+
+    def __init__(self, outside: Any) -> None:
+        self._outside = outside
+
+    def now(self) -> _datetime.datetime:
+        return workflow.now() if _in_workflow() else self._outside.now()
+
+    def time(self) -> float:
+        return workflow.time() if _in_workflow() else self._outside.time()
+
+    def monotonic(self) -> float:
+        return workflow.time() if _in_workflow() else self._outside.monotonic()
+
+    def uuid4(self) -> _uuid.UUID:
+        return workflow.uuid4() if _in_workflow() else self._outside.uuid4()
+
+    def uniform(self, a: float, b: float) -> float:
+        if _in_workflow():
+            return workflow.random().uniform(a, b)
+        return self._outside.uniform(a, b)
+
+
+def _install_sources() -> bool:
+    """Install workflow sources through Locus's seam; ``False`` if it has none."""
+    try:
+        sources = importlib.import_module("locus.core.sources")
+    except ImportError:
+        return False
+    current = sources.get_sources()
+    if not isinstance(current, _WorkflowSources):
+        sources.set_sources(_WorkflowSources(current))
+    return True
+
+
 def install_workflow_determinism() -> None:
-    """Replace the clock, id and random names in Locus's loop modules. Idempotent."""
+    """Give Locus's loop the workflow's clock, ids and randomness. Idempotent."""
     with _lock:
+        if _install_sources():
+            return
         for module_name in _MODULES:
             module = importlib.import_module(module_name)
             for name, (original, replacement) in _REPLACEMENTS.items():
