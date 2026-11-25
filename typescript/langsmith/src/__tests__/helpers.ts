@@ -9,11 +9,11 @@ import { randomUUID } from 'crypto';
 import type { ExecutionContext, TestFn } from 'ava';
 import type { AgentAddress, Client as LangSmithClient } from 'langsmith';
 import { Client } from '@temporalio/client';
-import { TestWorkflowEnvironment } from '@temporalio/testing';
+import type { TestWorkflowEnvironment } from '@temporalio/testing';
 import { Worker, bundleWorkflowCode, type WorkerOptions, type WorkflowBundle } from '@temporalio/worker';
 
 import { LangSmithPlugin, type LangSmithPluginOptions } from '../index';
-import { startLocalWithRetry } from './helpers/environment';
+import { createTestEnvironment } from './helpers/environment';
 
 /** Absolute path to the test workflow bundle (resolved from this module). */
 export const WORKFLOWS_PATH = require.resolve('./workflows/langsmith');
@@ -193,7 +193,7 @@ let sharedEnv: TestWorkflowEnvironment | undefined;
 /** Register a per-file shared `TestWorkflowEnvironment`; `withTracingWorker` will reuse it. */
 export function useSharedEnv(test: TestFn<unknown>): void {
   test.before(async () => {
-    sharedEnv = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+    sharedEnv = await createTestEnvironment();
   });
   test.after.always(async () => {
     await sharedEnv?.teardown();
@@ -230,7 +230,7 @@ function getBundle(plugin: LangSmithPlugin, workflowsPath: string, optionsKey: s
 }
 
 export async function withTracingWorker<T>(args: HarnessArgs<T>): Promise<T> {
-  const privateEnv = sharedEnv ? undefined : await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+  const privateEnv = sharedEnv ? undefined : await createTestEnvironment();
   const env = sharedEnv ?? privateEnv!;
   try {
     const taskQueue = args.taskQueue ?? `langsmith-test-${randomUUID()}`;

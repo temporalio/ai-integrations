@@ -100,5 +100,12 @@ export async function createTestWorkflowEnvironment(
       plugins: opts?.plugins,
     });
   }
+  if (process.env.TEMPORAL_TEST_ADDRESS) {
+    return await TestWorkflowEnvironment.createFromExistingServer({
+      address: process.env.TEMPORAL_TEST_ADDRESS,
+      client: opts?.client,
+      plugins: opts?.plugins,
+    });
+  }
   return await createLocalTestEnvironment(opts);
 }

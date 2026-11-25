@@ -28,9 +28,9 @@ maximum-version job also runs race detection. Nightly checks use
 failures are tracked in a `nightly` issue for the plugin.
 
 Tests must not require provider credentials. Use deterministic local models,
-mock transports or in-process servers. Tests that need Temporal use
-`testClient(t)` to lazily share a local dev server and its default client within
-the package's test process.
+mock transports or in-process servers. `make test` starts one local Temporal dev
+server. `testClient(t)` shares a client within the package's test process and can
+provision a server for direct `go test` runs.
 
 Repository conventions are in
 [`AGENTS.md`](../AGENTS.md).

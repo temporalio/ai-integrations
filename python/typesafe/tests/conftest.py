@@ -16,7 +16,7 @@ from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.typesafe._workflow import _questions_payload
 from tests import DEV_SERVER_DOWNLOAD_VERSION
-from tests.helpers.environment import start_local_with_retry
+from tests.helpers.environment import create_test_environment
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
@@ -56,26 +56,14 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 @pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
-    """Start the pinned local Temporal development server.
-
-    Attach instead of spawning by setting ``TEMPORAL_TEST_ADDRESS`` (a running
-    server's ``host:port``), or select the server binary with
-    ``TEMPORAL_DEV_SERVER_PATH`` when the SDK's own download is unreachable.
-    """
-    address = os.environ.get("TEMPORAL_TEST_ADDRESS")
-    if address:
-        environment = WorkflowEnvironment.from_client(await Client.connect(address))
-    else:
-        options: dict[str, Any] = {
-            "dev_server_download_version": DEV_SERVER_DOWNLOAD_VERSION,
-            "dev_server_existing_path": os.environ.get("TEMPORAL_DEV_SERVER_PATH"),
-        }
-        ip = os.environ.get("TEMPORAL_TEST_IP")
-        if ip:
-            options["ip"] = ip
-        environment = await start_local_with_retry(
-            partial(WorkflowEnvironment.start_local, **options)
+    """Connect to the shared Temporal server or start it for direct pytest runs."""
+    environment = await create_test_environment(
+        partial(
+            WorkflowEnvironment.start_local,
+            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
+            ip=os.environ.get("TEMPORAL_TEST_IP") or "127.0.0.1",
         )
+    )
     yield environment
     await environment.shutdown()
 

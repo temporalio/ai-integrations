@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
 
+from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,15 @@ _RETRYABLE_STARTUP_ERROR = re.compile(
     r"(?:tar|ZIP) archive(?: entry)?(?:$|:)"
     r")"
 )
+
+
+async def create_test_environment(
+    start: Callable[[], Awaitable[WorkflowEnvironment]],
+) -> WorkflowEnvironment:
+    """Use the launcher-owned server, or provision one for direct pytest runs."""
+    if address := os.environ.get("TEMPORAL_TEST_ADDRESS"):
+        return WorkflowEnvironment.from_client(await Client.connect(address))
+    return await start_local_with_retry(start)
 
 
 async def start_local_with_retry(

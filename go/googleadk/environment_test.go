@@ -22,14 +22,17 @@ import (
 // too, so later tests fail fast instead of repeating a failed CLI download.
 var devServerState struct {
 	once   sync.Once
+	client client.Client
 	server *testsuite.DevServer
 	err    error
 }
 
 func TestMain(m *testing.M) {
 	code := m.Run()
+	if c := devServerState.client; c != nil {
+		c.Close()
+	}
 	if srv := devServerState.server; srv != nil {
-		srv.Client().Close()
 		if err := srv.Stop(); err != nil {
 			// The SDK's console interrupt can fail on Windows CI. Keep shutdown
 			// best effort, as it was when every test owned a separate server.
@@ -55,11 +58,15 @@ func startDevServerWithRetry(start func() (*testsuite.DevServer, error)) (*tests
 	}
 }
 
-// testClient lazily starts the package's shared server and returns its default
-// client. TestMain closes both after all tests and their cleanups finish.
+// testClient shares one client for the package. Direct go test runs can start
+// their own server when the test launcher has not supplied an address.
 func testClient(t *testing.T) client.Client {
 	t.Helper()
 	devServerState.once.Do(func() {
+		if address := os.Getenv("TEMPORAL_TEST_ADDRESS"); address != "" {
+			devServerState.client, devServerState.err = client.Dial(client.Options{HostPort: address})
+			return
+		}
 		// On Windows the SDK may fail to stop a server without an attached
 		// console. Detached stdio keeps that process from holding go test's
 		// output pipes open; the CI runner reaps it when the job exits.
@@ -70,11 +77,14 @@ func testClient(t *testing.T) client.Client {
 			defer cancel()
 			return testsuite.StartDevServer(ctx, opts)
 		})
+		if devServerState.err == nil {
+			devServerState.client = devServerState.server.Client()
+		}
 	})
 	if devServerState.err != nil {
-		t.Fatalf("dev server unavailable (first use downloads the Temporal CLI, which needs network): %v", devServerState.err)
+		t.Fatalf("Temporal test server unavailable: %v", devServerState.err)
 	}
-	return devServerState.server.Client()
+	return devServerState.client
 }
 
 func testTaskQueue(t *testing.T) string {

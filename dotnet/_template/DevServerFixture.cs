@@ -12,20 +12,27 @@ using Xunit;
 
 namespace Temporalio.Template.Tests;
 
-/// <summary>One local dev server for the whole run, started under the repository's retry policy.</summary>
+/// <summary>Use the test launcher's server, or start one for a direct dotnet test run.</summary>
 public sealed partial class DevServerFixture : IAsyncLifetime
 {
-    public WorkflowEnvironment Env { get; private set; } = null!;
+    private WorkflowEnvironment? localEnvironment;
 
-    public ITemporalClient Client => Env.Client;
+    public ITemporalClient Client { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
+        if (Environment.GetEnvironmentVariable("TEMPORAL_TEST_ADDRESS") is { Length: > 0 } address)
+        {
+            Client = await TemporalClient.ConnectAsync(new(address));
+            return;
+        }
+
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                Env = await WorkflowEnvironment.StartLocalAsync();
+                localEnvironment = await WorkflowEnvironment.StartLocalAsync();
+                Client = localEnvironment.Client;
                 return;
             }
             catch (InvalidOperationException exception) when (attempt < 3 && IsRetryable(exception.Message))
@@ -37,9 +44,9 @@ public sealed partial class DevServerFixture : IAsyncLifetime
 
     public async ValueTask DisposeAsync()
     {
-        if (Env is not null)
+        if (localEnvironment is not null)
         {
-            await Env.ShutdownAsync();
+            await localEnvironment.ShutdownAsync();
         }
     }
 

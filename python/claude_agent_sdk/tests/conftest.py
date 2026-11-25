@@ -17,7 +17,7 @@ import pytest_timeout  # pyright: ignore[reportMissingTypeStubs]
 
 from temporalio.testing import WorkflowEnvironment
 from tests import DEV_SERVER_DOWNLOAD_VERSION
-from tests.helpers.environment import start_local_with_retry
+from tests.helpers.environment import create_test_environment
 from tests.helpers.harness import Harness
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
@@ -85,7 +85,7 @@ def pytest_timeout_set_timer(
 @pytest_asyncio.fixture(scope="session")
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     global _server_started
-    environment = await start_local_with_retry(
+    environment = await create_test_environment(
         partial(
             WorkflowEnvironment.start_local,
             dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
