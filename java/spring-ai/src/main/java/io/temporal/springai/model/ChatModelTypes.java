@@ -1,6 +1,5 @@
 package io.temporal.springai.model;
 
-import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -9,6 +8,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
+import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.metadata.FinishReasonCategory;
+import org.springframework.ai.content.Media;
 
 /**
  * Serializable types for chat model activity requests and responses.
@@ -27,10 +29,10 @@ public final class ChatModelTypes {
   public static final String DEFAULT_MODEL_NAME = "default";
 
   /**
-   * Maximum size, in bytes, of a single {@link MediaContent#data()} byte array carried across the
-   * chat activity boundary. Bytes above this threshold land inside workflow history events, which
-   * have a fixed 2 MiB per-event limit on the Temporal server. 1 MiB leaves headroom for the rest
-   * of a chat payload (messages, tool definitions, options).
+   * Maximum size, in bytes, of a single {@link Media} byte array carried across the chat activity
+   * boundary. Bytes above this threshold land inside workflow history events, which have a fixed 2
+   * MiB per-event limit on the Temporal server. 1 MiB leaves headroom for the rest of a chat
+   * payload (messages, tool definitions, options).
    *
    * <p>Users who want to raise or lower the cap can set the system property {@code
    * io.temporal.springai.maxMediaBytes} to a positive integer before the chat activity runs; values
@@ -49,14 +51,11 @@ public final class ChatModelTypes {
    * — retrying the same oversized payload will never succeed, and using a plain {@link
    * RuntimeException} here would cause the workflow task to be retried forever (or the activity to
    * churn through its {@code maxAttempts}) rather than surfacing the real problem. The failure
-   * message points the caller at the URI-based {@code Media} constructor. Pass-through otherwise.
+   * message points the caller at URI-based {@code Media}. Pass-through otherwise.
    */
   public static void checkMediaSize(byte[] data) {
-    if (data == null) {
-      return;
-    }
     long limit = MAX_MEDIA_BYTES_IN_HISTORY;
-    if (limit > 0 && data.length > limit) {
+    if (data != null && limit > 0 && data.length > limit) {
       throw ApplicationFailure.newNonRetryableFailure(
           "Media byte[] is "
               + data.length
@@ -64,7 +63,7 @@ public final class ChatModelTypes {
               + limit
               + "-byte limit for inline media in Temporal workflow history. Pass the media by "
               + "URI instead: store the bytes outside the workflow (e.g. S3) and construct "
-              + "Media(mimeType, URI). Set the system property "
+              + "Media with a URI and an explicit deterministic name. Set the system property "
               + "'io.temporal.springai.maxMediaBytes' to override this limit (or 0 to disable).",
           MEDIA_SIZE_EXCEEDED_FAILURE_TYPE);
     }
@@ -111,9 +110,15 @@ public final class ChatModelTypes {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record Generation(
         @JsonProperty("message") Message message,
-        @JsonProperty("finish_reason") String finishReason) {
+        @JsonProperty("finish_reason") @Nullable String finishReason,
+        @JsonProperty("finish_reason_category") @Nullable
+            FinishReasonCategory finishReasonCategory) {
+      public Generation(Message message, @Nullable String finishReason) {
+        this(message, finishReason, null);
+      }
+
       public Generation(Message message) {
-        this(message, null);
+        this(message, null, null);
       }
     }
 
@@ -142,98 +147,11 @@ public final class ChatModelTypes {
     }
   }
 
-  /**
-   * A message in the conversation.
-   *
-   * @param rawContent the message text content
-   * @param role the role of the message author
-   * @param name optional name for the participant
-   * @param toolCallId tool call ID this message responds to (for TOOL role)
-   * @param toolCalls tool calls requested by the model (for ASSISTANT role)
-   * @param mediaContents optional media attachments
-   * @param metadata optional assistant metadata, including provider continuation state
-   */
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  @JsonIgnoreProperties(ignoreUnknown = true)
+  /** A message with Spring AI's ordered parts serialized using its own JSON codec. */
   public record Message(
-      @JsonProperty("content") String rawContent,
-      @JsonProperty("role") Role role,
-      @JsonProperty("name") String name,
-      @JsonProperty("tool_call_id") String toolCallId,
-      @JsonProperty("tool_calls")
-          @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
-          List<ToolCall> toolCalls,
-      @JsonProperty("media") @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
-          List<MediaContent> mediaContents,
-      @JsonProperty("metadata") Map<String, Object> metadata) {
-    public Message(
-        String content,
-        Role role,
-        String name,
-        String toolCallId,
-        List<ToolCall> toolCalls,
-        List<MediaContent> mediaContents) {
-      this(content, role, name, toolCallId, toolCalls, mediaContents, null);
-    }
-
-    public Message(String content, Role role) {
-      this(content, role, null, null, null, null);
-    }
-
-    public Message(String content, List<MediaContent> mediaContents, Role role) {
-      this(content, role, null, null, null, mediaContents);
-    }
-
-    public enum Role {
-      @JsonProperty("system")
-      SYSTEM,
-      @JsonProperty("user")
-      USER,
-      @JsonProperty("assistant")
-      ASSISTANT,
-      @JsonProperty("tool")
-      TOOL
-    }
-
-    @JsonInclude(JsonInclude.Include.NON_NULL)
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public record ToolCall(
-        @JsonProperty("index") Integer index,
-        @JsonProperty("id") String id,
-        @JsonProperty("type") String type,
-        @JsonProperty("function") ChatCompletionFunction function) {
-      public ToolCall(String id, String type, ChatCompletionFunction function) {
-        this(null, id, type, function);
-      }
-    }
-
-    @JsonInclude(JsonInclude.Include.NON_NULL)
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public record ChatCompletionFunction(
-        @JsonProperty("name") String name, @JsonProperty("arguments") String arguments) {}
-  }
-
-  /**
-   * Media content within a message.
-   *
-   * @param mimeType the MIME type (e.g., "image/png")
-   * @param uri optional URI to the content
-   * @param data optional raw data bytes
-   */
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  @JsonIgnoreProperties(ignoreUnknown = true)
-  public record MediaContent(
-      @JsonProperty("mime_type") String mimeType,
-      @JsonProperty("uri") String uri,
-      @JsonProperty("data") byte[] data) {
-    public MediaContent(String mimeType, String uri) {
-      this(mimeType, uri, null);
-    }
-
-    public MediaContent(String mimeType, byte[] data) {
-      this(mimeType, null, data);
-    }
-  }
+      @JsonProperty("role") MessageType role,
+      @JsonProperty("parts_json") String partsJson,
+      @JsonProperty("metadata") Map<String, Object> metadata) {}
 
   /** A tool the model may call. */
   @JsonInclude(JsonInclude.Include.NON_NULL)
