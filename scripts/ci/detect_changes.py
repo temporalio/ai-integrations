@@ -7,6 +7,7 @@ Rules (see AGENTS.md, "CI architecture"):
   * push to main, schedule, workflow_dispatch, FORCE_ALL, unknown events, or an
     unusable diff base           -> every plugin of every language
   * .github/** or scripts/ci/**  -> every plugin of every language
+  * shared dev-server launcher   -> every plugin that uses it
   * <lang>/<plugin>/**           -> that plugin
   * any other <lang>/** file     -> every plugin of that language (shared resources)
   * scripts/** (non-ci)          -> no plugins; reported as scripts_only when nothing else changed
@@ -28,6 +29,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import LANGUAGES, compact_json, discover_plugins, repo_root, write_github_output  # noqa: E402
 
 ALL_EVENTS = {"push", "schedule", "workflow_dispatch"}
+TEST_LAUNCHER_LANGUAGES = {
+    "scripts/dev/run_temporal_tests.py": ("python", "typescript", "go", "dotnet"),
+    "scripts/dev/temporal-test.mk": ("typescript", "go", "dotnet"),
+}
 ZERO_SHA = "0" * 40
 
 
@@ -60,6 +65,9 @@ def select(
         if top == "scripts":
             if len(parts) > 1 and parts[1] == "ci":
                 return selected, True, False
+            if languages := TEST_LAUNCHER_LANGUAGES.get(f):
+                for language in languages:
+                    selected[language].update(plugins[language])
             scripts_touched = True
             continue
         if top in plugins:

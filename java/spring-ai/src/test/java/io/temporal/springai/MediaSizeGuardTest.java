@@ -82,8 +82,7 @@ class MediaSizeGuardTest {
 
   @Test
   void inboundPath_oversizedUserMessageMedia_failsTheWorkflow() {
-    // Workflow → activity direction: the workflow builds a Prompt with a huge byte[] media,
-    // ActivityChatModel.createActivityInput calls toMediaContent → checkMediaSize throws.
+    // The workflow encodes the prompt before scheduling the Activity.
     Worker worker = testEnv.newWorker(TASK_QUEUE);
     worker.registerWorkflowImplementationTypes(BigInboundMediaWorkflowImpl.class);
     worker.registerActivitiesImplementations(new ChatModelActivityImpl(new StubChatModel()));
@@ -129,8 +128,7 @@ class MediaSizeGuardTest {
 
   @Test
   void outboundPath_assistantEchoesOversizedMedia_failsTheActivity() {
-    // Activity → workflow direction: the stub ChatModel returns an assistant message with a
-    // huge byte[] media, ChatModelActivityImpl.fromMedia → checkMediaSize throws.
+    // The Activity encodes the oversized model response before returning it to the workflow.
     Worker worker = testEnv.newWorker(TASK_QUEUE);
     worker.registerWorkflowImplementationTypes(EchoMediaWorkflowImpl.class);
     worker.registerActivitiesImplementations(
@@ -168,7 +166,13 @@ class MediaSizeGuardTest {
       UserMessage userMessage =
           UserMessage.builder()
               .text(message)
-              .media(List.of(new Media(MimeTypeUtils.IMAGE_PNG, new ByteArrayResource(big))))
+              .media(
+                  List.of(
+                      Media.builder()
+                          .mimeType(MimeTypeUtils.IMAGE_PNG)
+                          .name("large")
+                          .data(big)
+                          .build()))
               .build();
       ActivityChatModel chatModel = ActivityChatModel.forDefault();
       return chatModel.call(new Prompt(List.of(userMessage))).getResult().getOutput().getText();
@@ -182,7 +186,13 @@ class MediaSizeGuardTest {
       UserMessage userMessage =
           UserMessage.builder()
               .text(message)
-              .media(List.of(new Media(MimeTypeUtils.IMAGE_PNG, new ByteArrayResource(small))))
+              .media(
+                  List.of(
+                      Media.builder()
+                          .mimeType(MimeTypeUtils.IMAGE_PNG)
+                          .name("small")
+                          .data(small)
+                          .build()))
               .build();
       ActivityChatModel chatModel = ActivityChatModel.forDefault();
       return chatModel.call(new Prompt(List.of(userMessage))).getResult().getOutput().getText();
@@ -197,8 +207,11 @@ class MediaSizeGuardTest {
               .text(message)
               .media(
                   List.of(
-                      new Media(
-                          MimeTypeUtils.IMAGE_PNG, URI.create("https://cdn.example.com/huge.png"))))
+                      Media.builder()
+                          .mimeType(MimeTypeUtils.IMAGE_PNG)
+                          .name("linked")
+                          .data(URI.create("https://cdn.example.com/huge.png"))
+                          .build()))
               .build();
       ActivityChatModel chatModel = ActivityChatModel.forDefault();
       return chatModel.call(new Prompt(List.of(userMessage))).getResult().getOutput().getText();

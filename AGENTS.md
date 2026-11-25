@@ -95,7 +95,7 @@ These rules apply to every plugin that runs model or tool calls in Activities.
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships; a plugin that depends on another plugin adds that coordinate too (`temporalio-mcp = false` in `openai_agents`), otherwise a fresh first-party release is invisible to `uv lock` for two weeks. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). `python/_shared/` owns the make recipes and composable Pyright/Ruff defaults; mypy and pydocstyle settings stay in each `pyproject.toml` because those tools cannot extend another config while preserving plugin overrides. All tools are invoked through `make` targets; see `make help`.
-- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Bind those options in a startup callback passed to `tests/helpers/environment.py`'s `start_local_with_retry`. This plugin-agnostic policy allows three attempts with a one-second delay only for the SDK's explicit startup timeout, executable download, and archive read/extraction errors. Other errors, including configuration, client connection and cancellation failures, propagate immediately.
+- `make test` provisions one Temporal dev server for all pytest workers and accepts pytest flags and selectors in `TEST_ARGS`. Live test fixtures connect through `create_test_environment` in `tests/helpers/environment.py` and require `TEMPORAL_TEST_ADDRESS`.
 - Test scaffolding: each plugin owns its provenance guard, local dev-server fixtures and pytest hooks. New plugins copy the standard implementations from `python/_template/tests/`; the conventions check keeps `environment.py`, `plugin_meta.py`, `provenance.py`, `test_env.py`, and `test_installed_matches_source.py` byte-identical to their canonical templates. Plugin-specific fixtures stay in that plugin's conftest. Tests must not require real provider credentials; use deterministic local models, mock transports, or in-process servers to exercise provider behavior in CI.
 
 ## Java conventions
@@ -152,12 +152,9 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   unpublished SDK test helpers are copied into each consuming plugin's
   `tests/helpers/`, with a private development-only link. Never use a local
   SDK checkout or another plugin's checkout as a dependency.
-- Local server startup uses `startLocalWithRetry`, with three attempts and a
-  one-second delay only for the SDK's explicit startup timeout, executable
-  download, and archive read/extraction errors. Other errors, including client
-  connection failures and `AbortError` cancellation, propagate immediately.
-  Bind each plugin's server configuration in the startup callback.
-  Copy the helper and its regression tests from
+- `make test` shares a local server across AVA test files. Live test fixtures connect through
+  `createTestEnvironment` and require `TEMPORAL_TEST_ADDRESS`. Supply any required server flags
+  through the launcher. Copy the helper and its regression test from
   `typescript/_template/src/__tests__/`; the conventions check keeps each
   plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
@@ -220,8 +217,8 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   VSTest packages (`Microsoft.NET.Test.Sdk`, `xunit.runner.visualstudio`, xunit 2) are not allowed;
   MTP mode rejects them. The runner's switches differ from VSTest: `make test` passes `--report-trx`,
   and `make test TEST_ARGS='--filter-class Temporalio.Extensions.MicrosoftAgentFramework.Tests.ReplayTests'` selects a
-  class. Tests self-provision the Temporal dev server with the repository's retry policy and need no
-  provider credentials.
+  class. Live tests connect to the dev server provisioned by `make test` and need no provider
+  credentials.
 - Tooling: `make sync`, `make lint` (`dotnet format --verify-no-changes` on the solution; analyzers run
   in the build), `make test`, `make build`, `make lock`, `make check-deps`. Formatting rules live in the
   plugin's `.editorconfig`, kept byte-identical to `dotnet/_template/.editorconfig`; project-wide
@@ -269,6 +266,18 @@ release notes. Start each title with the plugin it changes:
 ## CI
 
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.
+
+`make test` uses `scripts/dev/run_temporal_tests.py` for Python, TypeScript, Go, and .NET, both
+locally and in CI. The launcher needs Python 3.11 or newer. The non-Python Make targets select the
+system interpreter, with `TEMPORAL_TEST_PYTHON` available as an override. The launcher provisions a
+single headless Temporal dev server and passes `TEMPORAL_TEST_ADDRESS` to the suite. The four languages
+use the same CLI version pinned in the launcher. It verifies the archive against its release digest
+and caches the executable locally. Pass native test-runner flags and selectors through `TEST_ARGS`.
+Direct test-runner calls can attach to a server they manage by setting `TEMPORAL_TEST_ADDRESS`.
+The launcher retries the suite once with a fresh server if its local server exits during the run or
+two independent health checks fail after a test failure. It prints the failed server's log and
+preserves the test command's output. Java uses the SDK's in-process test service. Launcher changes
+select all plugins that use it in CI.
 
 - `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Jobs `python`, `typescript`, `java`, `go` and `dotnet` call their per-language reusable workflows once per selected plugin. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
 - `.github/workflows/_typescript-plugin.yml`: uses the shared runtime/platform matrix and independent pnpm lockfile for each plugin. Locked runs first use `make check-deps` on ubuntu/max to verify fresh resolution under the dependency cooldown without changing the committed lock. Every cell runs sync, lint and tests; ubuntu/max also packs, verifies contents and smoke-installs the tarball in a clean consumer. Nightly selects compatible latest dependencies. TypeScript nightly issues use `typescript/<plugin>` keys to avoid collisions with Python.
