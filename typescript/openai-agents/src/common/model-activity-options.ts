@@ -14,6 +14,7 @@ export interface ModelSummaryProvider {
   ): string;
 }
 
+/** @deprecated Use ActivityOptions in activityOptions and separate TemporalModelOptions execution settings. */
 export interface ModelActivityOptions extends Omit<ActivityOptions, 'summary'> {
   /** Use local Activities instead of regular Activities. @default false */
   useLocalActivity?: boolean;
@@ -56,6 +57,7 @@ export interface ModelActivityOptions extends Omit<ActivityOptions, 'summary'> {
  * `__openai_agents_config` header. The function form of `summary`
  * is excluded because functions cannot survive JSON serialization.
  */
+/** @deprecated Use SerializableModelOptions instead. */
 export type SerializableModelActivityOptions = Omit<ModelActivityOptions, 'summary'> & {
   /** Static summary string used as a tracing summary override. */
   summary?: string;

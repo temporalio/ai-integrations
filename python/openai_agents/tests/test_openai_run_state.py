@@ -13,7 +13,7 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from agents import (
@@ -53,20 +53,23 @@ from openai.types.responses.response_usage import (
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.workflow_streams import WorkflowStream
-from temporalio.openai_agents import ModelActivityParameters, ModelSummaryProvider
+from temporalio.openai_agents import ModelSummaryProvider, TemporalAgent
+from temporalio.openai_agents._model_options import _ModelOptions
 from temporalio.openai_agents._openai_runner import (
     TemporalOpenAIRunner,
 )
+from temporalio.openai_agents._temporal_model import (
+    TemporalModel,  # pyright: ignore[reportPrivateUsage]
+)
 from temporalio.openai_agents._temporal_model_provider import (
     _CaptureAgentFilter,  # pyright: ignore[reportPrivateUsage]
+    _current_agent,
     _TemporalModelProvider,  # pyright: ignore[reportPrivateUsage]
     capture_scope,
     install_model_provider,  # pyright: ignore[reportPrivateUsage]
 )
-from temporalio.openai_agents._temporal_model_stub import (
-    _TemporalModelStub,  # pyright: ignore[reportPrivateUsage]
-)
 from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders
+from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
 
 
@@ -203,7 +206,7 @@ def _run_again_reply(
 
 
 def _make_banker() -> Agent[None]:
-    return Agent[None](
+    return TemporalAgent[None](
         name="Banker",
         instructions="Move money when asked.",
         tools=[transfer_funds],
@@ -212,7 +215,7 @@ def _make_banker() -> Agent[None]:
 
 def _make_triage(use_handoff_object: bool) -> Agent[None]:
     banker = _make_banker()
-    return Agent[None](
+    return TemporalAgent[None](
         name="Triage",
         instructions="Hand off to the Banker.",
         handoffs=[handoff(banker) if use_handoff_object else banker],
@@ -272,6 +275,175 @@ async def _approve_and_resume(
         str(resumed.final_output),
         *[str(item.output) for item in resumed.new_items if hasattr(item, "output")],
     ]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff_object", [False, True])
+async def test_handoff_restores_tool_use_after_resume(
+    streamed: bool, use_handoff_object: bool
+) -> None:
+    banker = _make_banker()
+    banker.model_settings.tool_choice = "required"
+    triage = TemporalAgent[None](
+        name="Triage",
+        handoffs=[handoff(banker) if use_handoff_object else banker],
+    )
+    state = RunState(
+        context=RunContextWrapper(context=None),
+        original_input="Move 5 dollars.",
+        starting_agent=banker,
+        max_turns=10,
+    )
+    state.set_tool_use_tracker_snapshot({"Banker": ["transfer_funds"]})
+    restored = await RunState.from_string(triage, state.to_string())
+    model = ScriptedModel(
+        lambda _instructions, _input: ResponseBuilders.output_message(
+            "Transfer complete."
+        )
+    )
+    result = await _run(
+        triage, restored, streamed=streamed, run_config=RunConfig(model=model)
+    )
+    assert result.final_output == "Transfer complete."
+    assert model.seen_model_settings[0].tool_choice is None
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("shared_target", ["agent", "tool", "both"])
+async def test_shared_handoff_target_restores_after_approval(
+    streamed: bool, shared_target: Literal["agent", "tool", "both"]
+) -> None:
+    banker = _make_banker()
+    other = TemporalAgent[None](
+        name="Other", instructions="Other", handoffs=[handoff(banker)]
+    )
+    triage = TemporalAgent[None](name="Triage", instructions="Triage", handoffs=[other])
+    if shared_target in ("agent", "both"):
+        triage.handoffs.append(banker)
+    if shared_target in ("tool", "both"):
+        triage.tools.append(
+            banker.as_tool(tool_name="ask_banker", tool_description="Ask Banker")
+        )
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions == "Triage":
+            return ResponseBuilders.tool_call(
+                "{}", "transfer_to_other", call_id="triage-other"
+            )
+        if instructions == "Other":
+            return ResponseBuilders.tool_call(
+                "{}", "transfer_to_banker", call_id="other-banker"
+            )
+        return _banker_reply(instructions, input)
+
+    config = RunConfig(model=ScriptedModel(reply))
+    result = await _run(triage, "Move 5 dollars.", streamed=streamed, run_config=config)
+    assert len(result.interruptions) == 1
+    restored = await RunState.from_string(triage, result.to_state().to_string())
+    assert await _approve_and_resume(
+        triage, restored, streamed=streamed, run_config=config
+    ) == ["Transfer complete.", "transferred 5"]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_shared_handoff_target_tool_restores_nested_approval(
+    streamed: bool,
+) -> None:
+    banker = _make_banker()
+    triage = TemporalAgent[None](
+        name="Triage",
+        instructions="Triage",
+        handoffs=[handoff(banker)],
+        tools=[banker.as_tool(tool_name="ask_banker", tool_description="Ask Banker")],
+    )
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions != "Triage":
+            return _banker_reply(instructions, input)
+        if _has_tool_output(input, "ask-banker"):
+            return ResponseBuilders.output_message("Done.")
+        return ResponseBuilders.tool_call(
+            '{"input": "Move 5 dollars."}', "ask_banker", call_id="ask-banker"
+        )
+
+    config = RunConfig(model=ScriptedModel(reply))
+    result = await _run(triage, "Move 5 dollars.", streamed=streamed, run_config=config)
+    assert len(result.interruptions) == 1
+    restored = await RunState.from_string(triage, result.to_state().to_string())
+    resumed = await _approve_and_resume(
+        triage, restored, streamed=streamed, run_config=config
+    )
+    assert resumed[0] == "Done."
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("change", ["instructions", "tools"])
+@pytest.mark.parametrize("graph", ["target", "downstream", "shared_cycle"])
+async def test_handoff_callback_updates_graph(
+    streamed: bool,
+    change: Literal["instructions", "tools"],
+    graph: Literal["target", "downstream", "shared_cycle"],
+) -> None:
+    banker = TemporalAgent[None](name="Banker", instructions="Before callback.")
+    target = (
+        banker
+        if graph == "target"
+        else TemporalAgent[None](name="Other", instructions="Other", handoffs=[banker])
+    )
+    handoff_count = 0
+
+    async def configure_target(_context: RunContextWrapper[None]) -> None:
+        nonlocal handoff_count
+        handoff_count += 1
+        if change == "instructions":
+            banker.instructions = f"After callback {handoff_count}."
+        else:
+            banker.tools = [transfer_funds]
+
+    triage = TemporalAgent[None](
+        name="Triage",
+        instructions="Triage",
+        handoffs=[handoff(target, on_handoff=configure_target)],
+    )
+    if graph == "shared_cycle":
+        banker.handoffs = [triage]
+        triage.handoffs.append(banker)
+        triage.tools = [
+            banker.as_tool(tool_name="ask_banker", tool_description="Ask Banker")
+        ]
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions == "Triage":
+            return ResponseBuilders.tool_call(
+                "{}", f"transfer_to_{target.name.lower()}", call_id="triage-target"
+            )
+        if instructions == "Other":
+            return ResponseBuilders.tool_call(
+                "{}", "transfer_to_banker", call_id="triage-banker"
+            )
+        if change == "tools":
+            return _banker_reply(instructions, input)
+        return ResponseBuilders.output_message(instructions or "")
+
+    config = RunConfig(model=ScriptedModel(reply))
+    for invocation in range(1, 3):
+        result = await _run(
+            triage, "Move 5 dollars.", streamed=streamed, run_config=config
+        )
+        if change == "instructions":
+            assert result.final_output == f"After callback {invocation}."
+        else:
+            assert len(result.interruptions) == 1
+            restored = await RunState.from_string(triage, result.to_state().to_string())
+            assert await _approve_and_resume(
+                triage, restored, streamed=streamed, run_config=config
+            ) == ["Transfer complete.", "transferred 5"]
 
 
 @workflow.defn
@@ -370,7 +542,7 @@ class ConcurrentNestedResumeWorkflow:
     @workflow.run
     async def run(self) -> str:
         agents = [
-            Agent[None](
+            TemporalAgent[None](
                 name=name,
                 instructions=f"You are {name}.",
                 tools=[transfer_funds],
@@ -398,7 +570,7 @@ class ConcurrentNestedResumeWorkflow:
 
             return resume
 
-        orchestrator = Agent[None](
+        orchestrator = TemporalAgent[None](
             name="Orchestrator",
             instructions="You are Orchestrator.",
             tools=[resume_tool(a, s) for a, s in zip(agents, states)],
@@ -414,10 +586,10 @@ class ConcurrentAgentToolsWorkflow:
     @workflow.run
     async def run(self) -> str:
         helpers = [
-            Agent[None](name=name, instructions=f"You are {name}.")
+            TemporalAgent[None](name=name, instructions=f"You are {name}.")
             for name in ("Alpha", "Beta")
         ]
-        orchestrator = Agent[None](
+        orchestrator = TemporalAgent[None](
             name="Orchestrator",
             instructions="You are Orchestrator.",
             tools=[
@@ -541,7 +713,7 @@ class RepeatedRunsWorkflow:
         config = RunConfig(call_model_input_filter=record)
         failures = 0
         for _ in range(runs):
-            agent = Agent[None](
+            agent = TemporalAgent[None](
                 name="Looker",
                 instructions=_MODE_INSTRUCTIONS.get(mode, "Look it up."),
                 tools=[lookup, explode, cancel_run],
@@ -584,11 +756,9 @@ async def _execute(
     """Run a workflow and return its result and the activity summaries from its history."""
     async with AgentEnvironment(
         model=model,
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-            streaming_topic="events",
-            summary_override=summary_override,
-        ),
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=30)),
+        streaming_topic="events",
+        summary_provider=summary_override,
     ) as env:
         client = env.applied_on_client(client)
         async with new_worker(client, *ALL_WORKFLOWS) as worker:
@@ -749,7 +919,7 @@ async def test_capture_filter_returns_user_result_unchanged():
     async def async_filter(_data: CallModelData[Any]) -> ModelInputData:
         return returned
 
-    provider = _TemporalModelProvider(ModelActivityParameters())
+    provider = _TemporalModelProvider()
     data = _call_data(agent)
 
     sync_config = provider.install(RunConfig(call_model_input_filter=sync_filter))
@@ -775,31 +945,29 @@ async def test_capture_filter_returns_user_result_unchanged():
 
 def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs():
     target = Agent(name="target", model=ScriptedModel(_banker_reply))
-    middle = Agent(name="middle", handoffs=[target])
-    starting = Agent(name="starting", handoffs=[middle])
+    middle = TemporalAgent(name="middle", handoffs=[target])
+    starting = TemporalAgent(name="starting", handoffs=[middle])
     middle.handoffs.append(starting)  # a loop must not recurse forever
-    runner = TemporalOpenAIRunner(ModelActivityParameters())
+    runner = TemporalOpenAIRunner(_ModelOptions())
     with pytest.raises(ValueError, match="model name to be a string"):
         runner._prepare_workflow_run(starting, {})
 
 
 async def test_capture_filter_resolves_agent_lazily_and_is_installed_once():
     agent = _make_banker()
-    params = ModelActivityParameters()
-    config = install_model_provider(params, RunConfig())
+    config = install_model_provider(RunConfig())
     provider = config.model_provider
     assert isinstance(provider, _TemporalModelProvider)
     stub = provider.get_model("gpt-4o")
-    assert isinstance(stub, _TemporalModelStub)
-    assert stub._current_agent is not None  # pyright: ignore[reportPrivateUsage]
-    assert stub._current_agent() is None  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(stub, TemporalModel)
+    assert _current_agent.get() is None  # pyright: ignore[reportPrivateUsage]
 
     assert config.call_model_input_filter is not None
     config.call_model_input_filter(_call_data(agent))
-    assert stub._current_agent() is agent  # pyright: ignore[reportPrivateUsage]
+    assert _current_agent.get() is agent  # pyright: ignore[reportPrivateUsage]
 
     # A nested run reuses the parent's provider and filter instead of wrapping them again.
-    nested = install_model_provider(params, config)
+    nested = install_model_provider(config)
     assert nested.model_provider is provider
     assert isinstance(nested.call_model_input_filter, _CaptureAgentFilter)
     assert nested.call_model_input_filter.wrapped is None
@@ -833,12 +1001,12 @@ async def test_finished_runs_leave_no_agent_in_workflow_context(
 
 def test_capture_scope_restores_the_callers_context():
     outer_agent, inner_agent = _make_banker(), _make_triage(False)
-    config = install_model_provider(ModelActivityParameters(), RunConfig())
+    config = install_model_provider(RunConfig())
     provider = config.model_provider
     assert isinstance(provider, _TemporalModelProvider)
     stub = provider.get_model("gpt-4o")
-    assert isinstance(stub, _TemporalModelStub)
-    current_agent = stub._current_agent  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(stub, TemporalModel)
+    current_agent = _current_agent.get
     assert current_agent is not None
     assert config.call_model_input_filter is not None
     capture = config.call_model_input_filter

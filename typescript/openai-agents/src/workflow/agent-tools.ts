@@ -11,6 +11,7 @@ import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { inWorkflowContext } from '@temporalio/workflow';
 import { refuseTracingApiKey } from '../common/headers';
+import { TemporalModel } from './temporal-model';
 import { validateTemporalSandboxClient } from './sandbox-client';
 
 type AnyAgentTool = AgentTool<any, any, any>;
@@ -96,16 +97,16 @@ export function checkAgentToolOptions({ agent, runConfig, runOptions }: AgentToo
     throw ApplicationFailure.create({
       message:
         `${where} sets runConfig.modelProvider. Nested runs must use the runner's provider, which ` +
-        'sends model calls to Activities; set a string runConfig.model instead.',
+        'sends model calls to Activities; set a string or TemporalModel as runConfig.model instead.',
       type: 'AgentsWorkflowError',
       nonRetryable: true,
     });
   }
-  if (runConfig?.model !== undefined && typeof runConfig.model !== 'string') {
+  if (runConfig?.model !== undefined && typeof runConfig.model !== 'string' && !(runConfig.model instanceof TemporalModel)) {
     throw ApplicationFailure.create({
       message:
         `${where} sets runConfig.model to a Model object. In Temporal workflows, all models must be ` +
-        'specified as strings.',
+        'specified as strings or TemporalModel instances.',
       type: 'AgentsWorkflowError',
       nonRetryable: true,
     });

@@ -11,10 +11,12 @@ from temporalio.openai_agents._mcp import (
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
 )
-from temporalio.openai_agents._model_parameters import (
-    ModelActivityParameters,
+from temporalio.openai_agents._model_options import (
     ModelSummaryProvider,
 )
+from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._temporal_agent import TemporalAgent
+from temporalio.openai_agents._temporal_model import TemporalModel
 from temporalio.openai_agents._temporal_openai_agents import (
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
@@ -47,8 +49,10 @@ __all__ = [
     "OpenAIPayloadConverter",
     "SANDBOX_LOST_ERROR_TYPE",
     "SandboxClientProvider",
-    "StatelessMCPServerProvider",
     "StatefulMCPServerProvider",
+    "StatelessMCPServerProvider",
+    "TemporalAgent",
+    "TemporalModel",
     "TemporalWorkerEnvValue",
     "WorkflowSession",
     "temporal_worker_env_ref",

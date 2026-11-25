@@ -8,6 +8,8 @@ import {
   Manifest,
   SandboxAgent,
   SandboxError,
+  compaction,
+  prepareSandboxAgent,
   type SandboxClientResumeOptions,
   type SandboxExecResult,
   type SandboxPreservedSessionReuseOptions,
@@ -69,7 +71,37 @@ import { workerEnvValue } from '../common/worker-env-vars';
 import { TemporalSandboxClient, temporalSandboxClient } from '../workflow/sandbox-client';
 import { TemporalSandboxSession, sessionActivityOptions } from '../workflow/sandbox-session';
 import { TemporalOpenAIRunner } from '../workflow/runner';
+import { TemporalModel } from '../workflow/temporal-model';
 import { FakeSandboxClient, FakeSandboxSession } from './stubs/sandbox-fakes';
+
+for (const [name, modelName, runModelName, threshold] of [
+  ['agent model', 'gpt-5.4', undefined, 942818],
+  ['smaller agent model', 'gpt-4o', undefined, 115200],
+  ['run fallback', undefined, 'gpt-5.4', 942818],
+  ['agent precedence', 'gpt-4o', 'gpt-5.4', 115200],
+  ['unnamed model', '', undefined, undefined],
+  ['unknown model', 'custom-model', undefined, 240000],
+] as const) {
+  test(`TemporalModel preserves sandbox compaction parameters: ${name}`, (t) => {
+    const prepare = (temporal: boolean) =>
+      prepareSandboxAgent({
+        agent: new SandboxAgent({
+          name: 'sandbox',
+          model: temporal && modelName !== undefined ? new TemporalModel(modelName) : modelName,
+        }),
+        session: new FakeSandboxSession(),
+        capabilities: [compaction()],
+        runConfigModel: temporal && runModelName !== undefined ? new TemporalModel(runModelName) : runModelName,
+      });
+    const providerData = prepare(true).modelSettings.providerData;
+    t.deepEqual(providerData, prepare(false).modelSettings.providerData);
+    if (threshold !== undefined) {
+      t.deepEqual(providerData, {
+        context_management: [{ type: 'compaction', compact_threshold: threshold }],
+      });
+    }
+  });
+}
 
 /** An Activity context on `taskQueue`, which leaves the failures tests expect out of the log. */
 function activityContext(taskQueue: string): MockActivityEnvironment {
@@ -179,7 +211,7 @@ test('temporalSandboxClient defaults activity config only when omitted', (t) => 
 
 async function runForSandboxValidation(agent: Agent<any, any>, sandbox?: any): Promise<unknown> {
   const runner = Object.create(TemporalOpenAIRunner.prototype) as TemporalOpenAIRunner;
-  Object.assign(runner, { modelParams: {} });
+  Object.assign(runner, { modelOptions: { activityOptions: {} } });
   return runner.run(agent, 'hello', sandbox === undefined ? undefined : { runConfig: { sandbox } }).then(
     () => undefined,
     (error) => error

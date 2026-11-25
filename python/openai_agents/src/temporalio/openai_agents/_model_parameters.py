@@ -1,30 +1,12 @@
 """Parameters for configuring Temporal activity execution for model calls."""
 
-from abc import ABC, abstractmethod
+import warnings
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
-
-from agents import Agent, TResponseInputItem
 
 from temporalio.common import Priority, RetryPolicy
+from temporalio.openai_agents._model_options import ModelSummaryProvider
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
-
-
-class ModelSummaryProvider(ABC):
-    """Abstract base class for providing model summaries. Essentially just a callable,
-    but the arguments are sufficiently complex to benefit from names.
-    """
-
-    @abstractmethod
-    def provide(
-        self,
-        agent: Agent[Any] | None,
-        instructions: str | None,
-        input: str | list[TResponseInputItem],
-    ) -> str:
-        """Given the provided information, produce a summary for the model invocation activity."""
-        pass
 
 
 @dataclass
@@ -34,6 +16,10 @@ class ModelActivityParameters:
     This class encapsulates all the parameters that can be used to configure
     how Temporal activities are executed when making model calls through the
     OpenAI Agents integration.
+
+    .. deprecated:: 2.x
+        Use ActivityConfig via activity_config and the separate execution options
+        on OpenAIAgentsPlugin and AgentEnvironment instead.
     """
 
     task_queue: str | None = None
@@ -102,3 +88,12 @@ class ModelActivityParameters:
     .. warning::
         Streaming support is experimental and may change in future
         versions."""
+
+    def __post_init__(self) -> None:
+        """Warn when constructing the deprecated configuration type."""
+        warnings.warn(
+            "ModelActivityParameters is deprecated; use activity_config=ActivityConfig(...) "
+            "and separate execution options instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )

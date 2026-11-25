@@ -9,11 +9,12 @@ export { StatefulMCPServerProvider } from './worker/stateful-mcp-provider';
 export { SandboxClientProvider } from './worker/sandbox-provider';
 export { OnHostSandboxClientProvider } from './worker/on-host-sandbox-provider';
 export type { OnHostSandboxClientProviderOptions } from './worker/on-host-sandbox-provider';
+export type { ActivityOptions } from '@temporalio/workflow';
 export type {
-  ModelActivityOptions,
+  TemporalModelOptions,
   ModelSummaryProvider,
-  SerializableModelActivityOptions,
-} from './common/model-activity-options';
+  SerializableModelOptions,
+} from './common/model-options';
 export { DEDICATED_WORKER_FAILURE_TYPE, TOOL_FILTER_UNSUPPORTED_TYPE, TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from './common/mcp-types';
 export { SANDBOX_LOST_FAILURE_TYPE } from './common/sandbox-activity-types';
 export type {
@@ -27,3 +28,5 @@ export type { TracingApiKeyContext, TracingApiKeyResolver } from './worker/trace
 
 export { OpenAIAgentsTraceClientInterceptor } from './client/trace-interceptor';
 export type { OpenAIAgentsTraceClientInterceptorOptions } from './client/trace-interceptor';
+
+export type { ModelActivityOptions, SerializableModelActivityOptions } from './common/model-activity-options';

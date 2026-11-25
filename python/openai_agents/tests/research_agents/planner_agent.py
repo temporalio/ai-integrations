@@ -1,5 +1,6 @@
-from agents import Agent
 from pydantic import BaseModel
+
+from temporalio.openai_agents import TemporalAgent
 
 PROMPT = (
     "You are a helpful research assistant. Given a query, come up with a set of web searches "
@@ -21,7 +22,7 @@ class WebSearchPlan(BaseModel):
 
 
 def new_planner_agent():
-    return Agent(
+    return TemporalAgent(
         name="PlannerAgent",
         instructions=PROMPT,
         model="gpt-4o",

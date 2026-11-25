@@ -18,15 +18,13 @@ import {
   injectAgentsTraceHeader,
   type AgentsConfigHeader,
 } from '../common/headers';
-import type { SerializableModelActivityOptions } from '../common/model-activity-options';
+import type { SerializableModelOptions } from '../common/model-options';
 
-export interface OpenAIAgentsTraceClientInterceptorOptions {
+export interface OpenAIAgentsTraceClientInterceptorOptions extends SerializableModelOptions {
   /** Wrap client calls in `temporal:*` custom spans. @default false */
   addTemporalSpans?: boolean;
   /** Emit OTel spans on the Workflow side for agent-SDK trace/span events. @default false */
   useOtelInstrumentation?: boolean;
-  /** Model Activity options propagated to the Workflow via the config header. */
-  modelParams?: SerializableModelActivityOptions;
 }
 
 export class OpenAIAgentsTraceClientInterceptor implements WorkflowClientInterceptor {
@@ -40,7 +38,11 @@ export class OpenAIAgentsTraceClientInterceptor implements WorkflowClientInterce
     this.configHeader = {
       addTemporalSpans: options?.addTemporalSpans,
       useOtelInstrumentation: options?.useOtelInstrumentation,
-      modelParams: options?.modelParams,
+      modelParams: options?.modelParams === undefined ? undefined : { ...options.modelParams },
+      activityOptions: options?.activityOptions === undefined ? undefined : { ...options.activityOptions },
+      useLocalActivity: options?.useLocalActivity,
+      streamingTopic: options?.streamingTopic,
+      streamingBatchInterval: options?.streamingBatchInterval,
     };
   }
 

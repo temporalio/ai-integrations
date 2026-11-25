@@ -1222,3 +1222,16 @@ export async function tracingKeyRefusedWorkflow(entryPoint: TracingKeyEntryPoint
   }
   return 'not refused';
 }
+
+export {
+  temporalLegacyOptionsWorkflow,
+  temporalModelConfigurationWorkflow,
+  temporalModelConcurrentWorkflow,
+  temporalModelNestedWorkflow,
+  temporalModelLocalWorkflow,
+  temporalModelValidationWorkflow,
+  temporalModelStreamingWorkflow,
+  temporalModelApprovalWorkflow,
+  temporalModelLocalQueueWorkflow,
+  temporalModelStreamedHandoffResumeWorkflow,
+} from './temporal-models';

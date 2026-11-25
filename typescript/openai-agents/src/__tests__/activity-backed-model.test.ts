@@ -1,6 +1,5 @@
 import test from 'ava';
 import {
-  Agent,
   getGlobalTraceProvider,
   setTraceProcessors,
   withTrace,
@@ -9,8 +8,8 @@ import {
   type SpanData,
 } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
-import { ActivityBackedModel } from '../workflow/activity-backed-model';
-import type { ModelSummaryProvider } from '../common/model-activity-options';
+import { TemporalModel } from '../workflow/temporal-model';
+import type { ModelSummaryProvider } from '../common/model-options';
 import { streamingTextEvents } from './stubs/openai-agents-fakes';
 
 function minimalRequest(): ModelRequest {
@@ -59,18 +58,13 @@ test('getStreamedResponse: dynamic summary routes through executeWithOptions', a
       return 'dynamic summary';
     },
   };
-  const agent = new Agent({ name: 'A', model: 'gpt-4o' });
-  const model = new ActivityBackedModel(
-    'gpt-4o',
-    {
-      startToCloseTimeout: '60s',
-      streamingTopic: 'events',
-      summary: provider,
-    },
-    { agent: () => agent, modelSettings: () => undefined }
-  );
+  const model = new TemporalModel('gpt-4o', {
+    activityOptions: { startToCloseTimeout: '60s' },
+    streamingTopic: 'events',
+    summaryProvider: provider,
+  });
   const fake = fakeStreamActivities(events);
-  (model as any).activities = fake.activities;
+  (model as any).createActivities = () => fake.activities;
 
   const yielded = await withTrace('test', () => drain(model.getStreamedResponse(minimalRequest())));
 
@@ -79,21 +73,21 @@ test('getStreamedResponse: dynamic summary routes through executeWithOptions', a
   t.is(fake.withOptions[0]?.opts.summary, 'dynamic summary');
   t.is(provided?.instructions, 'sys');
   t.is(provided?.input, 'hi');
-  t.is(provided?.agent, agent);
+  t.is(provided?.agent, undefined);
   t.is(yielded.length, events.length);
 });
 
 test('a model call with modelSettings.timeoutMs fails before scheduling the Activity', async (t) => {
-  const model = new ActivityBackedModel('gpt-4o', { startToCloseTimeout: '60s', streamingTopic: 'events' });
+  const model = new TemporalModel('gpt-4o', { activityOptions: { startToCloseTimeout: '60s' }, streamingTopic: 'events' });
   const fake = fakeStreamActivities(streamingTextEvents('hi'));
   const calls: unknown[] = [];
-  (model as any).activities = {
+  (model as any).createActivities = () => ({
     ...fake.activities,
     invokeModelActivity: async (input: unknown) => {
       calls.push(input);
       return { usage: {}, output: [] };
     },
-  };
+  });
   const request = { ...minimalRequest(), modelSettings: { timeoutMs: 1000 } };
 
   const expected = { instanceOf: ApplicationFailure, message: /startToCloseTimeout/ };
@@ -104,9 +98,12 @@ test('a model call with modelSettings.timeoutMs fails before scheduling the Acti
 
 test('getStreamedResponse: no dynamic summary uses the plain proxy call', async (t) => {
   const events = streamingTextEvents('hi');
-  const model = new ActivityBackedModel('gpt-4o', { startToCloseTimeout: '60s', streamingTopic: 'events' });
+  const model = new TemporalModel('gpt-4o', {
+    activityOptions: { startToCloseTimeout: '60s' },
+    streamingTopic: 'events',
+  });
   const fake = fakeStreamActivities(events);
-  (model as any).activities = fake.activities;
+  (model as any).createActivities = () => fake.activities;
 
   const yielded = await withTrace('test', () => drain(model.getStreamedResponse(minimalRequest())));
 
@@ -133,8 +130,11 @@ test.serial('getStreamedResponse: opens a generation span carrying the model nam
   getGlobalTraceProvider().setDisabled(false);
 
   try {
-    const model = new ActivityBackedModel('gpt-4o-mini', { startToCloseTimeout: '60s', streamingTopic: 'events' });
-    (model as any).activities = fakeStreamActivities(events).activities;
+    const model = new TemporalModel('gpt-4o-mini', {
+      activityOptions: { startToCloseTimeout: '60s' },
+      streamingTopic: 'events',
+    });
+    (model as any).createActivities = () => fakeStreamActivities(events).activities;
     await withTrace('test', async () => {
       await drain(model.getStreamedResponse(minimalRequest()));
     });

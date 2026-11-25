@@ -18,6 +18,14 @@ const test = makeOpenAIAgentsTestFunction();
 // Compile-time check: plugin + client-interceptor modelParams reject function/object summary.
 {
   const _provider = null! as FakeModelProvider;
+  // @ts-expect-error — activityOptions.summary must be static text
+  new OpenAIAgentsPlugin({ modelProvider: _provider, activityOptions: { summary: { provide: () => 'x' } } });
+  // @ts-expect-error — activityOptions.summary must be static text
+  new OpenAIAgentsTraceClientInterceptor({ activityOptions: { summary: { provide: () => 'x' } } });
+  // @ts-expect-error — dynamic summaries stay in Workflow code
+  new OpenAIAgentsPlugin({ modelProvider: _provider, summaryProvider: { provide: () => 'x' } });
+  // @ts-expect-error — dynamic summaries stay in Workflow code
+  new OpenAIAgentsTraceClientInterceptor({ summaryProvider: { provide: () => 'x' } });
   // @ts-expect-error — modelParams.summary must be string, not function/object
   new OpenAIAgentsPlugin({ modelProvider: _provider, modelParams: { summary: { provide: () => 'x' } } });
   // @ts-expect-error — modelParams.summary must be string, not function/object

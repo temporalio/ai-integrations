@@ -5,12 +5,11 @@
 // using the same V8 isolate — workflowId alone would let the old run's
 // dispose wipe the new run's entry.
 import { workflowInfo } from '@temporalio/workflow';
-import type { SerializableModelActivityOptions } from '../common/model-activity-options';
+import type { SerializableModelOptions } from '../common/model-options';
 
-export interface PluginConfig {
+export interface PluginConfig extends SerializableModelOptions {
   addTemporalSpans: boolean;
   useOtelInstrumentation: boolean;
-  modelParams: SerializableModelActivityOptions;
   /** Where each sandbox provider, by name, puts the default `/workspace` root. */
   workspaceRoots?: Record<string, string>;
 }
@@ -36,7 +35,7 @@ export function getCurrentPluginConfig(): PluginConfig | undefined {
 
 /** This Workflow run's `workspaceRoots`, storing a default plugin config first if the start header carried none. */
 export function workspaceRoots(): Record<string, string> {
-  const defaults: PluginConfig = { addTemporalSpans: false, useOtelInstrumentation: false, modelParams: {} };
+  const defaults: PluginConfig = { addTemporalSpans: false, useOtelInstrumentation: false };
   const config = getCurrentPluginConfig() ?? defaults;
   setPluginConfig(config);
   return (config.workspaceRoots ??= {});

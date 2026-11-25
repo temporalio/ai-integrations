@@ -13,7 +13,7 @@ import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { inWorkflowContext } from '@temporalio/workflow';
 import { refuseTracingApiKey } from '../common/headers';
-import { ActivityBackedModelProvider } from './activity-backed-model';
+import { ActivityBackedModelProvider, TemporalModel, validateCurrentModelOptions } from './temporal-model';
 import { type AgentToolRecord, checkAgentToolOptions, getAgentToolRecord, isUnrecordedAgentTool } from './agent-tools';
 import { TemporalSandboxClient, validateTemporalSandboxClient } from './sandbox-client';
 
@@ -62,6 +62,7 @@ export function installRunningAgentCheck(prototype: object = Agent.prototype): v
   function getSystemPrompt(this: Agent<any, any>, runContext: RunContext<any>): Promise<string | undefined> {
     if (inWorkflowContext()) {
       rejectModelObject(this);
+      validateCurrentModelOptions(this);
       for (const tool of this.tools ?? []) checkToolOptions(tool, this);
     }
     return state.original.call(this, runContext);
@@ -100,6 +101,7 @@ interface RunnerCheckState {
 }
 
 interface RunOptionsLike {
+  stream?: boolean;
   session?: unknown;
   sandbox?: SandboxRunConfig;
   tracing?: TracingConfig;
@@ -153,11 +155,11 @@ export function installRunnerCheck(): void {
       });
     }
     const { model } = this.config;
-    if (model !== undefined && typeof model !== 'string') {
+    if (model !== undefined && typeof model !== 'string' && !(model instanceof TemporalModel)) {
       throw ApplicationFailure.create({
         message:
           `${where} has a Model object as runConfig.model. In Temporal workflows, all models must be ` +
-          'specified as strings.',
+          'specified as strings or TemporalModel instances.',
         type: 'AgentsWorkflowError',
         nonRetryable: true,
       });
@@ -173,7 +175,8 @@ export function installRunnerCheck(): void {
     }
     // Upstream emits `agent_start` on a resumed state only if no agent run is active, so start from
     // the state's current agent.
-    state.runningAgents.set(this, input instanceof RunState ? input._currentAgent : agent);
+    const currentAgent = input instanceof RunState ? input.currentAgent : agent;
+    state.runningAgents.set(this, currentAgent);
     const config = this.config as unknown as {
       modelProvider: ActivityBackedModelProvider;
       modelSettings?: ModelSettings;
@@ -181,10 +184,14 @@ export function installRunnerCheck(): void {
     config.modelProvider = config.modelProvider.forRun({
       agent: () => state.runningAgents.get(this),
       modelSettings: () => config.modelSettings,
+      model: () => this.config.model,
     });
     // Upstream uses `options.sandbox ?? config.sandbox`, and passes the same to nested runs.
     const sandbox = options?.sandbox ?? this.config.sandbox;
-    if (sandbox === undefined) return state.original.call(this, agent, input, options);
+    const invoke = (runOptions: RunOptionsLike | undefined) =>
+      config.modelProvider.withContext(() => state.original.call(this, agent, input, runOptions), options?.stream === true);
+    config.modelProvider.validateAgent(currentAgent, this.config.model, options?.stream === true);
+    if (sandbox === undefined) return invoke(options);
     validateTemporalSandboxClient(
       sandbox,
       `${where} ${options?.sandbox !== undefined ? 'runOptions.sandbox' : 'runConfig.sandbox'}`
@@ -195,7 +202,7 @@ export function installRunnerCheck(): void {
     if (resumes && frozen.client instanceof TemporalSandboxClient) {
       await frozen.client._fetchWorkspaceRoot(frozen.options);
     }
-    return state.original.call(this, agent, input, { ...options, sandbox: frozen });
+    return invoke({ ...options, sandbox: frozen });
   }
   Object.defineProperty(Runner.prototype, runnerCheckState, { value: state });
   Runner.prototype.run = run as typeof Runner.prototype.run;
@@ -239,11 +246,11 @@ function checkToolOptions(tool: Tool<any>, owner: Agent<any, any>): AgentToolRec
 
 function rejectModelObject(agent: Agent<any, any>): void {
   const rawModel = agent.model;
-  if (rawModel !== undefined && rawModel !== null && typeof rawModel !== 'string') {
+  if (rawModel !== undefined && rawModel !== null && typeof rawModel !== 'string' && !(rawModel instanceof TemporalModel)) {
     throw ApplicationFailure.create({
       message:
         `Agent '${agent.name}' has a Model object instead of a string model name. ` +
-        'In Temporal workflows, all models must be specified as strings: give the agent a model name.',
+        'In Temporal workflows, use a string model name or TemporalModel from @temporalio/openai-agents/workflow.',
       type: 'AgentsWorkflowError',
       nonRetryable: true,
     });
