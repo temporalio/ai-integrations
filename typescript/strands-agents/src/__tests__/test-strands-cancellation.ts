@@ -4,14 +4,79 @@ import { WorkflowFailedError } from '@temporalio/client';
 import { CancelledFailure } from '@temporalio/common';
 import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, helpers } from '@temporalio/test-helpers';
+import { Worker } from '@temporalio/worker';
 import { ActivityCancellationType } from '@temporalio/workflow';
 import { StrandsPlugin } from '..';
-import { setupTestEnv, StubModel, textTurn } from './helpers/strands';
-import { cancellableAgent, cancellableModelCall, helloAgent } from './workflows/strands';
+import { heartbeatTimeouts, setupTestEnv, StubModel, textTurn } from './helpers/strands';
+import {
+  abortSignalTimeout,
+  agentWithCancelSignal,
+  cancellableAgent,
+  cancellableModelCall,
+  helloAgent,
+} from './workflows/strands';
 
 const test = anyTest as TestFn<BaseContext>;
 
 setupTestEnv(test);
+
+test('AbortSignal.timeout is rejected in workflows without changing the native constructor', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const nativeAbortSignal = AbortSignal;
+  const nativeTimeout = AbortSignal.timeout;
+  const calls: string[] = [];
+  const worker = await createWorker({
+    maxCachedWorkflows: 0,
+    activities: {
+      async auditTool(message: string): Promise<void> {
+        calls.push(message);
+      },
+    },
+  });
+  const message =
+    'AbortSignal.timeout() is not supported in workflows. Use Temporal sleep() and AbortController instead.';
+  const history = await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortSignalTimeout, { workflowExecutionTimeout: '30 seconds' });
+    t.is(await handle.result(), message);
+    return handle.fetchHistory();
+  });
+  t.deepEqual(calls, [message]);
+  await Worker.runReplayHistory({ workflowBundle: t.context.workflowBundle }, history);
+  t.deepEqual(calls, [message]);
+  t.is(AbortSignal, nativeAbortSignal);
+  t.is(AbortSignal.timeout, nativeTimeout);
+  t.false(AbortSignal.timeout(60_000).aborted);
+});
+
+for (const mode of ['active', 'pre-aborted', 'hook'] as const) {
+  test(`direct invocation with cancel signal (${mode}) and replay`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    let modelCalls = 0;
+    class CountingModel extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        modelCalls++;
+        yield* super.stream(messages, options);
+      }
+    }
+    const plugin = (): StrandsPlugin =>
+      new StrandsPlugin({ models: { test: () => new CountingModel([textTurn('hello')]) } });
+    const worker = await createWorker({ plugins: [plugin()], maxCachedWorkflows: 0 });
+    const history = await worker.runUntil(async () => {
+      const handle = await startWorkflow(agentWithCancelSignal, {
+        args: [mode],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      t.deepEqual(await handle.result(), {
+        stopReason: mode === 'active' ? 'endTurn' : 'cancelled',
+        isAbortSignal: true,
+      });
+      return handle.fetchHistory();
+    });
+    t.is(modelCalls, mode === 'active' ? 1 : 0);
+    await Worker.runReplayHistory({ workflowBundle: t.context.workflowBundle, plugins: [plugin()] }, history);
+    t.is(modelCalls, mode === 'active' ? 1 : 0);
+  });
+}
 
 for (const streaming of [false, true]) {
   const path = streaming ? 'invokeModelStreaming' : 'invokeModel';
@@ -88,6 +153,11 @@ for (const cancellationType of [
       // The model's signal aborts while the worker runs, not because it shuts down.
       await aborted;
       const { events } = await handle.fetchHistory();
+      // The heartbeat timeout set on the agent wins. The config read can't heartbeat, so it gets none.
+      t.deepEqual(heartbeatTimeouts(events), [
+        ['strandsGetModelConfig', 0],
+        ['invokeModel', 5_000],
+      ]);
       t.true(events!.some((e) => e.activityTaskCancelRequestedEventAttributes), 'expected ActivityTaskCancelRequested');
       t.false(events!.some((e) => e.workflowTaskFailedEventAttributes), 'expected no WorkflowTaskFailed');
       t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');

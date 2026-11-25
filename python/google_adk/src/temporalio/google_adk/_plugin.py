@@ -17,10 +17,7 @@ import opentelemetry.metrics
 import opentelemetry.trace
 
 from temporalio import workflow
-from temporalio.contrib.pydantic import (
-    PydanticPayloadConverter,
-    ToJsonOptions,
-)
+from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.google_adk._model import (
     invoke_model,
@@ -112,10 +109,6 @@ def _warn_if_global_otel_providers_not_replay_safe() -> None:
 def setup_deterministic_runtime():
     """Configures ADK runtime for Temporal determinism.
 
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Installs Temporal-aware time, uuid, and random providers as the
     process-wide defaults for ADK's ``google.adk.platform`` seams. Inside a
     workflow they derive from ``workflow.now()`` / ``workflow.uuid4()`` /
@@ -168,10 +161,6 @@ def setup_deterministic_runtime():
 
 class GoogleAdkPlugin(SimplePlugin):
     """A Temporal Worker Plugin configured for ADK.
-
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
 
     This plugin configures:
     - Pydantic Payload Converter (required for ADK objects).
@@ -284,16 +273,9 @@ class GoogleAdkPlugin(SimplePlugin):
         self, converter: DataConverter | None
     ) -> DataConverter:
         if converter is None:
-            return DataConverter(payload_converter_class=_AdkPayloadConverter)
+            return DataConverter(payload_converter_class=PydanticPayloadConverter)
         elif converter.payload_converter_class is DefaultPayloadConverter:
             return dataclasses.replace(
-                converter, payload_converter_class=_AdkPayloadConverter
+                converter, payload_converter_class=PydanticPayloadConverter
             )
         return converter
-
-
-class _AdkPayloadConverter(PydanticPayloadConverter):
-    """PayloadConverter for Google ADK that strips unset None fields."""
-
-    def __init__(self) -> None:
-        super().__init__(ToJsonOptions(exclude_unset=True))

@@ -1,11 +1,12 @@
 """Task result cache for continue-as-new support.
 
-Caches task results by (module.qualname, args, kwargs) hash and by how many
+Caches task results by (task id, args, kwargs, context) hash and by how many
 identical calls the same caller made before in the run, so that previously
 completed calls are not re-executed after a continue-as-new when the run makes
-them again in the same order, while a call repeated within a run executes
-again. The cache state is a plain dict that can travel through
-workflow.continue_as_new().
+them again in the same order. The cache state is a plain dict that can travel
+through workflow.continue_as_new(). Each Workflow run has its own cache, and
+only what an earlier run handed over is served, each entry once, so a call
+repeated in one run executes again.
 """
 
 from __future__ import annotations
@@ -31,18 +32,72 @@ from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.errors import GraphBubbleUp
 from pydantic import BaseModel
 
-_task_cache: ContextVar[dict[str, Any] | None] = ContextVar(
-    "_temporal_task_cache", default=None
-)
-# Per key, how many places calls in this run have taken, and the places given
-# back by calls that stored no result. Neither is part of the cache, so they
-# do not travel through continue-as-new.
-_key_uses: ContextVar[dict[str, int] | None] = ContextVar(
-    "_temporal_task_key_uses", default=None
-)
-_free_places: ContextVar[dict[str, list[int]] | None] = ContextVar(
-    "_temporal_task_free_places", default=None
-)
+from temporalio import workflow
+
+# The attribute of a Workflow's event loop that holds its run's cache. The loop
+# is the Workflow instance, so __init__, run and the handlers of one run share
+# a cache, no other Workflow and no Replayer's instance of the same run sees
+# it, and it is freed with the instance.
+_RUN_CACHE = "_temporal_langgraph_task_cache"
+
+
+class _RunCache:
+    """The task cache of one Workflow run.
+
+    Both dicts map a call's key to its entries in the cache dict: its result
+    or Command, and its value types. ``carried`` holds what an earlier run
+    handed over and this run has not served yet. ``results`` holds the served
+    entries and this run's own results.
+    """
+
+    def __init__(self) -> None:
+        self.carried: dict[str, dict[str, Any]] = {}
+        self.results: dict[str, dict[str, Any]] = {}
+        # Per key, how many places calls in this run have taken, and the
+        # places given back by calls that stored no result. Neither is part
+        # of the cache, so they do not travel through continue-as-new.
+        self.uses: dict[str, int] = {}
+        self.free: dict[str, list[int]] = {}
+        # The keys of results written in this run by calls made in a node or
+        # task call that then failed (see call_scope()). Not part of the
+        # cache either.
+        self.stale: set[str] = set()
+        # Per scope whose last call failed or was interrupted: the LangGraph
+        # task that call ran as, the keys the calls made in it took, those of
+        # earlier attempts resumed from the checkpoint included, and whether
+        # it failed (see call_scope()). Not part of the cache either.
+        self.failed: dict[str, tuple[str | None, list[str], bool]] = {}
+        # Per LangGraph task of an entrypoint invocation that failed, was
+        # cancelled or was interrupted: its place in the enclosing scope if it
+        # is nested, and the places its finished calls held, which it gave
+        # back unless it was interrupted (see invocation_scope()). Not part of
+        # the cache either.
+        self.failed_invocations: dict[str, tuple[str | None, list[str]]] = {}
+
+
+def _run_cache() -> _RunCache:
+    loop = asyncio.get_running_loop()
+    run: _RunCache | None = getattr(loop, _RUN_CACHE, None)
+    if run is None:
+        run = _RunCache()
+        setattr(loop, _RUN_CACHE, run)
+    return run
+
+
+def _counting_run() -> _RunCache | None:
+    """Return the run's cache in a Workflow, or one that set_task_cache() made.
+
+    Calls made elsewhere, such as in a registered graph run by an Activity,
+    are not counted.
+    """
+    if workflow.in_workflow():
+        return _run_cache()
+    try:
+        return getattr(asyncio.get_running_loop(), _RUN_CACHE, None)
+    except RuntimeError:
+        return None
+
+
 # The call of a workflow-side node or task that the current code runs in (see
 # call_scope()), or "" outside one.
 _scope: ContextVar[str] = ContextVar("_temporal_task_scope", default="")
@@ -53,33 +108,32 @@ _taken: ContextVar[list[str] | None] = ContextVar("_temporal_task_taken", defaul
 _returned: ContextVar[list[str] | None] = ContextVar(
     "_temporal_task_returned", default=None
 )
-# Cache entries written in this run by calls made in a node or task call that
-# then failed (see call_scope()). Not part of the cache either.
-_stale: ContextVar[set[str] | None] = ContextVar("_temporal_task_stale", default=None)
-# Per scope whose last call failed or was interrupted: the LangGraph task that
-# call ran as, the keys the calls made in it took, those of earlier attempts
-# resumed from the checkpoint included, and whether it failed (see
-# call_scope()). Not part of the cache either.
-_failed: ContextVar[dict[str, tuple[str | None, list[str], bool]] | None] = ContextVar(
-    "_temporal_task_failed", default=None
-)
-# Per LangGraph task of an entrypoint invocation that failed, was cancelled or
-# was interrupted: its place in the enclosing scope if it is nested, and the
-# places its finished calls held, which it gave back unless it was
-# interrupted (see invocation_scope()). Not part of the cache either.
-_failed_invocations: ContextVar[dict[str, tuple[str | None, list[str]]] | None] = (
-    ContextVar("_temporal_task_failed_invocations", default=None)
-)
 
 
 def set_task_cache(cache: dict[str, Any] | None) -> None:
-    """Set the task result cache for the current context and restart call counting."""
-    _task_cache.set(cache)
-    _key_uses.set({})
-    _free_places.set({})
-    _stale.set(set())
-    _failed.set({})
-    _failed_invocations.set({})
+    """Add a cache from an earlier run to the current run's task cache.
+
+    Entries of a call the run already holds are skipped, so a cache passed
+    again is not served twice and never replaces a newer result.
+    """
+    run = _run_cache()
+    calls: dict[str, dict[str, Any]] = {}
+    for name, value in (cache or {}).items():
+        # A call's entries are named "<key>", "<key>:command" and "<key>:types".
+        calls.setdefault(name.partition(":")[0], {})[name] = value
+    for key, entries in calls.items():
+        if key not in run.results:
+            run.carried.setdefault(key, entries)
+
+
+def get_task_cache() -> dict[str, Any]:
+    """Get the current run's task cache as one dict for the next run."""
+    run = _run_cache()
+    return {
+        name: value
+        for entries in (*run.carried.values(), *run.results.values())
+        for name, value in entries.items()
+    }
 
 
 def occurrence_key(key: str) -> str:
@@ -97,9 +151,10 @@ def occurrence_key(key: str) -> str:
     """
     scope = _scope.get()
     base = f"{key}@{scope}" if scope else key
-    uses, free = _key_uses.get(), _free_places.get()
-    if uses is None or free is None:
+    run = _counting_run()
+    if run is None:
         return base
+    uses, free = run.uses, run.free
     if free.get(base):
         n = heappop(free[base])
     else:
@@ -119,10 +174,10 @@ def release(key: str) -> None:
     scope, such as a retry or the resumed call, takes its place, and after
     continue-as-new the first call gets that call's result.
     """
-    free = _free_places.get()
-    if free is not None:
+    run = _counting_run()
+    if run is not None:
         base, sep, n = key.rpartition("#")
-        heappush(free.setdefault(base if sep else key, []), int(n) if sep else 0)
+        heappush(run.free.setdefault(base if sep else key, []), int(n) if sep else 0)
         returned = _returned.get()
         if returned is not None:
             returned.append(key)
@@ -171,7 +226,8 @@ def invocation_scope(
     a list for a tuple.
     """
     task = _langgraph_task()
-    failed = _failed_invocations.get()
+    run = _counting_run()
+    failed = run.failed_invocations if run is not None else None
     earlier_key: str | None = None
     restored: list[str] = []
     if failed is not None and task is not None and task in failed:
@@ -248,7 +304,8 @@ def call_scope(
     key = occurrence_key(_scope_key(name, args, kwargs or {}))
     scope = sha256(key.encode()).hexdigest()[:16]
     task = _langgraph_task()
-    failed = _failed.get()
+    run = _counting_run()
+    failed = run.failed if run is not None else None
     restored: list[str] = []
     if failed is not None and scope in failed:
         failed_task, failed_keys, abandoned = failed.pop(scope)
@@ -287,17 +344,11 @@ def _langgraph_task() -> str | None:
     return (config.get("metadata") or {}).get("langgraph_checkpoint_ns")
 
 
-def _entries(key: str) -> tuple[str, str, str]:
-    """Return the cache entries a call under ``key`` can write."""
-    return key, f"{key}:command", f"{key}:types"
-
-
 def _retire(keys: list[str]) -> None:
     """Mark the results of the calls under ``keys`` stale."""
-    cache, stale = _task_cache.get(), _stale.get()
-    if cache is not None and stale is not None:
-        for key in keys:
-            stale.update(entry for entry in _entries(key) if entry in cache)
+    run = _counting_run()
+    if run is not None:
+        run.stale.update(key for key in keys if key in run.results)
 
 
 def _reclaim(keys: list[str]) -> None:
@@ -307,13 +358,13 @@ def _reclaim(keys: list[str]) -> None:
     so they keep their places, and their results stay for the next run.
     The enclosing call holds those places again too.
     """
-    free, taken = _free_places.get(), _taken.get()
-    if free is None:
+    run, taken = _counting_run(), _taken.get()
+    if run is None:
         return
     for key in keys:
         base, sep, n = key.rpartition("#")
         base, place = (base, int(n)) if sep else (key, 0)
-        places = free.get(base)
+        places = run.free.get(base)
         if places and place in places:
             places.remove(place)
             heapify(places)
@@ -323,19 +374,14 @@ def _reclaim(keys: list[str]) -> None:
 
 def _restart(keys: list[str]) -> None:
     """Count the calls under ``keys`` from their first place again."""
-    uses, free = _key_uses.get(), _free_places.get()
+    run = _counting_run()
+    if run is None:
+        return
     for key in keys:
         base, sep, _ = key.rpartition("#")
         base = base if sep else key
-        if uses is not None:
-            uses.pop(base, None)
-        if free is not None:
-            free.pop(base, None)
-
-
-def get_task_cache() -> dict[str, Any] | None:
-    """Get the task result cache for the current context."""
-    return _task_cache.get()
+        run.uses.pop(base, None)
+        run.free.pop(base, None)
 
 
 def task_id(func: Any) -> str:
@@ -468,26 +514,28 @@ def cache_key(
     return sha256(key_str.encode()).hexdigest()[:32]
 
 
-def cache_lookup(key: str) -> tuple[bool, Any]:
-    """Return (True, value) if cached, (False, None) otherwise.
+def cache_lookup(key: str) -> dict[str, Any] | None:
+    """Return the entries an earlier run cached for the call ``key``, or None.
 
-    A stale entry (see :func:`call_scope`) misses: the call is being made
-    again, so its old entries are dropped and it runs.
+    They are served once: they move to this run's results, so they still
+    travel to the next run, and a repeat of the call executes. A stale
+    result (see :func:`call_scope`) is dropped: the call is being made
+    again, so it runs. The run still holds the call, so a cache passed
+    again does not bring the result back.
     """
-    cache = _task_cache.get()
-    if cache is None or key not in cache:
-        return False, None
-    stale = _stale.get()
-    if stale and key in stale:
-        for entry in _entries(key.split(":", 1)[0]):
-            cache.pop(entry, None)
-            stale.discard(entry)
-        return False, None
-    return True, cache[key]
+    run = _run_cache()
+    if key in run.stale:
+        run.stale.discard(key)
+        run.results[key] = {}
+        return None
+    entries = run.carried.pop(key, None)
+    if entries is not None:
+        run.results[key] = entries
+    return entries
 
 
-def cache_put(key: str, value: Any) -> None:
-    """Store a value in the task result cache."""
-    cache = _task_cache.get()
-    if cache is not None:
-        cache[key] = value
+def cache_put(key: str, entries: dict[str, Any]) -> None:
+    """Store this run's result of the call ``key``, replacing an earlier one."""
+    run = _run_cache()
+    run.carried.pop(key, None)
+    run.results[key] = entries

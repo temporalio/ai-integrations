@@ -25,10 +25,6 @@ from ._model_activity import (
     _StreamingInvokeModelInput,
 )
 
-# Patch id for rebuilding ContextWindowOverflowException from a failed model Activity.
-# Never change it: it is recorded in histories as a marker.
-_CONTEXT_WINDOW_OVERFLOW_PATCH = "strands-agents.context-window-overflow-recovery"
-
 
 def _filter_serializable(state: dict[str, Any]) -> dict[str, Any]:
     """Keep invocation_state entries that JSON-serialize; drop the rest with a debug log."""
@@ -56,6 +52,13 @@ class TemporalModel(Model):
     ``TemporalModel`` itself does no I/O, so it is safe to instantiate at
     module level.
 
+    ``heartbeat_timeout`` defaults to 10 seconds. The model activities heartbeat
+    on a timer at half of it, so a cancel reaches a running model call and a lost
+    worker is noticed. Pass ``heartbeat_timeout=None`` to turn heartbeats off.
+    The timer runs on the worker's event loop, so a model factory or model call
+    that blocks the loop for longer than the timeout fails with a heartbeat
+    timeout (see the README).
+
     When ``streaming_topic`` is set, each ``StreamEvent`` is also published to
     the named topic on the workflow's
     :class:`temporalio.contrib.workflow_streams.WorkflowStream` for external
@@ -70,7 +73,7 @@ class TemporalModel(Model):
         schedule_to_close_timeout: timedelta | None = None,
         schedule_to_start_timeout: timedelta | None = None,
         start_to_close_timeout: timedelta | None = None,
-        heartbeat_timeout: timedelta | None = None,
+        heartbeat_timeout: timedelta | None = timedelta(seconds=10),
         retry_policy: RetryPolicy | None = None,
         cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL,
         versioning_intent: VersioningIntent | None = None,
@@ -137,11 +140,14 @@ class TemporalModel(Model):
         await asyncio.shield(self._config_load)
 
     async def _read_config(self) -> None:
+        # The config read runs synchronously, so it can't heartbeat.
+        options = dict(self._options)
+        options["heartbeat_timeout"] = None
         try:
             result: _ModelConfig = await workflow.execute_activity_method(
                 ModelActivity.get_model_config,
                 _ModelConfigInput(model_name=self._model_name),
-                **self._options,
+                **options,
             )
         except BaseException:
             self._config_load = None
@@ -234,14 +240,11 @@ class TemporalModel(Model):
             # Model providers raise ContextWindowOverflowException when the prompt is
             # too long, and Strands recovers by reducing the conversation and retrying.
             # The activity fails with a typed ApplicationError, so rebuild the Strands
-            # exception here, where Strands' event loop can catch it. Histories recorded
-            # before this change let the ActivityError propagate, and a Workflow may have
-            # handled it by scheduling other work, so they keep that behavior.
+            # exception here, where Strands' event loop can catch it.
             cause = error.__cause__
             if (
                 isinstance(cause, ApplicationError)
                 and cause.type == ContextWindowOverflowException.__name__
-                and workflow.patched(_CONTEXT_WINDOW_OVERFLOW_PATCH)
             ):
                 raise ContextWindowOverflowException(cause.message) from error
             raise

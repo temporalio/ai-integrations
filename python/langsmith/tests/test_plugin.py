@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import time
 import uuid
 from typing import Any
 from unittest.mock import MagicMock
@@ -56,6 +57,25 @@ class TestPluginConstruction:
     def test_reports_package_version(self) -> None:
         plugin = LangSmithPlugin(client=MagicMock())
         assert plugin.version() == importlib.metadata.version("temporalio-langsmith")
+
+    async def test_shutdown_flushes_after_queued_writes(self) -> None:
+        events: list[str] = []
+        client = MagicMock()
+        client.flush.side_effect = lambda: events.append("flush")
+        plugin = LangSmithPlugin(client=client)
+        assert plugin.interceptors is not None
+        assert plugin.run_context is not None
+        interceptor = plugin.interceptors[0]
+        assert isinstance(interceptor, LangSmithInterceptor)
+
+        def slow_write() -> None:
+            time.sleep(0.05)
+            events.append("write")
+
+        async with plugin.run_context():
+            interceptor._executor.submit(slow_write)
+
+        assert events == ["write", "flush"]
 
 
 class TestPluginIntegration:

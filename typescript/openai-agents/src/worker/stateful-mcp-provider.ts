@@ -17,7 +17,14 @@ import {
   type StatefulMcpServerSessionArgs,
 } from '../common/mcp-types';
 import { startAdaptiveHeartbeat } from './heartbeat';
-import { callToolWithMeta, filterListedTools, rejectCallableToolFilter, rejectToolMetaResolver } from './mcp-provider';
+import {
+  assertMCPServer,
+  assertMCPServerFactory,
+  callToolWithMeta,
+  filterListedTools,
+  rejectCallableToolFilter,
+  rejectToolMetaResolver,
+} from './mcp-provider';
 
 export function registerCancelShutdown(ctx: Context, dedicatedWorker: { shutdown: () => void }): void {
   ctx.cancelled.catch(() => {
@@ -273,6 +280,7 @@ export class StatefulMCPServerProvider {
     serverFactory: (factoryArgument?: unknown) => MCPServer,
     nativeConnection: NativeConnection
   ) {
+    assertMCPServerFactory(name, serverFactory);
     this._name = `${name}${MCP_STATEFUL_SUFFIX}`;
     this._serverFactory = serverFactory;
     this._nativeConnection = nativeConnection;
@@ -346,6 +354,7 @@ export class StatefulMCPServerProvider {
         }
 
         const server = this._serverFactory(input?.factoryArgument);
+        assertMCPServer(this.name, server);
 
         try {
           this._servers.set(sid, server);

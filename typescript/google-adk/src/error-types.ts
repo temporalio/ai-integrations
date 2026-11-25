@@ -35,6 +35,14 @@ export const ACTIVITY_TOOL_OUTSIDE_WORKFLOW_FAILURE_TYPE = 'GoogleAdkActivityToo
 export const MCP_TOOL_NOT_FOUND_FAILURE_TYPE = 'GoogleAdkMCPToolNotFound';
 
 /**
+ * Error type when an MCP toolset factory returns something other than a `BaseToolset` or
+ * `MCPConnectionParams` the installed ADK connects. Non-retryable, and raised inside each
+ * MCP Activity, so it arrives wrapped in an `ActivityFailure`: match it through the
+ * `.cause` chain.
+ */
+export const MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE = 'GoogleAdkMCPToolsetFactoryTypeError';
+
+/**
  * Error type for a failed model call. Raised inside an Activity, so it arrives
  * wrapped in an `ActivityFailure`: match it through the `.cause` chain. A request
  * carrying an `adk_agent_name` label, as an ADK agent run's requests do, has its

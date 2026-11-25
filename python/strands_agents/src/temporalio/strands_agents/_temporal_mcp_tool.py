@@ -23,7 +23,7 @@ from strands.types.tools import ToolGenerator, ToolResultContent, ToolUse
 
 from temporalio.exceptions import ActivityError, ApplicationError
 
-from ._temporal_activity_tool import _activity_error_event
+from ._temporal_activity_tool import _activity_error_event, _cancel_requests
 
 if TYPE_CHECKING:
     from temporalio.mcp import TemporalMCPClient as DurableMCPClient
@@ -78,11 +78,12 @@ class TemporalMCPTool(MCPAgentTool):
                 _error_result(tool_use_id, "tool input must be a JSON object")
             )
             return
+        cancel_requests = _cancel_requests()
         try:
             result = await self._client.call_tool(self.mcp_tool.name, arguments)
         except ActivityError as error:
             yield _elicitation_event(tool_use_id, error) or _activity_error_event(
-                tool_use_id, error
+                tool_use_id, error, cancel_requests=cancel_requests
             )
             return
         try:

@@ -4,6 +4,7 @@ import { ApplicationFailure } from '@temporalio/common';
 import { TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from '..';
 import { TOOL_FILTER_UNSUPPORTED_TYPE } from '../common/mcp-types';
 import { StatelessMCPServerProvider, filterListedTools } from '../worker/mcp-provider';
+import { StatefulMCPServerProvider } from '../worker/stateful-mcp-provider';
 import { statelessMcpServer } from '../workflow/mcp-client';
 
 function fakeServer(toolFilter: MCPServer['toolFilter'], onConnect = () => {}): MCPServer {
@@ -24,6 +25,61 @@ function fakeServer(toolFilter: MCPServer['toolFilter'], onConnect = () => {}): 
     async invalidateToolsCache() {},
   };
 }
+
+test('StatelessMCPServerProvider rejects invalid factory results before connecting or closing', async (t) => {
+  let connects = 0;
+  let closes = 0;
+  const incompleteServer = {
+    ...fakeServer(undefined, () => connects++),
+    async close() {
+      closes++;
+    },
+    callTool: undefined,
+  };
+  const invalidResults: [unknown, string][] = [
+    [undefined, 'undefined'],
+    [null, 'null'],
+    [42, 'number'],
+    [{}, 'Object'],
+    [Promise.resolve(fakeServer(undefined)), 'Promise'],
+    [incompleteServer, 'Object'],
+  ];
+  for (const [value, kind] of invalidResults) {
+    const activities = new StatelessMCPServerProvider('files', () => value as MCPServer)._getActivities();
+    for (const name of ['files-stateless-list-tools', 'files-stateless-call-tool']) {
+      const err = await t.throwsAsync(activities[name]!({ toolName: 'read', args: {} }), {
+        instanceOf: ApplicationFailure,
+      });
+      t.is(err?.type, 'MCPServerFactoryTypeError');
+      t.true(err?.nonRetryable);
+      t.is(
+        err?.message,
+        `MCP server factory 'files' returned ${kind}, ` +
+          'not a server with connect(), close(), listTools() and callTool() methods.'
+      );
+    }
+  }
+  t.is(connects, 0);
+  t.is(closes, 0);
+});
+
+test('MCP server providers refuse a factory that is not a function when they are built', (t) => {
+  const invalidFactories: [unknown, string][] = [
+    [undefined, 'undefined'],
+    [null, 'null'],
+    [42, 'number'],
+    [fakeServer(undefined), 'Object'],
+  ];
+  for (const [value, kind] of invalidFactories) {
+    const factory = value as () => MCPServer;
+    for (const build of [
+      () => new StatelessMCPServerProvider('files', factory),
+      () => new StatefulMCPServerProvider('files', factory, undefined as never),
+    ]) {
+      t.throws(build, { instanceOf: TypeError, message: `MCP server factory 'files' is ${kind}, not a function.` });
+    }
+  }
+});
 
 test('filterListedTools applies a static filter with the agent SDK rules', (t) => {
   const tools = ['read', 'read_all', 'delete'].map((name) => ({ name }));

@@ -38,11 +38,14 @@ from temporalio.client import Client
 from temporalio.common import RetryPolicy
 from temporalio.langgraph import LangGraphPlugin, cache, graph
 from temporalio.langgraph._task_cache import (
+    _RUN_CACHE,
+    _RunCache,
     cache_key,
     cache_lookup,
     cache_put,
     call_scope,
     get_task_cache,
+    invocation_scope,
     occurrence_key,
     release,
     set_task_cache,
@@ -454,10 +457,16 @@ def test_cache_key_reads_values():
     assert cache_key("task", ({"a"},), {}) != cache_key("task", (["a"],), {})
 
 
-def _occurrence_keys() -> None:
+def _new_run(cache: dict[str, Any] | None = None) -> None:
+    """Start a new run on this event loop that got ``cache`` from the last one."""
+    setattr(asyncio.get_running_loop(), _RUN_CACHE, _RunCache())
+    set_task_cache(cache)
+
+
+async def _occurrence_keys() -> None:
     key = cache_key("task", ("job-42",), {})
     other = cache_key("task", ("job-43",), {})
-    set_task_cache({})
+    _new_run()
     # The first call keeps the key earlier versions wrote, so caches they
     # carried through continue-as-new still hit; each repeat gets its own.
     assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#2"]
@@ -470,12 +479,15 @@ def _occurrence_keys() -> None:
         second = occurrence_key(key)
     assert first[0].startswith(f"{key}@") and first[1] == f"{first[0]}#1"
     assert second not in (key, first[0])
-    # graph() and entrypoint() start counting again.
+    # A run counts on when graph() or entrypoint() is called again, and the
+    # next run starts counting again.
     set_task_cache({})
+    assert occurrence_key(key) == f"{key}#3"
+    _new_run()
     assert occurrence_key(key) == key
     # A call that failed or was interrupted stored no result, so the next
     # identical call takes its place. Places go back lowest first.
-    set_task_cache({})
+    _new_run()
     calls = [occurrence_key(key) for _ in range(3)]
     release(calls[1])
     release(calls[0])
@@ -486,12 +498,12 @@ def _occurrence_keys() -> None:
     inner: list[str] = []
     with pytest.raises(ValueError), call_scope("node"):
         inner.append(occurrence_key(key))
-        cache_put(inner[0], "failed attempt")
+        cache_put(inner[0], {inner[0]: "failed attempt"})
         raise ValueError
     assert get_task_cache() == {inner[0]: "failed attempt"}
     with call_scope("node"):
         assert occurrence_key(key) == inner[0]
-        assert cache_lookup(inner[0]) == (False, None)
+        assert cache_lookup(inner[0]) is None
     assert get_task_cache() == {}
     # An interrupted one keeps them: the resumed call counts on.
     with pytest.raises(GraphInterrupt), call_scope("node"):
@@ -501,54 +513,71 @@ def _occurrence_keys() -> None:
         assert occurrence_key(key) == f"{inner[1]}#1"
     # A call that the failed call's retry doesn't make, because LangGraph
     # got its result from a checkpoint, keeps the result for the next run.
-    set_task_cache({})
+    _new_run()
     kept: list[str] = []
     with pytest.raises(ValueError), call_scope("node"):
         kept.append(occurrence_key(other))
-        cache_put(kept[0], "finished")
+        cache_put(kept[0], {kept[0]: "finished"})
         raise ValueError
     with call_scope("node"):
         pass
-    set_task_cache(get_task_cache())
+    _new_run(get_task_cache())
     with call_scope("node"):
         assert occurrence_key(other) == kept[0]
-    assert cache_lookup(kept[0]) == (True, "finished")
+    assert cache_lookup(kept[0]) == {kept[0]: "finished"}
     # When LangGraph runs a failed call again from its checkpoint, as the
     # same task, the calls made in it keep their places: one it restores
     # from the checkpoint is not made again, and the one that failed takes
     # the place it gave back.
-    set_task_cache({})
+    _new_run()
     token = var_child_runnable_config.set(
         RunnableConfig(metadata={"langgraph_checkpoint_ns": "node:1"})
     )
     done: list[str] = []
     with pytest.raises(ValueError), call_scope("node"):
         done.append(occurrence_key(key))
-        cache_put(done[0], "finished")
+        cache_put(done[0], {done[0]: "finished"})
         release(occurrence_key(key))
         raise ValueError
     with call_scope("node"):
         assert occurrence_key(key) == f"{done[0]}#1"
     var_child_runnable_config.reset(token)
-    set_task_cache(get_task_cache())
-    assert cache_lookup(done[0]) == (True, "finished")
+    _new_run(get_task_cache())
+    assert cache_lookup(done[0]) == {done[0]: "finished"}
     # Calls with other input count apart, so a failed call never shares a
     # scope with a call that has other input.
-    set_task_cache({})
+    _new_run()
     with call_scope("node", ("a",)):
         first = [occurrence_key(key)]
     with call_scope("node", ("b",)):
         assert occurrence_key(key) != first[0]
     # A scope's place is not a place of an Activity call with the same name
     # and input.
-    set_task_cache({})
+    _new_run()
     with call_scope("task", ("job-42",)):
         pass
     assert occurrence_key(key) == key
+    # A carried result is served once, even when an entrypoint invoked again
+    # after a failure is given the same cache again: its retried call runs.
+    _new_run({key: "carried"})
+    with pytest.raises(ValueError), invocation_scope("entry"):
+        assert cache_lookup(occurrence_key(key)) == {key: "carried"}
+        raise ValueError
+    with pytest.raises(ValueError), invocation_scope("entry"):
+        retry = occurrence_key(key)
+        assert cache_lookup(retry) is None
+        release(retry)
+        raise ValueError
+    set_task_cache({key: "carried"})
+    assert cache_lookup(occurrence_key(key)) is None
 
 
 def test_repeated_calls_get_their_own_keys():
-    copy_context().run(_occurrence_keys)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_occurrence_keys())
+    finally:
+        loop.close()
 
 
 async def _wrapped_scope(injected: frozenset[str], **kwargs: Any) -> str:
@@ -575,10 +604,18 @@ def test_injected_keywords_are_not_input():
 
 
 def _scope(*args: Any) -> str:
-    """Return the key of a call made in a ``call_scope()`` with ``args``."""
-    set_task_cache({})
-    with call_scope("node", args):
-        return occurrence_key("key")
+    """Return the key of a call made in a ``call_scope()`` with ``args``, in a new run."""
+
+    async def call() -> str:
+        set_task_cache({})
+        with call_scope("node", args):
+            return occurrence_key("key")
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(call())
+    finally:
+        loop.close()
 
 
 def _scopes_read_values() -> None:
@@ -605,17 +642,17 @@ def test_scopes_read_values():
 
 
 _SCOPE_IN_NEW_PROCESS = """
+import asyncio
 import json
-from contextvars import copy_context
 from temporalio.langgraph._task_cache import call_scope, occurrence_key, set_task_cache
 
-def scope():
+async def scope():
     set_task_cache({})
     state = {"tags": {"a", "b", "c"}, frozenset({"x", "y"}): json.dumps, "client": object()}
     with call_scope("node", (state,)):
         return occurrence_key("key")
 
-print(copy_context().run(scope))
+print(asyncio.run(scope()))
 """
 
 
@@ -726,37 +763,38 @@ async def test_graph_continue_as_new_cached_factory_nodes(client: Client):
 
 
 @dataclass
-class LegacyKeyInput:
+class NodeKeyInput:
     value: int
     cache: dict[str, Any] | None = None
     phase: int = 1
 
 
 @workflow.defn
-class LegacyKeyWorkflow:
+class NodeKeyWorkflow:
     """Runs the one-node graph, continuing-as-new once with the cache."""
 
     @workflow.run
-    async def run(self, input_data: LegacyKeyInput) -> dict[str, Any]:
-        app = graph("cached-legacy-id", cache=input_data.cache).compile()
+    async def run(self, input_data: NodeKeyInput) -> dict[str, Any]:
+        app = graph("cached-node-id", cache=input_data.cache).compile()
         state = await app.ainvoke({"value": input_data.value})
 
         if input_data.phase < 2:
             workflow.continue_as_new(
-                LegacyKeyInput(value=input_data.value, cache=cache(), phase=2)
+                NodeKeyInput(value=input_data.value, cache=cache(), phase=2)
             )
 
         return {"state": state, "cache": cache()}
 
 
-async def test_graph_continue_as_new_cached_module_qualname_key(client: Client):
-    """A module-level node keeps its pre-change ``module.qualname`` cache id.
+async def test_graph_continue_as_new_cached_node_key(client: Client):
+    """A Graph API node's cache entries are keyed by its activity name.
 
-    The entry is seeded exactly as an earlier version would have written
-    it — ``cache_key`` over the function's ``module.qualname``, its args,
-    and its context — so a node whose cache was populated before this
-    change is still honoured after continue-as-new. The seeded result (41)
-    differs from a real execution (20 * 2) so a cache miss is observable.
+    The seeded key is written out, so a change to the node's id, to the
+    arguments that go into the key or to the hash fails here: a run that
+    carries a cache through continue-as-new needs the same keys to replay.
+    The function's ``module.qualname``, which keyed a module-level node's
+    entries before, is not read any more. The seeded results (41 and 13)
+    differ from a real execution (20 * 2) so a cache miss is observable.
     """
     _reset()
     metadata = {
@@ -768,20 +806,25 @@ async def test_graph_continue_as_new_cached_module_qualname_key(client: Client):
     g.add_edge(START, "double")
 
     initial = {"value": 20}
-    legacy_id = f"{double.__module__}.{double.__qualname__}"
-    seeded = {cache_key(legacy_id, (initial,), {}, None): {"value": 41}}
+    key = "ec9773a01c5b8f9ceaf0ee9d1d1f93ed"
+    assert key == cache_key("graph-node:cached-node-id.double", (initial,), {}, None)
+    qualname_id = f"{double.__module__}.{double.__qualname__}"
+    seeded = {
+        key: {"value": 41},
+        cache_key(qualname_id, (initial,), {}, None): {"value": 13},
+    }
 
-    task_queue = f"graph-cached-legacy-id-{uuid4()}"
+    task_queue = f"graph-cached-node-id-{uuid4()}"
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[LegacyKeyWorkflow],
-        plugins=[LangGraphPlugin(graphs={"cached-legacy-id": g})],
+        workflows=[NodeKeyWorkflow],
+        plugins=[LangGraphPlugin(graphs={"cached-node-id": g})],
     ):
         result = await client.execute_workflow(
-            LegacyKeyWorkflow.run,
-            LegacyKeyInput(value=20, cache=seeded),
-            id=f"graph-cached-legacy-id-{uuid4()}",
+            NodeKeyWorkflow.run,
+            NodeKeyInput(value=20, cache=seeded),
+            id=f"graph-cached-node-id-{uuid4()}",
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=20),
         )

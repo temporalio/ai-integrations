@@ -195,7 +195,7 @@ def test_npm_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     assert save["with"]["overwrite"] is True
 
 
-@pytest.mark.parametrize("language", ["python", "java", "go", "typescript"])
+@pytest.mark.parametrize("language", ["python", "java", "go", "typescript", "dotnet"])
 def test_release_events_do_not_share_concurrency_between_workflows(language: str) -> None:
     workflow = yaml.safe_load(WORKFLOW.with_name(f"release-{language}.yml").read_text())
     assert workflow["concurrency"]["group"].startswith("${{ github.workflow }}-")

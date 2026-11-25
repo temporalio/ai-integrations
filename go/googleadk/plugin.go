@@ -17,7 +17,8 @@ import (
 
 // NewPlugin wires the integration as a Temporal worker plugin: it builds the
 // worker-side Activities from cfg, registers them at worker start, and closes
-// the cached MCP toolsets at worker stop. Add it to worker.Options.Plugins:
+// the cached MCP toolsets after the worker has stopped. Add it to
+// worker.Options.Plugins:
 //
 //	adkPlugin, err := googleadk.NewPlugin(googleadk.Config{
 //		Models:      map[string]googleadk.ModelFactory{ /* ... */ },
@@ -50,7 +51,7 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 	// run-context hooks fire once per workflow replay too. replayerKeys records
 	// which run contexts are replays so RunContextAfter never closes the
 	// worker's shared toolsets on a replay: Close is terminal, so closing there
-	// would fail every later MCP Activity on the worker non-retryably. Entries
+	// would fail every later MCP Activity attempt on the worker. Entries
 	// are counted, not merely set, because every replay on one replayer shares
 	// its instance key — concurrent replays must each pair their own
 	// before/after without the last one falling through to Close.
@@ -98,6 +99,8 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 			if replay {
 				return
 			}
+			// versionedPlugin.StopWorker runs this hook after the worker has
+			// stopped.
 			_ = acts.Close()
 		},
 	})
@@ -108,8 +111,19 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 }
 
 // versionedPlugin adds Version, which SDKs that report plugin versions in
-// worker heartbeats call. Older SDKs ignore it.
+// worker heartbeats call. Older SDKs ignore it. Its StopWorker closes the MCP
+// toolsets after the worker has stopped, not before.
 type versionedPlugin struct{ *temporal.SimplePlugin }
+
+// StopWorker stops the worker first and then runs the plugin's stop hook,
+// which closes the MCP toolsets. SimplePlugin's own StopWorker runs the hook
+// before the worker stops, while the worker can still start MCP Activities.
+func (p versionedPlugin) StopWorker(ctx context.Context, options worker.PluginStopWorkerOptions, next func(context.Context, worker.PluginStopWorkerOptions)) {
+	next(ctx, options)
+	// The worker has stopped, so the embedded StopWorker only has the hook
+	// left to run.
+	p.SimplePlugin.StopWorker(ctx, options, func(context.Context, worker.PluginStopWorkerOptions) {})
+}
 
 // Version returns this module's version without the leading "v", or "" when
 // the build has no version for it.

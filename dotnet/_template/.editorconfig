@@ -1,0 +1,29 @@
+# Canonical .editorconfig for every plugin under dotnet/. scripts/ci/check_conventions.py keeps each
+# plugin's copy byte-identical to this file, so `dotnet format` gives the same answer in every plugin.
+# Project-wide analyzer severities live in dotnet/_shared/analyzers.globalconfig. Each entry here is
+# either a gate whose comment states the probe that shows it live (charset, end_of_line and
+# insert_final_newline: an injected violation with and without the entry) or the editor baseline for
+# the files `dotnet format` never touches (`scripts/dev/narrow_dotnet_analyzers.py measure`,
+# temporalio/ai-integrations#523). Every formatting and style preference was removed because removing
+# it on its own changed neither `make lint` nor the build, so C# follows the Roslyn defaults. A
+# path-scoped rule, should a plugin ever need one, goes in its own section below.
+root = true
+
+[*]
+# UTF-8 without a BOM: `dotnet format` rejects a BOM only while this is set (CHARSET).
+charset = utf-8
+# LF, matching .gitattributes: `dotnet format` rejects CRLF only while this is set (ENDOFLINE).
+end_of_line = lf
+# StyleCop SA1518 reads this: without it a C# file may end without a newline in both build and lint.
+insert_final_newline = true
+# Editor baseline for the non-C# files (csproj, props, json, yml, md); for C#, StyleCop SA1028 and
+# SA1027 report trailing whitespace and tabs whether or not these are set.
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{csproj,props,targets,slnx,config,xml,json,yml,yaml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false

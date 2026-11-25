@@ -18,11 +18,14 @@ import dataclasses
 import importlib
 import warnings
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, is_cancelled_exception
+
+if TYPE_CHECKING:
+    from langchain_core.language_models import ModelProfile
 
 # Reserved key under which the CAN result cache rides inside a state snapshot.
 _CACHE_KEY = "__temporal_cache__"
@@ -264,6 +267,10 @@ async def run_deep_agent(
 ) -> Any:
     """Drive ``agent.ainvoke(input)`` with continue-as-new state carry.
 
+    .. warning::
+        Continue-as-new through this function is experimental. When it
+        triggers and what the snapshot holds may change in future versions.
+
     Once a completed turn leaves pending todos and history has grown past the
     limit, its messages and state files are carried into a fresh run via
     ``workflow.continue_as_new``. Todos are not restored as state:
@@ -309,6 +316,10 @@ async def run_deep_agent(
         # workflow-failure type rather than the framework's generic exception.
         cause = exc.__cause__
         if cause is not None and workflow.is_failure_exception(cause):
+            if is_cancelled_exception(cause) and workflow.patched(
+                "deepagents.raise-cancellation"
+            ):
+                raise cause
             raise DeepAgentsWorkflowError(f"Deep Agents run failed: {exc}") from cause
         raise
 
@@ -329,8 +340,8 @@ async def run_deep_agent(
                 carried = _extract_messages(input)
             else:
                 carried = _as_message_list(input)
-        # The snapshot goes through the payload converter, which would drop
-        # each message's type; carry messages in their dumpd form instead.
+        # The continued run decodes the snapshot as a dict, where a message
+        # would be a dict of its fields; carry messages in their dumpd form.
         snapshot: dict[str, Any] = {"messages": _serde.dump_carried_messages(carried)}
         files: Any = result.get("files")
         if isinstance(files, Mapping):
@@ -427,7 +438,9 @@ def create_temporal_deep_agent(
     elif activity_options is not None:
         if isinstance(model, TemporalModel):
             model = TemporalModel(
-                model=model.model, activity_options=dict(activity_options)
+                model=model.model,
+                activity_options=dict(activity_options),
+                profile=model.profile,
             )
         else:
             raise ValueError(
@@ -440,3 +453,24 @@ def create_temporal_deep_agent(
     else:
         kwargs["model"] = model
     return deepagents_mod.create_deep_agent(*args, **kwargs)
+
+
+async def get_model_profile(
+    model: str, *, activity_options: Mapping[str, Any] | None = None
+) -> ModelProfile | None:
+    """Return the LangChain profile of the Worker's model ``model`` from an Activity.
+
+    Deep Agents sizes summarization from ``model.profile`` (``max_input_tokens``),
+    and only the model name reaches the Workflow. Await this before building the
+    agent and pass the result to ``TemporalModel(profile=...)``. The profile is
+    recorded in History, so a later change on the Worker does not affect runs in
+    flight. The Activity runs with the model's activity options, overridden by
+    ``activity_options``.
+    """
+    from temporalio.deepagents._model import _resolve_activity_options
+
+    return await workflow.execute_activity(
+        _activity.GET_MODEL_PROFILE,
+        model,
+        **_resolve_activity_options(model, activity_options),
+    )

@@ -1,4 +1,4 @@
-import { address } from 'langsmith';
+import { AgentAddress } from 'langsmith';
 import type { RunTreeConfig } from 'langsmith/run_trees';
 import { traceable } from 'langsmith/traceable';
 import { createNexusServiceClient, executeChild, proxyActivities, workflowInfo } from '@temporalio/workflow';
@@ -6,7 +6,7 @@ import type * as activities from '../activities/routing';
 import { comprehensiveNexusService } from '../stubs/nexus';
 
 export const ROUTING_ENDPOINT = 'langsmith-routing-endpoint';
-export const ROUTING_ADDRESS = address.agent('support', 'staging');
+export const ROUTING_ADDRESS = { ...new AgentAddress('support', 'staging') };
 
 const { routingActivity } = proxyActivities<typeof activities>({ startToCloseTimeout: '30 seconds' });
 

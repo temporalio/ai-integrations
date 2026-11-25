@@ -35,7 +35,8 @@ type MCPToolsetOptions struct {
 	ToolFilter tool.Predicate
 	// ActivityOptions overrides the per-call Activity options for the ListMcpTools
 	// and CallMcpTool Activities. A zero StartToCloseTimeout falls back to the
-	// default one-minute tool timeout.
+	// default one-minute tool timeout, and a zero HeartbeatTimeout to 10
+	// seconds. A negative HeartbeatTimeout turns heartbeats off.
 	ActivityOptions workflow.ActivityOptions
 }
 
@@ -81,14 +82,16 @@ func (m *mcpToolset) Name() string { return m.name }
 // so the toolset and its filter issue them at the same points on every ADK
 // release. They return the list ADK v2.5.0 and earlier keep for the whole
 // agent run, even when the MCP server, the filter or another Tools call, such
-// as one from an InstructionProvider, has changed it since: ADK draws a UUID
-// from the workflow's random stream for each tool it keeps before every model
-// step, so the IDs it generates, such as tool confirmation IDs, stay the same
-// on every release. From the second model step, the proxy tools from that
-// list no longer pack themselves, so ProcessRequest alone decides what the
-// model request declares and dispatches. In the first step ADK packs them
-// before ProcessRequest runs, so that request also declares the tools of the
-// first list.
+// as one from an InstructionProvider, has changed it since. ADK draws a UUID
+// for each tool it keeps before every model step. Each model call starts a new
+// UUID generator, so these draws reach the IDs ADK generates, such as tool
+// confirmation IDs, only in the cases NewContext names, such as a response an
+// ADK plugin or BeforeModelCallbacks entry supplies instead of the model.
+// There, returning the first list keeps those IDs the same on every release.
+// From the second model step, the proxy tools from that list no longer pack
+// themselves, so ProcessRequest alone decides what the model request declares
+// and dispatches. In the first step ADK packs them before ProcessRequest runs,
+// so that request also declares the tools of the first list.
 //
 // One case still keeps different lists on different releases: an agent that
 // reaches the same toolset more than once, for example directly and through
@@ -139,7 +142,8 @@ func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	if !ok {
 		return nil, errMissingContext
 	}
-	actx := workflow.WithActivityOptions(wfCtx, resolveToolActivityOptions(m.activityOptions, ""))
+	ao := resolveHeartbeatTimeout(resolveToolActivityOptions(m.activityOptions, ""))
+	actx := workflow.WithActivityOptions(wfCtx, ao)
 	var decls []*genai.FunctionDeclaration
 	if err := workflow.ExecuteActivity(actx, ListMcpToolsActivityName, mcpListInput{Toolset: m.name}).Get(wfCtx, &decls); err != nil {
 		return nil, err
@@ -490,7 +494,7 @@ func (t *mcpProxyTool) Run(ctx agent.Context, args any) (map[string]any, error) 
 	if !ok {
 		return nil, errMissingContext
 	}
-	ao := resolveToolActivityOptions(t.activityOptions, "")
+	ao := resolveHeartbeatTimeout(resolveToolActivityOptions(t.activityOptions, ""))
 	ao.Summary = toolSummary(ctx, t.Name())
 	actx := workflow.WithActivityOptions(wfCtx, ao)
 	argsMap, _ := args.(map[string]any)
@@ -555,9 +559,8 @@ type mcpCallOutput struct {
 // {name, description} — lets the model produce well-formed arguments.
 func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*genai.FunctionDeclaration, error) {
 	log := activity.GetLogger(ctx)
-	// No-op unless the user set a HeartbeatTimeout on the toolset's Activity
-	// options; then a slow MCP server (or first-connect) must not be falsely
-	// heartbeat-timed-out and retried. Same rationale as InvokeModel.
+	// Heartbeat on a timer, so a slow MCP server (or first-connect) is not
+	// falsely heartbeat-timed-out and retried. Same rationale as InvokeModel.
 	stopHeartbeats := startPeriodicHeartbeats(ctx)
 	defer stopHeartbeats()
 	ts, err := a.mcpToolset(ctx, in.Toolset)
@@ -598,9 +601,8 @@ func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*gena
 // retryable wrapError.
 func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCallOutput, error) {
 	log := activity.GetLogger(ctx)
-	// No-op unless the user set a HeartbeatTimeout on the toolset's Activity
-	// options; then a slow MCP tool call must not be falsely heartbeat-timed-out
-	// and retried. Same rationale as InvokeModel.
+	// Heartbeat on a timer, so a slow MCP tool call is not falsely
+	// heartbeat-timed-out and retried. Same rationale as InvokeModel.
 	stopHeartbeats := startPeriodicHeartbeats(ctx)
 	defer stopHeartbeats()
 	ts, err := a.mcpToolset(ctx, in.Toolset)
@@ -691,8 +693,9 @@ func (a *Activities) mcpToolset(ctx context.Context, name string) (tool.Toolset,
 	defer a.mcpMu.Unlock()
 	if a.mcpClosed {
 		// Close is terminal: rebuilding here would cache a toolset nothing will
-		// ever close. Non-retryable — the worker is shutting down.
-		return nil, newApplicationError(ErrorTypeMCP, false, nil,
+		// ever close. Retryable, so another worker on the Task Queue can run
+		// the call.
+		return nil, newApplicationError(ErrorTypeMCP, true, nil,
 			"MCP toolsets are closed (Activities.Close was called)")
 	}
 	if ts, ok := a.mcpCache[name]; ok {

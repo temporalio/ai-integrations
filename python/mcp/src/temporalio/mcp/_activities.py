@@ -143,6 +143,32 @@ def _dump(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json")
 
 
+@asynccontextmanager
+async def _heartbeating() -> AsyncGenerator[None, None]:
+    """Heartbeat at half the Activity's heartbeat timeout while the block runs.
+
+    A cancel reaches a running Activity only in a heartbeat's response. The
+    beats come from a timer, not from the request's progress, so a slow request
+    isn't mistaken for a lost worker.
+    """
+    timeout = activity.info().heartbeat_timeout if activity.in_activity() else None
+    if not timeout:
+        yield
+        return
+
+    async def beat(interval: float) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            activity.heartbeat()
+
+    task = asyncio.create_task(beat(timeout.total_seconds() / 2))
+    try:
+        yield
+    finally:
+        # Not awaited: awaiting it here could swallow a cancel of the Activity.
+        task.cancel()
+
+
 def _normalize_list_result(
     value: BaseModel | list[Any], result_type: type[_ListResult], field: str
 ) -> _ListResult:
@@ -178,10 +204,13 @@ class _MCPActivities:
     ) -> _Result:
         has_session = False
         try:
-            async with self._pool.backend(
-                server,
-                factory_argument=request.factory_argument,
-            ) as backend:
+            async with (
+                _heartbeating(),
+                self._pool.backend(
+                    server,
+                    factory_argument=request.factory_argument,
+                ) as backend,
+            ):
                 # Only older-protocol connections have MCP sessions. Each
                 # Activity attempt opens its own, so a retry starts a new one.
                 has_session = not backend.cacheable

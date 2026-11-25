@@ -51,7 +51,9 @@ const a2aCancelTimeout = 5 * time.Second
 //
 // A zero StartToCloseTimeout in ao falls back to one minute, and with no
 // RetryPolicy Temporal retries a failed fetch without limit, including a card
-// file missing on the worker, which another worker or a redeploy can supply.
+// file missing on the worker, which another worker or a redeploy can supply. A
+// zero HeartbeatTimeout falls back to 10 seconds, and a negative one turns
+// heartbeats off.
 func NewA2AAgentCardProvider(source string, ao workflow.ActivityOptions) remoteagent.AgentCardProvider {
 	// A method value, not a func literal, so remoteAgentSendsFromWorkflow can
 	// recognize it: a func literal gets a new code pointer when inlined.
@@ -69,21 +71,27 @@ func (p a2aCardProvider) resolve(ctx context.Context) (*a2a.AgentCard, error) {
 		return nil, errMissingContext
 	}
 	var card a2a.AgentCard
-	if err := executeA2AActivity(wfCtx, p.activityOptions, ResolveA2AAgentCardActivityName, invocationAgentName(ctx), p.source, &card); err != nil {
+	if err := executeA2AActivity(wfCtx, resolveHeartbeatTimeout(p.activityOptions), ResolveA2AAgentCardActivityName, invocationAgentName(ctx), p.source, &card); err != nil {
 		return nil, err
 	}
 	return &card, nil
 }
 
 // NewA2AClientProvider returns a ClientProvider for ADK's remote A2A agent
-// (remoteagent.NewA2A) whose client sends each message in the SendA2AMessage
-// Activity and each cancellation in CancelA2ATask.
+// (remoteagent.NewA2A). Its client sends each message in a SendA2AMessage
+// Activity and each cancellation in a CancelA2ATask Activity, both with ao:
 //
-// A zero StartToCloseTimeout in ao falls back to one minute, and with no
-// RetryPolicy Temporal retries without limit. A send that times out is sent
-// again and starts another remote task, so set a StartToCloseTimeout longer
-// than the remote agent takes to answer. A cancellation gets a single
-// 5-second attempt, as in ADK; the rest of ao applies to it.
+//   - StartToCloseTimeout: one minute when zero. A send that times out is
+//     sent again, which starts another remote task, so set it longer than the
+//     remote agent takes to answer.
+//   - RetryPolicy: when nil, Temporal retries without limit.
+//   - HeartbeatTimeout: 10 seconds when zero. A negative one turns heartbeats
+//     off.
+//
+// A cancellation gets a single 5-second attempt, as in ADK. The server caps its
+// heartbeat timeout at those 5 seconds, and nothing cancels a cancellation, so
+// its heartbeats only tell the server the worker is still there. Only a
+// cancellation slower than about 2.5 seconds sends one.
 //
 // The client sets the message ID from the workflow's random stream when it
 // sends. ADK's BeforeRequestCallbacks run earlier and see the random ID a2a-go
@@ -154,7 +162,7 @@ func (c *a2aClient) send(ctx context.Context, req *a2a.SendMessageRequest, strea
 	}
 	var res a2aSendResult
 	in := a2aSendInput{Card: c.card, Request: req, Stream: stream}
-	err := executeA2AActivity(wfCtx, c.activityOptions, SendA2AMessageActivityName, c.agentName, in, &res)
+	err := executeA2AActivity(wfCtx, resolveHeartbeatTimeout(c.activityOptions), SendA2AMessageActivityName, c.agentName, in, &res)
 	return res, err
 }
 
@@ -166,7 +174,7 @@ func (c *a2aClient) CancelTask(ctx context.Context, req *a2a.CancelTaskRequest) 
 		return nil, errMissingContext
 	}
 	wfCtx, _ = workflow.NewDisconnectedContext(wfCtx)
-	ao := c.activityOptions
+	ao := resolveHeartbeatTimeout(c.activityOptions)
 	ao.StartToCloseTimeout = a2aCancelTimeout
 	ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
 	var task a2a.Task
@@ -211,8 +219,9 @@ type a2aSendResult struct {
 	// Error is the error that ended the stream after Events. It comes back
 	// with the events instead of failing the Activity because the remote agent
 	// has started the task: a retry would send the message again and start a
-	// second one. ADK keeps the events, turns the error into an error event and
-	// cancels the task, as without Temporal.
+	// second one. As without Temporal, ADK keeps the events and cancels the
+	// task. It turns the error into an error event or, from ADK v2.8.0,
+	// returns it from the agent's run.
 	Error string
 }
 
@@ -372,8 +381,9 @@ func appendA2APart(parts a2a.ContentParts, p *a2a.Part) a2a.ContentParts {
 //   - a call that failed with an HTTP status is retried for 408, 409, 429 and
 //     5xx, as a model call is;
 //   - an A2A error the remote agent answers with is not: sending again would
-//     start another task, and ADK turns the failed call into an error event,
-//     as without Temporal;
+//     start another task, and ADK ends the failed call as it does without
+//     Temporal, with an error event or, from ADK v2.8.0, with an error from
+//     the agent's run;
 //   - a card source ADK cannot read, an interface URL that does not parse or
 //     is untrusted, or a reply that is not valid JSON, is not;
 //   - anything else, such as a network error or a card file missing on this
@@ -423,10 +433,11 @@ var defaultA2AClientFactory = a2aclient.NewFactory(
 )
 
 // a2aStatusTransport turns an HTTP error status into an a2aHTTPStatusError, so
-// a2aError can decide retries from the status. a2a-go's JSON-RPC transport
-// reports the status only as text, and its REST transport turns any error body
-// into an A2A error: a JSON one with no A2A reason becomes an internal error,
-// which is not retried, and any other one a server error. A redirect is left
+// a2aError can decide retries from the status. a2a-go's own transports do not
+// expose the status. Depending on the transport and the a2a-go release, an
+// error status comes back as a plain error, which is retried whatever the
+// status, or as an A2A error, which is not retried: a2a-go's REST transport
+// turns a gateway's JSON 503 into an internal error. A redirect is left
 // to the http.Client, which follows it. With keepA2AErrors, an error body that
 // names an A2A error, as a2a-go's REST server writes it, is left to a2a-go,
 // also when it comes as application/a2a+json, the media type the A2A spec
@@ -450,7 +461,7 @@ func (t a2aStatusTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 	_ = resp.Body.Close()
 	if err == nil && isA2AErrorBody(body) {
-		// a2a-go decodes an error body only as application/json.
+		// Before v2.7.0, a2a-go decodes an error body only as application/json.
 		resp.Header.Set("Content-Type", "application/json")
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return resp, nil
@@ -526,8 +537,14 @@ func (e *a2aHTTPStatusError) Error() string { return "unexpected HTTP status: " 
 // model callback that gets past the model-call check: a BeforeModelCallbacks
 // entry that answers instead of the model, or an OnModelErrorCallbacks entry
 // that turns the refusal into a transfer. It sees the agent that an agenttool
-// in an agent's Tools wraps, but not one in its Toolsets, and not the agents
-// below a wrapped agent.
+// in an agent's Tools wraps, but not one in its Toolsets, not the agents
+// below a wrapped agent, and not an agent that is a node of a workflowagent
+// graph.
+//
+// Later 1.x releases may refuse more agent shapes that send from Workflow
+// code, so a tree that passes today may be refused in new runs after an
+// upgrade. A new check will not change how Histories recorded on earlier 1.x
+// releases replay.
 func NewRunnerPlugin(root agent.Agent) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: "googleadk",

@@ -8,6 +8,33 @@ import {
   TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
 } from '../common/mcp-types';
 
+// Names a value for an error message: `undefined`, `null`, `number`, or an object's class, such as `MCPServerStdio`.
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object' && typeof value !== 'function') return typeof value;
+  return (value as { constructor?: { name?: string } }).constructor?.name || typeof value;
+}
+
+/** Refuse a factory that isn't a function when the provider is built, not in every MCP Activity. */
+export function assertMCPServerFactory(name: string, factory: unknown): void {
+  if (typeof factory !== 'function') {
+    throw new TypeError(`MCP server factory '${name}' is ${describeValue(factory)}, not a function.`);
+  }
+}
+
+/** Check that a factory result has the methods the Worker calls. */
+export function assertMCPServer(name: string, server: unknown): asserts server is MCPServer {
+  const methods = ['connect', 'close', 'listTools', 'callTool'] as const;
+  if (server != null && methods.every((method) => typeof (server as MCPServer)[method] === 'function')) return;
+  throw ApplicationFailure.create({
+    message:
+      `MCP server factory '${name}' returned ${describeValue(server)}, ` +
+      'not a server with connect(), close(), listTools() and callTool() methods.',
+    type: 'MCPServerFactoryTypeError',
+    nonRetryable: true,
+  });
+}
+
 /**
  * Fails on a callable `toolFilter` on the server the factory returns. It needs the agent and the
  * run context, which exist only in the Workflow, so the Worker cannot apply it.
@@ -73,6 +100,7 @@ export class StatelessMCPServerProvider {
     public readonly name: string,
     private serverFactory: (factoryArgument?: unknown) => MCPServer
   ) {
+    assertMCPServerFactory(name, serverFactory);
     this._name = `${name}${MCP_STATELESS_SUFFIX}`;
   }
 
@@ -80,6 +108,7 @@ export class StatelessMCPServerProvider {
     return {
       [`${this._name}${MCP_LIST_TOOLS_SUFFIX}`]: async (input?: { factoryArgument?: unknown }) => {
         const s = this.serverFactory(input?.factoryArgument);
+        assertMCPServer(this.name, s);
         rejectCallableToolFilter(s);
         rejectToolMetaResolver(s);
         try {
@@ -96,6 +125,7 @@ export class StatelessMCPServerProvider {
         factoryArgument?: unknown;
       }) => {
         const s = this.serverFactory(input.factoryArgument);
+        assertMCPServer(this.name, s);
         rejectCallableToolFilter(s);
         rejectToolMetaResolver(s);
         try {

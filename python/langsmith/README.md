@@ -1,6 +1,6 @@
 # LangSmith Plugin for Temporal Python SDK
 
-> Release stage: [Public Preview](https://docs.temporal.io/develop/python/integrations/langsmith).
+> Release stage: [Generally Available](https://docs.temporal.io/develop/python/integrations/langsmith).
 
 This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) allows your [LangSmith](https://smith.langchain.com/) traces to work within Temporal Workflows. It propagates trace context across Worker boundaries so that `@traceable` calls, LLM invocations, and Temporal operations show up in a single connected trace, and ensures that replaying does not generate duplicate traces.
 
@@ -218,7 +218,7 @@ my_step
 
 ## Agent and Environment Destinations
 
-With LangSmith 0.14.4 or later, an agent/environment address can select where
+With LangSmith 0.14.10 or later, an agent/environment address can select where
 traces are sent:
 
 ```python
@@ -226,7 +226,7 @@ import langsmith
 from temporalio.langsmith import LangSmithPlugin
 
 plugin = LangSmithPlugin(
-    address=langsmith.address.agent("support", "staging"),
+    address=langsmith.agent_address("support", "staging"),
 )
 ```
 

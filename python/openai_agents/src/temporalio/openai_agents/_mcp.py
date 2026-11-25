@@ -14,7 +14,22 @@ from agents.mcp import MCPServer
 from agents.mcp.server import RequireApprovalSetting
 from mcp import GetPromptResult, ListPromptsResult  # type:ignore
 from mcp import Tool as MCPTool  # type:ignore
-from mcp.types import CallToolResult  # type:ignore
+from mcp.types import (  # type:ignore
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+    CallToolResult,
+)
+
+try:
+    from mcp import (  # type: ignore[attr-defined]  # mcp>=2
+        MCPError as McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
+except ImportError:  # mcp<2
+    from mcp.shared.exceptions import (  # type: ignore[attr-defined,assignment,no-redef]
+        McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1.workflow_pb2 import (
@@ -175,6 +190,30 @@ class _StatelessMCPServerReference(MCPServer):  # type:ignore[reportUnusedClass]
         )
 
 
+# JSON-RPC errors that a retry of the same request cannot fix. INTERNAL_ERROR,
+# timeouts and unknown codes stay retryable. Each stateless activity opens a new
+# connection, so a lost session is retried on a fresh one and needs no exception.
+_NON_RETRYABLE_PROTOCOL_ERRORS = frozenset(
+    {PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS}
+)
+
+
+def _protocol_error(err: McpError) -> ApplicationError:
+    """Convert an MCP protocol error to an ``ApplicationError``.
+
+    Errors a retry cannot fix (invalid request/params, unknown method, parse
+    error) are non-retryable so the activity does not keep retrying them.
+    """
+    error = err.error
+    details = (error.code,) if error.data is None else (error.code, error.data)
+    return ApplicationError(
+        error.message,
+        *details,
+        type="MCPProtocolError",
+        non_retryable=error.code in _NON_RETRYABLE_PROTOCOL_ERRORS,
+    )
+
+
 class StatelessMCPServerProvider:
     """A stateless MCP server implementation for Temporal workflows.
 
@@ -261,6 +300,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.list_tools()
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
@@ -270,6 +311,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.call_tool(args.tool_name, args.arguments, args.meta)
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
@@ -281,6 +324,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.list_prompts()
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
@@ -290,6 +335,8 @@ class StatelessMCPServerProvider:
             try:
                 await server.connect()
                 return await server.get_prompt(args.name, args.arguments)
+            except McpError as err:
+                raise _protocol_error(err) from err
             finally:
                 await server.cleanup()
 
@@ -370,10 +417,6 @@ class _StatefulServerSessionArguments:
 
 # Seconds between heartbeats of the ``-server-session`` activity.
 _HEARTBEAT_INTERVAL = 30.0
-
-# Patch marker of runs whose operations without a schedule-to-start or
-# schedule-to-close timeout follow the session activity.
-_SESSION_WATCH_PATCH = "openai-agents-stateful-mcp-session-watch"
 
 # Seconds the ``-server-session`` activity waits for the server to show its
 # first heartbeat.
@@ -729,16 +772,12 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         schedule_to_start_timeout or schedule_to_close_timeout already ends an
         operation once that worker is gone. Without either, the operation would
         wait forever, so fail it with DedicatedWorkerFailure once the session
-        activity has ended. Only runs with the patch marker do this: runs
-        recorded before it schedule the operation as earlier versions did, so
-        their histories replay.
+        activity has ended.
         """
         session = self._connect_handle
         assert session
-        if (
-            self._config.get("schedule_to_start_timeout")
-            or self._config.get("schedule_to_close_timeout")
-            or not workflow.patched(_SESSION_WATCH_PATCH)
+        if self._config.get("schedule_to_start_timeout") or self._config.get(
+            "schedule_to_close_timeout"
         ):
             return await workflow.execute_activity(
                 activity, args=args, result_type=result_type, **self._config
@@ -900,6 +939,13 @@ class StatefulMCPServerProvider:
             DeprecationWarning,
             stacklevel=2,
         )
+        # Fail when the Worker is built, not in every session Activity.
+        if not callable(server_factory):
+            kind = type(server_factory)  # type: ignore[reportUnreachable]
+            raise TypeError(
+                f"MCP server factory {name!r} is "
+                f"{kind.__module__}.{kind.__qualname__}, not callable"
+            )
         self._server_factory = server_factory
         self._server_name = name
         self._name = name + "-stateful"

@@ -3,19 +3,15 @@ import contextlib
 import contextvars
 import dataclasses
 import sys
-import weakref
-from collections.abc import AsyncIterator, Awaitable, Generator
+from collections.abc import AsyncIterator, Generator
 from typing import Any, Callable
 
 from agents import (
     Agent,
     AgentsException,
-    FunctionTool,
-    Handoff,
     ModelProvider,
     MultiProvider,
     RunConfig,
-    RunContextWrapper,
     RunResult,
     RunResultStreaming,
     RunState,
@@ -35,12 +31,15 @@ from temporalio.openai_agents._errors import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
-    _current_run_model_settings,
     _TemporalModelProvider,
     capture_scope,
     install_model_provider,
 )
-from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._temporal_model_stub import (
+    _current_streamed_run,
+    _StreamedRun,
+    _TemporalModelStub,
+)
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
@@ -137,91 +136,6 @@ async def _wait_for_tool_operations(run: _AgentRun) -> bool:
                     operation.task.cancel()
 
 
-# Recursively replace models in all agents
-def _convert_agent(
-    model_params: ModelActivityParameters,
-    agent: Agent[Any],
-    seen: dict[int, Agent] | None,
-    *,
-    visited: set[int] | None = None,
-) -> Agent[Any]:
-    if seen is None:
-        seen = dict()
-    if visited is None:
-        visited = set()
-
-    new_agent = seen.get(id(agent))
-    if new_agent is not None and id(agent) in visited:
-        return new_agent
-
-    # This agent has already been processed in some other run
-    if isinstance(agent.model, _TemporalModelStub):
-        return agent
-
-    visited.add(id(agent))
-    if new_agent is None:
-        new_agent = dataclasses.replace(agent)
-        seen[id(agent)] = new_agent
-    else:
-        for field in dataclasses.fields(agent):
-            if field.init:
-                setattr(new_agent, field.name, getattr(agent, field.name))
-
-    name = _model_name(agent)
-
-    new_handoffs: list[Agent | Handoff] = []
-    for handoff in agent.handoffs:
-        if isinstance(handoff, Agent):
-            new_handoffs.append(
-                _convert_agent(model_params, handoff, seen, visited=visited)
-            )
-        elif isinstance(handoff, Handoff):
-            original_invoke = handoff.on_invoke_handoff
-
-            # Use default parameter to capture original_invoke by value, not reference
-            async def on_invoke(
-                context: RunContextWrapper[Any],
-                args: str,
-                invoke_func: Callable[
-                    [RunContextWrapper[Any], str], Awaitable[Any]
-                ] = original_invoke,
-            ) -> Agent:
-                handoff_agent = await invoke_func(context, args)
-                return _convert_agent(model_params, handoff_agent, seen)
-
-            new_handoff = dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
-            handoff_agent = (
-                handoff._agent_ref() if handoff._agent_ref is not None else None
-            )
-            if isinstance(handoff_agent, Agent):
-                new_handoff._agent_ref = weakref.ref(
-                    _convert_agent(model_params, handoff_agent, seen, visited=visited)
-                )
-            new_handoffs.append(new_handoff)
-        else:
-            raise TypeError(f"Unknown handoff type: {type(handoff)}")
-
-    new_agent.model = _TemporalModelStub(
-        model_name=name,
-        model_params=model_params,
-        agent=agent,
-        current_run_model_settings=_current_run_model_settings.get,
-    )
-    new_agent.handoffs = new_handoffs
-    new_agent.tools = [
-        dataclasses.replace(
-            tool,
-            _agent_instance=_convert_agent(
-                model_params, tool._agent_instance, seen, visited=visited
-            ),
-        )
-        if isinstance(tool, FunctionTool) and isinstance(tool._agent_instance, Agent)
-        else tool
-        for tool in agent.tools
-    ]
-    return new_agent
-
-
 # True during an agent run, so the Workflow loop runs sync function tools inline.
 _in_agent_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_in_agent_run", default=False
@@ -290,14 +204,6 @@ def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
         if isinstance(handoff, Agent) and _has_sandbox_agent(handoff, seen):
             return True
     return False
-
-
-# Runs without this patch marker started before the plugin refused
-# ``RunConfig.model_provider``. They keep the old behavior, the Worker's provider, so that
-# they replay.
-_REFUSE_RUN_MODEL_PROVIDER_PATCH = "openai_agents.refuse-run-model-provider"
-# Runs started without it keep running on copies of the agents, so their histories replay.
-_RUN_CALLER_AGENTS_PATCH = "openai_agents.run-caller-agents"
 
 
 def _is_default_model_provider(provider: ModelProvider) -> bool:
@@ -443,14 +349,13 @@ class TemporalOpenAIRunner(AgentRunner):
         if not isinstance(
             run_config.model_provider, _TemporalModelProvider
         ) and not _is_default_model_provider(run_config.model_provider):
-            if workflow.patched(_REFUSE_RUN_MODEL_PROVIDER_PATCH):
-                raise ValueError(
-                    "Temporal workflows do not support RunConfig.model_provider. Model "
-                    "calls use the provider set on the Worker with "
-                    "OpenAIAgentsPlugin(model_provider=...). To use several providers, "
-                    "set a MultiProvider with a prefix map there and choose a provider "
-                    "by model name."
-                )
+            raise ValueError(
+                "Temporal workflows do not support RunConfig.model_provider. Model "
+                "calls use the provider set on the Worker with "
+                "OpenAIAgentsPlugin(model_provider=...). To use several providers, "
+                "set a MultiProvider with a prefix map there and choose a provider "
+                "by model name."
+            )
 
         # Model calls run in an Activity, which cannot get the run's own tracing key.
         if run_config.tracing is not None:
@@ -488,8 +393,6 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        if not workflow.patched(_RUN_CALLER_AGENTS_PATCH):
-            return _convert_agent(self.model_params, starting_agent, None), run_config
         return starting_agent, run_config
 
     async def run(
@@ -604,12 +507,22 @@ class TemporalOpenAIRunner(AgentRunner):
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
-        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
-            streamed_result = self._runner.run_streamed(
-                starting_agent=starting_agent,
-                input=input,
-                **kwargs,
-            )
+        streamed_run = _StreamedRun()
+        token = _current_streamed_run.set(streamed_run)
+        try:
+            with (
+                capture_scope(run_config.model_settings),
+                _inline_sync_function_tools(),
+            ):
+                streamed_result = self._runner.run_streamed(
+                    starting_agent=starting_agent,
+                    input=input,
+                    **kwargs,
+                )
+        finally:
+            _current_streamed_run.reset(token)
+        # The model stub reads it to watch the run's parallel input guardrails.
+        streamed_run.result = streamed_result
 
         # Mirror the AgentsException -> AgentsWorkflowError rewrap done
         # in run() above. The streaming runner attaches the actual run
@@ -669,12 +582,3 @@ def _reraise_workflow_failure(e: AgentsException) -> None:
         )
         reraise.__traceback__ = e.__traceback__
         raise reraise from e.__cause__
-
-
-def _model_name(agent: Agent[Any]) -> str | None:
-    name = agent.model
-    if name is not None and not isinstance(name, str):
-        raise ValueError(
-            "Temporal workflows require a model name to be a string in the agent."
-        )
-    return name

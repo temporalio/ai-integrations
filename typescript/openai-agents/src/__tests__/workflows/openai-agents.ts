@@ -6,6 +6,7 @@ import {
   Handoff,
   MemorySession,
   RunState,
+  Usage,
   getGlobalTraceProvider,
   setDefaultModelProvider,
   tool,
@@ -142,6 +143,11 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, prompt, { maxTurns: 5 });
   return result.finalOutput ?? '';
+}
+
+export async function mcpFactoryValidationWorkflow(activityName: string): Promise<void> {
+  const activities = proxyActivities<Record<string, () => Promise<void>>>({ startToCloseTimeout: '10 seconds' });
+  await activities[activityName]!();
 }
 
 export async function mcpToolFilterWorkflow(stateful: boolean): Promise<string[]> {
@@ -382,12 +388,25 @@ export type RunningAgentRejection =
  * `modelProvider: undefined`, which upstream spreads over the inherited one; a registered default
  * provider would then run the inline model. `tool-start-memory-session` sets a `MemorySession` in the
  * tool's `runOptions`, and the `*-tracing-key` kinds a tracing key in its `runOptions` or `runConfig`.
+ * The inline model answers rather than throws: upstream turns a nested run's failure into a generic
+ * tool output, so only its answer shows that a run reached it.
  * Returns the run's failure, or its output when a nested run's failure became the tool's output.
  */
 export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection): Promise<string> {
   const inlineModel: Model = {
     async getResponse() {
-      throw new Error('the inline model ran in the Workflow');
+      return {
+        output: [
+          {
+            type: 'message',
+            id: 'msg_inline',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'the inline model ran in the Workflow' }],
+          },
+        ],
+        usage: new Usage(),
+      };
     },
     // eslint-disable-next-line require-yield
     async *getStreamedResponse() {
@@ -505,6 +524,23 @@ export async function nestedToolCancelWorkflow(input: {
   const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
   if (!input.stream) return (await runner.run(lead, 'go', { maxTurns: input.maxTurns })).finalOutput ?? '';
   const result = await runner.run(lead, 'go', { stream: true, maxTurns: input.maxTurns });
+  for await (const _event of result);
+  await result.completed;
+  return result.finalOutput ?? '';
+}
+
+/** The agent calls `holdTool`, an Activity that runs until the test cancels the Workflow. */
+export async function activityToolCancelWorkflow(stream: boolean): Promise<string> {
+  new WorkflowStream();
+  const holdTool = activityAsTool<() => Promise<string>>({
+    name: 'holdTool',
+    description: 'Hold',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+  });
+  const agent = new Agent({ name: 'Holder', model: 'gpt-4o-mini', tools: [holdTool] });
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  if (!stream) return (await runner.run(agent, 'go')).finalOutput ?? '';
+  const result = await runner.run(agent, 'go', { stream: true });
   for await (const _event of result);
   await result.completed;
   return result.finalOutput ?? '';

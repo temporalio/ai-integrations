@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 
 import nightly_report
+import pytest
 import release_tool
 import yaml
 
@@ -33,8 +36,8 @@ def test_classify_aggregates_results_by_plugin() -> None:
             _job("ci-status", "failure"),
         ]
     )
-    assert failing == {"openai_agents"}
-    assert passing == {"mcp"}
+    assert failing == {"python/openai_agents"}
+    assert passing == {"python/mcp"}
 
 
 def test_report_matches_ci_workflow_job_names() -> None:
@@ -46,6 +49,7 @@ def test_report_matches_ci_workflow_job_names() -> None:
         ("java", "Java"),
         ("go", "Go"),
         ("typescript", "TypeScript"),
+        ("dotnet", ".NET"),
     ):
         names = {
             job["name"]
@@ -62,9 +66,12 @@ def test_report_matches_ci_workflow_job_names() -> None:
         # The release workflows' check-nightly looks the issue up by the title this report gives it.
         (key,), _ = nightly_report.classify([_job(f"{expected_name} (fakeplug) / matrix", "failure")])
         assert nightly_report.title_for(key) == release_tool.nightly_issue_title(language, "fakeplug")
-    assert {"python", "java", "go", "typescript"}.issubset(
+    assert {"python", "java", "go", "typescript", "dotnet"}.issubset(
         workflow["jobs"]["nightly-report"]["needs"]
     )
+    report = workflow["jobs"]["nightly-report"]
+    assert report["permissions"]["vulnerability-alerts"] == "read"
+    assert any(step.get("run") == "python3 scripts/ci/nightly_report.py --dependabot" for step in report["steps"])
 
 
 def test_typescript_and_python_langsmith_have_separate_nightly_issues() -> None:
@@ -77,7 +84,7 @@ def test_typescript_and_python_langsmith_have_separate_nightly_issues() -> None:
         ]
     )
     assert failing == {"typescript/langsmith"}
-    assert passing == {"langsmith"}
+    assert passing == {"python/langsmith"}
 
 
 def test_classify_go_failures_and_keep_language_identities_separate() -> None:
@@ -92,7 +99,7 @@ def test_classify_go_failures_and_keep_language_identities_separate() -> None:
         ]
     )
     assert failing == {"go/shared"}
-    assert passing == {"shared", "go/recovered"}
+    assert passing == {"python/shared", "go/recovered"}
 
 
 def test_java_failures_are_aggregated_by_plugin() -> None:
@@ -102,5 +109,107 @@ def test_java_failures_are_aggregated_by_plugin() -> None:
             _job("Java (spring-ai) / matrix", "success"),
         ]
     )
-    assert failing == {"spring-ai"}
+    assert failing == {"java/spring-ai"}
     assert not passing
+
+
+def test_dotnet_failures_use_the_language_root_key() -> None:
+    failing, passing = nightly_report.classify(
+        [
+            _job(".NET (microsoft-agent-framework) / microsoft-agent-framework (windows-latest, dotnet10.0)", "failure"),
+            _job(".NET (microsoft-agent-framework) / matrix", "success"),
+            _job(".NET (other) / other (ubuntu-latest, dotnet10.0)", "success"),
+        ]
+    )
+    assert failing == {"dotnet/microsoft-agent-framework"}
+    assert passing == {"dotnet/other"}
+    assert nightly_report.title_for("dotnet/microsoft-agent-framework") == release_tool.nightly_issue_title("dotnet", "microsoft-agent-framework")
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "success"])
+@pytest.mark.parametrize("existing_issue", [False, True])
+@pytest.mark.parametrize("language", ["Python", "Java"])
+def test_report_creates_or_reuses_issue_with_qualified_title(
+    monkeypatch: pytest.MonkeyPatch, conclusion: str, existing_issue: bool,
+    language: str,
+) -> None:
+    repo = "temporalio/ai-integrations"
+    run_url = f"https://github.com/{repo}/actions/runs/123"
+    key = f"{language.lower()}/langsmith"
+    title = f"nightly: {key} failing (latest)"
+    issues = [{"number": 500, "title": "nightly: typescript/langsmith failing (latest)"}]
+    if existing_issue:
+        issues.append({"number": 444, "title": title})
+    calls: list[tuple[str, ...]] = []
+
+    def gh(*args: str) -> str:
+        calls.append(args)
+        if args[0] == "api":
+            assert args == ("api", f"repos/{repo}/actions/runs/123/jobs?per_page=30", "--paginate")
+            return json.dumps({"jobs": [_job("Conventions and tooling tests", "success")]}) + json.dumps(
+                {"jobs": [_job(f"{language} (langsmith) / matrix", conclusion)]}
+            )
+        if args[:2] == ("issue", "list"):
+            return json.dumps(issues)
+        return ""
+
+    monkeypatch.setattr(nightly_report, "_gh", gh)
+    monkeypatch.setattr(nightly_report.subprocess, "run", lambda *args, **kwargs: None)
+    assert nightly_report.main(["--repo", repo, "--run-id", "123"]) == 0
+    actions = calls[2:]
+    if not existing_issue:
+        if conclusion == "failure":
+            assert len(actions) == 1
+            assert actions[0][:6] == ("issue", "create", "--repo", repo, "--title", title)
+        else:
+            assert actions == []
+        return
+    if conclusion == "failure":
+        assert actions == [("issue", "comment", "444", "--repo", repo, "--body", f"Still failing: {run_url}")]
+    else:
+        assert actions == [("issue", "close", "444", "--repo", repo, "--comment", f"Green again: {run_url}")]
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_api_read_retries_gateway_errors_without_duplicating_partial_pages(
+    monkeypatch: pytest.MonkeyPatch, status: int,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    delays: list[int] = []
+    endpoint = "repos/owner/repo/actions/runs/123/jobs?per_page=30"
+
+    def gh(*args: str) -> str:
+        calls.append(args)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(
+                1, args, output='{"jobs": [{"id": 1}]}', stderr=f"gh: Server Error (HTTP {status})",
+            )
+        return '{"jobs": [{"id": 1}]}\n{"jobs": [{"id": 2}]}'
+
+    monkeypatch.setattr(nightly_report, "_gh", gh)
+    monkeypatch.setattr(nightly_report.time, "sleep", delays.append)
+    assert nightly_report._api_items(endpoint, "jobs") == [{"id": 1}, {"id": 2}]
+    assert calls == [("api", endpoint, "--paginate")] * 2
+    assert delays == [1]
+
+
+@pytest.mark.parametrize("status,attempts", [(502, 3), (401, 1), (403, 1), (404, 1), (429, 1)])
+def test_api_read_propagates_permanent_or_exhausted_errors(
+    monkeypatch: pytest.MonkeyPatch, status: int, attempts: int,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    delays: list[int] = []
+    error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=f"gh: request failed (HTTP {status})")
+
+    def gh(*args: str) -> str:
+        calls.append(args)
+        raise error
+
+    monkeypatch.setattr(nightly_report, "_gh", gh)
+    monkeypatch.setattr(nightly_report.time, "sleep", delays.append)
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        nightly_report.main(["--repo", "owner/repo", "--run-id", "123"])
+    assert caught.value is error
+    assert len(calls) == attempts
+    assert all(call[0] == "api" for call in calls)
+    assert delays == list(range(1, attempts))

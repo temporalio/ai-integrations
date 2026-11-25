@@ -45,6 +45,11 @@ export interface TemporalModelOptions {
  * it must match a key in {@link StrandsPlugin}'s `models` map. A name not
  * present in `models` raises an error inside the model activity at first call.
  *
+ * `activityOptions.heartbeatTimeout` defaults to 10 seconds. The model activities heartbeat on a
+ * timer at half of it, so a cancel reaches a running model call and a lost worker is noticed. Pass
+ * `heartbeatTimeout: 0` to turn heartbeats off. The config read runs synchronously and can't
+ * heartbeat, so it's scheduled without a heartbeat timeout.
+ *
  * `TemporalAgent` reads the worker model's config before its first call. With a plain Strands
  * `Agent`, call `await model.loadConfig()` before building the agent: without it, the model reports
  * itself as stateless, and a stateful worker model fails every call.
@@ -93,11 +98,13 @@ export class TemporalModel extends Model<BaseModelConfig> {
    */
   loadConfig(): Promise<void> | undefined {
     if (this.configLoaded) return undefined;
+    // The config read runs synchronously, so it can't heartbeat.
     const activities = workflow.proxyActivities<{
       [GET_MODEL_CONFIG_ACTIVITY](input: GetModelConfigInput): Promise<ModelConfigInfo>;
     }>({
       startToCloseTimeout: '10 minutes',
       ...this.activityOptions,
+      heartbeatTimeout: undefined,
     });
     return activities[GET_MODEL_CONFIG_ACTIVITY]({ modelName: this.modelName }).then(({ stateful, ...config }) => {
       this.config = config;
@@ -118,6 +125,7 @@ export class TemporalModel extends Model<BaseModelConfig> {
     }>({
       startToCloseTimeout: '10 minutes',
       ...this.activityOptions,
+      heartbeatTimeout: this.activityOptions.heartbeatTimeout ?? '10 seconds',
     });
 
     const { modelState, ...rest } = options ?? {};

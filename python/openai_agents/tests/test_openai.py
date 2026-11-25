@@ -3,11 +3,13 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
+import email.utils
 import functools
 import importlib.metadata
 import json
 import os
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -152,7 +154,6 @@ from temporalio.openai_agents._invoke_model_activity import (
 )
 from temporalio.openai_agents._openai_runner import (
     _coerce_run_config,
-    _convert_agent,
 )
 from temporalio.openai_agents._temporal_model_stub import (
     _TemporalModelStub,
@@ -3120,6 +3121,34 @@ def test_should_retry_false_stays_non_retryable():
     assert err.value.next_retry_delay == timedelta(milliseconds=5000)
 
 
+def test_retry_after_http_date_propagated():
+    retry_at = email.utils.formatdate(time.time() + 30, usegmt=True)
+    with pytest.raises(ApplicationError) as err:
+        _raise_for_openai_status(_openai_status_error(429, {"retry-after": retry_at}))
+    assert not err.value.non_retryable
+    assert err.value.next_retry_delay is not None
+    assert timedelta(seconds=28) < err.value.next_retry_delay <= timedelta(seconds=30)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"retry-after": email.utils.formatdate(time.time() + 30, usegmt=True)},
+        {"retry-after": "soon"},
+        {"retry-after": "Wed, 21 Oct 10000 07:28:00 GMT"},
+        {"retry-after": "Wed, 2000000000 Oct 2026 07:28:00 GMT"},
+        {"retry-after": "1e20"},
+        {"retry-after-ms": "soon"},
+        {"retry-after-ms": "1e20"},
+    ],
+)
+def test_retry_after_does_not_change_non_retryable_status(headers: dict[str, str]):
+    with pytest.raises(ApplicationError) as err:
+        _raise_for_openai_status(_openai_status_error(400, headers))
+    assert err.value.non_retryable
+    assert err.value.type == "APIStatusError"
+
+
 def test_retry_after_ms_takes_precedence_over_retry_after():
     with pytest.raises(ApplicationError) as err:
         _raise_for_openai_status(
@@ -3343,15 +3372,32 @@ async def test_alternative_model(client: Client):
             await workflow_handle.result()
 
 
-async def test_heartbeat(client: Client, env: WorkflowEnvironment):
+# WaitModel takes a second, so a 0.5-second heartbeat timeout passes only if the
+# model activity heartbeats. With nothing set, the default is 10 seconds.
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        (
+            ModelActivityParameters(heartbeat_timeout=timedelta(seconds=0.5)),
+            timedelta(seconds=0.5),
+        ),
+        (ModelActivityParameters(), timedelta(seconds=10)),
+        (ModelActivityParameters(heartbeat_timeout=None), None),
+    ],
+    ids=["set", "default", "off"],
+)
+async def test_heartbeat(
+    client: Client,
+    env: WorkflowEnvironment,
+    params: ModelActivityParameters,
+    expected: timedelta | None,
+):
     if env.supports_time_skipping:
         pytest.skip("Relies on real timing, skip.")
 
     async with AgentEnvironment(
         model=WaitModel(),
-        model_params=ModelActivityParameters(
-            heartbeat_timeout=timedelta(seconds=0.5),
-        ),
+        model_params=params,
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
@@ -3366,6 +3412,13 @@ async def test_heartbeat(client: Client, env: WorkflowEnvironment):
                 task_queue=worker.task_queue,
             )
             await workflow_handle.result()
+            heartbeat_timeouts = [
+                e.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+                or None
+                async for e in workflow_handle.fetch_history_events()
+                if e.HasField("activity_task_scheduled_event_attributes")
+            ]
+    assert heartbeat_timeouts == [expected]
 
 
 @workflow.defn
@@ -5737,28 +5790,6 @@ async def test_stateful_mcp_server_empty_block(client: Client):
             with pytest.raises(WorkflowFailureError) as err:
                 await handle.result()
             assert isinstance(err.value.cause, CancelledError)
-
-
-async def test_model_conversion_loops():
-    agent = init_agents()
-    converted = _convert_agent(ModelActivityParameters(), agent, None)
-    seat_booking_handoff = converted.handoffs[1]
-    assert isinstance(seat_booking_handoff, Handoff)
-    context: RunContextWrapper[AirlineAgentContext] = RunContextWrapper(
-        context=AirlineAgentContext()  # type: ignore
-    )
-    seat_booking_agent = await seat_booking_handoff.on_invoke_handoff(context, "")
-    triage_agent = seat_booking_agent.handoffs[0]
-    assert isinstance(triage_agent, Agent)
-    assert isinstance(triage_agent.model, _TemporalModelStub)
-    seat_booking_agent = await seat_booking_handoff.on_invoke_handoff(context, "")
-    triage_agent = seat_booking_agent.handoffs[0]
-    assert isinstance(triage_agent, Agent)
-    assert isinstance(triage_agent.model, _TemporalModelStub)
-    seat_booking_agent = await seat_booking_handoff.on_invoke_handoff(context, "")
-    triage_agent = seat_booking_agent.handoffs[0]
-    assert isinstance(triage_agent, Agent)
-    assert isinstance(triage_agent.model, _TemporalModelStub)
 
 
 def test_sandbox_apply_patch_tool_round_trips_through_activity_input():

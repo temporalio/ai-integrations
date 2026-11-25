@@ -14,10 +14,51 @@ import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import { ApplicationFailure } from '@temporalio/common';
 import type { Duration } from '@temporalio/common/lib/time';
+import { encodeCallOptionsFileData } from './file-data';
 
 // `ReadableStream` is a sandbox global; type-only import keeps `node:stream/web`
 // out of the workflow bundle (es2023 lib has no DOM types).
 declare const ReadableStream: typeof import('node:stream/web').ReadableStream;
+
+function abortReason(signal: AbortSignal): unknown {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error || typeof reason !== 'object' || reason === null) return reason;
+  const { name, message } = reason as { name?: unknown; message?: unknown };
+  if (name !== 'AbortError' && name !== 'TimeoutError') return reason;
+  // The sandbox `AbortController` comes from the host realm, so its reason fails the
+  // `instanceof Error` check in the AI SDK's `isAbortError`. Rebuild it in this realm.
+  return Object.assign(new Error(String(message)), { name });
+}
+
+// An `AbortSignal` can't cross the payload converter, so the caller's signal cancels the
+// Activity from the Workflow instead.
+//
+// Not an `async` function. A call that cancels nothing must resume the Workflow at the
+// same point as a direct Activity call, or its commands can change order on replay.
+function runAbortable<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  if (signal === undefined) return fn();
+  return cancelOnAbort(signal, fn);
+}
+
+async function cancelOnAbort<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+  if (signal.aborted) throw abortReason(signal);
+  const scope = new workflow.CancellationScope();
+  const onAbort = (): void => scope.cancel();
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await scope.run(fn);
+  } catch (err) {
+    if (signal.aborted && workflow.isCancellation(err)) throw abortReason(signal);
+    throw err;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+// An older Event History can hold a reasoning block whose provider metadata the Workflow
+// never saw. The Activity kept it from `reasoning-end`, and the replayed block left it out.
+// Such a history replays only if the block still carries none.
+const REASONING_METADATA_PATCH = 'vercel-ai-sdk-reasoning-provider-metadata';
 
 /**
  * Options for configuring the TemporalProvider with per-model activity settings.
@@ -54,7 +95,19 @@ export interface TemporalProviderOptions {
    * Activity options specific to embedding model calls.
    * Merged with default options, with these taking precedence.
    */
-  embeddingModel?: ActivityOptions;
+  embeddingModel?: ActivityOptions & {
+    /**
+     * Largest number of values that `embedMany` sends to one `invokeEmbeddingModel` Activity.
+     * When set, `embedMany` splits the values into chunks of this size and runs one Activity per
+     * chunk, in parallel up to its `maxParallelCalls`. Unset sends all values to one Activity.
+     * Changing it in a deployed Workflow needs Workflow versioning.
+     *
+     * Each chunk gets the full `providerOptions`. The model that can cut per-value options
+     * to a chunk is on the Worker, and it needs all the values to do so. To send them to
+     * each Activity would put the full input in Event History one time for each chunk.
+     */
+    maxEmbeddingsPerCall?: number;
+  };
 }
 
 /**
@@ -75,16 +128,25 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     this.streamingBatchInterval = options?.streamingBatchInterval;
   }
 
+  // The Workflow sandbox has no network. URL parts go to the model Activity, which downloads
+  // the ones the real model does not support.
   get supportedUrls(): Record<string, RegExp[]> {
-    return {};
+    return { '*': [/.*/] };
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     const activities = workflow.proxyActivities({
       startToCloseTimeout: '10 minutes',
       ...this.options,
+      heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
-    const result = await activities.invokeModel!({ modelId: this.modelId, options });
+    const { abortSignal, ...callOptions } = options;
+    const result = await runAbortable(abortSignal, () =>
+      activities.invokeModel!({
+        modelId: this.modelId,
+        options: encodeCallOptionsFileData(callOptions),
+      })
+    );
     if (result === undefined) {
       throw ApplicationFailure.nonRetryable('Received undefined response from model activity.');
     }
@@ -110,15 +172,24 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     const activities = workflow.proxyActivities({
       startToCloseTimeout: '10 minutes',
       ...this.options,
+      heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
-    const result = await activities.invokeModelStreaming!({
-      modelId: this.modelId,
-      options,
-      streamingTopic: this.streamingTopic,
-      streamingBatchInterval: this.streamingBatchInterval,
-    });
+    const { abortSignal, ...callOptions } = options;
+    const result = await runAbortable(abortSignal, () =>
+      activities.invokeModelStreaming!({
+        modelId: this.modelId,
+        options: encodeCallOptionsFileData(callOptions),
+        streamingTopic: this.streamingTopic,
+        streamingBatchInterval: this.streamingBatchInterval,
+      })
+    );
     if (result === undefined) {
       throw ApplicationFailure.nonRetryable('Received undefined response from streaming model activity.');
+    }
+
+    let timestamp = result.response?.timestamp ? new Date(result.response.timestamp) : undefined;
+    if (timestamp !== undefined && isNaN(timestamp.getTime())) {
+      timestamp = undefined;
     }
 
     // Wrap the accumulated result as a ReadableStream that replays the content.
@@ -126,13 +197,11 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     const stream = new ReadableStream({
       start(controller: ReadableStreamDefaultController) {
         controller.enqueue({ type: 'stream-start', warnings: result.warnings ?? [] });
+        // A Workflow can schedule a command for each stream part. So this part is sent for
+        // every response, also when all its fields are empty, to keep replay the same.
         if (result.response !== undefined) {
-          controller.enqueue({
-            type: 'response-metadata',
-            id: result.response.id,
-            modelId: result.response.modelId,
-            timestamp: result.response.timestamp ? new Date(result.response.timestamp) : undefined,
-          });
+          const { id, modelId } = result.response;
+          controller.enqueue({ type: 'response-metadata', id, modelId, timestamp });
         }
         let partIndex = 0;
         for (const item of result.content ?? []) {
@@ -142,7 +211,12 @@ export class TemporalLanguageModel implements LanguageModelV4 {
             controller.enqueue({ type: 'text-delta', id, delta: item.text });
             controller.enqueue({ type: 'text-end', id });
           } else if (item.type === 'reasoning') {
-            controller.enqueue({ type: 'reasoning-start', id });
+            const withMetadata = item.providerMetadata !== undefined && workflow.patched(REASONING_METADATA_PATCH);
+            controller.enqueue({
+              type: 'reasoning-start',
+              id,
+              ...(withMetadata && { providerMetadata: item.providerMetadata }),
+            });
             controller.enqueue({ type: 'reasoning-delta', id, delta: item.text });
             controller.enqueue({ type: 'reasoning-end', id });
           } else {
@@ -171,9 +245,10 @@ export class TemporalEmbeddingModel implements EmbeddingModelV4 {
   readonly specificationVersion = 'v4';
   readonly provider = 'temporal';
   /**
-   * Undefined to let the underlying provider handle chunking, as it knows its own limits.
+   * The `maxEmbeddingsPerCall` provider option. Undefined unless set, so `embedMany` sends all
+   * values to one Activity.
    */
-  readonly maxEmbeddingsPerCall = undefined;
+  readonly maxEmbeddingsPerCall: number | undefined;
   /**
    * Indicates the underlying embedding model API can handle concurrent requests.
    * Set to true since we delegate to the actual provider which manages its own concurrency.
@@ -182,21 +257,26 @@ export class TemporalEmbeddingModel implements EmbeddingModelV4 {
 
   constructor(
     readonly modelId: string,
-    readonly options?: ActivityOptions
-  ) {}
+    readonly options?: ActivityOptions & { maxEmbeddingsPerCall?: number }
+  ) {
+    this.maxEmbeddingsPerCall = options?.maxEmbeddingsPerCall;
+  }
 
   async doEmbed(options: EmbeddingModelV4CallOptions): Promise<EmbeddingModelV4Result> {
+    const { maxEmbeddingsPerCall: _maxEmbeddingsPerCall, ...activityOptions } = this.options ?? {};
     const activities = workflow.proxyActivities({
       startToCloseTimeout: '10 minutes',
-      ...this.options,
+      ...activityOptions,
+      heartbeatTimeout: activityOptions.heartbeatTimeout ?? '10 seconds',
     });
-    const result = await activities.invokeEmbeddingModel!({
-      modelId: this.modelId,
-      values: options.values,
-      providerOptions: options.providerOptions,
-      headers: options.headers,
-      // Note: abortSignal is not serializable, Temporal's cancellation handles this
-    });
+    const result = await runAbortable(options.abortSignal, () =>
+      activities.invokeEmbeddingModel!({
+        modelId: this.modelId,
+        values: options.values,
+        providerOptions: options.providerOptions,
+        headers: options.headers,
+      })
+    );
     if (result === undefined) {
       throw ApplicationFailure.nonRetryable('Received undefined response from embedding model activity.');
     }

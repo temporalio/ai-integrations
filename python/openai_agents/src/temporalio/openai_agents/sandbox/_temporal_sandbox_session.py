@@ -14,6 +14,7 @@ from temporalio import workflow
 from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ExecArgs,
     HydrateWorkspaceArgs,
+    OnHostSandboxSessionState,
     PersistWorkspaceArgs,
     PersistWorkspaceResult,
     PtyExecStartArgs,
@@ -34,6 +35,20 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
 from temporalio.workflow import ActivityConfig
 
 
+def _session_activity_config(
+    config: ActivityConfig, state: SandboxSessionState
+) -> ActivityConfig:
+    """Send an operation on a pinned sandbox to the Task Queue of the process holding it.
+
+    A state without a queue keeps the configured routing.
+    """
+    if not isinstance(state, OnHostSandboxSessionState):
+        return config
+    routed = config.copy()
+    routed["task_queue"] = state.task_queue
+    return routed
+
+
 class TemporalSandboxSession(BaseSandboxSession):
     """A BaseSandboxSession that routes all I/O through Temporal activities.
 
@@ -42,7 +57,9 @@ class TemporalSandboxSession(BaseSandboxSession):
     flag (both provided by the worker-side ``SessionResult``).
 
     Activity names are prefixed with the provider ``name`` so that dispatches
-    reach the correct sandbox backend's activities on the worker.
+    reach the correct sandbox backend's activities on the worker. Operations on a
+    sandbox from an ``OnHostSandboxClientProvider`` go to the Task Queue in its
+    state.
 
     Each activity receives a single Pydantic model instance. Because the Temporal
     client is configured with ``pydantic_data_converter``, all fields are
@@ -89,7 +106,7 @@ class TemporalSandboxSession(BaseSandboxSession):
                 user=user,
             ),
             result_type=ExecResultModel,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         return ExecResult(
             stdout=result.stdout, stderr=result.stderr, exit_code=result.exit_code
@@ -108,7 +125,7 @@ class TemporalSandboxSession(BaseSandboxSession):
             f"{self._name}-sandbox_session_read",
             arg=ReadArgs(state=self.state, path=str(path)),
             result_type=ReadResult,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         return io.BytesIO(result.data)
 
@@ -119,7 +136,7 @@ class TemporalSandboxSession(BaseSandboxSession):
         await workflow.execute_activity(
             f"{self._name}-sandbox_session_write",
             arg=WriteArgs(state=self.state, path=str(path), data=data.read()),
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
 
     async def running(self) -> bool:
@@ -128,7 +145,7 @@ class TemporalSandboxSession(BaseSandboxSession):
             f"{self._name}-sandbox_session_running",
             arg=RunningArgs(state=self.state),
             result_type=RunningResult,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         return result.is_running
 
@@ -137,7 +154,7 @@ class TemporalSandboxSession(BaseSandboxSession):
         await workflow.execute_activity(
             f"{self._name}-sandbox_session_shutdown",
             arg=StopArgs(state=self.state),
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
 
     async def persist_workspace(self) -> io.IOBase:
@@ -146,7 +163,7 @@ class TemporalSandboxSession(BaseSandboxSession):
             f"{self._name}-sandbox_session_persist_workspace",
             arg=PersistWorkspaceArgs(state=self.state),
             result_type=PersistWorkspaceResult,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         return io.BytesIO(result.data)
 
@@ -155,7 +172,7 @@ class TemporalSandboxSession(BaseSandboxSession):
         await workflow.execute_activity(
             f"{self._name}-sandbox_session_hydrate_workspace",
             arg=HydrateWorkspaceArgs(state=self.state, data=data.read()),
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
 
     def supports_pty(self) -> bool:
@@ -186,7 +203,7 @@ class TemporalSandboxSession(BaseSandboxSession):
                 max_output_tokens=max_output_tokens,
             ),
             result_type=PtyExecUpdateResult,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         return PtyExecUpdate(
             process_id=result.process_id,
@@ -214,7 +231,7 @@ class TemporalSandboxSession(BaseSandboxSession):
                 max_output_tokens=max_output_tokens,
             ),
             result_type=PtyExecUpdateResult,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         return PtyExecUpdate(
             process_id=result.process_id,
@@ -229,7 +246,7 @@ class TemporalSandboxSession(BaseSandboxSession):
             f"{self._name}-sandbox_session_start",
             arg=StartArgs(state=self.state),
             result_type=SessionResult,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         self._state = result.state
 
@@ -239,6 +256,6 @@ class TemporalSandboxSession(BaseSandboxSession):
             f"{self._name}-sandbox_session_stop",
             arg=StopArgs(state=self.state),
             result_type=SessionResult,
-            **self._config,
+            **_session_activity_config(self._config, self._state),
         )
         self._state = result.state

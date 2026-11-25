@@ -21,7 +21,8 @@ dev = ["pytest>=9,<10", "pyyaml>=6,<7"]
 [tool.uv]
 package = false
 # Keep in sync with every python/*/pyproject.toml (asserted by scripts/ci/check_conventions.py).
-required-version = ">=0.12.5,<0.13"
+# Dependabot currently runs uv 0.13; uv_build is constrained separately.
+required-version = ">=0.13.0,<0.14"
 exclude-newer = "2 weeks"
 
 [tool.pytest.ini_options]

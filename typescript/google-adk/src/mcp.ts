@@ -39,13 +39,13 @@ import {
   type RunAsyncToolRequest,
   type ToolProcessLlmRequest,
 } from '@google/adk';
-import { ApplicationFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure } from '@temporalio/common';
 import { type ActivityOptions, inWorkflowContext, isCancellation, log, proxyActivities } from '@temporalio/workflow';
 
 import { underAbortSignal } from './abort';
 import { gateOnConfirmation } from './confirmation';
 import { MCP_TOOLSET_OUTSIDE_WORKFLOW_FAILURE_TYPE } from './error-types';
-import { activityOptionsFrom } from './model';
+import { activityOptionsFrom, withDefaultHeartbeatTimeout } from './model';
 
 /**
  * A worker-side factory that produces a real MCP toolset (or connection
@@ -64,6 +64,13 @@ import { activityOptionsFrom } from './model';
  * therefore be a single long-lived instance the factory returns each time, and closing
  * it stays the factory author's job. Supplying {@link MCPConnectionParams} instead
  * hands that lifecycle to the plugin.
+ *
+ * The factory must be synchronous. It must return a {@link BaseToolset} or
+ * {@link MCPConnectionParams} with type `StdioConnectionParams`,
+ * `StreamableHTTPConnectionParams` or, from ADK 2.3, `SseConnectionParams`. Anything
+ * else, including the `Promise` of an async factory, fails the Activity without retries
+ * with `MCP_TOOLSET_FACTORY_TYPE_FAILURE_TYPE`. A factory whose toolset isn't ready yet
+ * should throw instead: exceptions are retried.
  */
 export type MCPToolsetFactory = () => BaseToolset | MCPConnectionParams;
 
@@ -107,8 +114,11 @@ export interface TemporalMCPToolsetOptions {
   /** Prefix applied to advertised tool names (mirrors ADK `MCPToolset`). */
   prefix?: string;
   /**
-   * Per-call Activity configuration (timeouts, retry, task queue). Tool calls
-   * take it as given; {@link TemporalMCPToolset.listResources} and
+   * Per-call Activity configuration (timeouts, retry, task queue).
+   * `heartbeatTimeout` defaults to 10 seconds. The MCP Activities heartbeat on a
+   * timer at half of it, so a cancel reaches a running call and a lost worker is
+   * noticed. Set it to `0` to turn the timer off. Tool calls take the rest as
+   * given; {@link TemporalMCPToolset.listResources} and
    * {@link TemporalMCPToolset.readResource} default `retry.maximumAttempts` to
    * 3 first, because a resource failure is skipped rather than raised. Set
    * `retry.maximumAttempts` yourself to override that, or
@@ -296,7 +306,9 @@ export class TemporalMCPToolset extends BaseToolset {
   override async close(): Promise<void> {}
 
   private activities(defaultSummary: string): MCPActivities {
-    return proxyActivities<MCPActivities>(activityOptionsFrom(this.options.activity, defaultSummary));
+    return proxyActivities<MCPActivities>(
+      activityOptionsFrom(withDefaultHeartbeatTimeout(this.options.activity), defaultSummary)
+    );
   }
 
   /**
@@ -316,7 +328,7 @@ export class TemporalMCPToolset extends BaseToolset {
       ...activity,
       retry: { maximumAttempts: DEFAULT_RESOURCE_MAX_ATTEMPTS, ...activity?.retry },
     };
-    return proxyActivities<MCPActivities>(activityOptionsFrom(options, defaultSummary));
+    return proxyActivities<MCPActivities>(activityOptionsFrom(withDefaultHeartbeatTimeout(options), defaultSummary));
   }
 
   /** The real ADK toolset for the direct (non-Workflow) path. */
@@ -378,7 +390,10 @@ class TemporalMCPTool extends BaseTool {
       if (gated !== undefined) return gated;
     }
     const activities = proxyActivities<MCPActivities>(
-      activityOptionsFrom(this.toolsetOptions.activity, `adk.mcp ${this.toolsetOptions.name}.${this.originalName}`)
+      activityOptionsFrom(
+        withDefaultHeartbeatTimeout(this.toolsetOptions.activity),
+        `adk.mcp ${this.toolsetOptions.name}.${this.originalName}`
+      )
     );
     const callTool = activities[`${this.toolsetOptions.name}-callTool`] as (args: MCPCallToolArgs) => Promise<unknown>;
     // Cancellable once the gate has let the call through, as for `activityAsTool`.
@@ -525,7 +540,7 @@ class TemporalLoadMcpResourceTool extends BaseTool {
       }
     } catch (err) {
       if (isCancellation(err)) throw err;
-      warn(`Failed to list MCP resources: ${String(err)}`);
+      warn(`Failed to list MCP resources: ${describeFailure(err)}`);
     }
 
     const lastContent = llmRequest.contents.at(-1);
@@ -548,7 +563,7 @@ class TemporalLoadMcpResourceTool extends BaseTool {
         }
       } catch (err) {
         if (isCancellation(err)) throw err;
-        warn(`Failed to read MCP resource '${resourceName}': ${String(err)}`);
+        warn(`Failed to read MCP resource '${resourceName}': ${describeFailure(err)}`);
       }
     }
   }
@@ -578,6 +593,11 @@ function warn(message: string): void {
   } else {
     console.warn(message);
   }
+}
+
+/** `String(err)`, plus the Activity's own error: an `ActivityFailure` says only "Activity task failed". */
+function describeFailure(err: unknown): string {
+  return err instanceof ActivityFailure && err.cause ? `${String(err)}: ${String(err.cause)}` : String(err);
 }
 
 /** Mirrors ADK's `appendInstructions` (`models/llm_request.ts`), which the `common` surface does not export. */

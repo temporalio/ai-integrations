@@ -12,15 +12,20 @@ test('layerModelParams: neither header nor constructor — returns DEFAULT', (t)
   const merged = layerModelParams(undefined, undefined);
   t.is(merged.startToCloseTimeout, DEFAULT_MODEL_ACTIVITY_OPTIONS.startToCloseTimeout);
   t.is(merged.useLocalActivity, DEFAULT_MODEL_ACTIVITY_OPTIONS.useLocalActivity);
+  t.is(merged.heartbeatTimeout, '10s');
 });
 
 test('layerModelParams: constructor only, no header — header-less Workflow gets defaultModelParams', (t) => {
   // A Schedule/UI/CLI-started Workflow has no config header, so the constructor
   // default is the only source layered above DEFAULT.
-  const merged = layerModelParams({ startToCloseTimeout: '120s', streamingTopic: 'events' }, undefined);
+  const merged = layerModelParams(
+    { startToCloseTimeout: '120s', streamingTopic: 'events', heartbeatTimeout: 0 },
+    undefined
+  );
   t.is(merged.startToCloseTimeout, '120s');
   t.is(merged.streamingTopic, 'events');
   t.is(merged.useLocalActivity, false);
+  t.is(merged.heartbeatTimeout, 0);
 });
 
 test('layerModelParams: both present — client overrides matching field, non-overlapping constructor fields survive', (t) => {
@@ -57,8 +62,9 @@ test('layerModelParams: a defined falsy field in the header overrides a truthy l
 });
 
 test('layerModelParams: a defined 0 in the header overrides a lower layer', (t) => {
-  const merged = layerModelParams({ streamingBatchInterval: 100 }, { streamingBatchInterval: 0 });
+  const merged = layerModelParams({ streamingBatchInterval: 100 }, { streamingBatchInterval: 0, heartbeatTimeout: 0 });
   t.is(merged.streamingBatchInterval, 0);
+  t.is(merged.heartbeatTimeout, 0);
 });
 
 test('layerModelParams: function-form summary from defaultModelParams passes through', (t) => {

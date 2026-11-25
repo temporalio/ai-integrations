@@ -17,6 +17,7 @@ import {
   defaultTestProvider,
   findInCauseChain,
   getScheduledActivitySummaries,
+  getScheduledHeartbeatTimeouts,
   setupTestEnv,
   uid,
   withWorker,
@@ -185,6 +186,9 @@ test.serial('appliesActivityTimeout', async (t) => {
     // 1 the Workflow fails with a TimeoutFailure in the cause chain.
     const timeout = findInCauseChain(caught, TimeoutFailure);
     t.not(timeout, undefined);
+    // `heartbeatTimeout: 0` schedules the call without a heartbeat timeout.
+    const { events } = await handle.fetchHistory();
+    t.deepEqual(getScheduledHeartbeatTimeouts(events ?? [], 'adk-invokeModel'), [undefined]);
   });
 });
 

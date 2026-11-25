@@ -24,10 +24,6 @@ _TOOL_CONTEXT_PARAM = "tool_context"
 class ToolContextSnapshot:
     """Serializable snapshot of the ADK ``ToolContext`` for activity-backed tools.
 
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
-
     ADK's ``ToolContext`` holds live, non-serializable objects, so it cannot
     cross the activity boundary: activity inputs are sent to the server and
     may run on a different worker than the workflow. This snapshot carries the
@@ -423,10 +419,6 @@ def _snapshot_tool_context(tool_context: Any) -> ToolContextSnapshot:
 def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     """Decorator/Wrapper to wrap a Temporal Activity as an ADK Tool.
 
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
-
     This ensures the activity's signature is preserved for ADK's tool schema generation
     while marking it as a tool that executes via 'workflow.execute_activity'.
 
@@ -434,7 +426,9 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     callable-class instance, a method passed as ``Class.method``, or a
     callable-class activity passed as its class. The tool offers the parameters
     the activity is called with: without a method's ``self``, and from
-    ``__call__`` for a class. A class whose ``__call__`` is not a function,
+    ``__call__`` for a class. ADK leaves ``*args`` out of the declaration, as
+    it does for a plain function, so the model can't fill it and the activity
+    gets an empty ``*args``. A class whose ``__call__`` is not a function,
     staticmethod, classmethod or ``functools.partialmethod``, can't be read, or
     takes keyword-only arguments or ``**kwargs`` raises ``ValueError``. So does
     a method taking ``self`` whose class can't be reached from the function's
@@ -457,6 +451,10 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     """
     signature, hints, doc = _tool_signature(activity_def)
     tool_context_param = _tool_context_parameter(activity_def, signature, hints)
+    has_var_args = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL
+        for p in signature.parameters.values()
+    )
     # ADK passes every argument by name, and the activity gets them by
     # position, so bind positional-only parameters by name too.
     binding = signature.replace(
@@ -492,6 +490,10 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
                 return await result
             else:
                 return result
+
+        if has_var_args:
+            # bound.args spreads *args; bound.arguments holds it as one tuple.
+            activity_args = list(bound.args)
 
         if not activity_args:
             return await workflow.execute_activity(activity_def, **options)
@@ -552,10 +554,6 @@ def activity_node(
     **kwargs: Any,
 ) -> "FunctionNode":
     """Wraps a Temporal Activity as a node for an ADK workflow graph.
-
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
 
     The returned ``google.adk.workflow.FunctionNode`` can be placed in a
     ``Workflow(edges=[...])`` graph or invoked from a dynamic node via

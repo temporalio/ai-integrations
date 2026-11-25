@@ -1,7 +1,7 @@
 // Workflows for histories recorded with stateful MCP operations.
-// `src/__tests__/histories/stateful-mcp-*.json` were recorded with these
-// Workflows on earlier versions of the plugin, and test-openai-agents.ts
-// replays them on this one.
+// `src/__tests__/histories/<major>.x/stateful-mcp-*.json` were recorded with
+// these Workflows, and test-openai-agents-mcp-sessions.ts replays the current
+// major's on this version.
 import {
   CancellationScope,
   condition,

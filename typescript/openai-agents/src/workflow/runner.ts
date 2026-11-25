@@ -31,7 +31,6 @@ import {
 import { unwrapTemporalFailure } from '../common/errors';
 import { refuseTracingApiKey } from '../common/headers';
 import { ActivityBackedModelProvider } from './activity-backed-model';
-import { getAgentToolRecord } from './agent-tools';
 import { checkAgent } from './check-agent';
 import { validateTemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
@@ -240,14 +239,14 @@ export class TemporalOpenAIRunner {
     }
 
     // Normalized, so a malformed agent graph, such as an `undefined` tool, fails the run.
-    let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     try {
       validateSandboxRunConfig(agent, options?.runConfig?.sandbox);
       checkAgent(agent);
-      preparedInput = input instanceof RunState ? await prepareRunState(agent, input) : input;
     } catch (error) {
       throw normalizeAgentsRunError(error);
     }
+    // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
+    if (input instanceof RunState) input.clearTrace();
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
@@ -276,7 +275,7 @@ export class TemporalOpenAIRunner {
     const scope = CancellationScope.current();
     try {
       if (options?.stream === true) {
-        const streamed = (await innerRunner.run(agent, preparedInput as any, {
+        const streamed = (await innerRunner.run(agent, input as any, {
           ...sharedRunOptions,
           stream: true,
         })) as StreamedRunResult<TContext, TAgent>;
@@ -289,12 +288,15 @@ export class TemporalOpenAIRunner {
           scope.cancelRequested.then(done, raiseError);
         };
         completion._raiseError = (error: unknown) => {
-          if (!scope.consideredCancelled) return raiseError(error);
-          scope.cancelRequested.then(() => raiseError(error), raiseError);
+          // Only a tool's or guardrail's Temporal failure is normalized; other errors reject as they are.
+          const toolFailure = !unwrapTemporalFailure(error) && unwrapTemporalFailure(error, true);
+          const failure = toolFailure ? normalizeAgentsRunError(error) : error;
+          if (!scope.consideredCancelled) return raiseError(failure);
+          scope.cancelRequested.then(() => raiseError(failure), raiseError);
         };
         return streamed;
       }
-      const result = (await innerRunner.run(agent, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
+      const result = (await innerRunner.run(agent, input as any, sharedRunOptions)) as RunResult<any, TAgent>;
       if (scope.consideredCancelled) await scope.cancelRequested;
       return result;
     } catch (error) {
@@ -307,87 +309,23 @@ export class TemporalOpenAIRunner {
 }
 
 /**
- * Fails the run if restoring `input` would move one of its approvals to another agent. Restoring finds
- * an agent through handoffs and the tools `agent.asTool()` returned, so the approval of an agent reached
- * only through a copy of such a tool goes to the parent or to another agent of the same name, and
- * resumed it would stay pending. Checks agent objects, not names, from both `agent` and the state's
- * current agent, so a state whose agents were built again for this run is checked too.
- */
-function checkRestoredInterruptions(agent: Agent<any, any>, input: RunState<any, any>): void {
-  const roots = [agent, input._currentAgent];
-  const restorable = collectAgents(roots, false);
-  const reachable = collectAgents(roots, true);
-  for (const interruption of input.getInterruptions()) {
-    if (restorable.has(interruption.agent) || !reachable.has(interruption.agent)) continue;
-    throw ApplicationFailure.create({
-      message:
-        `The approval for '${interruption.name}' of agent '${interruption.agent.name}' can't be resumed: ` +
-        "this run's sandbox state is restored from its serialized form, which finds a nested agent only " +
-        'through the tool its agent.asTool() returned, not a copy such as a toolNamespace() one. Give the ' +
-        'parent agent the tool agent.asTool() returned.',
-      type: 'AgentsWorkflowError',
-      nonRetryable: true,
-    });
-  }
-}
-
-/**
- * The agents reached from `roots` through handoffs and `asTool()` tools: all of them, or with
- * `throughCopies` false, only the tools `asTool()` returned, as upstream's `RunState` does.
- */
-function collectAgents(roots: Agent<any, any>[], throughCopies: boolean): Set<Agent<any, any>> {
-  const seen = new Set<Agent<any, any>>();
-  const queue = [...roots];
-  for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
-    if (seen.has(next)) continue;
-    seen.add(next);
-    for (const h of next.handoffs ?? []) queue.push(h instanceof Handoff ? h.agent : h);
-    for (const tool of next.tools ?? []) {
-      const record = getAgentToolRecord(tool);
-      if (record !== undefined && (throughCopies || record.tool === tool)) queue.push(record.agent);
-    }
-  }
-  return seen;
-}
-
-/**
- * A state with sandbox sessions holds upstream's live-session identity, which would resolve manifest
- * environment references on the Workflow thread rather than in the resume Activity, so it's rebuilt
- * from its string, with its own context objects. That also lists tools and so runs MCP tool filters.
- * Other states resume as they are, as upstream: restoring finds an `asTool()` agent only through the
- * tool object `asTool()` returned, and not an agent that only a custom `Handoff`'s callback picked.
- */
-async function prepareRunState<TContext, TAgent extends Agent<any, any>>(
-  agent: TAgent,
-  state: RunState<TContext, TAgent>
-): Promise<RunState<TContext, TAgent>> {
-  let prepared = state;
-  if (state._sandbox !== undefined) {
-    checkRestoredInterruptions(agent, state);
-    prepared = (await RunState.fromStringWithContext(agent, state.toString(), state._context)) as RunState<
-      TContext,
-      TAgent
-    >;
-  }
-  // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
-  prepared.clearTrace();
-  return prepared;
-}
-
-/**
  * Returns the value the caller should throw: unwrapped TemporalFailure if
- * reachable via `cause` / `AggregateError.errors`, else an `AgentsWorkflowError`
- * ApplicationFailure wrapping a plain Error, else the original non-Error.
+ * reachable via `cause` / `AggregateError.errors`, else for a plain Error an `AgentsWorkflowError`
+ * ApplicationFailure whose cause is the TemporalFailure a tool or guardrail failed with,
+ * non-retryable only if that is a non-retryable ApplicationFailure, or else a non-retryable
+ * one whose cause is the Error itself, else the original non-Error.
  */
 export function normalizeAgentsRunError(error: unknown): unknown {
   const temporalFailure = unwrapTemporalFailure(error);
   if (temporalFailure) return temporalFailure;
   if (error instanceof Error) {
+    const toolFailure = unwrapTemporalFailure(error, true);
     return ApplicationFailure.create({
       message: `Agent workflow failed: ${error.message}`,
       type: 'AgentsWorkflowError',
-      nonRetryable: true,
-      cause: error,
+      nonRetryable:
+        toolFailure === undefined || (toolFailure instanceof ApplicationFailure && toolFailure.nonRetryable === true),
+      cause: toolFailure ?? error,
     });
   }
   return error;

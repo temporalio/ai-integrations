@@ -215,11 +215,34 @@ func TestPluginClosesMCPToolsetsOnWorkerStop(t *testing.T) {
 	assert.Equal(t, int32(1), ct.closed.Load(), "a second stop must not close again")
 }
 
+// TestPluginClosesMCPToolsetsAfterWorkerStops proves the stop order: the
+// plugin's StopWorker hook calls next, which is what stops the worker, while
+// the cached toolset is still open, and closes the toolset afterwards. A
+// worker that has not stopped can still start an MCP Activity.
+func TestPluginClosesMCPToolsetsAfterWorkerStops(t *testing.T) {
+	ct := &pluginClosableToolset{Toolset: pluginSearchServer()}
+	plugin := newMCPPlugin(t, ct)
+
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	env.RegisterWorkflow(agentRunWorkflow)
+	startPluginWorker(t, plugin, "worker-1", testRegistry{env})
+	runSearchWorkflow(t, env)
+
+	closedInNext := int32(-1)
+	plugin.StopWorker(context.Background(),
+		worker.PluginStopWorkerOptions{WorkerInstanceKey: "worker-1"},
+		func(context.Context, worker.PluginStopWorkerOptions) { closedInNext = ct.closed.Load() },
+	)
+	assert.Equal(t, int32(0), closedInNext, "the toolset must stay open until next has stopped the worker")
+	assert.Equal(t, int32(1), ct.closed.Load(), "the toolset must be closed once the worker has stopped")
+}
+
 // TestPluginReplayDoesNotCloseToolsets proves the replay guard: a plugin shared
 // with a workflow replayer runs its after-hook once per replay, and that pass
 // must neither close nor terminally poison the worker's shared Activities —
 // Close is terminal, so closing on replay would fail every later MCP Activity
-// on the worker non-retryably. After the replay, the full worker lifecycle
+// attempt on the worker. After the replay, the full worker lifecycle
 // still works and Close fires exactly once, at worker stop.
 func TestPluginReplayDoesNotCloseToolsets(t *testing.T) {
 	ct := &pluginClosableToolset{Toolset: pluginSearchServer()}

@@ -6,7 +6,7 @@ language = "python"
 coordinate = "temporalio-langsmith"
 registry = "pypi"
 root-api = "temporalio.langsmith"
-maturity = "public-preview"
+maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/python/integrations/langsmith"
 
 [ci]

@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/workflowstreams"
 	"go.temporal.io/sdk/temporal"
@@ -127,9 +128,9 @@ func TestStreamingIntegration(t *testing.T) {
 	}
 }
 
-// TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, remote
-// A2A sub-agent (plain and streamed), and multi-decision HITL workflows against
-// the dev server, then replays each recorded history with
+// TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, MCP,
+// remote A2A sub-agent (plain and streamed), and multi-decision HITL workflows
+// against the dev server, then replays each recorded history with
 // worker.WorkflowReplayer — the canonical determinism guarantee. A replay
 // failure here is exactly the non-determinism the plugin's NewContext
 // (time/uuid/task providers) exists to prevent. The replay must also send no
@@ -151,17 +152,29 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 		"solo-model":               scriptedModelFactory(googleadk.TextResponse("hello from solo")),
 		"remote-root-model":        transferToRemoteModel(),
 		"remote-stream-root-model": transferToRemoteModel(),
+		"mcp-model": scriptedModelFactory(
+			googleadk.FunctionCallResponse("c1", "search", map[string]any{"query": "temporal"}),
+			googleadk.TextResponse("found it"),
+		),
 	}
 	for name, factory := range multiConfirmModels() {
 		models[name] = factory
 	}
-	startWorker(t, c, taskQueue, googleadk.Config{Models: models})
+	startWorker(t, c, taskQueue, googleadk.Config{
+		Models:      models,
+		MCPToolsets: map[string]googleadk.MCPFactory{"search-server": searchServer().Factory()},
+	})
 
 	ctx := context.Background()
 	inputs := map[string]runInput{
 		taskQueue + "-solo": {
 			ModelName:   "solo-model",
 			UserMessage: "hi",
+		},
+		taskQueue + "-mcp": {
+			ModelName:   "mcp-model",
+			UserMessage: "search for temporal",
+			MCPToolset:  "search-server",
 		},
 		taskQueue + "-multi": {
 			ModelName:   "root-model",
@@ -223,6 +236,30 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 	require.Equal(t, []string{"guarded_alpha", "guarded_beta", "guarded_gamma"}, mcRes.ResumedToolResponses,
 		"resumed responses must follow the confirmations' request order, not the rotated decision order")
 	executions = append(executions, execution{mcRun.GetID(), mcRun.GetRunID()})
+
+	// The plugin's Activities get a 10-second heartbeat timeout by default. The
+	// guarded tools are the user's own Activities (ActivityAsTool) and get none.
+	heartbeatTimeouts := map[string]bool{}
+	for _, e := range executions {
+		events := c.GetWorkflowHistory(ctx, e.id, e.runID, false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+		for events.HasNext() {
+			event, err := events.Next()
+			require.NoError(t, err)
+			if a := event.GetActivityTaskScheduledEventAttributes(); a != nil {
+				heartbeatTimeouts[a.GetActivityType().GetName()+" "+a.GetHeartbeatTimeout().AsDuration().String()] = true
+			}
+		}
+	}
+	assert.Equal(t, map[string]bool{
+		"googleadk.InvokeModel 10s":         true,
+		"googleadk.ListMcpTools 10s":        true,
+		"googleadk.CallMcpTool 10s":         true,
+		"googleadk.ResolveA2AAgentCard 10s": true,
+		"googleadk.SendA2AMessage 10s":      true,
+		"guarded_alpha 0s":                  true,
+		"guarded_beta 0s":                   true,
+		"guarded_gamma 0s":                  true,
+	}, heartbeatTimeouts)
 
 	replayer := worker.NewWorkflowReplayer()
 	replayer.RegisterWorkflow(agentRunWorkflow)

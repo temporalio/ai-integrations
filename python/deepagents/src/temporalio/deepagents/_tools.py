@@ -14,9 +14,9 @@ the user three explicit ways to move that work to an activity:
 * :class:`TemporalBackend` — wrap a real-I/O backend so each file/exec op runs
   as an activity.
 
-The choice is always explicit: an unwrapped non-builtin tool runs in-workflow,
-and the plugin warns at construction so that is a conscious decision, never a
-silent one.
+An unwrapped non-builtin tool runs in-workflow. The plugin warns about one
+passed in the ``tools=`` keyword of ``create_deep_agent``; it does not check
+``tools`` passed by position or a sub-agent's tools.
 
 Registries here live in a ``temporalio``-namespaced (sandbox-passthrough) module
 and are process-local. Tools must be registered at startup in every activity
@@ -37,6 +37,7 @@ import uuid as _uuid
 import warnings
 import weakref
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import is_dataclass
 from datetime import timedelta
 from types import SimpleNamespace
@@ -78,6 +79,14 @@ _BACKEND_REGISTRY_LOCK = threading.Lock()
 # set by the plugin. Not per-workflow state: fixed for the worker's lifetime, and
 # this module is sandbox-passthrough so the workflow sees the configured value.
 _tool_defaults: dict[str, Any] = {}
+
+# The public arun entry point receives the model's call id and RunnableConfig;
+# StructuredTool's coroutine receives only the validated tool arguments.
+_tool_call_context: ContextVar[tuple[str | None, dict[str, Any]] | None] = ContextVar(
+    "_temporal_deepagents_tool_call", default=None
+)
+
+_TOOL_CONTEXT_PATCH = "deepagents.wrapped-tool-call-context"
 
 
 def set_tool_defaults(options: Any) -> None:
@@ -217,6 +226,10 @@ def lookup_backend(ref: str) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
+# Options activity_as_tool builds itself from the model's tool call.
+_RESERVED_ACTIVITY_OPTIONS = frozenset({"arg", "args"})
+
+
 def _call_function(method: Any) -> Callable | None:
     """Return the function under a function, staticmethod, classmethod or partialmethod."""
     while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
@@ -288,8 +301,13 @@ def _class_doc(cls: type) -> str | None:
 
 def _tool_signature(
     activity: Callable,
-) -> tuple[inspect.Signature, dict[str, Any], str | None]:
-    """Return the parameters the model fills, their types, and the tool's docstring."""
+) -> tuple[inspect.Signature, dict[str, Any], str | None, bool]:
+    """Return the parameters the model fills, their types, and the tool's docstring.
+
+    The signature keeps the activity's ``*args``, so LangChain builds the same
+    schema for it as for the function itself. The fourth item is True when there
+    is one.
+    """
     if inspect.isclass(activity):
         # Workflow code references a callable-class activity by its class, but the
         # worker's registered instance runs __call__, so take __call__'s parameters
@@ -332,14 +350,16 @@ def _tool_signature(
         params = list(signature.parameters.values())
         if params and params[0].name == "self":
             signature = signature.replace(parameters=params[1:])
-    # The tool passes the model's arguments to the activity by position, one per
-    # parameter, so it can't pass *args, keyword-only arguments or **kwargs. The
-    # model names every argument, positional-only ones included.
+    # The tool passes the model's arguments to the activity by position, so it
+    # can't pass keyword-only arguments or **kwargs. *args is offered as a list,
+    # spread into the call. The model names every argument, positional-only ones
+    # included.
     parameters = []
+    star = False
     for p in signature.parameters.values():
         if p.kind is inspect.Parameter.VAR_POSITIONAL:
-            raise ValueError(f"activity_as_tool cannot pass *{p.name}.")
-        if p.kind is inspect.Parameter.KEYWORD_ONLY:
+            star = True
+        elif p.kind is inspect.Parameter.KEYWORD_ONLY:
             message = f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
             if bound_by_keyword:
                 message += (
@@ -352,17 +372,15 @@ def _tool_signature(
         if p.kind is inspect.Parameter.POSITIONAL_ONLY:
             p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
         parameters.append(p)
-    return signature.replace(parameters=parameters), hints, doc
+    return signature.replace(parameters=parameters), hints, doc, star
 
 
 def activity_as_tool(
     activity: Callable,
     *,
-    start_to_close_timeout: timedelta,
     name: str | None = None,
     description: str | None = None,
-    retry_policy: Any = None,
-    summary: str | None = None,
+    activity_options: ActivityConfig | None = None,
 ) -> BaseTool:
     """Expose an existing Temporal activity as a Deep Agents tool.
 
@@ -370,22 +388,31 @@ def activity_as_tool(
     when called in-workflow, dispatches to the activity via
     ``workflow.execute_activity`` — Temporal owns its retries and timeout.
 
+    An activity's ``*args`` is offered as a list, spread into the call. The SDK
+    reads no argument types for an activity with ``*args``, so the Worker decodes
+    its arguments without them: a dataclass parameter arrives as a ``dict``.
+
     Args:
         activity: A function decorated with ``@activity.defn``, a method passed
             as ``Class.method``, or a callable-class activity passed as its class.
-        start_to_close_timeout: Required per-call timeout for the activity.
         name: Override the tool name advertised to the model (defaults to
             the activity definition name).
         description: Override the tool description advertised to the model
             (defaults to the activity docstring).
-        retry_policy: Optional Temporal retry policy for the activity.
-        summary: Optional ``summary=`` recorded on each activity invocation.
+        activity_options: The ``workflow.execute_activity`` options for each
+            call: timeouts, ``retry_policy``, ``task_queue``,
+            ``heartbeat_timeout``, ``activity_id``, ``summary``, and so on. Must
+            set ``start_to_close_timeout`` or ``schedule_to_close_timeout``.
+            ``summary`` defaults to ``"tool:<name>"``. ``arg`` and ``args`` are
+            reserved: the tool builds them from the model's call.
 
     Raises:
         ValueError: If ``activity`` is not a named activity, is an instance of a
             callable-class activity, is a class without a ``__call__`` the tool
-            can use, or takes arguments the tool can't pass: ``*args``,
-            keyword-only arguments or ``**kwargs``.
+            can use, or takes arguments the tool can't pass: keyword-only
+            arguments or ``**kwargs``; if ``activity_options`` sets ``arg`` or
+            ``args``; or if it sets neither a start-to-close nor a
+            schedule-to-close timeout.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -409,23 +436,47 @@ def activity_as_tool(
             f"activity_as_tool requires the activity class {type(activity).__name__}, "
             "not an instance of it."
         )
-    signature, hints, doc = _tool_signature(activity)
+    signature, hints, doc, star = _tool_signature(activity)
     tool_desc = description or (doc or f"Temporal activity {tool_name}.")
-    act_summary = summary or f"tool:{tool_name}"
+
+    opts: dict[str, Any] = dict(activity_options or {})
+    reserved = _RESERVED_ACTIVITY_OPTIONS & opts.keys()
+    if reserved:
+        raise ValueError(
+            f"activity_options must not set {', '.join(sorted(reserved))}: "
+            "the tool builds the activity arguments from the model's call."
+        )
+    if (
+        opts.get("start_to_close_timeout") is None
+        and opts.get("schedule_to_close_timeout") is None
+    ):
+        raise ValueError(
+            "activity_as_tool requires start_to_close_timeout or "
+            "schedule_to_close_timeout in activity_options."
+        )
+    # The default summary this helper has always recorded.
+    opts.setdefault("summary", f"tool:{tool_name}")
+    # The model sends *args as a list under its own name, so the call binds it as
+    # an ordinary parameter, None when the model leaves it out.
+    call_signature = signature.replace(
+        parameters=[
+            p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+            if p.kind is inspect.Parameter.VAR_POSITIONAL
+            else p
+            for p in signature.parameters.values()
+        ]
+    )
 
     async def _run(*args: Any, **kwargs: Any) -> Any:
         # The model's arguments go to the activity by position, in parameter order.
         # Defaults are passed too: the worker decodes arguments with the
         # activity's type hints only when every parameter has a value.
-        bound = signature.bind(*args, **kwargs)
+        bound = call_signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        return await workflow.execute_activity(
-            activity,
-            args=bound.args,
-            start_to_close_timeout=start_to_close_timeout,
-            retry_policy=retry_policy,
-            summary=act_summary,
-        )
+        activity_args = list(bound.args)
+        if star:
+            activity_args.extend(activity_args.pop() or ())
+        return await workflow.execute_activity(activity, args=activity_args, **opts)
 
     # StructuredTool builds the model-facing schema from _run's signature and types.
     setattr(_run, "__signature__", signature)
@@ -458,11 +509,17 @@ def tool_as_activity(
     invoked in-workflow, dispatches ``deepagents.invoke_tool`` instead of running
     the tool body inline.
 
-    Call this at module import or worker startup on every process that can
-    execute tool activities. Registration inside a workflow alone does not
-    make the tool available in another worker process.
+    Call this at the top level of the module that defines the tool, on every
+    process that can execute tool activities, and import that module in the
+    workflow file under ``workflow.unsafe.imports_passed_through()``. A tool
+    defined in code the workflow sandbox loads (the workflow file, a module it
+    imports without that guard, or the body of ``run``) is registered as the
+    sandbox's copy, and the activity then runs that copy under the sandbox's
+    restrictions. Registration inside a workflow alone does not make the tool
+    available in another worker process.
     """
     with workflow.unsafe.imports_passed_through():
+        from langchain_core.runnables.config import ensure_config
         from langchain_core.tools import BaseTool, StructuredTool
 
     base_tool: BaseTool
@@ -482,11 +539,25 @@ def tool_as_activity(
     async def _run(**kwargs: Any) -> Any:
         from temporalio.deepagents.workflow import call_tool
 
-        tool_call_id = kwargs.pop("__tool_call_id__", None) or workflow.uuid4().hex
+        modern = workflow.patched(_TOOL_CONTEXT_PATCH)
+        if modern and base_tool.return_direct:
+            from temporalio.deepagents.workflow import DeepAgentsWorkflowError
+
+            raise DeepAgentsWorkflowError(
+                "tool_as_activity does not support return_direct=True. "
+                "Return from the Workflow explicitly after calling the tool."
+            )
+        context = _tool_call_context.get() if modern else None
+        call_id, config = context if context is not None else (None, {})
+        fallback_id = kwargs.pop("__tool_call_id__", None)
+        tool_call_id = (
+            call_id if call_id is not None else fallback_id or workflow.uuid4().hex
+        )
         activity_input = _activity.ToolActivityInput(
             tool_name=tool_name,
             tool_call_id=tool_call_id,
             args=kwargs,
+            config=config,
         )
         output = await call_tool(
             activity_input,
@@ -494,20 +565,38 @@ def tool_as_activity(
             **opts,
         )
         message = _serde.load_object(output.message)
-        # Return CONTENT, not the pre-built ToolMessage: the activity cannot
-        # know the model's real tool_call_id, so a ToolMessage assembled there
-        # carries a generated id that a real provider rejects as an unpaired
-        # tool_result. Given plain content, the tool node stamps the model's
-        # own id — exactly as it does for unwrapped tools.
         with workflow.unsafe.imports_passed_through():
             from langchain_core.messages import ToolMessage
 
-        if isinstance(message, ToolMessage):
+        if isinstance(message, ToolMessage) and call_id is None:
+            # Native calls with bare arguments return content, while calls
+            # carrying a model's tool-call id return the complete ToolMessage.
             return message.content
         return message
 
+    class ActivityTool(StructuredTool):
+        """A native StructuredTool whose validated coroutine dispatches an Activity."""
+
+        async def arun(
+            self, tool_input: str | dict[str, Any], *args: Any, **kwargs: Any
+        ) -> Any:
+            """Retain the native validation and callback path around dispatch."""
+            config = ensure_config(kwargs.get("config"))
+            if kwargs.get("run_id") is not None:
+                config["run_id"] = kwargs["run_id"]
+            token = _tool_call_context.set(
+                (
+                    kwargs.get("tool_call_id"),
+                    _serde.strip_runnable_config(config),
+                )
+            )
+            try:
+                return await super().arun(tool_input, *args, **kwargs)
+            finally:
+                _tool_call_context.reset(token)
+
     _ROUTED_TOOL_NAMES.add(tool_name)
-    return StructuredTool(
+    return ActivityTool(
         name=tool_name,
         description=base_tool.description,
         args_schema=base_tool.args_schema,  # type: ignore[arg-type]

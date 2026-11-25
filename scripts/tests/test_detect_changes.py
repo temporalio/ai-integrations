@@ -107,3 +107,21 @@ def test_root_license_fans_out_to_every_plugin(repo: Path) -> None:
     commit_all(repo, "add license")
     r = _run(repo, base, "LICENSE")
     assert r["python"] == ["alpha", "beta"] and r["typescript"] == ["gamma"]
+
+
+def test_dotnet_plugins_are_discovered_from_directory_build_props(repo: Path, tmp_path: Path) -> None:
+    _setup(repo)
+    for name in ("zeta", "eta"):
+        plugin = repo / "dotnet" / name
+        plugin.mkdir(parents=True)
+        (plugin / "Directory.Build.props").write_text("<Project />\n")
+    (repo / "dotnet" / "_shared").mkdir()
+    (repo / "dotnet" / "_shared" / "dotnet.mk").write_text("all:\n")
+    base = commit_all(repo, "add dotnet plugins")
+    r = _run(repo, base, "dotnet/zeta/src/Temporalio.Zeta/Plugin.cs")
+    assert r["dotnet"] == ["zeta"] and r["python"] == [] and r["mode"] == "diff"
+    r = _run(repo, base, "dotnet/_shared/dotnet.mk")
+    assert r["dotnet"] == ["eta", "zeta"] and r["python"] == []
+    out = tmp_path / "out.txt"
+    detect_changes.main(["--repo-root", str(repo), "--event", "pull_request", "--base", base, "--github-output", str(out)])
+    assert 'dotnet=["eta","zeta"]' in out.read_text()
