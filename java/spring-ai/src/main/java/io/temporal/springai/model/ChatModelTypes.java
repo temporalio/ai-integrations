@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.metadata.FinishReasonCategory;
 import org.springframework.ai.content.Media;
 
 /**
@@ -109,9 +110,15 @@ public final class ChatModelTypes {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record Generation(
         @JsonProperty("message") Message message,
-        @JsonProperty("finish_reason") String finishReason) {
+        @JsonProperty("finish_reason") @Nullable String finishReason,
+        @JsonProperty("finish_reason_category") @Nullable
+            FinishReasonCategory finishReasonCategory) {
+      public Generation(Message message, @Nullable String finishReason) {
+        this(message, finishReason, null);
+      }
+
       public Generation(Message message) {
-        this(message, null);
+        this(message, null, null);
       }
     }
 

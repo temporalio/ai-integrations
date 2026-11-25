@@ -203,10 +203,13 @@ public class ChatModelActivityImpl implements ChatModelActivity {
     List<ChatModelTypes.ChatModelActivityOutput.Generation> generations =
         response.getResults().stream()
             .map(
-                gen ->
-                    new ChatModelTypes.ChatModelActivityOutput.Generation(
-                        MessagePartsCodec.encode(gen.getOutput()),
-                        gen.getMetadata() != null ? gen.getMetadata().getFinishReason() : null))
+                gen -> {
+                  var metadata = gen.getMetadata();
+                  return new ChatModelTypes.ChatModelActivityOutput.Generation(
+                      MessagePartsCodec.encode(gen.getOutput()),
+                      metadata != null ? metadata.getFinishReason() : null,
+                      metadata != null ? metadata.getFinishReasonCategory() : null);
+                })
             .collect(Collectors.toList());
 
     ChatModelTypes.ChatModelActivityOutput.ChatResponseMetadata metadata = null;

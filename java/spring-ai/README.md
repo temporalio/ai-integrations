@@ -73,8 +73,9 @@ them as metadata. Provider-owned continuation data travels in the message parts.
 ## Structured output
 
 `entity(...)` and `responseEntity(...)` convert the model's answer in workflow code,
-after the model Activity has completed. When the answer doesn't match the target
-type, Spring AI's `BeanOutputConverter` throws a Jackson
+after the model Activity has completed. When a provider refusal or safety filter
+leaves no usable answer, Spring AI throws `ContentFilteredException`. When
+`BeanOutputConverter` fails to convert an answer, it raises a Jackson
 `tools.jackson.core.JacksonException`. If the workflow doesn't handle it, the
 workflow task fails and is retried, but the model's answer is already in the
 history, so every retry fails the same way and the workflow stays running.

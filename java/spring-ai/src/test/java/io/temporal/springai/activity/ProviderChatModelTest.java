@@ -21,6 +21,7 @@ import io.temporal.springai.model.ChatModelTypes.*;
 import io.temporal.springai.util.ChatOptionsCodec;
 import io.temporal.springai.util.MessagePartsCodec;
 import io.temporal.testing.TestWorkflowEnvironment;
+import io.temporal.worker.WorkflowImplementationOptions;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 import java.util.List;
@@ -31,7 +32,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.springframework.ai.chat.client.ContentFilteredException;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.metadata.FinishReasonCategory;
+import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
@@ -44,32 +48,7 @@ class ProviderChatModelTest {
   @BeforeEach
   void setUp() {
     client = mock(OpenAIClient.class, RETURNS_DEEP_STUBS);
-    ChatCompletion reply =
-        ChatCompletion.builder()
-            .id("reply")
-            .created(0)
-            .model("worker-model")
-            .addChoice(
-                ChatCompletion.Choice.builder()
-                    .index(0)
-                    .finishReason(ChatCompletion.Choice.FinishReason.STOP)
-                    .logprobs(Optional.empty())
-                    .message(
-                        ChatCompletionMessage.builder()
-                            .content("pong")
-                            .refusal(Optional.empty())
-                            .build())
-                    .build())
-            .build();
-    HttpResponseFor<ChatCompletion> rawResponse = mock();
-    when(rawResponse.parse()).thenReturn(reply);
-    when(rawResponse.headers()).thenReturn(Headers.builder().build());
-    when(client
-            .chat()
-            .completions()
-            .withRawResponse()
-            .create(any(ChatCompletionCreateParams.class), any(RequestOptions.class)))
-        .thenReturn(rawResponse);
+    replyWith(ChatCompletionMessage.builder().content("pong").refusal(Optional.empty()).build());
     // Mirror the SDK's delegation so both parsed and raw-response Spring AI calls work.
     when(client
             .chat()
@@ -84,6 +63,84 @@ class ProviderChatModelTest {
                     .create(invocation.getArgument(0), invocation.getArgument(1))
                     .parse());
   }
+
+  private void replyWith(ChatCompletionMessage message) {
+    ChatCompletion reply =
+        ChatCompletion.builder()
+            .id("reply")
+            .created(0)
+            .model("worker-model")
+            .addChoice(
+                ChatCompletion.Choice.builder()
+                    .index(0)
+                    .finishReason(ChatCompletion.Choice.FinishReason.STOP)
+                    .logprobs(Optional.empty())
+                    .message(message)
+                    .build())
+            .build();
+    HttpResponseFor<ChatCompletion> rawResponse = mock();
+    when(rawResponse.parse()).thenReturn(reply);
+    when(rawResponse.headers()).thenReturn(Headers.builder().build());
+    when(client
+            .chat()
+            .completions()
+            .withRawResponse()
+            .create(any(ChatCompletionCreateParams.class), any(RequestOptions.class)))
+        .thenReturn(rawResponse);
+  }
+
+  @Test
+  void openAiRefusalRemainsFilteredAcrossTheActivityBoundary() {
+    replyWith(ChatCompletionMessage.builder().content("").refusal("I cannot answer.").build());
+    OpenAiChatModel provider = model(OpenAiChatOptions.builder().model("worker-model").build());
+    var metadata = provider.call(new Prompt("ping")).getResult().getMetadata();
+    assertEquals("STOP", metadata.getFinishReason());
+    assertEquals(FinishReasonCategory.FILTERED, metadata.getFinishReasonCategory());
+
+    try (TestWorkflowEnvironment env = TestWorkflowEnvironment.newInstance()) {
+      String taskQueue = "openai-refusal";
+      var worker = env.newWorker(taskQueue);
+      worker.registerWorkflowImplementationTypes(
+          WorkflowImplementationOptions.newBuilder()
+              .setFailWorkflowExceptionTypes(RuntimeException.class)
+              .build(),
+          RefusalWorkflowImpl.class);
+      worker.registerActivitiesImplementations(new ChatModelActivityImpl(provider));
+      env.start();
+
+      var workflow =
+          env.getWorkflowClient()
+              .newWorkflowStub(
+                  RefusalWorkflow.class,
+                  WorkflowOptions.newBuilder().setTaskQueue(taskQueue).build());
+      assertEquals("STOP", workflow.structuredOutput());
+    }
+  }
+
+  @WorkflowInterface
+  public interface RefusalWorkflow {
+    @WorkflowMethod
+    String structuredOutput();
+  }
+
+  public static class RefusalWorkflowImpl implements RefusalWorkflow {
+    @Override
+    public String structuredOutput() {
+      try {
+        TemporalChatClient.builder(ActivityChatModel.forDefault())
+            .build()
+            .prompt()
+            .user("ping")
+            .call()
+            .entity(StructuredReply.class);
+        return null;
+      } catch (ContentFilteredException refusal) {
+        return refusal.getFinishReason();
+      }
+    }
+  }
+
+  public record StructuredReply(String answer) {}
 
   @Test
   void noOptions_usesSelectedModelsProviderDefaults() {

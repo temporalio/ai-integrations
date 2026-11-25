@@ -352,11 +352,15 @@ public class ActivityChatModel implements ChatModel {
                 gen -> {
                   AssistantMessage message =
                       (AssistantMessage) MessagePartsCodec.decode(gen.message());
-                  return gen.finishReason() != null
-                      ? new Generation(
-                          message,
-                          ChatGenerationMetadata.builder().finishReason(gen.finishReason()).build())
-                      : new Generation(message);
+                  if (gen.finishReason() == null && gen.finishReasonCategory() == null) {
+                    return new Generation(message);
+                  }
+                  return new Generation(
+                      message,
+                      ChatGenerationMetadata.builder()
+                          .finishReason(gen.finishReason())
+                          .finishReasonCategory(gen.finishReasonCategory())
+                          .build());
                 })
             .collect(Collectors.toList());
 
