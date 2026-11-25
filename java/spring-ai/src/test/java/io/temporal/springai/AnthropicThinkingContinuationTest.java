@@ -1,7 +1,6 @@
 package io.temporal.springai;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.*;
@@ -46,6 +45,7 @@ class AnthropicThinkingContinuationTest {
             """
             [
               {"type":"thinking","thinking":"considering","signature":"first-signature"},
+              {"type":"text","text":"checking","citations":[]},
               {"type":"redacted_thinking","data":"opaque-redacted-data"},
               {"type":"thinking","thinking":"ready","signature":"second-signature"},
               {"type":"tool_use","id":"toolu","name":"echo","caller":{"type":"direct"},"input":{}}
@@ -103,15 +103,15 @@ class AnthropicThinkingContinuationTest {
             .filter(m -> m.role().asString().equals("assistant"))
             .findFirst()
             .orElseThrow();
-    var blocks = assistant.content().asBlockParams();
-    assertEquals(4, blocks.size());
+    var blocks = assistant.content().asContentBlockParams();
+    assertEquals(5, blocks.size());
     assertEquals("considering", blocks.get(0).asThinking().thinking());
     assertEquals("first-signature", blocks.get(0).asThinking().signature());
-    assertEquals("opaque-redacted-data", blocks.get(1).asRedactedThinking().data());
-    assertEquals("ready", blocks.get(2).asThinking().thinking());
-    assertEquals("second-signature", blocks.get(2).asThinking().signature());
-    assertTrue(blocks.get(3).isToolUse());
-    assertEquals("toolu", blocks.get(3).asToolUse().id());
+    assertEquals("checking", blocks.get(1).asText().text());
+    assertEquals("opaque-redacted-data", blocks.get(2).asRedactedThinking().data());
+    assertEquals("ready", blocks.get(3).asThinking().thinking());
+    assertEquals("second-signature", blocks.get(3).asThinking().signature());
+    assertEquals("toolu", blocks.get(4).asToolUse().id());
   }
 
   private Message message(String id, String reason, String content) throws JsonProcessingException {
