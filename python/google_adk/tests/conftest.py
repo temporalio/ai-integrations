@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -56,6 +57,12 @@ async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
 async def client(env: WorkflowEnvironment) -> Client:
     """Return the local environment's client."""
     return env.client
+
+
+@pytest.fixture
+def task_queue() -> str:
+    """Isolate each test case's worker on the shared server."""
+    return f"google-adk-test-{uuid.uuid4()}"
 
 
 # There is an issue in tests sometimes in GitHub Actions where even though all tests
