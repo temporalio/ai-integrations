@@ -12,7 +12,7 @@ Published as [`temporalio-locus`](https://pypi.org/project/temporalio-locus/) an
 uv add temporalio-locus
 ```
 
-Add the Locus extra for your model provider, for example `locus-sdk[oci]` for OCI Generative AI.
+Add the Locus extra for your model provider, for example `locus-sdk[oci]` for OCI Generative AI, and `temporalio-locus[mcp]` to use MCP servers.
 
 ## Quickstart
 
@@ -82,6 +82,7 @@ Build the `Agent` and its `TemporalModel` in Workflow code. Build the real model
 | Model call | `Agent(model=TemporalModel(name, ...))` | `locus_model_complete` Activity |
 | Streamed model call | `agent.run(prompt, stream_tokens=True)` | `locus_model_stream` Activity; the Workflow gets the chunks when the call ends, and subscribers get them live with `streaming_topic` |
 | Tool that does I/O | `activity_as_tool(fn, ...)` | the Activity `fn` |
+| MCP server's tools | `Agent(mcp_servers=[TemporalMCPClient(name, ...)])` | `temporalio.mcp.{name}.list-tools` and `temporalio.mcp.{name}.call-tool` Activities |
 | `@tool` function, sync or async | passed to `Agent(tools=[...])` | Workflow code; must be deterministic |
 
 ## Models
@@ -97,6 +98,36 @@ A failed tool Activity is handed to the model as a tool error, as Locus does for
 ## Cancellation
 
 Cancelling the Workflow cancels a running model call: the heartbeat delivers the cancel to the Activity, and the model's `complete` or `stream` is cancelled on the Worker. This needs a `heartbeat_timeout`, which `TemporalModel` sets by default.
+
+## MCP
+
+An MCP server's tools run as Activities. Register a factory for each server on the Worker, and refer to it by name in Workflow code with `TemporalMCPClient`. This needs the `mcp` extra, `temporalio-locus[mcp]`, which brings [`temporalio-mcp`](https://github.com/temporalio/ai-integrations/tree/main/python/mcp) and MCP Python SDK v2.
+
+```python
+# worker
+from mcp import Client, StdioServerParameters, stdio_client
+
+plugin = LocusPlugin(
+    models={"default": lambda: get_model("oci:openai.gpt-5.5")},
+    mcp_clients={
+        "orders": lambda: Client(
+            stdio_client(StdioServerParameters(command="orders-mcp-server"))
+        )
+    },
+)
+
+# workflow
+orders = TemporalMCPClient("orders", start_to_close_timeout=timedelta(seconds=30))
+agent = Agent(model=TemporalModel("default", ...), mcp_servers=[orders])
+```
+
+- The factory returns an `mcp.Client`, not Locus's `MCPClient`: the connection lives on the Worker, so its transport and credentials never enter Event History. Locus's own `MCPClient` connects from where it is built and is not supported in Workflow code.
+- Listing the server's tools is the `temporalio.mcp.{name}.list-tools` Activity, and each tool call is a `temporalio.mcp.{name}.call-tool` Activity whose summary is the tool's name. The listing runs once per `TemporalMCPClient`; with `mcp_servers` that is on the agent's first run.
+- `await orders.load_tools()` returns the tools as Locus tools, to pass in `Agent(tools=[...])` beside your own.
+- `prefix="shop"` names the tools `shop_{name}` for the model; `allowed_tools=[...]` keeps only the named tools.
+- A tool the server reports as failed is a tool error for the model, and its Activity succeeds. An Activity that fails, such as one whose server is down, is retried with `retry_policy`; by default without limit.
+- Text, `structuredContent`, images and other content blocks reach Locus as they do from its `MCPClient`.
+- Per-run headers (`headers_provider`), progress notifications and tool filters that are functions are not carried.
 
 ## Multi-agent shapes
 
@@ -205,7 +236,7 @@ Locus has no clock or id seam, so the plugin replaces the `time`, `datetime`, `u
 ## Not supported in Workflow code
 
 - `agent.run_sync(...)`: it starts a thread. Use `await agent.arun(...)` or `agent.run(...)`.
-- Checkpointers, memory managers, MCP servers, RAG stores and other Locus features that do their own I/O. Event History is the state store; call such features from an Activity.
+- Checkpointers, memory managers, Locus's `MCPClient`, RAG stores and other Locus features that do their own I/O. Event History is the state store; call such features from an Activity. For MCP use `TemporalMCPClient`.
 - Model call options that cannot be sent as JSON, such as a callback. The run fails with `LocusUnserializableModelOption`; set such an option on the model the factory builds.
 
 ## Payload size
