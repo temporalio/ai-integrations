@@ -17,11 +17,16 @@ endif
 export UV_NO_EDITABLE := 1
 
 PYTEST_ARGS ?=
-# Keep the dependency versions selected by sync or sync-latest through all tool runs.
+# Keep the dependency versions selected by sync, sync-latest or sync-lowest through all tool runs.
 UV_RUN := uv run --locked
 PYTEST := $(UV_RUN) pytest -n auto --dist=worksteal
+# uv records sync-lowest's resolution mode in uv.lock, and `uv run --locked` rejects a lock
+# made another way, so every target keeps that mode while the lock has it.
+ifneq ($(shell grep -s 'resolution-mode = "lowest-direct"' uv.lock),)
+export UV_RESOLUTION := lowest-direct
+endif
 
-.PHONY: help sync sync-latest check-deps format lint test build clean
+.PHONY: help sync sync-latest sync-lowest check-deps format lint test build clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
@@ -31,7 +36,13 @@ sync: ## Install locked dependencies and this plugin (non-editable); creates uv.
 	@test -f uv.lock || uv lock
 	uv sync --locked
 
+sync-latest: export UV_RESOLUTION := highest
 sync-latest: ## Re-lock to the newest allowed versions and install (nightly lane; lock not committed)
+	uv lock --upgrade
+	uv sync --locked
+
+sync-lowest: export UV_RESOLUTION := lowest-direct
+sync-lowest: ## Re-lock to the lowest allowed versions of direct dependencies and install (nightly lane; lock not committed)
 	uv lock --upgrade
 	uv sync --locked
 
