@@ -46,8 +46,6 @@ from temporalio.google_adk import GoogleAdkPlugin, TemporalModel
 from temporalio.google_adk.workflow import activity_node
 from temporalio.worker import Replayer, Worker
 
-TASK_QUEUE = "adk-graph-task-queue"
-
 
 @activity.defn
 async def fetch_data(query: str) -> str:
@@ -322,10 +320,10 @@ def _adk_client(client: Client) -> Client:
     return Client(**new_config)
 
 
-def _worker(client: Client) -> Worker:
+def _worker(client: Client, task_queue: str) -> Worker:
     return Worker(
         client,
-        task_queue=TASK_QUEUE,
+        task_queue=task_queue,
         activities=[fetch_data, enrich_item, combine_parts, shout, join_parts],
         workflows=[
             SequentialGraphWorkflow,
@@ -343,14 +341,14 @@ def _worker(client: Client) -> Worker:
 
 
 @pytest.mark.asyncio
-async def test_graph_sequential_with_activity_node(client: Client):
+async def test_graph_sequential_with_activity_node(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             SequentialGraphWorkflow.run,
             "hello",
             id=f"graph-sequential-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == "data-for-hello summarized"
@@ -361,28 +359,30 @@ async def test_graph_sequential_with_activity_node(client: Client):
     [("bug: crash", "routed-to-bug"), ("question", "routed-to-other")],
 )
 @pytest.mark.asyncio
-async def test_graph_conditional_routing(client: Client, ticket: str, expected: str):
+async def test_graph_conditional_routing(
+    client: Client, task_queue: str, ticket: str, expected: str
+):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             RoutingGraphWorkflow.run,
             ticket,
             id=f"graph-routing-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == expected
 
 
 @pytest.mark.asyncio
-async def test_graph_parallel_fanout_join(client: Client):
+async def test_graph_parallel_fanout_join(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             ParallelJoinGraphWorkflow.run,
             "go",
             id=f"graph-join-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     # JoinNode aggregates branch outputs keyed by predecessor node name.
@@ -390,28 +390,28 @@ async def test_graph_parallel_fanout_join(client: Client):
 
 
 @pytest.mark.asyncio
-async def test_graph_multi_param_activity_node(client: Client):
+async def test_graph_multi_param_activity_node(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             MultiParamActivityNodeWorkflow.run,
             "go",
             id=f"graph-multiparam-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == "L+R"
 
 
 @pytest.mark.asyncio
-async def test_graph_positional_only_activity_node(client: Client):
+async def test_graph_positional_only_activity_node(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             PositionalOnlyGraphWorkflow.run,
             "go",
             id=f"graph-positional-only-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == "GO-done"
@@ -447,57 +447,57 @@ async def test_activity_node_rejects_bad_dict_input():
 
 
 @pytest.mark.asyncio
-async def test_graph_llm_agent_node(client: Client):
+async def test_graph_llm_agent_node(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         LLMRegistry.register(GraphAgentModel)
         result = await client.execute_workflow(
             AgentNodeGraphWorkflow.run,
             "graph_model",
             id=f"graph-agent-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == "final:agent-says-hi"
 
 
 @pytest.mark.asyncio
-async def test_graph_node_timeout(client: Client):
+async def test_graph_node_timeout(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             TimeoutGraphWorkflow.run,
             "go",
             id=f"graph-timeout-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == "timed-out"
 
 
 @pytest.mark.asyncio
-async def test_graph_node_retry(client: Client):
+async def test_graph_node_retry(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             RetryGraphWorkflow.run,
             "go",
             id=f"graph-retry-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == "ok-after-2"
 
 
 @pytest.mark.asyncio
-async def test_graph_node_retry_jitter_replay_safe(client: Client):
+async def test_graph_node_retry_jitter_replay_safe(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         handle = await client.start_workflow(
             JitteredRetryGraphWorkflow.run,
             "go",
             id=f"graph-retry-jitter-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
         result = await handle.result()

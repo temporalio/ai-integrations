@@ -63,6 +63,13 @@ def test_other_scripts_select_nothing_and_report_scripts_only(repo: Path) -> Non
     assert r["python"] == [] and r["any"] is False and r["scripts_only"] is True and r["mode"] == "none"
 
 
+def test_dev_server_launcher_selects_its_consumers() -> None:
+    plugins = {lang: [lang + "-plugin"] for lang in ("python", "typescript", "go", "dotnet", "java")}
+    result, all_plugins, scripts_only = detect_changes.select(["scripts/dev/run_temporal_tests.py"], plugins)
+    assert result == {lang: ({names[0]} if lang != "java" else set()) for lang, names in plugins.items()}
+    assert not all_plugins and not scripts_only
+
+
 def test_root_files_select_nothing(repo: Path) -> None:
     base = _setup(repo)
     r = _run(repo, base, "README.md")

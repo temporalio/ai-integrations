@@ -100,7 +100,7 @@ jobs:
       - name: Lint and type-check
         run: cd "$PLUGIN_DIR" && make lint
       - name: Test
-        run: cd "$PLUGIN_DIR" && make test PYTEST_ARGS="-s --junit-xml=junit/test.xml"
+        run: cd "$PLUGIN_DIR" && make test TEST_ARGS="-s --junit-xml=junit/test.xml"
       - name: Build, verify, and smoke-test distributions
         # Only on the designated dist cell: the release pipeline publishes the ubuntu-built artifacts.
         if: matrix.dist

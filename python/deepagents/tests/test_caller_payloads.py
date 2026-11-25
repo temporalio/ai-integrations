@@ -251,16 +251,17 @@ async def test_readme_agent_keeps_message_types(
 ) -> None:
     plugin = DeepAgentsPlugin(model_provider=mock_model_provider(["done"]))
     client = _client_with(env.client, plugin)
+    task_queue = f"da-payloads-readme-{uuid.uuid4()}"
     async with Worker(
         client,
-        task_queue="da-payloads-readme",
+        task_queue=task_queue,
         workflows=[LongResearchAgent],
     ):
         handle = await client.start_workflow(
             LongResearchAgent.run,
             {"messages": [question]},
-            id=f"da-payloads-readme-{uuid.uuid4()}",
-            task_queue="da-payloads-readme",
+            id=task_queue,
+            task_queue=task_queue,
         )
         result = await _wait(handle, handle.result())
 
