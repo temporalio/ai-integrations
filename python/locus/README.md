@@ -80,7 +80,7 @@ Build the `Agent` and its `TemporalModel` in Workflow code. Build the real model
 | Locus | In a Workflow | Runs as |
 | --- | --- | --- |
 | Model call | `Agent(model=TemporalModel(name, ...))` | `locus_model_complete` Activity |
-| Streamed model call | `agent.run(prompt, stream_tokens=True)` | `locus_model_stream` Activity; chunks arrive together when the call ends |
+| Streamed model call | `agent.run(prompt, stream_tokens=True)` | `locus_model_stream` Activity; the Workflow gets the chunks when the call ends, and subscribers get them live with `streaming_topic` |
 | Tool that does I/O | `activity_as_tool(fn, ...)` | the Activity `fn` |
 | `@tool` function, sync or async | passed to `Agent(tools=[...])` | Workflow code; must be deterministic |
 
@@ -97,6 +97,43 @@ A failed tool Activity is handed to the model as a tool error, as Locus does for
 ## Cancellation
 
 Cancelling the Workflow cancels a running model call: the heartbeat delivers the cancel to the Activity, and the model's `complete` or `stream` is cancelled on the Worker. This needs a `heartbeat_timeout`, which `TemporalModel` sets by default.
+
+## Streaming
+
+The Workflow receives a streamed call's chunks together, when the model Activity returns, so that replay sees the same chunks. To show them to a user while the model is still answering, pass `streaming_topic` to `TemporalModel` and host a [`WorkflowStream`](https://docs.temporal.io/workflow-streams) on the Workflow. The model Activity then also publishes each `ModelChunkEvent` on that topic as the model produces it, batched on `streaming_batch_interval` (default 100 ms), and clients subscribe with `WorkflowStreamClient`.
+
+```python
+# workflow
+@workflow.defn
+class ChatWorkflow:
+    def __init__(self) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent(
+            model=TemporalModel(
+                "default",
+                start_to_close_timeout=timedelta(seconds=60),
+                streaming_topic="tokens",
+            )
+        )
+        text = ""
+        async for event in agent.run(prompt, stream_tokens=True):
+            if isinstance(event, ModelChunkEvent) and event.content:
+                text += event.content
+        return text
+
+# client
+stream = WorkflowStreamClient.create(client, workflow_id)
+async for item in stream.subscribe(["tokens"], result_type=ModelChunkEvent):
+    print(item.data.content or "", end="", flush=True)
+```
+
+- Locus streams a model call only in a streamed run, `agent.run(prompt, stream_tokens=True)`. `agent.arun(...)` makes unstreamed calls and publishes nothing.
+- Without a `WorkflowStream` on the Workflow, published chunks are dropped and the run is unaffected.
+- Publishing is a side effect of an Activity attempt: a failed attempt may leave chunks on the topic before the retry publishes its own.
+- Workflow Streams is at an experimental release stage in the Python SDK.
 
 ## Waiting on a person
 
@@ -119,7 +156,6 @@ Inside a Workflow, Locus's time budgets, `TimeLimit`, timestamps, run ids, tool-
 - `agent.run_sync(...)`: it starts a thread. Use `await agent.arun(...)` or `agent.run(...)`.
 - Checkpointers, memory managers, MCP servers, RAG stores and other Locus features that do their own I/O. Event History is the state store; call such features from an Activity.
 - Model call options that cannot be sent as JSON, such as a callback. The run fails with `LocusUnserializableModelOption`; set such an option on the model the factory builds.
-- Live token streaming to a client. Streamed chunks reach the Workflow when the model call ends.
 
 ## Payload size
 

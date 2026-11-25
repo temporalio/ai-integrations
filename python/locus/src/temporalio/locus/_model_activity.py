@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -13,6 +14,7 @@ from locus.core.messages import Message
 from locus.models.base import ModelProtocol, ModelResponse
 from locus.models.failover import FailoverReason, classify
 from temporalio import activity
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
 
 from ._heartbeat import heartbeat_every
@@ -28,6 +30,10 @@ class ModelCallInput(BaseModel):
     messages: list[Message]
     tools: list[dict[str, Any]] | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+    # Set only for a streamed call that also publishes its chunks to a
+    # WorkflowStream topic for outside subscribers.
+    streaming_topic: str | None = None
+    streaming_batch_interval_seconds: float = 0.1
 
 
 class ModelStreamResult(BaseModel):
@@ -69,16 +75,35 @@ class ModelActivities:
 
     @activity.defn(name=STREAM_ACTIVITY)
     async def stream(self, input: ModelCallInput) -> ModelStreamResult:
-        """Run one streamed completion on the named model and return its chunks."""
+        """Run one streamed completion on the named model and return its chunks.
+
+        With ``streaming_topic`` set, each chunk is also published to that topic
+        of the workflow's ``WorkflowStream`` as the model produces it. The
+        workflow still gets every chunk in the result, so replay does not
+        depend on what was published.
+        """
         model = self._model(input.model_name)
+        chunks: list[ModelChunkEvent] = []
         async with heartbeat_every():
             try:
-                chunks = [
-                    chunk
+                if input.streaming_topic is None:
                     async for chunk in model.stream(
                         input.messages, input.tools, **input.options
+                    ):
+                        chunks.append(chunk)
+                else:
+                    client = WorkflowStreamClient.from_within_activity(
+                        batch_interval=timedelta(
+                            seconds=input.streaming_batch_interval_seconds
+                        ),
                     )
-                ]
+                    topic = client.topic(input.streaming_topic, type=ModelChunkEvent)
+                    async with client:
+                        async for chunk in model.stream(
+                            input.messages, input.tools, **input.options
+                        ):
+                            chunks.append(chunk)
+                            topic.publish(chunk)
             except Exception as err:
                 raise _as_failure(err) from err
         return ModelStreamResult(chunks=chunks)

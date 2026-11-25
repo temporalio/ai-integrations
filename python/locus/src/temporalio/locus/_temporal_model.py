@@ -34,8 +34,15 @@ class TemporalModel:
     ``heartbeat_timeout`` defaults to 10 seconds; the activities heartbeat on a
     timer at half of it. Pass ``None`` to turn heartbeats off.
 
-    ``stream`` is batched: the activity collects the model's chunks and the
-    workflow yields them once the call has finished.
+    ``stream`` is batched for the workflow: the activity collects the model's
+    chunks and the workflow yields them once the call has finished.
+
+    To show chunks to outside consumers while the model is still answering,
+    set ``streaming_topic`` and host a
+    :class:`temporalio.contrib.workflow_streams.WorkflowStream` on the
+    workflow. Each chunk of a streamed call is then also published on that
+    topic, batched on ``streaming_batch_interval``. Locus streams a call only
+    in a streamed run, ``agent.run(prompt, stream_tokens=True)``.
     """
 
     def __init__(
@@ -52,13 +59,17 @@ class TemporalModel:
         versioning_intent: VersioningIntent | None = None,
         summary: str | None = None,
         priority: Priority = Priority.default,
+        streaming_topic: str | None = None,
+        streaming_batch_interval: timedelta = timedelta(milliseconds=100),
     ) -> None:
-        """Set the model name and the options its activities run with."""
+        """Set the model name, the activity options and the streaming settings."""
         if schedule_to_close_timeout is None and start_to_close_timeout is None:
             raise ValueError(
                 "TemporalModel needs start_to_close_timeout or schedule_to_close_timeout"
             )
         self.model_name = model_name
+        self._streaming_topic = streaming_topic
+        self._streaming_batch_interval = streaming_batch_interval
         self._options: dict[str, Any] = {
             "task_queue": task_queue,
             "schedule_to_close_timeout": schedule_to_close_timeout,
@@ -117,9 +128,14 @@ class TemporalModel:
         **kwargs: Any,
     ) -> AsyncIterator[ModelChunkEvent]:
         """Run one streamed completion as the ``locus_model_stream`` activity."""
+        call = self._input(messages, tools, kwargs)
+        call.streaming_topic = self._streaming_topic
+        call.streaming_batch_interval_seconds = (
+            self._streaming_batch_interval.total_seconds()
+        )
         result = await workflow.execute_activity(
             STREAM_ACTIVITY,
-            self._input(messages, tools, kwargs),
+            call,
             result_type=ModelStreamResult,
             **self._options,
         )
