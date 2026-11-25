@@ -1,15 +1,14 @@
 """``TESTED_VERSIONS`` is coupled to the lock, so a lock bump moves it in the same PR.
 
 The range runs from the floor the plugin was first tested on through the
-``agent-framework-core`` version ``uv.lock`` pins, which CI runs on every
-change. This test always runs and fails when the upper bound and the lock
-disagree, or when the README's Installation sentence stops naming the range;
-the nightly's newest-dependency lane keeps the seam guards as its signal, so a
-newer framework release does not turn the nightly red by itself.
+``agent-framework-core`` version the committed ``uv.lock`` pins. Locked runs
+check the upper bound against that lock. Both dependency modes check that the
+README's Installation sentence names the range.
 """
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 
@@ -31,6 +30,10 @@ def _locked_version(package: str) -> str:
     raise AssertionError(f"{package} is not in {LOCK}")
 
 
+@pytest.mark.skipif(
+    os.environ.get("DEPS") == "latest",
+    reason="Latest dependency runs replace the committed lock with a temporary lock",
+)
 def test_tested_range_matches_the_lock() -> None:
     if not LOCK.is_file():
         pytest.skip(f"{LOCK} is absent; the range check needs the lock file")
@@ -43,6 +46,9 @@ def test_tested_range_matches_the_lock() -> None:
         "tested-range sentence in the README's Installation paragraph in the same "
         "PR as the lock bump."
     )
+
+
+def test_readme_names_the_tested_range() -> None:
     assert TESTED_VERSIONS in README.read_text(encoding="utf-8"), (
         f"the README's Installation paragraph must name the tested range "
         f"{TESTED_VERSIONS!r}; move it with the lock bump."
