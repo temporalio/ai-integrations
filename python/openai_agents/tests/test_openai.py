@@ -47,6 +47,7 @@ from agents import (
     MCPToolApprovalRequest,
     MessageOutputItem,
     Model,
+    ModelBehaviorError,
     ModelProvider,
     ModelResponse,
     ModelSettings,
@@ -64,6 +65,7 @@ from agents import (
     ToolInputGuardrailData,
     TResponseInputItem,
     Usage,
+    UserError,
     function_tool,
     handoff,
     input_guardrail,
@@ -98,6 +100,7 @@ from openai.types.responses import (
     ResponseInputTextParam,
     ResponseOutputMessage,
     ResponseOutputMessageParam,
+    ResponseOutputRefusal,
 )
 from openai.types.responses.response_file_search_tool_call import Result
 from openai.types.responses.response_function_web_search import ActionSearch
@@ -123,6 +126,7 @@ from temporalio.client import (
     WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
+    WorkflowUpdateFailedError,
 )
 from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -144,6 +148,8 @@ from temporalio.openai_agents import (
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
     _mcp,
+    _openai_runner,
+    _workflow_failure,
 )
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
@@ -4264,6 +4270,290 @@ async def test_output_type(client: Client):
             result = await workflow_handle.result()
             assert isinstance(result, OutputType)
             assert result.answer == "My answer"
+
+
+@workflow.defn
+class CaughtOutputTypeErrorWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        agent: Agent = Agent(
+            name="Assistant",
+            instructions="You are a helpful assistant, adhere to the json schema output",
+            output_type=OutputType,
+        )
+        try:
+            await Runner.run(starting_agent=agent, input="Hello!")
+        except ModelBehaviorError as e:
+            return f"caught: {e}"
+        return "not raised"
+
+
+def invalid_output_type_mock_model():
+    return TestModel.returning_responses(
+        [ResponseBuilders.output_message('{"answer": 42}')]
+    )
+
+
+async def test_invalid_output_type_fails_workflow(client: Client):
+    """A final output that doesn't match output_type fails the Workflow.
+
+    The model's answer is recorded in History, so retrying the Workflow Task
+    would replay the same answer and fail the same way forever.
+    """
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, OutputTypeWorkflow) as worker:
+            workflow_handle = await client.start_workflow(
+                OutputTypeWorkflow.run,
+                id=f"invalid-output-type-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowFailureError) as e:
+                await workflow_handle.result()
+            cause = e.value.cause
+            assert isinstance(cause, ApplicationError)
+            assert cause.type == "ModelBehaviorError"
+            assert "Invalid JSON when parsing model output" in cause.message
+
+            workflow_task_failures = [
+                event
+                async for event in workflow_handle.fetch_history_events()
+                if event.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED
+            ]
+            assert workflow_task_failures == []
+
+
+async def test_invalid_output_type_can_be_caught(client: Client):
+    """Workflow code that catches ModelBehaviorError still gets it first."""
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, CaughtOutputTypeErrorWorkflow) as worker:
+            result = await client.execute_workflow(
+                CaughtOutputTypeErrorWorkflow.run,
+                id=f"caught-output-type-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            assert result.startswith("caught: Invalid JSON when parsing model output")
+
+
+@workflow.defn
+class InvalidOutputUpdateWorkflow:
+    """Runs the agent in an Update handler while the Workflow waits."""
+
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(lambda: False)
+
+    @workflow.update
+    async def ask(self) -> str:
+        agent: Agent = Agent(
+            name="Assistant",
+            instructions="You are a helpful assistant, adhere to the json schema output",
+            output_type=OutputType,
+        )
+        result = await Runner.run(starting_agent=agent, input="Hello!")
+        return result.final_output.answer
+
+
+async def test_invalid_output_in_update_fails_only_the_update(client: Client):
+    """A ModelBehaviorError that escapes an Update handler fails the Update, not the Workflow."""
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, InvalidOutputUpdateWorkflow) as worker:
+            handle = await client.start_workflow(
+                InvalidOutputUpdateWorkflow.run,
+                id=f"invalid-output-update-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowUpdateFailedError) as err:
+                await handle.execute_update(InvalidOutputUpdateWorkflow.ask)
+            cause = err.value.cause
+            assert isinstance(cause, ApplicationError)
+            assert cause.type == "ModelBehaviorError"
+            assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
+            await handle.terminate()
+
+
+@workflow.defn
+class RefusalFallbackWorkflow:
+    """Recovers from a model_refusal fallback that doesn't match output_type.
+
+    The Agents SDK raises that as a ``UserError`` whose cause is a
+    ``ModelBehaviorError``. The Workflow must get the ``UserError`` itself.
+    """
+
+    @workflow.run
+    async def run(self) -> str:
+        agent: Agent = Agent(
+            name="Assistant",
+            instructions="You are a helpful assistant, adhere to the json schema output",
+            output_type=OutputType,
+        )
+        try:
+            await Runner.run(
+                starting_agent=agent,
+                input="Hello!",
+                error_handlers={"model_refusal": lambda _: {"answer": 42}},
+            )
+        except UserError as e:
+            cause = type(e.__cause__).__name__
+            return f"recovered from {type(e).__name__} caused by {cause}"
+        return "not raised"
+
+
+def refusal_mock_model():
+    return TestModel.returning_responses(
+        [
+            ResponseBuilders.model_response(
+                ResponseOutputMessage(
+                    id="",
+                    content=[ResponseOutputRefusal(refusal="No.", type="refusal")],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+            )
+        ]
+    )
+
+
+# The Agents SDK warns while it serializes the mismatched fallback.
+@pytest.mark.filterwarnings("ignore::UserWarning")
+async def test_user_error_caused_by_model_behavior_error_can_be_caught(
+    client: Client,
+):
+    """A UserError whose cause is a ModelBehaviorError reaches Workflow code unchanged."""
+    async with AgentEnvironment(
+        model=refusal_mock_model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, RefusalFallbackWorkflow) as worker:
+            result = await client.execute_workflow(
+                RefusalFallbackWorkflow.run,
+                id=f"refusal-fallback-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            assert result == "recovered from UserError caused by ModelBehaviorError"
+
+
+@workflow.defn(name="OutputTypeWorkflow")
+class FixedOutputTypeWorkflow:
+    """OutputTypeWorkflow after a code fix that catches ModelBehaviorError."""
+
+    @workflow.run
+    async def run(self) -> OutputType:
+        agent: Agent = Agent(
+            name="Assistant",
+            instructions="You are a helpful assistant, adhere to the json schema output",
+            output_type=OutputType,
+        )
+        try:
+            result = await Runner.run(starting_agent=agent, input="Hello!")
+        except ModelBehaviorError:
+            return OutputType(answer="fallback")
+        return result.final_output
+
+
+async def test_invalid_output_type_upgrade_keeps_retrying_run_recoverable(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    """A run that was retrying its Workflow Task before the upgrade keeps doing so.
+
+    The run starts on a Worker without the patch, as on an older release, and its
+    Workflow Task fails on the invalid output. An upgraded Worker must not fail the
+    Workflow, so that a Workflow code fix can still recover the run.
+    """
+    task_queue = str(uuid.uuid4())
+    model_params = ModelActivityParameters(
+        start_to_close_timeout=timedelta(seconds=120),
+    )
+
+    async def pending_workflow_task_attempt(handle: WorkflowHandle) -> int:
+        description = await handle.describe()
+        assert description.status == WorkflowExecutionStatus.RUNNING
+        return description.raw_description.pending_workflow_task.attempt
+
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(), model_params=model_params
+    ) as env:
+        old_client = env.applied_on_client(client)
+        with monkeypatch.context() as m:
+            # A Worker from before the patch never records its marker.
+            for module in (_openai_runner, _workflow_failure):
+                m.setattr(module, "model_behavior_error_fails_workflow", lambda: False)
+            async with new_worker(
+                old_client,
+                OutputTypeWorkflow,
+                task_queue=task_queue,
+                max_cached_workflows=0,
+            ):
+                handle = await old_client.start_workflow(
+                    OutputTypeWorkflow.run,
+                    id=f"invalid-output-type-upgrade-{uuid.uuid4()}",
+                    task_queue=task_queue,
+                    execution_timeout=timedelta(seconds=60),
+                )
+
+                async def failed_once() -> int:
+                    attempt = await pending_workflow_task_attempt(handle)
+                    assert attempt >= 2
+                    return attempt
+
+                old_attempt = await assert_eventually(failed_once)
+
+    async with AgentEnvironment(
+        model=invalid_output_type_mock_model(), model_params=model_params
+    ) as env:
+        new_client = env.applied_on_client(client)
+        async with new_worker(
+            new_client,
+            OutputTypeWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+
+            async def failed_on_upgraded_worker() -> None:
+                attempt = await pending_workflow_task_attempt(handle)
+                assert attempt > old_attempt
+
+            await assert_eventually(
+                failed_on_upgraded_worker, timeout=timedelta(seconds=20)
+            )
+
+        async with new_worker(
+            new_client,
+            FixedOutputTypeWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            result = await handle.result()
+            assert result.answer == "fallback"
 
 
 @workflow.defn
