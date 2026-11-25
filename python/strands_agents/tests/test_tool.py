@@ -1,4 +1,5 @@
 import functools
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -8,10 +9,10 @@ from uuid import uuid4
 
 import pytest
 from strands import tool
-from strands_tools import (  # pyright: ignore[reportMissingTypeStubs]
-    calculator,
-    file_read,
-)
+from strands.multiagent import Swarm
+from strands.multiagent.graph import GraphBuilder
+from strands.tools.tools import PythonAgentTool
+from strands.types.tools import ToolResult, ToolUse
 
 from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
@@ -19,7 +20,7 @@ from temporalio.client import Client, WorkflowHistory
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
-from tests.common import get_activities
+from tests.common import get_activities, get_tool_results
 from tests.mock_model import MockModel
 from tests.postponed_activities import LoadParcels
 
@@ -29,18 +30,51 @@ def letter_counter(word: str, letter: str) -> int:
     return word.lower().count(letter.lower())
 
 
+tool_threads: list[int] = []
+
+
+@tool
+def record_thread() -> str:
+    """Record the thread the tool runs on."""
+    tool_threads.append(threading.get_ident())
+    return "ok"
+
+
+def _shout(tool_use: ToolUse, **_kwargs: Any) -> ToolResult:
+    word = tool_use["input"]["word"]
+    return {
+        "toolUseId": tool_use["toolUseId"],
+        "status": "success",
+        "content": [{"text": word.upper()}],
+    }
+
+
+# A module-based sync tool, which Strands runs from strands.tools.tools.
+shout = PythonAgentTool(
+    "shout",
+    {
+        "name": "shout",
+        "description": "Upper-case a word.",
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {"word": {"type": "string"}},
+                "required": ["word"],
+            }
+        },
+    },
+    _shout,
+)
+
+
 @activity.defn(name="read_file")
 async def read_file_activity(path: str) -> str:
-    result = file_read.file_read(
-        {
-            "toolUseId": "read_file",
-            "name": "file_read",
-            "input": {"path": path, "mode": "view"},
-        }
-    )
-    text = result["content"][0].get("text")
-    assert text is not None
-    return text
+    return Path(path).read_text()
+
+
+@activity.defn(name="divide")
+async def divide_activity(dividend: int, divisor: int) -> float:
+    return dividend / divisor
 
 
 @activity.defn(name="track_parcel")
@@ -144,12 +178,16 @@ class ToolWorkflow:
             model="mock",
             start_to_close_timeout=timedelta(seconds=15),
             tools=[
-                calculator,
+                activity_as_tool(
+                    divide_activity,
+                    start_to_close_timeout=timedelta(seconds=15),
+                ),
                 activity_as_tool(
                     read_file_activity,
                     start_to_close_timeout=timedelta(seconds=15),
                 ),
                 letter_counter,
+                shout,
                 activity_as_tool(
                     TrackParcel, start_to_close_timeout=timedelta(seconds=15)
                 ),
@@ -182,13 +220,14 @@ async def test_tool(client: Client, tmp_path: Path):
                 [
                     {"name": "read_file", "input": {"path": str(fixture)}},
                     {
-                        "name": "calculator",
-                        "input": {"expression": "3111696 / 74088"},
+                        "name": "divide",
+                        "input": {"dividend": 3111696, "divisor": 74088},
                     },
                     {
                         "name": "letter_counter",
                         "input": {"word": "strawberry", "letter": "R"},
                     },
+                    {"name": "shout", "input": {"word": "strawberry"}},
                     {"name": "track_parcel", "input": {"parcel_id": "P-1"}},
                     {"name": "quote_parcel", "input": {"parcel_id": "P-2"}},
                     {"name": "ship_parcel", "input": {"parcel_id": "P-3"}},
@@ -210,6 +249,7 @@ async def test_tool(client: Client, tmp_path: Path):
         workflows=[ToolWorkflow],
         activities=[
             read_file_activity,
+            divide_activity,
             TrackParcel("acme-post"),
             Shipping("acme-post").quote,
             ShipParcel("unused"),
@@ -236,9 +276,11 @@ async def test_tool(client: Client, tmp_path: Path):
         "invoke_model",
         "read_file",
         "invoke_model",
-        # calculator (in-workflow)
+        "divide",
         "invoke_model",
         # letter_counter (in-workflow)
+        "invoke_model",
+        # shout (in-workflow)
         "invoke_model",
         "track_parcel",
         "invoke_model",
@@ -253,6 +295,18 @@ async def test_tool(client: Client, tmp_path: Path):
         "locate_parcel",
         "invoke_model",
     ]
+    # The model got the results of letter_counter and shout, sync tools run in
+    # the workflow: a @tool function and a module tool.
+    assert get_tool_results(history)[2:4] == [
+        [{"text": "3"}],
+        [{"text": "STRAWBERRY"}],
+    ]
+    assert get_tool_results(history)[1] == [{"text": "42.0"}]
+    # Outside a workflow, Strands still runs a sync tool on a thread.
+    tool_use: ToolUse = {"toolUseId": "t", "name": "record_thread", "input": {}}
+    async for _ in record_thread.stream(tool_use, {}):
+        pass
+    assert tool_threads[-1] != threading.get_ident()
     assert _activity_calls(client, history, "parcel") == [
         (["P-1"], "parcel P-1 via acme-post"),
         (["P-2"], "quote for P-2 via acme-post"),
@@ -301,6 +355,79 @@ async def test_tool(client: Client, tmp_path: Path):
     await Replayer(
         workflows=[ToolWorkflow],
         plugins=[plugin],
+    ).replay_workflow(history)
+
+
+@workflow.defn
+class MultiAgentToolWorkflow:
+    @workflow.run
+    async def run(self, kind: str) -> list[str]:
+        first = TemporalAgent(
+            name="first",
+            model="first",
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        second = TemporalAgent(
+            name="second",
+            model="second",
+            tools=[shout],
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+        if kind == "swarm":
+            result = await Swarm([first, second]).invoke_async("go")
+            visited = [node.node_id for node in result.node_history]
+        else:
+            builder = GraphBuilder()
+            builder.add_node(first, "first")
+            builder.add_node(second, "second")
+            builder.add_edge("first", "second")
+            builder.set_entry_point("first")
+            builder.set_max_node_executions(2)
+            graph_result = await builder.build().invoke_async("go")
+            visited = list(graph_result.results)
+        return visited
+
+
+@pytest.mark.parametrize("kind", ["swarm", "graph"])
+async def test_sync_tools_in_multi_agent(client: Client, kind: str):
+    first_turns: list[str | dict[str, Any]] = []
+    if kind == "swarm":
+        first_turns.append(
+            {
+                "name": "handoff_to_agent",
+                "input": {"agent_name": "second", "message": "Finish the task."},
+            }
+        )
+    first_turns.append("First done.")
+    plugin = StrandsPlugin(
+        models={
+            "first": lambda: MockModel(first_turns),
+            "second": lambda: MockModel(
+                [{"name": "shout", "input": {"word": "hello"}}, "Done!"]
+            ),
+        }
+    )
+    task_queue = f"multi-agent-tools-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MultiAgentToolWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            MultiAgentToolWorkflow.run,
+            kind,
+            id=f"multi-agent-tools-{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        assert await handle.result() == ["first", "second"]
+
+    history = await handle.fetch_history()
+    assert [{"text": "HELLO"}] in get_tool_results(history)
+    await Replayer(
+        workflows=[MultiAgentToolWorkflow], plugins=[plugin]
     ).replay_workflow(history)
 
 

@@ -1,6 +1,6 @@
 # Strands Agents
 
-> Release stage: [Public Preview](https://docs.temporal.io/develop/python/integrations/strands-agents).
+> Release stage: [Generally Available](https://docs.temporal.io/develop/python/integrations/strands-agents).
 
 This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) allows you to run [Strands Agents](https://strandsagents.com/) inside Temporal Workflows, routing model invocations, tool calls, and MCP tool calls through Temporal Activities for durable execution, Temporal-managed retries, and timeouts.
 
@@ -123,6 +123,10 @@ A worker model that keeps the conversation server-side, such as `OpenAIResponses
 Stateful model calls run as their own activities, `strands_invoke_stateful_model` and `strands_invoke_stateful_model_streaming`. While you roll out this version, a worker running an earlier version does not register them, so it fails such a call (`NotFoundError`) and Temporal retries it until an upgraded worker takes it. Upgrade every worker on the task queue before a `retry_policy` with a low `maximum_attempts` runs out, or route upgraded workflows to upgraded workers with Worker Versioning.
 
 A run that continues as new starts with no messages when its model is stateful, so it needs the model state it carries. If that run's workers do not have this version, or its config activity runs on a worker that does not, it treats the model as stateless, ignores the carried response id and starts the model's conversation over. Keep such runs on upgraded workers, and do not roll workers back to an earlier version while they continue as new.
+
+A model call that fails with a context window overflow raises `ContextWindowOverflowException` in the workflow, so Strands reduces the conversation and calls the model again, as it does natively. Releases before 1.0 let the overflow reach the workflow as an `ActivityError`, and later builds of `main` gated the change with a patch marker, which this version no longer reads. So a run that hit an overflow before you deploy this version fails to replay on it with `[TMPRL1100]`, and a run that hits one on this version fails to replay on an earlier version. Let those runs finish on their original workers before you upgrade, or keep them there with Worker Versioning, and do not roll workers back to an earlier version while runs that hit an overflow on this version are open.
+
+When the model gives no valid structured output, or stops at its token limit, Strands raises `StructuredOutputException` or `MaxTokensReachedException` in the workflow, as it does natively, and workflow code can catch it. If one escapes the workflow's run method or a signal handler, the workflow fails with a retryable `ApplicationError` of that type, so a workflow retry policy can start another run. It doesn't fail the workflow task: the model's answers are in the history, so a retried workflow task would get the same answers and fail again. If one escapes an update handler, only the update fails: the caller gets a `WorkflowUpdateFailedError` whose cause is that `ApplicationError`, and the workflow keeps running, so its retry policy doesn't apply. This is gated by the patch `temporalio.strands_agents.agent-loop-errors-fail-workflow`, checked before an invocation's first activity; runs that started an invocation on an earlier version keep failing the workflow task, so a workflow code fix can still recover them.
 
 ## Retries
 
@@ -397,33 +401,28 @@ variable available to that worker.
 
 ## Tools
 
-Decorate non-deterministic tools with `@activity.defn`, or if you're importing tools from `strands_tools`, wrap them in a thin async function. Then, register the activity on the worker via `Worker(activities=[...])` and pass it to the agent with `workflow.activity_as_tool(activity, **options)` along with any activity options (e.g. `start_to_close_timeout`):
+Run non-deterministic tools in Activities. For an imported tool, call it from a thin async function decorated with `@activity.defn`. Register the Activity on the worker and pass it to the agent with `workflow.activity_as_tool`, along with any Activity options such as `start_to_close_timeout`.
 
 ```python
-from strands_tools import shell
+from temporalio import activity
 from temporalio.strands_agents import workflow as strands_workflow
 
 @activity.defn
 async def fetch_user(user_id: str) -> dict:
     ...
 
-@activity.defn(name="shell")
-async def shell_activity(command: str) -> dict:
-    return shell.shell(command=command, non_interactive=True)
-
 # workflow
 agent = TemporalAgent(
     start_to_close_timeout=timedelta(seconds=60),
     tools=[
         strands_workflow.activity_as_tool(fetch_user, start_to_close_timeout=timedelta(seconds=30)),
-        strands_workflow.activity_as_tool(shell_activity, start_to_close_timeout=timedelta(seconds=15)),
     ],
 )
 
 # worker
 Worker(
     ...,
-    activities=[fetch_user, shell_activity],
+    activities=[fetch_user],
     plugins=[StrandsPlugin(models=MODELS)],
 )
 ```
@@ -445,6 +444,21 @@ cancellation independently still produces a failed tool result for the agent.
 error result can fail replay on this version. Keep those runs on their original
 workers with Worker Versioning. To recover a run stuck during tool cancellation,
 reset it to before the affected tool call and run it on upgraded workers.
+
+Other tools run directly in the workflow, so they must be deterministic, like
+workflow code. Sync tools run there too, not in a separate thread as they do
+outside Temporal. They run again on every replay. Their combined work in one
+Workflow Task can trigger deadlock detection (two seconds by default), even if
+each tool takes less than two seconds. Tools from packages the plugin passes
+through the sandbox, such as `strands_tools`, are not checked by it; wrap them
+as activities as described above.
+
+**Breaking change:** a run recorded on an earlier version whose sync tool got
+an error can fail replay on this version: if the workflow then acted on what
+the tool now does, if the tool issues commands itself or takes more than two
+seconds, or if a `Swarm` agent handed off. Let runs that called a sync tool
+finish on their original workers first, or keep them there with Worker
+Versioning.
 
 ## Hooks
 
@@ -536,20 +550,20 @@ class MyWorkflow:
 
 ### Tool-body interrupts
 
-A `@strands.tool` function can raise `InterruptException(Interrupt(...))` directly. The agent stops with the interrupt, the workflow handles the resume the same way as for hooks.
+A `@strands.tool(context=True)` function can call `tool_context.interrupt(name, reason=...)`. The agent stops with the interrupt, and the workflow handles the resume the same way as for hooks. On resume, Strands runs the tool again, and the call returns the response instead of raising.
 
 ```python
 from strands import tool
-from strands.interrupt import Interrupt, InterruptException
+from strands.types.tools import ToolContext
 
-@tool
-def delete_thing(name: str) -> str:
-    raise InterruptException(
-        Interrupt(id=f"delete:{name}", name="approval", reason=f"delete {name}?")
-    )
+@tool(context=True)
+def delete_thing(name: str, tool_context: ToolContext) -> str:
+    if tool_context.interrupt("approval", reason=f"delete {name}?") != "approve":
+        return f"kept {name}"
+    return f"deleted {name}"
 ```
 
-The same works from an `activity_as_tool`-wrapped activity. The plugin's failure converter preserves the `Interrupt` payload across the activity boundary, so `AgentResult.interrupts` is populated just like the in-workflow case:
+An `activity_as_tool`-wrapped activity has no `tool_context`, so it raises `InterruptException(Interrupt(...))` instead. The plugin's failure converter preserves the `Interrupt` payload across the activity boundary, so `AgentResult.interrupts` is populated just like the in-workflow case:
 
 ```python
 from strands.interrupt import Interrupt, InterruptException
@@ -634,9 +648,9 @@ MCP support runs on [`temporalio-mcp`](https://github.com/temporalio/ai-integrat
 uv add "temporalio-strands-agents[mcp]"
 ```
 
-`StrandsPlugin(mcp_clients=...)` takes a mapping of `name → mcp.Client factory`, mirroring the `models=` pattern. The plugin registers the `temporalio-mcp` activities for each server, such as `temporalio.mcp.{name}.list-tools` and `temporalio.mcp.{name}.call-tool`. Workflow-side, `TemporalMCPClient(server="name")` is a pure handle: it references the server by name, discovers tools by running `list-tools`, and carries the per-call activity options.
+`StrandsPlugin(mcp_clients=...)` takes a mapping of `name → mcp.Client factory`. The worker calls a factory each time it opens a connection, so return a new `mcp.Client` and transport from every call, and do not cache it. The plugin registers the `temporalio-mcp` activities for each server, such as `temporalio.mcp.{name}.list-tools` and `temporalio.mcp.{name}.call-tool`. Workflow-side, `TemporalMCPClient(server="name")` is a pure handle: it references the server by name, discovers tools by running `list-tools`, and carries the per-call activity options.
 
-These are the activities that `temporalio.mcp.MCPPlugin` registers, so `temporalio.mcp.TemporalMCPClient` can also use these servers, for prompts and resources for example. Don't register the same server name through `MCPPlugin` or `OpenAIAgentsPlugin` on the same worker: Temporal rejects the duplicate activity types.
+These are the activities that `temporalio.mcp.MCPPlugin` registers, so `temporalio.mcp.TemporalMCPClient` can also use these servers, for prompts and resources for example, as long as it passes no `factory_argument`. Don't register the same server name through `MCPPlugin` or `OpenAIAgentsPlugin` on the same worker: Temporal rejects the duplicate activity types.
 
 ```python
 from mcp import Client, StdioServerParameters, stdio_client
@@ -678,7 +692,7 @@ github = TemporalMCPClient(
 )
 ```
 
-A tool that reports an error returns a failed tool result to the agent. Errors a retry cannot fix, such as an unknown tool or invalid arguments, reach the agent at once as a failed tool result. Internal server errors, timeouts and lost connections fail the attempt and are retried under the activity's `retry_policy`. See the [`temporalio-mcp` README](https://github.com/temporalio/ai-integrations/tree/main/python/mcp#errors-and-retries) for which errors are retried.
+A tool that reports an error returns a failed tool result to the agent. Errors a retry cannot fix reach the agent at once as a failed tool result, without a retry. These include an unknown tool, invalid arguments, a malformed result that the MCP client cannot parse, such as one whose `content` is not a list, and a result that does not match the tool's output schema. Internal server errors, timeouts and lost connections fail the attempt and are retried under the activity's `retry_policy`. See the [`temporalio-mcp` README](https://github.com/temporalio/ai-integrations/tree/main/python/mcp#errors-and-retries) for which errors are retried.
 
 Without `start_to_close_timeout` or `schedule_to_close_timeout`, the MCP activities get a one-minute `start_to_close_timeout`. The default retry policy retries without limit, so an agent turn waits while its MCP server is down. To give up instead, bound the retries:
 
@@ -690,7 +704,7 @@ echo = TemporalMCPClient(
 )
 ```
 
-A call-tool activity that runs out of attempts returns a failed tool result to the agent, which can go on without the tool. A list-tools activity that runs out of attempts does not reach the agent. It runs before every model call, and the result depends on which Strands event-loop cycle makes that call, not on how many model calls came before it. In the first cycle of an `invoke_async()`, the `ActivityError` propagates from the call and, if the workflow does not catch it, fails the workflow. That covers the first model call of every invocation, including one on an agent whose earlier invocations completed, and a model call that an `AfterModelCallEvent` hook repeats in that cycle by setting `retry = True`. Strands starts a new cycle after the agent runs tools, and when it asks the model again for a `structured_output_model` result that the model answered in plain text, so no tool needs to have run. In such a cycle, including a model call a hook repeats there, Strands wraps the `ActivityError` in an `EventLoopException`: the workflow task fails on every retry, and the workflow stays open until it is reset or terminated. With `cache_tools=True`, a `TemporalMCPClient` stops listing after its first successful listing, so only that first listing can fail.
+A call-tool activity that runs out of attempts returns a failed tool result to the agent, which can go on without the tool. A list-tools activity that runs out of attempts does not reach the agent. It runs before every model call, and the result depends on which Strands event-loop cycle makes that call, not on how many model calls came before it. In the first cycle of an `invoke_async()` that starts with a model call, the `ActivityError` propagates from the call and, if the workflow does not catch it, fails the workflow. That covers the first model call of every such invocation, including one on an agent whose earlier invocations completed, and a model call that an `AfterModelCallEvent` hook repeats in that cycle by setting `retry = True`. An invocation that resumes a tool interrupt runs the approved tools first, so its first model call is in a later cycle. Strands starts a new cycle after the agent runs tools, and when it asks the model again for a `structured_output_model` result that the model answered in plain text, so no tool needs to have run. In such a cycle, including a model call a hook repeats there, Strands wraps the `ActivityError` in an `EventLoopException`: the workflow task fails on every retry, and the workflow stays open until it is reset or terminated. With `cache_tools=True`, a `TemporalMCPClient` stops listing after its first successful listing, so only that first listing can fail.
 
 Tool names must be unique on one agent. Two tools may not have the same name, or names that differ only by `-` or `_`: for example two servers that both list `search`, a server that lists a name twice, or a server tool named like a tool in `tools=[...]`, a `TemporalSandbox` tool or a tool a Signal handler adds while the servers list. `TemporalAgent` learns its MCP tools only when it lists them, so the model call after that listing raises `MCPToolNameConflictError`, a `ValueError` and a non-retryable `ApplicationError`: the first one, or, with `cache_tools=False`, a later one if a server starts listing such a name. It is raised again at every later model call while the duplicate lasts; between `cache_tools=True` listings, that is the rest of the run. This holds for an agent built before or after its clients listed. Give one `TemporalMCPClient` a different `prefix`, or drop the tool with its `tool_filters`. While a server lists a name, the name is the server's: a tool you put under it is replaced at the next model call, and a tool you remove comes back, also with `cache_tools=True`. A `structured_output_model` named like an MCP tool the agent already has gets Strands' own `ValueError` when the call starts, as in Strands.
 
@@ -717,9 +731,10 @@ StrandsPlugin(
 
 Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools` and `{name}-call-tool` activities. To upgrade:
 
-- Return an `mcp.Client` from each factory, and move `prefix` and `tool_filters` from the factory to `TemporalMCPClient`. `mcp.Client` doesn't take them: a factory that still passes `prefix=` fails every MCP activity with a `TypeError`, which is retried. A factory that still returns Strands' `MCPClient` fails every MCP activity with an error that says so, also retried until the worker is fixed. Without distinct prefixes, same-named tools from different servers are refused (see above).
+- Return an `mcp.Client` from each factory, and move `prefix` and `tool_filters` from the factory to `TemporalMCPClient`. Pass the `mcp.Client` the transport itself, a `StdioServerParameters` or a URL, not a function that returns the transport as Strands' `MCPClient` took. `mcp.Client` doesn't take `prefix` or `tool_filters`: a factory that still passes `prefix=` fails every MCP activity with a `TypeError`, which is retried. A factory that returns the wrong client type, such as Strands' `MCPClient`, now fails the Activity without retries with type `MCPServerFactoryTypeError`. An `mcp.Client` built on a function fails without retries with type `MCPServerFactoryTransportError`. A client passed in place of its factory, or any other value that isn't callable, makes `StrandsPlugin(...)` raise `TypeError`, so the worker doesn't start. Fix these factories before upgrading: these errors used to retry, but deploying a corrected worker no longer resumes an Activity that has already failed. Without distinct prefixes, same-named tools from different servers are refused (see above).
 - Callable `tool_filters` now run in the workflow, so they must be deterministic.
-- Set connection options on `mcp.Client`. Strands `MCPClient` options without an `mcp.Client` counterpart, such as `startup_timeout`, no longer apply.
+- Set connection options on `mcp.Client`. Strands `MCPClient` options and subclass overrides, such as `map_mcp_content_to_tool_result_content`, do not apply; tool results are mapped as Strands' default `MCPClient` maps them.
+- A call-tool failure that a retry can fix (a lost connection, an internal server error, a timeout) used to give the model `Tool execution failed` at once; it is now retried under `retry_policy`, without limit by default. `mcp_connection_idle_timeout=None` used to mean five minutes; it now keeps connections until the worker shuts down. A server on an older MCP protocol now gets a new connection, a new process for stdio, for every activity.
 - Workflows started on earlier versions that use MCP tools must finish on workers running them before those workers are upgraded.
 
 ## Observability

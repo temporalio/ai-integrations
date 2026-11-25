@@ -23,6 +23,9 @@ importers:
       '@temporalio/plugin':
         specifier: ^1.24.0
         version: 1.24.0
+      '@temporalio/worker':
+        specifier: ^1.24.0
+        version: 1.24.0
       '@temporalio/workflow':
         specifier: ^1.24.0
         version: 1.24.0
@@ -91,9 +94,6 @@ importers:
         specifier: link:tests/helpers
         version: link:tests/helpers
       '@temporalio/testing':
-        specifier: ^1.24.0
-        version: 1.24.0
-      '@temporalio/worker':
         specifier: ^1.24.0
         version: 1.24.0
       '@tsconfig/node20':

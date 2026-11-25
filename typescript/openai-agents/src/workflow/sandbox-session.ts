@@ -23,8 +23,7 @@ import type {
   WriteStdinArgs,
 } from '@openai/agents-core/sandbox';
 import { recordExposedPortEndpoint } from '@openai/agents-core/sandbox';
-import type { ActivityOptions } from '@temporalio/common';
-import { scheduleActivity } from '@temporalio/workflow';
+import { scheduleActivity, type ActivityOptions } from '@temporalio/workflow';
 import {
   SANDBOX_EDITOR_CREATE_FILE_SUFFIX,
   SANDBOX_EDITOR_DELETE_FILE_SUFFIX,
@@ -51,7 +50,7 @@ import {
   encodeEntry,
   encodeManifest,
   sandboxSpanName,
-  serializeSessionEnvelope,
+  serializeWorkflowSessionState,
   type EncodedManifest,
   type SerializedSandboxSessionState,
   type SerializedToolOutputImage,
@@ -60,9 +59,20 @@ import {
 import { maybeTemporalSpan } from './span-helpers';
 
 /**
+ * The Activity options for an operation on a session: `config`, sent to the Task Queue of the Worker
+ * process that holds the session when the state names one.
+ */
+export function sessionActivityOptions(
+  config: ActivityOptions,
+  state: { taskQueue?: string }
+): ActivityOptions {
+  return state.taskQueue === undefined ? config : { ...config, taskQueue: state.taskQueue };
+}
+
+/**
  * Workflow-side handle for a sandbox session. Holds only serializable state;
  * every real sandbox operation is dispatched as an Activity to the
- * `SandboxClientProvider` registered under the same name on the Worker.
+ * sandbox client provider registered under the same name on the Worker.
  *
  * `registerPreStopHook` is intentionally not implemented so the SDK runs its
  * managed pre-stop-hook fallback instead.
@@ -82,7 +92,11 @@ export class TemporalSandboxSession implements SandboxSession<TemporalSandboxSes
   }
 
   private stateInput(): SerializedSandboxSessionState {
-    return serializeSessionEnvelope(this.state.sessionId, this.state, this.state.providerState);
+    return serializeWorkflowSessionState(this.state);
+  }
+
+  private activityOptions(): ActivityOptions {
+    return sessionActivityOptions(this._config, this.state);
   }
 
   private dispatch<T>(suffix: string, input: Record<string, unknown>, extraArgs: unknown[] = []): Promise<T> {
@@ -94,7 +108,7 @@ export class TemporalSandboxSession implements SandboxSession<TemporalSandboxSes
         scheduleActivity<T>(
           `${this._name}${suffix}`,
           [{ state: this.stateInput(), ...input }, ...extraArgs],
-          this._config
+          this.activityOptions()
         ),
       data
     );
@@ -121,7 +135,7 @@ export class TemporalSandboxSession implements SandboxSession<TemporalSandboxSes
   }
 
   createEditor(runAs?: string): Editor {
-    return new TemporalEditor(this._name, this._config, () => this.stateInput(), runAs);
+    return new TemporalEditor(this._name, () => this.activityOptions(), () => this.stateInput(), runAs);
   }
 
   async exec(args: ExecCommandArgs): Promise<SandboxExecResult> {
@@ -201,7 +215,7 @@ export class TemporalSandboxSession implements SandboxSession<TemporalSandboxSes
 class TemporalEditor implements Editor {
   constructor(
     private readonly name: string,
-    private readonly config: ActivityOptions,
+    private readonly activityOptions: () => ActivityOptions,
     private readonly stateInput: () => SerializedSandboxSessionState,
     private readonly runAs?: string
   ) {}
@@ -214,7 +228,7 @@ class TemporalEditor implements Editor {
         scheduleActivity<ApplyPatchResult | undefined>(
           `${this.name}${suffix}`,
           [{ state, operation, runAs: this.runAs }],
-          this.config
+          this.activityOptions()
         ),
       { sessionId: state.sessionId }
     );

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, is_cancelled_exception
 
 if TYPE_CHECKING:
     from langchain_core.language_models import ModelProfile
@@ -267,6 +267,10 @@ async def run_deep_agent(
 ) -> Any:
     """Drive ``agent.ainvoke(input)`` with continue-as-new state carry.
 
+    .. warning::
+        Continue-as-new through this function is experimental. When it
+        triggers and what the snapshot holds may change in future versions.
+
     Once a completed turn leaves pending todos and history has grown past the
     limit, its messages and state files are carried into a fresh run via
     ``workflow.continue_as_new``. Todos are not restored as state:
@@ -312,6 +316,10 @@ async def run_deep_agent(
         # workflow-failure type rather than the framework's generic exception.
         cause = exc.__cause__
         if cause is not None and workflow.is_failure_exception(cause):
+            if is_cancelled_exception(cause) and workflow.patched(
+                "deepagents.raise-cancellation"
+            ):
+                raise cause
             raise DeepAgentsWorkflowError(f"Deep Agents run failed: {exc}") from cause
         raise
 
@@ -332,8 +340,8 @@ async def run_deep_agent(
                 carried = _extract_messages(input)
             else:
                 carried = _as_message_list(input)
-        # The snapshot goes through the payload converter, which would drop
-        # each message's type; carry messages in their dumpd form instead.
+        # The continued run decodes the snapshot as a dict, where a message
+        # would be a dict of its fields; carry messages in their dumpd form.
         snapshot: dict[str, Any] = {"messages": _serde.dump_carried_messages(carried)}
         files: Any = result.get("files")
         if isinstance(files, Mapping):

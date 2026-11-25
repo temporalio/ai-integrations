@@ -1,3 +1,4 @@
+import inspect
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, cast
@@ -285,14 +286,40 @@ def create_backend(factory: Callable[[], AgentsMCPServer]) -> _OpenAIMCPServerBa
     )()
 
 
-def test_factory_that_does_not_return_an_mcp_server_is_non_retryable() -> None:
+async def _coroutine() -> None:
+    pass
+
+
+@pytest.mark.parametrize("make_value", [object, _coroutine])
+def test_factory_that_does_not_return_an_mcp_server_is_non_retryable(
+    make_value: Callable[[], Any],
+) -> None:
+    value = make_value()
+    kind = type(value)
+    # Passed in place of the factory, the value fails when the Worker is built,
+    # with the deprecated stateful provider too.
+    for build in (
+        lambda: openai_agents.OpenAIAgentsPlugin(mcp_servers={"hello": value}),
+        lambda: openai_agents.StatefulMCPServerProvider("hello", value),
+    ):
+        with pytest.raises(TypeError) as type_error:
+            build()
+        assert str(type_error.value) == (
+            f"MCP server factory 'hello' is {kind.__module__}.{kind.__qualname__}, "
+            "not callable"
+        )
+
     with pytest.raises(ApplicationError) as err:
-        create_backend(lambda: cast(AgentsMCPServer, object()))
+        create_backend(lambda: value)
     assert err.value.message == (
-        "MCP server factory 'hello' returned builtins.object, not agents.mcp.MCPServer"
+        f"MCP server factory 'hello' returned {kind.__module__}.{kind.__qualname__}, "
+        "not agents.mcp.MCPServer"
     )
     assert err.value.type == "MCPServerFactoryTypeError"
     assert err.value.non_retryable
+    if inspect.iscoroutine(value):
+        # Closed, so Python doesn't warn that it was never awaited.
+        assert inspect.getcoroutinestate(value) == inspect.CORO_CLOSED
 
 
 def test_callable_worker_side_tool_filter_is_rejected() -> None:

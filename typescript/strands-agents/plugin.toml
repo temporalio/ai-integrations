@@ -4,7 +4,7 @@ language = "typescript"
 coordinate = "@temporalio/strands-agents"
 registry = "npm"
 root-api = "@temporalio/strands-agents"
-maturity = "pre-release"
+maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/typescript/integrations/strands-agents"
 
 [ci]

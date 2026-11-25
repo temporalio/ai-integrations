@@ -8,6 +8,7 @@ import {
   type Span as AgentSpan,
   type SpanData,
 } from '@openai/agents-core';
+import { ApplicationFailure } from '@temporalio/common';
 import { ActivityBackedModel } from '../workflow/activity-backed-model';
 import type { ModelSummaryProvider } from '../common/model-activity-options';
 import { streamingTextEvents } from './stubs/openai-agents-fakes';
@@ -80,6 +81,25 @@ test('getStreamedResponse: dynamic summary routes through executeWithOptions', a
   t.is(provided?.input, 'hi');
   t.is(provided?.agent, agent);
   t.is(yielded.length, events.length);
+});
+
+test('a model call with modelSettings.timeoutMs fails before scheduling the Activity', async (t) => {
+  const model = new ActivityBackedModel('gpt-4o', { startToCloseTimeout: '60s', streamingTopic: 'events' });
+  const fake = fakeStreamActivities(streamingTextEvents('hi'));
+  const calls: unknown[] = [];
+  (model as any).activities = {
+    ...fake.activities,
+    invokeModelActivity: async (input: unknown) => {
+      calls.push(input);
+      return { usage: {}, output: [] };
+    },
+  };
+  const request = { ...minimalRequest(), modelSettings: { timeoutMs: 1000 } };
+
+  const expected = { instanceOf: ApplicationFailure, message: /startToCloseTimeout/ };
+  t.true((await t.throwsAsync(withTrace('test', () => model.getResponse(request)), expected))?.nonRetryable);
+  await t.throwsAsync(withTrace('test', () => drain(model.getStreamedResponse(request))), expected);
+  t.is(calls.length + fake.plain.length, 0);
 });
 
 test('getStreamedResponse: no dynamic summary uses the plain proxy call', async (t) => {

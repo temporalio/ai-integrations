@@ -16,10 +16,6 @@ import { ApplicationFailure } from '@temporalio/common';
 import type { Duration } from '@temporalio/common/lib/time';
 import { encodeCallOptionsFileData } from './file-data';
 
-// An older Event History can hold an Activity that `experimental_download` scheduled for a
-// URL. Such a history replays only if the model still reports that it supports no URL.
-const DOWNLOAD_IN_ACTIVITY_PATCH = 'vercel-ai-sdk-download-urls-in-model-activity';
-
 // `ReadableStream` is a sandbox global; type-only import keeps `node:stream/web`
 // out of the workflow bundle (es2023 lib has no DOM types).
 declare const ReadableStream: typeof import('node:stream/web').ReadableStream;
@@ -34,17 +30,13 @@ function abortReason(signal: AbortSignal): unknown {
   return Object.assign(new Error(String(message)), { name });
 }
 
-// An older Event History can hold a model call that ran to its end after its signal
-// aborted. Such a history replays only if the abort still sends no command.
-const ABORT_CANCELS_ACTIVITY_PATCH = 'vercel-ai-sdk-abort-signal-cancels-model-activity';
-
 // An `AbortSignal` can't cross the payload converter, so the caller's signal cancels the
 // Activity from the Workflow instead.
 //
 // Not an `async` function. A call that cancels nothing must resume the Workflow at the
 // same point as a direct Activity call, or its commands can change order on replay.
 function runAbortable<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
-  if (signal === undefined || !workflow.patched(ABORT_CANCELS_ACTIVITY_PATCH)) return fn();
+  if (signal === undefined) return fn();
   return cancelOnAbort(signal, fn);
 }
 
@@ -62,6 +54,11 @@ async function cancelOnAbort<T>(signal: AbortSignal, fn: () => Promise<T>): Prom
     signal.removeEventListener('abort', onAbort);
   }
 }
+
+// An older Event History can hold a reasoning block whose provider metadata the Workflow
+// never saw. The Activity kept it from `reasoning-end`, and the replayed block left it out.
+// Such a history replays only if the block still carries none.
+const REASONING_METADATA_PATCH = 'vercel-ai-sdk-reasoning-provider-metadata';
 
 /**
  * Options for configuring the TemporalProvider with per-model activity settings.
@@ -134,7 +131,7 @@ export class TemporalLanguageModel implements LanguageModelV4 {
   // The Workflow sandbox has no network. URL parts go to the model Activity, which downloads
   // the ones the real model does not support.
   get supportedUrls(): Record<string, RegExp[]> {
-    return workflow.patched(DOWNLOAD_IN_ACTIVITY_PATCH) ? { '*': [/.*/] } : {};
+    return { '*': [/.*/] };
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
@@ -214,7 +211,12 @@ export class TemporalLanguageModel implements LanguageModelV4 {
             controller.enqueue({ type: 'text-delta', id, delta: item.text });
             controller.enqueue({ type: 'text-end', id });
           } else if (item.type === 'reasoning') {
-            controller.enqueue({ type: 'reasoning-start', id });
+            const withMetadata = item.providerMetadata !== undefined && workflow.patched(REASONING_METADATA_PATCH);
+            controller.enqueue({
+              type: 'reasoning-start',
+              id,
+              ...(withMetadata && { providerMetadata: item.providerMetadata }),
+            });
             controller.enqueue({ type: 'reasoning-delta', id, delta: item.text });
             controller.enqueue({ type: 'reasoning-end', id });
           } else {

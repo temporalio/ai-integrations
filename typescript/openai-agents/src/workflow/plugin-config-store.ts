@@ -11,6 +11,8 @@ export interface PluginConfig {
   addTemporalSpans: boolean;
   useOtelInstrumentation: boolean;
   modelParams: SerializableModelActivityOptions;
+  /** Where each sandbox provider, by name, puts the default `/workspace` root. */
+  workspaceRoots?: Record<string, string>;
 }
 
 const configByRun = new Map<string, PluginConfig>();
@@ -30,4 +32,12 @@ export function clearPluginConfig(): void {
 
 export function getCurrentPluginConfig(): PluginConfig | undefined {
   return configByRun.get(currentKey());
+}
+
+/** This Workflow run's `workspaceRoots`, storing a default plugin config first if the start header carried none. */
+export function workspaceRoots(): Record<string, string> {
+  const defaults: PluginConfig = { addTemporalSpans: false, useOtelInstrumentation: false, modelParams: {} };
+  const config = getCurrentPluginConfig() ?? defaults;
+  setPluginConfig(config);
+  return (config.workspaceRoots ??= {});
 }

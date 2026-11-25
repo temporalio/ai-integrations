@@ -6,6 +6,7 @@ import {
   Handoff,
   MemorySession,
   RunState,
+  Usage,
   getGlobalTraceProvider,
   setDefaultModelProvider,
   tool,
@@ -387,12 +388,25 @@ export type RunningAgentRejection =
  * `modelProvider: undefined`, which upstream spreads over the inherited one; a registered default
  * provider would then run the inline model. `tool-start-memory-session` sets a `MemorySession` in the
  * tool's `runOptions`, and the `*-tracing-key` kinds a tracing key in its `runOptions` or `runConfig`.
+ * The inline model answers rather than throws: upstream turns a nested run's failure into a generic
+ * tool output, so only its answer shows that a run reached it.
  * Returns the run's failure, or its output when a nested run's failure became the tool's output.
  */
 export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection): Promise<string> {
   const inlineModel: Model = {
     async getResponse() {
-      throw new Error('the inline model ran in the Workflow');
+      return {
+        output: [
+          {
+            type: 'message',
+            id: 'msg_inline',
+            role: 'assistant',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'the inline model ran in the Workflow' }],
+          },
+        ],
+        usage: new Usage(),
+      };
     },
     // eslint-disable-next-line require-yield
     async *getStreamedResponse() {

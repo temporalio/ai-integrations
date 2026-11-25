@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
+import sys
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace
 from datetime import timedelta
@@ -25,7 +27,9 @@ from ._failure_converter import (
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._sync_calls import refuse_sync_calls_in_workflows
+from ._sync_tools import run_sync_tools_in_workflows
 from ._worker_env_ref import AllowAllWorkerEnvVars
+from ._workflow_failure import AgentLoopErrorInterceptor
 from ._workflow_time import install_workflow_time
 
 if TYPE_CHECKING:
@@ -55,7 +59,9 @@ class StrandsPlugin(SimplePlugin):
     ``temporalio.mcp.MCPPlugin`` (``temporalio.mcp.{server}.list-tools``,
     ``temporalio.mcp.{server}.call-tool`` and the other MCP operations) for each
     entry. Each factory takes no arguments, returns an ``mcp.Client`` (MCP
-    Python SDK v2) and needs the ``mcp`` extra. Workflow-side
+    Python SDK v2) and needs the ``mcp`` extra. The worker calls a factory each
+    time it opens a connection, so return a new ``mcp.Client`` and transport
+    from every call instead of caching one. Workflow-side
     ``TemporalMCPClient(server="...")`` discovers tools by running
     ``list-tools``; whether it lists once per workflow or once per agent turn is
     controlled by its ``cache_tools`` option. Don't register the same server
@@ -154,6 +160,9 @@ class StrandsPlugin(SimplePlugin):
             # Strands re-raises this when its conversation manager cannot reduce the
             # context any further; fail the workflow instead of retrying the task forever.
             workflow_failure_exception_types=[ContextWindowOverflowException],
+            # StructuredOutputException and MaxTokensReachedException come from model
+            # answers already in History; fail the Workflow when one escapes it.
+            interceptors=[AgentLoopErrorInterceptor()],
             run_context=mcp_plugin.run_context if mcp_plugin else None,
         )
 
@@ -171,16 +180,63 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
     # wrapper takes none.
     import mcp
 
+    # Fail when the plugin is built, not on every activity attempt.
+    if not callable(factory):
+        kind = type(factory)  # type: ignore[reportUnreachable]
+        raise TypeError(
+            f"MCP server factory {server!r} is "
+            f"{kind.__module__}.{kind.__qualname__}, not callable"
+        )
+    try:
+        if sys.version_info >= (3, 14):
+            import annotationlib  # type: ignore[reportUnreachable]
+
+            # Only the parameters matter; don't evaluate deferred annotations, which
+            # may name imports that exist only under TYPE_CHECKING.
+            signature = inspect.signature(
+                factory, annotation_format=annotationlib.Format.STRING
+            )
+        else:
+            signature = inspect.signature(factory)  # type: ignore[reportUnreachable]
+    except (TypeError, ValueError):
+        signature = (
+            None  # Some callables have no signature; the call reports a mismatch.
+        )
+    if signature is not None:
+        try:
+            signature.bind()
+        except TypeError as err:
+            # Fail when the plugin is built, not on every activity attempt.
+            raise TypeError(
+                f"MCP server factory {server!r} must take no arguments: {err}"
+            ) from err
+
     def create() -> Client:
         client = factory()
         if not isinstance(client, mcp.Client):
-            # Retryable, so a run waits for the worker to be fixed instead of failing.
             kind = type(client)
+            if inspect.iscoroutine(client):
+                # An async factory; close it so Python doesn't warn it was never awaited.
+                client.close()
             raise ApplicationError(
                 f"MCP server factory {server!r} returned "
                 f"{kind.__module__}.{kind.__qualname__}, not mcp.Client; "
                 "mcp_clients factories must return an mcp.Client "
-                "(see the upgrade notes in the plugin README)"
+                "(see the upgrade notes in the plugin README)",
+                type="MCPServerFactoryTypeError",
+                non_retryable=True,
+            )
+        transport = client.server
+        if callable(transport) and not hasattr(transport, "__aenter__"):
+            # The shape a factory written for Strands' MCPClient takes when only its
+            # import changes: mcp.Client(lambda: stdio_client(...)).
+            raise ApplicationError(
+                f"MCP server factory {server!r} returned an mcp.Client whose server "
+                "is a function; pass the transport itself, a StdioServerParameters "
+                "or a URL, not a function that returns the transport "
+                "(see the upgrade notes in the plugin README)",
+                type="MCPServerFactoryTransportError",
+                non_retryable=True,
             )
         return client
 
@@ -195,6 +251,7 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
     if not runner:
         raise ValueError("No WorkflowRunner provided to the Strands plugin.")
     install_workflow_time()
+    run_sync_tools_in_workflows()
     if isinstance(runner, SandboxedWorkflowRunner):
         return replace(
             runner,

@@ -195,6 +195,16 @@ export class ActivityBackedModel implements Model {
    * its run copy the defaults as its own settings, which win.
    */
   private toWire(request: ModelRequest, agent: Agent<any, any> | undefined): SerializedModelRequest {
+    // Upstream times the call out by aborting `request.signal`, which can't stop the Activity.
+    if (request.modelSettings.timeoutMs !== undefined) {
+      throw ApplicationFailure.create({
+        message:
+          "modelSettings.timeoutMs can't stop a model call that runs as an Activity. Set startToCloseTimeout " +
+          "in the plugin's modelParams, or the runner's defaultModelParams, instead.",
+        type: 'AgentsWorkflowError',
+        nonRetryable: true,
+      });
+    }
     const wire = toSerializedModelRequest(request);
     const hasModelSettings = (agent as { hasExplicitModelSettings?(): boolean } | undefined)?.hasExplicitModelSettings;
     if (this.modelName !== '' || agent === undefined || hasModelSettings?.call(agent) !== false) return wire;

@@ -200,6 +200,32 @@ test('invokeModelStreaming retains the latest text provider metadata', async (t)
   ]);
 });
 
+test('invokeModelStreaming retains the latest reasoning provider metadata', async (t) => {
+  const startMetadata = { test: { source: 'start' } };
+  const deltaMetadata = { test: { source: 'delta' } };
+  const endMetadata = { test: { source: 'end' } };
+  const parts: LanguageModelV4StreamPart[] = [
+    { type: 'reasoning-start', id: 'start-only', providerMetadata: startMetadata },
+    { type: 'reasoning-delta', id: 'start-only', delta: 'first' },
+    { type: 'reasoning-end', id: 'start-only' },
+    { type: 'reasoning-start', id: 'updated-by-delta', providerMetadata: startMetadata },
+    { type: 'reasoning-delta', id: 'updated-by-delta', delta: 'second', providerMetadata: deltaMetadata },
+    { type: 'reasoning-end', id: 'updated-by-delta' },
+    { type: 'reasoning-start', id: 'updated-by-end', providerMetadata: startMetadata },
+    { type: 'reasoning-delta', id: 'updated-by-end', delta: 'third', providerMetadata: deltaMetadata },
+    { type: 'reasoning-end', id: 'updated-by-end', providerMetadata: endMetadata },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
+  ];
+
+  const { result } = await runStreamingActivity(parts);
+
+  t.deepEqual(result.content, [
+    { type: 'reasoning', text: 'first', providerMetadata: startMetadata },
+    { type: 'reasoning', text: 'second', providerMetadata: deltaMetadata },
+    { type: 'reasoning', text: 'third', providerMetadata: endMetadata },
+  ]);
+});
+
 test('invokeModelStreaming throws when the stream emits an error and no finish part', async (t) => {
   const parts: LanguageModelV4StreamPart[] = [
     { type: 'stream-start', warnings: [] },

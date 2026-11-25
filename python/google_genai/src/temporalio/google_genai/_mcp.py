@@ -121,6 +121,7 @@ class _ConnectionRecord:
         self._ready: asyncio.Future[ClientSession] = loop.create_future()
         self._idle_handle: asyncio.TimerHandle | None = None
         self._inflight = 0
+        self._failure: BaseException | None = None
         self._owner = asyncio.create_task(self._run(factory))
 
     async def _run(self, factory: McpSessionFactory) -> None:
@@ -142,13 +143,19 @@ class _ConnectionRecord:
         except BaseException as err:
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
-            _CONNECTIONS.pop(self._server, None)
-            if self._ready.done():
-                raise
-            self._ready.set_exception(err)
-            # The waiting calls get the error through ``_ready``. Nobody awaits
-            # this task once its record is dropped, so raising the error here
-            # too would only make asyncio log it as never retrieved.
+            # Only drop our own entry: a newer record may already own the key.
+            if _CONNECTIONS.get(self._server) is self:
+                del _CONNECTIONS[self._server]
+            if self._idle_handle is not None:
+                self._idle_handle.cancel()
+                self._idle_handle = None
+            if not self._ready.done():
+                self._ready.set_exception(err)
+            else:
+                self._failure = err
+            # The waiting calls get the error through ``_ready`` or ``session()``.
+            # Nobody awaits this task once its record is dropped, so raising
+            # the error here too would only make asyncio log it as never retrieved.
             # Cancellation and interpreter exits still propagate.
             if not isinstance(err, Exception):
                 raise
@@ -179,7 +186,7 @@ class _ConnectionRecord:
         # A call may have acquired the connection between the timer firing and
         # this task running; only evict if it is still idle.
         if self._inflight == 0:
-            await _evict_connection(self._server)
+            await _evict_connection(self._server, self)
 
     async def aclose(self) -> None:
         """Signal the owner task to exit its context manager and wait for it."""
@@ -193,8 +200,15 @@ class _ConnectionRecord:
             pass
 
     async def session(self) -> ClientSession:
-        """Return the live session, or raise the connect failure."""
-        return await self._ready
+        """Return the live session, or raise the connect failure.
+
+        The wait is shielded. Cancelling this caller must not cancel the shared
+        connect future, or any other caller waiting on the same connection.
+        """
+        session = await asyncio.shield(self._ready)
+        if self._failure is not None:
+            raise self._failure
+        return session
 
 
 async def get_connection(
@@ -219,9 +233,21 @@ async def get_connection(
     return session, record
 
 
-async def _evict_connection(server: str) -> None:
-    record = _CONNECTIONS.pop(server, None)
+async def _evict_connection(
+    server: str, expected: _ConnectionRecord | None = None
+) -> None:
+    """Close and uncache the connection for ``server``.
+
+    When ``expected`` is given, only evict if that exact record is still the
+    cached one; a stale caller must not close a newer connection that replaced
+    it.  A record that is no longer cached is still closed.
+    """
+    record = _CONNECTIONS.get(server)
+    if expected is not None and record is not expected:
+        await expected.aclose()
+        return
     if record is not None:
+        del _CONNECTIONS[server]
         await record.aclose()
 
 
@@ -245,11 +271,11 @@ def build_list_tools_activity(
         try:
             return await session.list_tools()
         except McpError as err:
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise _protocol_error(err) from err
         except Exception:
             # The session may be broken; drop it so the next call reconnects.
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise
         finally:
             record.release()
@@ -277,11 +303,11 @@ def build_call_tool_activity(
         try:
             return await session.call_tool(name=req.name, arguments=req.arguments)
         except McpError as err:
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise _protocol_error(err) from err
         except Exception:
             # The session may be broken; drop it so the next call reconnects.
-            await _evict_connection(server)
+            await _evict_connection(server, record)
             raise
         finally:
             record.release()
