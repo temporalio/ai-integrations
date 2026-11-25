@@ -418,6 +418,10 @@ class _StatefulServerSessionArguments:
 # Seconds between heartbeats of the ``-server-session`` activity.
 _HEARTBEAT_INTERVAL = 30.0
 
+# Patch marker of runs that leave a block normally when it ends before its
+# session activity starts.
+_UNSTARTED_SESSION_PATCH = "openai-agents-stateful-mcp-unstarted-session"
+
 # Seconds the ``-server-session`` activity waits for the server to show its
 # first heartbeat.
 _STORE_TIMEOUT = 30.0
@@ -705,7 +709,11 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         with no cause, whatever the session's error, since the SDK then drops
         the session's result. A cancellation wins over this failure only when
         it leaves the ``async with`` block: ``cleanup()`` called directly after
-        a workflow cancellation raises it.
+        a workflow cancellation raises it. If the session activity hasn't
+        started, as when the block is left before its first ``await``, returns
+        once it is cancelled and disconnects, so a later ``cleanup()`` does
+        nothing and operations fail as not connected. A cancellation of the
+        calling task still raises.
         """
         if self._connect_handle:
             session = self._connect_handle
@@ -714,6 +722,17 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
                 inspect.iscoroutine(coro)
                 and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
             )
+            if not started and workflow.patched(_UNSTARTED_SESSION_PATCH):
+                # Cancelling a session activity that never started schedules
+                # nothing. asyncio.wait() lets it end without raising its
+                # CancelledError, so a CancelledError here is a cancellation
+                # of this task, as one requested before cleanup, and leaves
+                # with it. Runs recorded without the marker raise the
+                # session's CancelledError below, so they still do and replay.
+                self._connect_handle = None
+                session.cancel()
+                await asyncio.wait([session])
+                return
             cancels = _cancel_requests()
             session.cancel()
             try:
