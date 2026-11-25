@@ -98,6 +98,17 @@ A failed tool Activity is handed to the model as a tool error, as Locus does for
 
 Cancelling the Workflow cancels a running model call: the heartbeat delivers the cancel to the Activity, and the model's `complete` or `stream` is cancelled on the Worker. This needs a `heartbeat_timeout`, which `TemporalModel` sets by default.
 
+## Multi-agent shapes
+
+Locus's shapes run in Workflow code as they are. Give every agent a `TemporalModel`; each agent's model calls are then Activities, and the shape's own control flow replays with the Workflow.
+
+```python
+pipeline = SequentialPipeline(agents=[researcher, writer])
+result = await pipeline.run("Summarise the incident.")
+```
+
+Tested: `SequentialPipeline`, `ParallelPipeline` (its agents' model Activities run concurrently) and `StateGraph` with agent nodes. Other shapes, and `interrupt()` in a graph, are not tested yet.
+
 ## Streaming
 
 The Workflow receives a streamed call's chunks together, when the model Activity returns, so that replay sees the same chunks. To show them to a user while the model is still answering, pass `streaming_topic` to `TemporalModel` and host a [`WorkflowStream`](https://docs.temporal.io/workflow-streams) on the Workflow. The model Activity then also publishes each `ModelChunkEvent` on that topic as the model produces it, batched on `streaming_batch_interval` (default 100 ms), and clients subscribe with `WorkflowStreamClient`.
@@ -149,7 +160,9 @@ async def refund_with_approval(order_id: str) -> str:
 
 ## Time, ids and randomness
 
-Inside a Workflow, Locus's time budgets, `TimeLimit`, timestamps, run ids, tool-call ids and retry jitter use the Workflow's clock, `workflow.uuid4()` and `workflow.random()`, so a replayed run takes the same path. Locus has no clock or id seam, so the plugin replaces the `time`, `datetime`, `uuid4` and `random` names in these Locus modules: `locus.core.state`, `locus.core.events`, `locus.core.messages`, `locus.core.termination`, `locus.agent.agent`, `locus.agent.runtime_loop`, `locus.agent.model_retry` and `locus.tools.executor`. Activities and plain Locus code in the same process keep the real clock.
+Inside a Workflow, Locus's time budgets, `TimeLimit`, timestamps, run ids, tool-call ids and retry jitter use the Workflow's clock, `workflow.uuid4()` and `workflow.random()`, so a replayed run takes the same path. Activities and plain Locus code in the same process keep the real clock.
+
+Locus has no clock or id seam, so the plugin replaces the `time`, `datetime`, `uuid4` and `random` names in the Locus modules the loop and the shapes run (`locus.core.state`, `locus.core.events`, `locus.core.messages`, `locus.core.termination`, `locus.agent.agent`, `locus.agent.runtime_loop`, `locus.agent.model_retry`, `locus.tools.executor` and the `locus.multiagent` modules). Two reads stay on the system's clock and random generator, because Locus imports them inside the function: a `StateGraph` node cache's `ttl_seconds` check and the jitter of a node's `RetryPolicy`. Avoid a node cache with a ttl in Workflow code.
 
 ## Not supported in Workflow code
 

@@ -25,8 +25,8 @@ from typing import Any
 
 from temporalio import workflow
 
-# The Locus modules the agent loop runs, and that read a clock, make an id or
-# draw a random number.
+# The Locus modules the agent loop and the multi-agent shapes run, and that read
+# a clock, make an id or draw a random number.
 _MODULES = (
     "locus.core.state",
     "locus.core.events",
@@ -36,6 +36,12 @@ _MODULES = (
     "locus.agent.runtime_loop",
     "locus.agent.model_retry",
     "locus.tools.executor",
+    "locus.multiagent.functional",
+    "locus.multiagent.graph",
+    "locus.multiagent.handoff",
+    "locus.multiagent.orchestrator",
+    "locus.multiagent.specialist",
+    "locus.multiagent.swarm",
 )
 
 
