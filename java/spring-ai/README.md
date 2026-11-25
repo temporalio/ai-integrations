@@ -53,12 +53,13 @@ embedding, and MCP modules are detected through Spring auto-configuration.
 With Spring AI 2.1, the chat Activity preserves the order of message parts and
 their provider-owned payloads through tool continuations. For example, Anthropic
 thinking signatures and redacted thinking survive the round trip alongside text
-and tool calls.
+and tool calls. System instructions support plain text parts and reach the model
+as the text returned by Spring AI's `getText()`.
 
 Large chat prompts and model responses, including ordered parts and tool results,
-can exceed Temporal's payload limit. Pass references for large media. Supply media
-as bytes or URI strings. Spring AI 2.1's media codec converts `java.net.URL` objects
-to strings, so the integration refuses that input type. When creating media in
+can exceed Temporal's payload limit. Pass references for large media. The integration
+accepts byte arrays and URI strings as media data. Spring AI 2.1's media codec converts
+`java.net.URL` objects to strings during the round trip. When creating media in
 Workflow code, set a deterministic name with `Media.builder().name(...)`. Spring AI
 otherwise generates a name with a random UUID. The integration preserves media names
 verbatim, including names returned by a model Activity. For a unique name in a

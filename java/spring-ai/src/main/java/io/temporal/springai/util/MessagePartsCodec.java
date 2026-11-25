@@ -2,13 +2,13 @@ package io.temporal.springai.util;
 
 import io.temporal.failure.ApplicationFailure;
 import io.temporal.springai.model.ChatModelTypes;
-import java.net.URL;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.springframework.ai.chat.messages.AbstractMessage;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
@@ -42,15 +42,13 @@ public final class MessagePartsCodec {
   private MessagePartsCodec() {}
 
   public static ChatModelTypes.Message encode(Message message) {
-    List<MessagePart> parts =
-        message instanceof AbstractMessage springMessage
-            ? springMessage.getParts()
-            : List.of(TextPart.of(message.getText()));
+    MessageType role = message.getMessageType();
+    List<MessagePart> parts = partsForEncoding(message, role);
     validateMedia(parts);
     Map<String, Object> metadata = new LinkedHashMap<>(message.getMetadata());
     // Spring AI reconstructs this entry from the message role when decoding.
     metadata.remove(AbstractMessage.MESSAGE_TYPE);
-    if (message.getMessageType() != MessageType.ASSISTANT
+    if (role != MessageType.ASSISTANT
         && !isJsonMetadata(metadata, Collections.newSetFromMap(new IdentityHashMap<>()))) {
       throw ApplicationFailure.newNonRetryableFailure(
           "Spring AI user, system, and tool message metadata requires string keys and values of"
@@ -59,8 +57,37 @@ public final class MessagePartsCodec {
               + " and remove any cyclic references before calling the chat model.",
           "UnsupportedSpringAiMessageMetadata");
     }
-    return new ChatModelTypes.Message(
-        message.getMessageType(), PARTS_WRITER.writeValueAsString(parts), metadata);
+    return new ChatModelTypes.Message(role, PARTS_WRITER.writeValueAsString(parts), metadata);
+  }
+
+  private static List<MessagePart> partsForEncoding(Message message, MessageType role) {
+    if (message instanceof AbstractMessage springMessage) {
+      if (role != MessageType.SYSTEM) {
+        return springMessage.getParts();
+      }
+      validateSystemParts(springMessage.getParts());
+    }
+    // SystemMessage takes one string. Use the same text the provider reads from the prompt.
+    String text = message.getText();
+    if (role == MessageType.SYSTEM && text == null) {
+      throw ApplicationFailure.newNonRetryableFailure(
+          "Spring AI system messages require text content.", "UnsupportedSpringAiSystemMessage");
+    }
+    return List.of(TextPart.of(text));
+  }
+
+  private static void validateSystemParts(List<MessagePart> parts) {
+    if (parts.isEmpty()
+        || parts.stream()
+            .anyMatch(
+                part ->
+                    !(part instanceof TextPart text)
+                        || text.payload() != null
+                        || !text.attributes().isEmpty())) {
+      throw ApplicationFailure.newNonRetryableFailure(
+          "Spring AI system messages require plain text parts without payloads or attributes.",
+          "UnsupportedSpringAiSystemMessage");
+    }
   }
 
   private static void validateMedia(List<MessagePart> parts) {
@@ -69,11 +96,11 @@ public final class MessagePartsCodec {
         Object data = mediaPart.media().getData();
         if (data instanceof byte[] bytes) {
           ChatModelTypes.checkMediaSize(bytes);
-        } else if (data instanceof URL) {
-          // Spring AI's media deserializer turns URL objects into strings.
+        } else if (!(data instanceof String)) {
           throw ApplicationFailure.newNonRetryableFailure(
-              "Spring AI ordered media parts require a URI string or byte array."
-                  + " Pass the URI as a string instead of a java.net.URL object.",
+              "Spring AI media data requires a String or byte array. Received "
+                  + (data == null ? "null" : data.getClass().getTypeName())
+                  + ". Pass the media URI as a string or supply its bytes.",
               "UnsupportedSpringAiMedia");
         }
       } else if (part instanceof ToolResultPart toolResult) {
@@ -119,10 +146,13 @@ public final class MessagePartsCodec {
       case USER -> UserMessage.builder().parts(parts).metadata(metadata).build();
       case TOOL -> ToolResponseMessage.builder().parts(parts).metadata(metadata).build();
       case SYSTEM -> {
-        if (parts.size() != 1 || !(parts.get(0) instanceof TextPart text)) {
-          throw new IllegalArgumentException("System messages require a single text part");
-        }
-        yield SystemMessage.builder().text(text.text()).metadata(metadata).build();
+        validateSystemParts(parts);
+        String text =
+            parts.stream()
+                .map(TextPart.class::cast)
+                .map(TextPart::text)
+                .collect(Collectors.joining());
+        yield SystemMessage.builder().text(text).metadata(metadata).build();
       }
     };
   }
