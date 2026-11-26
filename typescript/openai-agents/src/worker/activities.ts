@@ -8,6 +8,7 @@ import {
   type StreamEvent,
 } from '@openai/agents-core';
 import { APIError } from 'openai';
+import { Context } from '@temporalio/activity';
 import { ApplicationFailure, type Duration } from '@temporalio/common';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
@@ -167,6 +168,15 @@ function toModelInvocationFailure(error: unknown): ApplicationFailure {
 }
 
 /**
+ * After the Activity is cancelled the model client aborts with its own error, which Temporal
+ * would record as a retryable failure. Throw the signal's `CancelledFailure` instead.
+ */
+function failureOrCancellation(error: unknown): unknown {
+  const signal = Context.current().cancellationSignal;
+  return signal.aborted ? signal.reason : toModelInvocationFailure(error);
+}
+
+/**
  * Creates the model Activity functions registered with the Worker. Activities
  * use the provided ModelProvider to resolve models and execute LLM calls.
  */
@@ -186,14 +196,17 @@ export function createModelActivity(
       try {
         // Outside the inner catch: toModelInvocationFailure would rewrap a
         // credential-injection failure as a retryable ModelInvocationError.
-        const request = await fromSerializedModelRequest(input.request, hostedToolCredentials);
+        const request = {
+          ...(await fromSerializedModelRequest(input.request, hostedToolCredentials)),
+          signal: Context.current().cancellationSignal,
+        };
 
         try {
           const model = await Promise.resolve(modelProvider.getModel(input.modelName));
           const response = await model.getResponse(request);
           return toSerializedModelResponse(response);
         } catch (error) {
-          throw toModelInvocationFailure(error);
+          throw failureOrCancellation(error);
         }
       } finally {
         stopHeartbeat();
@@ -204,7 +217,10 @@ export function createModelActivity(
       const stopHeartbeat = startAdaptiveHeartbeat();
 
       try {
-        const request = await fromSerializedModelRequest(input.request, hostedToolCredentials);
+        const request = {
+          ...(await fromSerializedModelRequest(input.request, hostedToolCredentials)),
+          signal: Context.current().cancellationSignal,
+        };
 
         try {
           const model = await Promise.resolve(modelProvider.getModel(input.modelName));
@@ -238,7 +254,7 @@ export function createModelActivity(
 
           return events;
         } catch (error) {
-          throw toModelInvocationFailure(error);
+          throw failureOrCancellation(error);
         }
       } finally {
         stopHeartbeat();
