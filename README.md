@@ -16,6 +16,7 @@ cadence.
 | [`dotnet/microsoft-agent-framework`](dotnet/microsoft-agent-framework) | [![NuGet](https://img.shields.io/nuget/vpre/Temporalio.Extensions.MicrosoftAgentFramework.svg)](https://www.nuget.org/packages/Temporalio.Extensions.MicrosoftAgentFramework) (Pre-release) |
 | [`go/googleadk`](go/googleadk) | [![Go Reference](https://pkg.go.dev/badge/go.temporal.io/googleadk.svg)](https://pkg.go.dev/go.temporal.io/googleadk) |
 | [`java/google-adk`](java/google-adk) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/google-adk.svg)](https://central.sonatype.com/artifact/io.temporal/google-adk) (Public Preview) |
+| [`java/langchain4j`](java/langchain4j) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/langchain4j.svg)](https://central.sonatype.com/artifact/io.temporal/langchain4j) (Pre-release) |
 | [`java/spring-ai`](java/spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/spring-ai) (Public Preview) |
 | [`python/claude_agent_sdk`](python/claude_agent_sdk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-claude-agent-sdk.svg)](https://pypi.org/project/temporalio-claude-agent-sdk/) (Pre-release) |
 | [`python/deepagents`](python/deepagents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-deepagents.svg)](https://pypi.org/project/temporalio-deepagents/) (Public Preview) |
