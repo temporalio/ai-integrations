@@ -7,13 +7,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Heartbeats an activity in the background while a model call runs, so a heartbeat timeout set by
- * the caller detects a dead worker. Does nothing when the activity has no heartbeat timeout.
+ * Heartbeats an activity in the background while a model or MCP call runs, so a heartbeat timeout
+ * set by the caller detects a dead worker and a cancellation reaches the call. Does nothing when
+ * the activity has no heartbeat timeout.
  */
 public final class Heartbeats implements AutoCloseable {
 
@@ -29,32 +31,47 @@ public final class Heartbeats implements AutoCloseable {
           });
 
   @Nullable private final ScheduledFuture<?> ticks;
+  private final AtomicReference<ActivityCompletionException> completion;
 
-  private Heartbeats(@Nullable ScheduledFuture<?> ticks) {
+  private Heartbeats(
+      @Nullable ScheduledFuture<?> ticks, AtomicReference<ActivityCompletionException> completion) {
     this.ticks = ticks;
+    this.completion = completion;
   }
 
   /**
-   * Starts heartbeating at a third of the activity's heartbeat timeout, if it has one. The ticks
-   * stop once the server reports the activity as cancelled or timed out.
+   * Starts heartbeating for a call that can't be cancelled; see {@link
+   * #start(ActivityExecutionContext, Runnable)}.
    */
   public static Heartbeats start(ActivityExecutionContext context) {
+    return start(context, () -> {});
+  }
+
+  /**
+   * Starts heartbeating at a third of the activity's heartbeat timeout, if it has one. When the
+   * server reports the activity as cancelled or timed out, the ticks stop and {@code onCompletion}
+   * runs once so the in-flight call can be abandoned.
+   */
+  public static Heartbeats start(ActivityExecutionContext context, Runnable onCompletion) {
+    AtomicReference<ActivityCompletionException> completion = new AtomicReference<>();
     Duration timeout = context.getInfo().getHeartbeatTimeout();
     if (timeout == null || timeout.isZero() || timeout.isNegative()) {
-      return new Heartbeats(null);
+      return new Heartbeats(null, completion);
     }
     long periodMillis = Math.max(1, timeout.toMillis() / 3);
-    ScheduledFuture<?>[] self = new ScheduledFuture<?>[1];
+    AtomicReference<ScheduledFuture<?>> handle = new AtomicReference<>();
     ScheduledFuture<?> ticks =
         EXECUTOR.scheduleAtFixedRate(
             () -> {
               try {
                 context.heartbeat(null);
               } catch (ActivityCompletionException e) {
-                synchronized (self) {
-                  if (self[0] != null) {
-                    self[0].cancel(false);
+                if (completion.compareAndSet(null, e)) {
+                  ScheduledFuture<?> self = handle.get();
+                  if (self != null) {
+                    self.cancel(false);
                   }
+                  onCompletion.run();
                 }
               } catch (RuntimeException e) {
                 // A failed heartbeat is retried at the next tick; the call itself is unaffected.
@@ -64,10 +81,14 @@ public final class Heartbeats implements AutoCloseable {
             periodMillis,
             periodMillis,
             TimeUnit.MILLISECONDS);
-    synchronized (self) {
-      self[0] = ticks;
-    }
-    return new Heartbeats(ticks);
+    handle.set(ticks);
+    return new Heartbeats(ticks, completion);
+  }
+
+  /** Returns the cancellation or timeout the server reported during the call, if any. */
+  @Nullable
+  public ActivityCompletionException completion() {
+    return completion.get();
   }
 
   @Override

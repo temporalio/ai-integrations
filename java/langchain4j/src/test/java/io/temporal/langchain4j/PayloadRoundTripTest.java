@@ -26,13 +26,24 @@ import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.output.FinishReason;
 import dev.langchain4j.model.output.TokenUsage;
+import dev.langchain4j.service.tool.ToolExecutionResult;
 import io.temporal.api.common.v1.Payload;
 import io.temporal.common.converter.DataConverter;
 import io.temporal.common.converter.DefaultDataConverter;
+import io.temporal.langchain4j.activity.CallMcpToolInput;
+import io.temporal.langchain4j.activity.CallMcpToolOutput;
 import io.temporal.langchain4j.activity.ChatInput;
 import io.temporal.langchain4j.activity.ChatOutput;
+import io.temporal.langchain4j.activity.ChatStreamPart;
+import io.temporal.langchain4j.activity.ListMcpToolsOutput;
+import io.temporal.langchain4j.activity.StreamingChatInput;
+import io.temporal.langchain4j.activity.StreamingChatOutput;
 import io.temporal.langchain4j.internal.ChatCodec;
+import io.temporal.langchain4j.internal.McpCodec;
+import io.temporal.langchain4j.model.ModelStreamEvent;
 import java.util.Base64;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
@@ -172,6 +183,117 @@ class PayloadRoundTripTest {
     IllegalArgumentException error =
         assertThrows(IllegalArgumentException.class, () -> ChatCodec.encode("model", request));
     assertTrue(error.getMessage().contains(ProviderParameters.class.getName()));
+  }
+
+  @Test
+  void streamingInputAndOutputWithEveryPartType() {
+    StreamingChatInput input =
+        new StreamingChatInput(
+            ChatCodec.encode(
+                "model", ChatRequest.builder().messages(UserMessage.from("Hi")).build()),
+            "model-output");
+    assertEquals(input, roundTrip(input, StreamingChatInput.class));
+    assertEquals(
+        new StreamingChatInput(input.request(), null),
+        roundTrip(new StreamingChatInput(input.request(), null), StreamingChatInput.class));
+
+    StreamingChatOutput output =
+        new StreamingChatOutput(
+            ChatCodec.encode(ChatResponse.builder().aiMessage(AiMessage.from("Hello")).build()),
+            List.of(
+                new ChatStreamPart(ChatStreamPart.Type.PARTIAL_THINKING, "hmm", null, null, null),
+                new ChatStreamPart(ChatStreamPart.Type.PARTIAL_RESPONSE, "Hel", null, null, null),
+                new ChatStreamPart(ChatStreamPart.Type.PARTIAL_TOOL_CALL, "{\"a\"", 0, null, "add"),
+                new ChatStreamPart(
+                    ChatStreamPart.Type.COMPLETE_TOOL_CALL, "{\"a\":1}", 0, "call-1", "add")));
+    assertEquals(output, roundTrip(output, StreamingChatOutput.class));
+  }
+
+  @Test
+  void modelStreamEvents() {
+    ModelStreamEvent part =
+        new ModelStreamEvent(
+            "workflow",
+            "run",
+            "1",
+            "model",
+            2,
+            3,
+            ModelStreamEvent.Kind.PART,
+            new ChatStreamPart(ChatStreamPart.Type.PARTIAL_RESPONSE, "Hel", null, null, null));
+    assertEquals(part, roundTrip(part, ModelStreamEvent.class));
+    ModelStreamEvent complete =
+        new ModelStreamEvent(
+            "workflow", "run", "1", "model", 2, 4, ModelStreamEvent.Kind.COMPLETE, null);
+    assertEquals(complete, roundTrip(complete, ModelStreamEvent.class));
+  }
+
+  @Test
+  void mcpToolSpecificationsWithParameterSchemas() {
+    ToolSpecification tool =
+        ToolSpecification.builder()
+            .name("search")
+            .description("Searches the docs")
+            .parameters(
+                JsonObjectSchema.builder()
+                    .addStringProperty("query", "What to look for")
+                    .addProperty("limit", JsonIntegerSchema.builder().build())
+                    .required("query")
+                    .build())
+            .build();
+    ListMcpToolsOutput output =
+        roundTrip(new ListMcpToolsOutput(List.of(tool.toJson())), ListMcpToolsOutput.class);
+    assertEquals(tool, ToolSpecification.fromJson(output.tools().get(0)));
+  }
+
+  @Test
+  void mcpToolRequests() {
+    ToolExecutionRequest request =
+        ToolExecutionRequest.builder().id("call-1").name("search").arguments("{\"q\":1}").build();
+    assertEquals(
+        request,
+        McpCodec.decode(roundTrip(McpCodec.encode("docs", request), CallMcpToolInput.class)));
+    ToolExecutionRequest withoutId = ToolExecutionRequest.builder().name("search").build();
+    assertEquals(
+        withoutId,
+        McpCodec.decode(roundTrip(McpCodec.encode("docs", withoutId), CallMcpToolInput.class)));
+  }
+
+  @Test
+  void mcpToolResultsWithEveryContentTypeAStructuredResultAndAttributes() {
+    String png = Base64.getEncoder().encodeToString(new byte[] {(byte) 0x89, 'P', 'N', 'G'});
+    ToolExecutionResult result =
+        ToolExecutionResult.builder()
+            .resultContents(
+                List.of(TextContent.from("Found it"), ImageContent.from(png, "image/png")))
+            .result(Map.of("hits", List.of(1, 2), "next", Map.of("page", 2)))
+            .attributes(Map.of("traceId", "abc", "cost", 3))
+            .isError(true)
+            .build();
+
+    assertEquals(result, roundTripMcp(result));
+  }
+
+  @Test
+  void mcpToolResultsWithTextOrNoContent() {
+    ToolExecutionResult text = ToolExecutionResult.builder().resultText("plain").build();
+    assertEquals(text, roundTripMcp(text));
+    ToolExecutionResult empty =
+        ToolExecutionResult.builder().resultTextSupplier(() -> null).build();
+    ToolExecutionResult decoded = roundTripMcp(empty);
+    assertEquals(List.of(), decoded.resultContents());
+    assertEquals(empty, decoded);
+  }
+
+  @Test
+  void mcpErrorsForTheModel() {
+    CallMcpToolOutput output =
+        roundTrip(McpCodec.errorForLlm("No such record."), CallMcpToolOutput.class);
+    assertEquals("No such record.", output.errorForLlm());
+  }
+
+  private static ToolExecutionResult roundTripMcp(ToolExecutionResult result) {
+    return McpCodec.decode(roundTrip(McpCodec.encode("search", result), CallMcpToolOutput.class));
   }
 
   /** Stands in for a provider's parameters class, such as {@code OpenAiChatRequestParameters}. */

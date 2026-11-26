@@ -14,4 +14,4 @@ runtime-versions = ["17", "25"]
 
 [smoke]
 dependencies = ["io.temporal:temporal-sdk:1.40.0"]
-imports = ["io.temporal.langchain4j.LangChain4jPlugin", "io.temporal.langchain4j.model.TemporalChatModel"]
+imports = ["io.temporal.langchain4j.LangChain4jPlugin", "io.temporal.langchain4j.model.TemporalChatModel", "io.temporal.langchain4j.model.TemporalStreamingChatModel"]
