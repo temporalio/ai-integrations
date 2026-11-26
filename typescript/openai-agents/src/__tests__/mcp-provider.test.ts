@@ -63,6 +63,56 @@ test('StatelessMCPServerProvider rejects invalid factory results before connecti
   t.is(closes, 0);
 });
 
+test('a rejecting async factory fails the Activity without an unhandled rejection', async (t) => {
+  const unhandled: unknown[] = [];
+  const listener = (reason: unknown) => unhandled.push(reason);
+  process.on('unhandledRejection', listener);
+  try {
+    const activities = new StatelessMCPServerProvider('files', (async () => {
+      throw new Error('server not ready');
+    }) as unknown as () => MCPServer)._getActivities();
+    const err = await t.throwsAsync(activities['files-stateless-list-tools']!({}), { instanceOf: ApplicationFailure });
+    t.is(err?.type, 'MCPServerFactoryTypeError');
+    // Unhandled rejections surface after the microtask queue drains and a macrotask turn.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    t.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
+});
+
+test('a thenable factory result is rejected without calling its then', async (t) => {
+  let thenCalls = 0;
+  const lazy = {
+    then() {
+      thenCalls++;
+    },
+  };
+  const throwing = {
+    get then(): never {
+      throw new Error('then getter');
+    },
+  };
+  const proxied = new Proxy(Promise.resolve(), {});
+  const customCatch = Promise.resolve();
+  customCatch.catch = () => {
+    throw new Error('catch override');
+  };
+  const customThen = Promise.resolve();
+  void Object.defineProperty(customThen, 'then', {
+    get(): never {
+      throw new Error('then getter on a native Promise');
+    },
+  });
+  for (const result of [lazy, throwing, proxied, customCatch, customThen]) {
+    const activities = new StatelessMCPServerProvider('files', (() => result) as unknown as () => MCPServer)._getActivities();
+    const err = await t.throwsAsync(activities['files-stateless-list-tools']!({}), { instanceOf: ApplicationFailure });
+    t.is(err?.type, 'MCPServerFactoryTypeError');
+    t.true(err?.nonRetryable);
+  }
+  t.is(thenCalls, 0);
+});
+
 test('MCP server providers refuse a factory that is not a function when they are built', (t) => {
   const invalidFactories: [unknown, string][] = [
     [undefined, 'undefined'],
