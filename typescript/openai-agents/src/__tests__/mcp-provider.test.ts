@@ -164,3 +164,64 @@ test('StatelessMCPServerProvider refuses a toolMetaResolver without connecting',
   }
   t.is(connects, 0);
 });
+
+class ProtocolError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+    readonly data?: unknown
+  ) {
+    super(message);
+    this.name = 'ProtocolError';
+  }
+}
+
+function failingServer(error: Error): MCPServer {
+  return {
+    ...fakeServer(undefined),
+    async listTools() {
+      throw error;
+    },
+    async callTool() {
+      throw error;
+    },
+  };
+}
+
+test('stateless MCP activities fail a JSON-RPC error a retry cannot fix without retries', async (t) => {
+  for (const code of [-32700, -32600, -32601, -32602]) {
+    const activities = new StatelessMCPServerProvider('files', () =>
+      failingServer(new ProtocolError(code, 'rejected', { why: 'x' }))
+    )._getActivities();
+    for (const name of ['files-stateless-list-tools', 'files-stateless-call-tool']) {
+      const err = await t.throwsAsync(activities[name]!({ toolName: 'read', args: {} }), {
+        instanceOf: ApplicationFailure,
+      });
+      t.is(err?.type, 'MCPProtocolError');
+      t.true(err?.nonRetryable);
+      t.is(err?.message, 'rejected');
+      t.deepEqual(err?.details, [code, { why: 'x' }]);
+    }
+  }
+});
+
+test('stateless MCP activities find a protocol error behind a wrapper error', async (t) => {
+  const wrapped = new Error('call failed', {
+    cause: new ProtocolError(-32602, 'Invalid params'),
+  });
+  const activities = new StatelessMCPServerProvider('files', () => failingServer(wrapped))._getActivities();
+  const err = await t.throwsAsync(activities['files-stateless-call-tool']!({ toolName: 'read', args: {} }), {
+    instanceOf: ApplicationFailure,
+  });
+  t.true(err?.nonRetryable);
+});
+
+test('stateless MCP activities keep internal errors and plain errors retryable', async (t) => {
+  for (const error of [new ProtocolError(-32603, 'Internal error'), new Error('socket hang up')]) {
+    const activities = new StatelessMCPServerProvider('files', () => failingServer(error))._getActivities();
+    for (const name of ['files-stateless-list-tools', 'files-stateless-call-tool']) {
+      const err = await t.throwsAsync(activities[name]!({ toolName: 'read', args: {} }));
+      t.is(err, error);
+    }
+  }
+});
