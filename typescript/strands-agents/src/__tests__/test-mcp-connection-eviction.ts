@@ -7,6 +7,7 @@
  */
 import test from 'ava';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import type { McpClient } from '@strands-agents/sdk';
 import { ApplicationFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
@@ -202,6 +203,80 @@ test('a failed listTools does not close the shared connection under an in-flight
   t.deepEqual(state.disconnects, ['client-1']);
   t.is(state.factoryCalls, 1);
 });
+
+// JSON-RPC error *responses*. The transport delivered them, so the connection is fine.
+// -32601 is what a mistyped tool name comes back as; -32602 is invalid params.
+const APPLICATION_ERROR_CODES = [-32700, -32600, -32601, -32602, -32603, -32042] as const;
+// Same codes the Python MCP pool refuses to reuse: connection closed, request
+// timeout, unsupported protocol version.
+const UNUSABLE_CONNECTION_CODES = [-32000, -32001, -32022] as const;
+
+function clientsThatFailOnce(code: number) {
+  let failed = false;
+  return fakeMcpClients({
+    callTool: async (clientId, toolName) => {
+      if (toolName === 'fail' && !failed) {
+        failed = true;
+        throw new McpError(code, 'tool rejected');
+      }
+      return { handledBy: clientId };
+    },
+    listTools: async () => {
+      if (!failed) {
+        failed = true;
+        throw new McpError(code, 'list rejected');
+      }
+      return [];
+    },
+  });
+}
+
+for (const operation of ['listTools', 'callTool'] as const) {
+  test(`a JSON-RPC error from ${operation} keeps the shared connection`, async (t) => {
+    for (const code of APPLICATION_ERROR_CODES) {
+      const server = `keep-${operation}-${code}`;
+      const { factory, state } = clientsThatFailOnce(code);
+      const connections = new McpConnections();
+      const activity = (
+        operation === 'listTools'
+          ? buildListToolsActivity(server, factory, connections)
+          : buildCallToolActivity(server, factory, connections)
+      ) as (args: CallToolInput | { server: string }) => Promise<unknown>;
+      const failing = operation === 'listTools' ? { server } : input('fail');
+      const err = await t.throwsAsync(new MockActivityEnvironment().run(activity, failing));
+      t.true(err instanceof McpError, `${operation} ${code} did not surface the McpError`);
+      t.is((err as McpError).code, code);
+      await flush();
+      t.deepEqual(state.disconnects, [], `${operation} code ${code} retired a connection that answered`);
+      const again = operation === 'listTools' ? { server } : input('ok');
+      await new MockActivityEnvironment().run(activity, again);
+      t.is(state.factoryCalls, 1, `${operation} code ${code} opened a second connection`);
+      await connections.evict(server);
+    }
+  });
+
+  test(`an unusable McpError from ${operation} retires the shared connection`, async (t) => {
+    for (const code of UNUSABLE_CONNECTION_CODES) {
+      const server = `drop-${operation}-${code}`;
+      const { factory, state } = clientsThatFailOnce(code);
+      const connections = new McpConnections();
+      const activity = (
+        operation === 'listTools'
+          ? buildListToolsActivity(server, factory, connections)
+          : buildCallToolActivity(server, factory, connections)
+      ) as (args: CallToolInput | { server: string }) => Promise<unknown>;
+      const failing = operation === 'listTools' ? { server } : input('fail');
+      const err = await t.throwsAsync(new MockActivityEnvironment().run(activity, failing));
+      t.true(err instanceof McpError);
+      await flush();
+      t.deepEqual(state.disconnects, ['client-1'], `${operation} code ${code} left a dead connection cached`);
+      const again = operation === 'listTools' ? { server } : input('ok');
+      await new MockActivityEnvironment().run(activity, again);
+      t.is(state.factoryCalls, 2, `${operation} code ${code} reused a dead connection`);
+      await connections.evict(server);
+    }
+  });
+}
 
 test('a failed callTool with nothing else in flight closes the connection and the next call reconnects', async (t) => {
   const server = 'soloServer';
