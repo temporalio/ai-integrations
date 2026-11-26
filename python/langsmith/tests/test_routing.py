@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 
 import langsmith
 import pytest
-from langsmith import AgentAddress, agent_address, trace, traceable, tracing_context
 from langsmith import Client as LangSmithClient
+from langsmith import trace, traceable, tracing_context
 from langsmith.run_trees import RunTree, WriteReplica
 from langsmith.utils import LangSmithUserError
 
@@ -38,8 +38,12 @@ from tests.test_integration import (
     traceable_activity,
 )
 
-ADDRESS = agent_address("support", "staging")
-OTHER_ADDRESS = agent_address("support", "production")
+# The plugin allows LangSmith 0.14.2, but agent addresses arrived in 0.14.10.
+pytest.importorskip(
+    "langsmith", minversion="0.14.10", reason="Agent addresses need LangSmith 0.14.10."
+)
+ADDRESS = langsmith.agent_address("support", "staging")
+OTHER_ADDRESS = langsmith.agent_address("support", "production")
 REPLICAS: list[WriteReplica] = [
     {"project_name": "primary", "primary": True},
     {"project_name": "default"},
@@ -314,7 +318,7 @@ async def test_replica_ids_and_updates_across_temporal(
     env: WorkflowEnvironment,
     source: str,
     add_temporal_runs: bool,
-    secondary_address: AgentAddress | None,
+    secondary_address: langsmith.AgentAddress | None,
 ) -> None:
     """Only the primary keeps original IDs; each complete tree gets matching updates."""
     mock = make_mock_ls_client(InMemoryRunCollector())

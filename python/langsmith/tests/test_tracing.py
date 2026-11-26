@@ -9,9 +9,9 @@ from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import langsmith
 import pytest
 from langsmith import (
-    agent_address,
     get_current_run_tree,
     run_helpers,
     trace,
@@ -24,10 +24,20 @@ from temporalio.langsmith import LangSmithInterceptor, _tracing
 from temporalio.langsmith._tracing import destination_context
 from tests.helpers.langsmith import langsmith_release
 
-ADDRESS = agent_address("support", "staging")
-OTHER_ADDRESS = agent_address("support", "production")
+# The plugin allows LangSmith 0.14.2, but agent addresses arrived in 0.14.10.
+HAS_ADDRESSES = hasattr(langsmith, "agent_address")
+ADDRESS = langsmith.agent_address("support", "staging") if HAS_ADDRESSES else None
+OTHER_ADDRESS = (
+    langsmith.agent_address("support", "production") if HAS_ADDRESSES else None
+)
 _DESTINATION = {"project_name": "plugin-project"}
-_ADDRESS_DEFAULT = pytest.param({"address": ADDRESS}, id="address")
+_ADDRESS_DEFAULT = pytest.param(
+    {"address": ADDRESS},
+    id="address",
+    marks=pytest.mark.skipif(
+        not HAS_ADDRESSES, reason="Agent addresses need LangSmith 0.14.10."
+    ),
+)
 
 
 def _destination(run: RunTree | None) -> dict[str, str]:
@@ -115,7 +125,7 @@ def test_traceable_destination_precedence(
     # Cross destination modes where supported, including address over project.
     explicit: dict[str, Any] = (
         {"address": OTHER_ADDRESS}
-        if "project_name" in fallback
+        if "project_name" in fallback and HAS_ADDRESSES
         else {"project_name": "explicit-project"}
     )
     monkeypatch.setenv("LANGSMITH_PROJECT", "env-project")
