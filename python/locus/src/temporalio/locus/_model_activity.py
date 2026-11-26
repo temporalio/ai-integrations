@@ -71,7 +71,12 @@ class ModelActivities:
                     input.messages, input.tools, **input.options
                 )
             except Exception as err:
-                raise _as_failure(err) from err
+                failure = _as_failure(err)
+                if failure is err:
+                    # Not ``raise err from err``: an error that is its own cause
+                    # cannot be converted to a Failure.
+                    raise
+                raise failure from err
 
     @activity.defn(name=STREAM_ACTIVITY)
     async def stream(self, input: ModelCallInput) -> ModelStreamResult:
@@ -105,7 +110,12 @@ class ModelActivities:
                             chunks.append(chunk)
                             topic.publish(chunk)
             except Exception as err:
-                raise _as_failure(err) from err
+                failure = _as_failure(err)
+                if failure is err:
+                    # Not ``raise err from err``: an error that is its own cause
+                    # cannot be converted to a Failure.
+                    raise
+                raise failure from err
         return ModelStreamResult(chunks=chunks)
 
     def activities(self) -> list[Callable[..., Any]]:

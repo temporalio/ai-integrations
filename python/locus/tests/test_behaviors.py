@@ -197,6 +197,33 @@ async def test_final_model_error_fails_the_run_without_retry(client: Client) -> 
     assert cause.cause.type == "Locus.format_error"
 
 
+async def test_unclassified_model_error_is_recorded_as_it_was_raised(
+    client: Client,
+) -> None:
+    failures: list[Exception] = [ValueError("boom") for _ in range(3)]
+    model = ScriptedModel("refund", {"order_id": "1"}, failures=failures)
+    client = _client(client, model)
+    task_queue = f"locus-{uuid.uuid4()}"
+    async with Worker(
+        client, task_queue=task_queue, workflows=[RefundWorkflow], activities=[refund]
+    ):
+        with pytest.raises(WorkflowFailureError) as raised:
+            await client.execute_workflow(
+                RefundWorkflow.run,
+                "refund order 1",
+                id=f"refund-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    # Left to the retry policy, and History holds the model's own error.
+    assert model.calls == 3
+    cause = raised.value.cause
+    assert isinstance(cause, ActivityError)
+    assert isinstance(cause.cause, ApplicationError)
+    assert cause.cause.type == "ValueError"
+    assert cause.cause.message == "boom"
+
+
 @workflow.defn
 class StreamingWorkflow:
     @workflow.run
