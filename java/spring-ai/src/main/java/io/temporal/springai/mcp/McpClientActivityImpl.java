@@ -1,6 +1,7 @@
 package io.temporal.springai.mcp;
 
 import io.modelcontextprotocol.client.McpSyncClient;
+import io.modelcontextprotocol.spec.McpError;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.temporal.failure.ApplicationFailure;
 import java.util.List;
@@ -63,12 +64,56 @@ public class McpClientActivityImpl implements McpClientActivity {
           .setNonRetryable(true)
           .build();
     }
-    return client.callTool(request);
+    try {
+      return client.callTool(request);
+    } catch (RuntimeException e) {
+      throw classify(clientName, e);
+    }
   }
 
   @Override
   public Map<String, McpSchema.ListToolsResult> listTools() {
     return mcpClients.entrySet().stream()
-        .collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().listTools()));
+        .collect(
+            Collectors.toMap(
+                Map.Entry::getKey,
+                e -> {
+                  try {
+                    return e.getValue().listTools();
+                  } catch (RuntimeException ex) {
+                    throw classify(e.getKey(), ex);
+                  }
+                }));
+  }
+
+  /**
+   * Fails the activity non-retryably when the MCP server rejected the request with a JSON-RPC
+   * protocol error that retrying the same request cannot fix (parse error, invalid request, method
+   * not found, invalid params). Any other error, including transport failures, is returned as is so
+   * the activity retry policy still applies.
+   */
+  private static RuntimeException classify(String clientName, RuntimeException error) {
+    Throwable cause = error;
+    for (int depth = 0; cause != null && depth < 16; depth++) {
+      if (cause instanceof McpError mcpError && isNonRetryable(mcpError)) {
+        return ApplicationFailure.newNonRetryableFailureWithCause(
+            "MCP client '" + clientName + "' rejected the request: " + error.getMessage(),
+            "McpError",
+            error);
+      }
+      cause = cause.getCause();
+    }
+    return error;
+  }
+
+  private static boolean isNonRetryable(McpError error) {
+    if (error.getJsonRpcError() == null || error.getJsonRpcError().code() == null) {
+      return false;
+    }
+    int code = error.getJsonRpcError().code();
+    return code == McpSchema.ErrorCodes.PARSE_ERROR
+        || code == McpSchema.ErrorCodes.INVALID_REQUEST
+        || code == McpSchema.ErrorCodes.METHOD_NOT_FOUND
+        || code == McpSchema.ErrorCodes.INVALID_PARAMS;
   }
 }
