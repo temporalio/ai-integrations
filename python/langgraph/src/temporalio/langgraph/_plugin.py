@@ -39,7 +39,11 @@ from temporalio.langgraph._task_cache import (
     set_task_cache,
     task_id,
 )
-from temporalio.langgraph._workflow import wrap_workflow
+from temporalio.langgraph._workflow import (
+    scope_router,
+    track_invocations,
+    wrap_workflow,
+)
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import Interceptor, ReplayerConfig, WorkerConfig, WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
@@ -406,8 +410,24 @@ class LangGraphPlugin(SimplePlugin):
                         user_func,
                         opts,
                         context_schema=graph.context_schema,
+                        injected=frozenset(runnable.func_accepts),
                     )
                     runnable.func = None
+                # Routers run in the workflow and can call tasks too.
+                for source, branches in graph.branches.items():
+                    for branch_name, branch in branches.items():
+                        branches[branch_name] = branch._replace(
+                            path=scope_router(
+                                f"{graph_name}.{source}.{branch_name}", branch.path
+                            )
+                        )
+
+        # Functional API: an entrypoint runs in the workflow; each invocation
+        # tracks its calls, so a failed one can be invoked again.
+        for program in (entrypoints or {}).values():
+            for pregel_node in program.nodes.values():
+                if isinstance(pregel_node.bound, RunnableCallable):
+                    track_invocations(pregel_node.bound)
 
         # Functional API: Wrap @task functions as Temporal Activities.
         if tasks:
@@ -523,6 +543,7 @@ class LangGraphPlugin(SimplePlugin):
         kwargs: dict[str, Any] | None = None,
         *,
         context_schema: type[Any] | None = None,
+        injected: frozenset[str] = frozenset(),
     ) -> Callable:
         """Prepare a node or task to execute as an activity or inline in the workflow."""
         opts = kwargs or {}
@@ -561,7 +582,11 @@ class LangGraphPlugin(SimplePlugin):
             )
         elif execute_in == "workflow":
             return wrap_workflow(
-                func, streaming_topic=self._streaming_topic, summary_fn=summary_fn
+                activity_name,
+                func,
+                injected=injected,
+                streaming_topic=self._streaming_topic,
+                summary_fn=summary_fn,
             )
         else:
             raise ValueError(f"Invalid execute_in value: {execute_in}")
@@ -582,11 +607,12 @@ def graph(
     Args:
         name: Graph name as registered with LangGraphPlugin.
         cache: Optional task result cache from a cache() call in an earlier
-            run, passed on through continue-as-new. The first call of an
-            Activity node with the same input as a call in that cache gets
-            the cached result instead of running. The cache belongs to the
-            Workflow run, not to this graph: every graph and entrypoint of
-            the run uses it, and a later call without ``cache`` keeps it.
+            run, passed on through continue-as-new. The Activity node calls
+            completed in that run get their cached results instead of
+            running when this run makes them again, with the same input and
+            in the same order. The cache belongs to the Workflow run, not to
+            this graph: every graph and entrypoint of the run uses it, and a
+            later call without ``cache`` keeps it.
     """
     graphs = _workflow_graphs.get(workflow.info().run_id)
     if graphs is None:
@@ -617,12 +643,12 @@ def entrypoint(
     Args:
         name: Entrypoint name as registered with Plugin.
         cache: Optional task result cache from a cache() call in an earlier
-            run, passed on through continue-as-new. The first call of an
-            Activity task with the same arguments as a call in that cache
-            gets the cached result instead of running. The cache belongs to
-            the Workflow run, not to this entrypoint: every graph and
-            entrypoint of the run uses it, and a later call without
-            ``cache`` keeps it.
+            run, passed on through continue-as-new. The Activity task calls
+            completed in that run get their cached results instead of
+            running when this run makes them again, with the same arguments
+            and in the same order. The cache belongs to the Workflow run,
+            not to this entrypoint: every graph and entrypoint of the run
+            uses it, and a later call without ``cache`` keeps it.
     """
     entrypoints = _workflow_entrypoints.get(workflow.info().run_id)
     if entrypoints is None:
@@ -642,8 +668,9 @@ def cache() -> dict[str, Any] | None:
 
     Pass it to the next run through continue-as-new and give it to
     graph(name, cache=...) or entrypoint(name, cache=...) there. It holds
-    the latest result of each Activity node or task call of this run, and
-    what earlier runs handed over. Returns None if the cache is empty.
+    the result of every Activity node or task call of this run, each
+    repeat of a call included, and what earlier runs handed over. Returns
+    None if the cache is empty.
     """
     if not workflow.in_workflow():
         # The cache is kept on the Workflow's event loop, so other code has none.

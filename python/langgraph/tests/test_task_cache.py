@@ -258,11 +258,11 @@ async def test_repeated_call_executes_in_every_workflow(
 async def test_carried_result_is_served_once(
     client: Client, max_cached_workflows: int, fetch_for_each_call: bool
 ) -> None:
-    """A call made twice per run gets the last run's latest result, then executes.
+    """A call made twice per run gets both of the last run's results, in order.
 
     With no cached Workflows, every Workflow Task replays the run from its
     history first. Passing the carried cache again before the second call
-    does not serve it again.
+    does not change that.
     """
     plugin = _counter_plugin()
     [(chain, histories)] = await _run_chains(
@@ -274,10 +274,10 @@ async def test_carried_result_is_served_once(
 
     assert [[result["count"] for result in run] for run in chain.results] == [
         [1, 2],
-        [2, 3],
-        [3, 4],
+        [1, 2],
+        [1, 2],
     ]
-    assert _scheduled(histories) == [2, 1, 1]
+    assert _scheduled(histories) == [2, 0, 0]
     await _replay(plugin, ChainWorkflow, histories)
 
 
@@ -572,7 +572,7 @@ async def count_twice_at_once(job: str) -> list[int]:
 async def test_parallel_calls_with_equal_input_all_run(client: Client) -> None:
     """Two identical calls started together both run.
 
-    The next run gets the latest result for one of them and runs the other.
+    The next run gets both results back, each in its own place.
     """
     _calls.clear()
     fan_out: StateGraph[Any, Any, Any, Any] = StateGraph(Counts)
@@ -596,10 +596,9 @@ async def test_parallel_calls_with_equal_input_all_run(client: Client) -> None:
         [run[0] for run in jobs.results],
     ):
         assert sorted(first) == [1, 2]
-        # Either result of the first run can be the latest. 3 is the call that ran.
-        assert sorted(second) in ([1, 3], [2, 3])
+        assert second == first
     for histories in (sent_histories, job_histories):
-        assert _scheduled(histories) == [2, 1]
+        assert _scheduled(histories) == [2, 0]
         await _replay(plugin, ChainWorkflow, histories)
 
 
@@ -609,8 +608,8 @@ async def command_then_result(state: Value) -> Any:  # pyright: ignore[reportUnu
     return Command(update={"value": count}) if count == 1 else {"value": count}
 
 
-async def test_latest_result_replaces_an_earlier_command(client: Client) -> None:
-    """The next run gets a call's latest result, not the Command it returned first."""
+async def test_repeated_calls_get_back_a_command_and_a_result(client: Client) -> None:
+    """The next run gets back the first call's Command and the second call's result."""
     _calls.clear()
     [(chain, histories)] = await _run_chains(
         client,
@@ -618,8 +617,8 @@ async def test_latest_result_replaces_an_earlier_command(client: Client) -> None
         Chain(graph="kinds", input=Value(value=0), calls=2, runs_left=1),
     )
 
-    assert chain.results == [[{"value": 1}, {"value": 2}], [{"value": 2}, {"value": 3}]]
-    assert _scheduled(histories) == [2, 1]
+    assert chain.results == [[{"value": 1}, {"value": 2}]] * 2
+    assert _scheduled(histories) == [2, 0]
 
 
 @task

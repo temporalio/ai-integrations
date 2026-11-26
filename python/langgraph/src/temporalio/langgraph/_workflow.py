@@ -5,21 +5,27 @@
 from __future__ import annotations
 
 import dataclasses
+import weakref
 from collections.abc import Awaitable
 from inspect import iscoroutinefunction
 from typing import Any, Callable
 
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph._internal._constants import CONFIG_KEY_RUNTIME
+from langgraph._internal._runnable import RunnableCallable
 
 from temporalio import workflow
 from temporalio.contrib.workflow_streams._stream import _PUBLISH_SIGNAL
 from temporalio.langgraph._langgraph_config import refuse_idle_timeout
+from temporalio.langgraph._task_cache import call_scope, invocation_scope
 
 
 def wrap_workflow(
+    name: str,
     func: Callable[..., Any],
     *,
+    injected: frozenset[str] = frozenset(),
     streaming_topic: str | None = None,
     summary_fn: Callable[[tuple[Any, ...], dict[str, Any]], str | None] | None = None,
 ) -> Callable[..., Awaitable[Any]]:
@@ -35,6 +41,10 @@ def wrap_workflow(
     ``summary_fn`` result updates the workflow's current details via
     :func:`temporalio.workflow.set_current_details` (last-writer-wins);
     an empty result clears it.
+
+    The calls it makes are counted per call of ``name`` with its input (see
+    :func:`call_scope`): its arguments, without the keyword arguments named
+    in ``injected``, which LangGraph passes to a node.
     """
 
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -58,10 +68,12 @@ def wrap_workflow(
                     token = var_child_runnable_config.set(
                         {**config, "configurable": configurable}
                     )
+            caller = {k: v for k, v in kwargs.items() if k not in injected}
             try:
-                if iscoroutinefunction(func):
-                    return await func(*args, **kwargs)
-                return func(*args, **kwargs)
+                with call_scope(name, args, caller):
+                    if iscoroutinefunction(func):
+                        return await func(*args, **kwargs)
+                    return func(*args, **kwargs)
             finally:
                 if token is not None:
                     var_child_runnable_config.reset(token)
@@ -74,3 +86,64 @@ def wrap_workflow(
         return await run(stream_writer=topic.publish)
 
     return wrapper
+
+
+def scope_router(name: str, path: Runnable[Any, Any]) -> Runnable[Any, Any]:
+    """Wrap a conditional edge's router so its calls are counted per router call.
+
+    LangGraph runs a router in its source node's task once the node
+    finishes, so the routers of parallel nodes would otherwise make their
+    calls in the order the nodes finish, which changes after continue-as-new
+    when the nodes' results come from the cache. Like a workflow-side node,
+    a router counts its calls per call of ``name`` with its input (see
+    :func:`call_scope`), and per LangGraph task, which tells apart the
+    tasks that ``Send`` makes for one node.
+    """
+
+    async def aroute(value: Any, config: RunnableConfig) -> Any:
+        with call_scope(name, (_task_path(config), value)):
+            return await path.ainvoke(value, config)
+
+    def route(value: Any, config: RunnableConfig) -> Any:
+        with call_scope(name, (_task_path(config), value)):
+            return path.invoke(value, config)
+
+    return RunnableCallable(
+        route, aroute, name=path.get_name(), trace=False, recurse=False
+    )
+
+
+# The entrypoint functions that track_invocations() has wrapped.
+_tracked: weakref.WeakSet[RunnableCallable] = weakref.WeakSet()
+
+
+def track_invocations(runnable: RunnableCallable) -> None:
+    """Run an entrypoint's function in an invocation scope, in place.
+
+    Each invocation then tracks its calls (see :func:`invocation_scope`).
+    Its input is the positional argument; LangGraph injects the keyword
+    arguments. Wraps a function once, however many plugins are built with it.
+    """
+    if runnable in _tracked:
+        return
+    name, func, afunc = runnable.get_name(), runnable.func, runnable.afunc
+    if func is not None:
+
+        def tracked(*args: Any, **kwargs: Any) -> Any:
+            with invocation_scope(name, args):
+                return func(*args, **kwargs)
+
+        runnable.func = tracked
+    if afunc is not None:
+
+        async def atracked(*args: Any, **kwargs: Any) -> Any:
+            with invocation_scope(name, args):
+                return await afunc(*args, **kwargs)
+
+        runnable.afunc = atracked
+    _tracked.add(runnable)
+
+
+def _task_path(config: RunnableConfig) -> Any:
+    """Return the path of the LangGraph task that ``config`` belongs to."""
+    return (config.get("metadata") or {}).get("langgraph_path")
