@@ -9,6 +9,8 @@ import importlib.metadata
 import inspect
 import sys
 import warnings
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Callable
@@ -19,6 +21,7 @@ from langgraph.pregel import Pregel
 from langgraph.types import CachePolicy, TimeoutPolicy
 
 from temporalio import activity, workflow
+from temporalio.client import WorkflowHistory
 from temporalio.langgraph._activity import (
     ValueTypes,
     wrap_activity,
@@ -28,6 +31,7 @@ from temporalio.langgraph._entrypoint import (
     validate_entrypoint_checkpointers,
     workflow_entrypoint,
 )
+from temporalio.langgraph._event_loop import validate_stream_id_plugins
 from temporalio.langgraph._interceptor import (
     LangGraphInterceptor,
     _workflow_entrypoints,
@@ -41,7 +45,14 @@ from temporalio.langgraph._task_cache import (
 )
 from temporalio.langgraph._workflow import wrap_workflow
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import Interceptor, ReplayerConfig, WorkerConfig, WorkflowRunner
+from temporalio.worker import (
+    Interceptor,
+    Replayer,
+    ReplayerConfig,
+    WorkerConfig,
+    WorkflowReplayResult,
+    WorkflowRunner,
+)
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 _ACTIVITY_OPTION_KEYS: frozenset[str] = frozenset(
@@ -466,8 +477,23 @@ class LangGraphPlugin(SimplePlugin):
         except importlib.metadata.PackageNotFoundError:
             return ""
 
+    @asynccontextmanager
+    async def run_replayer(
+        self,
+        replayer: Replayer,
+        histories: AsyncIterator[WorkflowHistory],
+        next: Callable[..., Any],
+    ) -> AsyncGenerator[AsyncIterator[WorkflowReplayResult], None]:
+        """Refuse incompatible tracing hooks before replay processes history."""
+        validate_stream_id_plugins(replayer.plugins)
+        async with super().run_replayer(replayer, histories, next) as results:
+            yield results
+
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
         """See base class. Also refuses a second instance, and applies this one once."""
+        validate_stream_id_plugins(config.get("plugins", ()))
+        if client := config.get("client"):
+            validate_stream_id_plugins(client.config()["plugins"])
         self._refuse_second_instance(
             config, "Worker", " A Worker also gets the plugins of its Client."
         )

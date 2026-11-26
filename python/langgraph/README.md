@@ -473,7 +473,37 @@ class AstreamBridge:
         topic.publish({"done": True})
 ```
 
-Bridge `"updates"`, `"values"` or `"debug"`. In workflow code `astream()` yields nothing for `"messages"`.
+Bridge `"updates"`, `"values"` or `"debug"`. Model tokens emitted inside an
+Activity node are not forwarded through the Workflow's `"messages"` mode; publish
+them from the Activity to a topic when external subscribers need live tokens.
+
+`app.astream_events(..., version="v2")` also works in Workflow code. Events are
+local to the Workflow; publish them to a `WorkflowStream` topic when external
+subscribers need them. The plugin schedules stream callbacks only from the same
+Workflow event loop; cross-thread callbacks remain unsupported. Existing histories
+retain their previous behavior through the `langchain-same-loop-streams` patch.
+
+The shim is also installed before Signal-With-Start and Update-With-Start handlers
+run. Generated event `run_id` and `parent_ids` are replay-stable in Workflows;
+Activities and ordinary clients retain LangChain's native IDs. This uses the
+separate `langchain-replay-stable-run-ids` patch, so existing histories retain
+their original ID generation. Explicitly supplied run IDs are preserved. Read-only
+Queries and Update validators retain native ID generation.
+
+When installing this plugin alongside `temporalio-langsmith`, upgrade both packages together.
+Older LangSmith plugins (including 1.0.0) lack the workflow-local streaming-ID
+capability and are rejected before Worker initialization or Replayer history processing, in either
+registration order, including plugins inherited from a Client. The check also
+applies when the older package is installed but configured on a different Worker,
+because its UUID hooks are process-wide. This prevents
+recording histories whose child IDs would change after upgrading LangSmith.
+
+This guarantee covers event trace IDs, not every ID inside a message payload.
+In particular, LangGraph can generate a new `ToolMessage.id` when a tool returns
+a string. Do not use that generated message ID to acknowledge or deduplicate
+across Workflow replay. Use `ToolMessage.tool_call_id` to correlate a result with
+its originating tool call (for model calls executed in Activities, that call ID
+is recorded in the Activity result), or assign your own replay-stable message ID.
 
 ### Retry semantics
 

@@ -7,7 +7,7 @@ import dataclasses
 import importlib.metadata
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import langchain_core.env
 import langsmith
@@ -36,6 +36,9 @@ class LangSmithPlugin(SimplePlugin):
     Provides automatic LangSmith run creation for workflows, activities,
     and other Temporal operations with context propagation.
     """
+
+    # Capability checked by independently installed LangGraph/DeepAgents plugins.
+    _temporal_langchain_stream_ids: ClassVar[bool] = True
 
     def __init__(
         self,
