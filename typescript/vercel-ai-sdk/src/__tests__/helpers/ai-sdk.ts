@@ -1,11 +1,11 @@
 import type { TestFn } from 'ava';
 import type { BaseContext } from '@temporalio/test-helpers';
-import { test as anyTest, createBaseBundlerOptions, TestWorkflowEnvironment } from '@temporalio/test-helpers';
+import { test as anyTest, createBaseBundlerOptions } from '@temporalio/test-helpers';
 import { workflowInterceptorModules } from '@temporalio/testing';
 import { bundleWorkflowCode, DefaultLogger } from '@temporalio/worker';
 import { AiSdkPlugin } from '../..';
 import { helloWorkflowGenerator, TestProvider } from '../stubs/ai-sdk';
-import { startLocalWithRetry } from './environment';
+import { createTestEnvironment } from './environment';
 
 export const remoteTests = ['1', 't', 'true'].includes((process.env.AI_SDK_REMOTE_TESTS ?? 'false').toLowerCase());
 
@@ -14,7 +14,7 @@ export function makeAiSdkTestFunction(): TestFn<BaseContext> {
   // AVA runs one file at a time; small feature suites bound concurrent Workers.
   const test = anyTest as TestFn<BaseContext>;
   test.before(async (t) => {
-    const env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+    const env = await createTestEnvironment();
     const workflowBundle = await bundleWorkflowCode({
       ...createBaseBundlerOptions(),
       workflowsPath: require.resolve('../workflows/ai-sdk'),

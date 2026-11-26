@@ -46,8 +46,6 @@ from temporalio.google_adk import (
 )
 from temporalio.worker import Replayer, Worker
 
-TASK_QUEUE = "adk-hitl-task-queue"
-
 # Worker-side record of real activity executions, keyed by workflow id.
 _ACTIVITY_EXECUTIONS: dict[str, list[Any]] = {}
 
@@ -295,10 +293,10 @@ def _adk_client(client: Client) -> Client:
     return Client(**new_config)
 
 
-def _worker(client: Client) -> Worker:
+def _worker(client: Client, task_queue: str) -> Worker:
     return Worker(
         client,
-        task_queue=TASK_QUEUE,
+        task_queue=task_queue,
         activities=[danger_activity],
         workflows=[
             HumanInputGraphWorkflow,
@@ -352,14 +350,14 @@ def test_pending_hitl_requests_ignores_credential_requests():
 
 
 @pytest.mark.asyncio
-async def test_human_input_node_update_resume(client: Client):
+async def test_human_input_node_update_resume(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         handle = await client.start_workflow(
             HumanInputGraphWorkflow.run,
             "make a plan",
             id=f"hitl-input-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
         pending = await handle.execute_update(
@@ -379,7 +377,9 @@ async def test_human_input_node_update_resume(client: Client):
 
 @pytest.mark.parametrize("confirmed", [True, False])
 @pytest.mark.asyncio
-async def test_tool_confirmation_activity_as_tool(client: Client, confirmed: bool):
+async def test_tool_confirmation_activity_as_tool(
+    client: Client, task_queue: str, confirmed: bool
+):
     client = _adk_client(client)
     workflow_id = f"hitl-confirm-{confirmed}-{uuid.uuid4()}"
     # max_cached_workflows=0 forces a full history replay on every workflow
@@ -387,13 +387,13 @@ async def test_tool_confirmation_activity_as_tool(client: Client, confirmed: boo
     # response references the confirmation function-call id, which must
     # regenerate identically on replay (it derives from workflow.uuid4() via
     # the platform uuid seam the plugin installs).
-    async with _worker(client):
+    async with _worker(client, task_queue):
         LLMRegistry.register(ConfirmationModel)
         handle = await client.start_workflow(
             ConfirmationAgentWorkflow.run,
             "confirmation_model",
             id=workflow_id,
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
         pending = await handle.execute_update(
@@ -421,14 +421,14 @@ async def test_tool_confirmation_activity_as_tool(client: Client, confirmed: boo
 
 
 @pytest.mark.asyncio
-async def test_hitl_multiple_pending_partial_response(client: Client):
+async def test_hitl_multiple_pending_partial_response(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         handle = await client.start_workflow(
             MultiPendingGraphWorkflow.run,
             "go",
             id=f"hitl-multi-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
         pending = await handle.execute_update(
@@ -459,14 +459,14 @@ async def test_hitl_multiple_pending_partial_response(client: Client):
 
 
 @pytest.mark.asyncio
-async def test_default_interrupt_id_replay_safe(client: Client):
+async def test_default_interrupt_id_replay_safe(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         handle = await client.start_workflow(
             DefaultInterruptIdWorkflow.run,
             "go",
             id=f"hitl-default-id-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
         pending = await handle.execute_update(
