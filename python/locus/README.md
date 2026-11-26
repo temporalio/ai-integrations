@@ -231,7 +231,7 @@ async def refund_with_approval(order_id: str) -> str:
 
 Inside a Workflow, Locus's time budgets, `TimeLimit`, timestamps, run ids, tool-call ids and retry jitter use the Workflow's clock, `workflow.uuid4()` and `workflow.random()`, so a replayed run takes the same path. Activities and plain Locus code in the same process keep the real clock.
 
-Where Locus has `locus.core.sources`, the plugin installs its sources through it. Older Locus releases have no such seam; there the plugin replaces the `time`, `datetime`, `uuid4` and `random` names in the Locus modules the loop and the shapes run (`locus.core.state`, `locus.core.events`, `locus.core.interrupt`, `locus.core.messages`, `locus.core.termination`, `locus.agent.agent`, `locus.agent.runtime_loop`, `locus.agent.model_retry`, `locus.tools.executor` and the `locus.multiagent` modules). On those releases two reads stay on the system's clock and random generator, because Locus imports them inside the function: a `StateGraph` node cache's `ttl_seconds` check and the jitter of a node's `RetryPolicy`. Avoid a node cache with a ttl in Workflow code there.
+The plugin installs its sources through `locus.core.sources`, the one place Locus reads a clock, an id or a random number from, so this covers the loop, the multi-agent shapes and `StateGraph` alike. That module exists from Locus 6.8, which is why the plugin requires it.
 
 ## Not supported in Workflow code
 

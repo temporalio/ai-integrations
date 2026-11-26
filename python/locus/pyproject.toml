@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
   "temporalio>=1.36.0,<2",
-  "locus-sdk>=5.4,<7",
+  "locus-sdk>=6.8,<7",
   "pydantic>=2.0.0,<3",
 ]
 
@@ -62,7 +62,7 @@ dev = [
 default-groups = ["dev"]
 required-version = ">=0.13.0,<0.14"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
-exclude-newer-package = { temporalio = false, temporalio-mcp = false }   # first-party packages are exempt: SDK releases and temporalio-mcp releases must be adoptable on day one
+exclude-newer-package = { temporalio = false, temporalio-mcp = false, locus-sdk = false }   # first-party packages are exempt: SDK releases and temporalio-mcp releases must be adoptable on day one; locus-sdk is exempt because the plugin needs the hooks of its newest release
 link-mode = "copy"
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
 

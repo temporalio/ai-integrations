@@ -13,6 +13,7 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P2W"
 
 [options.exclude-newer-package]
+locus-sdk = false
 temporalio = false
 temporalio-mcp = false
 
@@ -501,7 +502,7 @@ wheels = [
 
 [[package]]
 name = "locus-sdk"
-version = "5.4.0"
+version = "6.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -509,9 +510,9 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f5/81/e31c1719e52c70fec7342eab45ae9e2ee37b1290908052882ecec62eefd4/locus_sdk-5.4.0.tar.gz", hash = "sha256:dfc03fccc846b486b92d0de6cdf09185dcd133908dfefa5ed5cc39148faf2b25", size = 2417143, upload-time = "2026-11-10T22:11:07.011Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c1/de/e176f6976d7e557fc1e8591b193597da5e2199c9a10f3e52f9b6c0c8c088/locus_sdk-6.8.0.tar.gz", hash = "sha256:beb64766b1229dfe56b4a04d1d67a5665c1d023e95ad8d7ae4360574d1433cd6", size = 3251951, upload-time = "2026-11-26T01:18:29.974Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/32/6f/dcb2bbc34e2546c7f7e10bafd66a5c9e97eb2911dc5d36fe1a6048e9fa29/locus_sdk-5.4.0-py3-none-any.whl", hash = "sha256:f534af9dff2e6d7b9cc794f19c50d4e34cfba10c7486ba0ca556ac563d156ff8", size = 1481200, upload-time = "2026-11-10T22:11:04.675Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/01/9d6c68d4759b6f5d57fe8e96320bc9fa7237815eaa831f164210a47b5ef0/locus_sdk-6.8.0-py3-none-any.whl", hash = "sha256:50aaa873d287e9df6fa9ead47201f4274eabeb51c6b60c1d8aa3e996d439562c", size = 1996862, upload-time = "2026-11-26T01:18:28.219Z" },
 ]
 
 [[package]]
@@ -1346,7 +1347,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "locus-sdk", specifier = ">=5.4,<7" },
+    { name = "locus-sdk", specifier = ">=6.8,<7" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2,<3" },
     { name = "mcp-types", marker = "extra == 'mcp'", specifier = ">=2,<3" },
     { name = "pydantic", specifier = ">=2.0.0,<3" },
