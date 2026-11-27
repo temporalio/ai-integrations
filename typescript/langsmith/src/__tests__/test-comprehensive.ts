@@ -50,8 +50,6 @@ async function runComprehensive(addTemporalRuns: boolean): Promise<InMemoryRunCo
       nexusServices: [comprehensiveNexusServiceHandler],
     },
     body: async ({ client, taskQueue, env }) => {
-      await env.createNexusEndpoint(COMPREHENSIVE_NEXUS_ENDPOINT, taskQueue);
-
       const ready = activities.resetReady();
       const pipeline = traceable(
         async () => {
@@ -86,7 +84,12 @@ async function runComprehensive(addTemporalRuns: boolean): Promise<InMemoryRunCo
         },
         { name: 'user_pipeline', client: collector.asClient(), tracingEnabled: true }
       );
-      await pipeline();
+      const endpoint = await env.createNexusEndpoint(COMPREHENSIVE_NEXUS_ENDPOINT, taskQueue);
+      try {
+        await pipeline();
+      } finally {
+        await env.deleteNexusEndpoint(endpoint);
+      }
     },
   });
   return collector;

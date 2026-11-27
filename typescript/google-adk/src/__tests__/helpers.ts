@@ -19,7 +19,7 @@ import {
 import type { FunctionDeclaration } from '@google/genai';
 import { Type } from '@google/genai';
 import { defaultPayloadConverter } from '@temporalio/common';
-import { TestWorkflowEnvironment } from '@temporalio/testing';
+import type { TestWorkflowEnvironment } from '@temporalio/testing';
 import {
   bundleWorkflowCode,
   Worker,
@@ -31,7 +31,7 @@ import {
 
 import { GoogleAdkPlugin } from '../index';
 import { FakeLlm, type MockMCPToolDefinition } from '../testing';
-import { startLocalWithRetry } from './helpers/environment';
+import { createTestEnvironment } from './helpers/environment';
 
 const here = __dirname;
 
@@ -75,7 +75,7 @@ export function uid(prefix: string): string {
 export function setupTestEnv(test: TestFn): () => TestWorkflowEnvironment {
   let env: TestWorkflowEnvironment;
   test.before(async () => {
-    env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+    env = await createTestEnvironment();
   });
   test.after.always(async () => {
     await env?.teardown();
