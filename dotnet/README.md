@@ -38,6 +38,6 @@ direct dependency in the CI checkout; failures are tracked in a `nightly` issue 
 
 Tests must not require provider credentials. Use deterministic fakes (an `IChatClient` that replays
 scripted responses, in-process MCP servers) and the Temporal dev server that
-`Temporalio.Testing.WorkflowEnvironment.StartLocalAsync` downloads on first run.
+`make test` downloads and caches on first run.
 
 Repository conventions are in [`AGENTS.md`](../AGENTS.md).

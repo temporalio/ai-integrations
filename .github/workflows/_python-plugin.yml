@@ -58,6 +58,7 @@ jobs:
       matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
     env:
       PLUGIN_DIR: python/${{ inputs.plugin }} # run steps `cd` here; never interpolate inputs into run blocks
+      DEPS: ${{ inputs.deps }}
       UV_NO_EDITABLE: "1" # editable installs cannot resolve temporalio.contrib.* from src/
       UV_LINK_MODE: copy
       COLUMNS: "120"
@@ -89,8 +90,6 @@ jobs:
         if: matrix.dist && inputs.deps == 'locked'
         run: cd "$PLUGIN_DIR" && make check-deps
       - name: Sync environment
-        env:
-          DEPS: ${{ inputs.deps }}
         run: |
           cd "$PLUGIN_DIR"
           case "$DEPS" in
@@ -101,7 +100,7 @@ jobs:
       - name: Lint and type-check
         run: cd "$PLUGIN_DIR" && make lint
       - name: Test
-        run: cd "$PLUGIN_DIR" && make test PYTEST_ARGS="-s --junit-xml=junit/test.xml"
+        run: cd "$PLUGIN_DIR" && make test TEST_ARGS="-s --junit-xml=junit/test.xml"
       - name: Build, verify, and smoke-test distributions
         # Only on the designated dist cell: the release pipeline publishes the ubuntu-built artifacts.
         if: matrix.dist

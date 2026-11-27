@@ -64,6 +64,7 @@ from temporalio.openai_agents._temporal_worker_env_ref import (
 from temporalio.openai_agents._trace_interceptor import (
     OpenAIAgentsContextPropagationInterceptor,
 )
+from temporalio.openai_agents._workflow_failure import ModelBehaviorErrorInterceptor
 from temporalio.openai_agents.sandbox._on_host_sandbox_client_provider import (
     OnHostSandboxClientProvider,
 )
@@ -670,7 +671,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         super().__init__(
             name="OpenAIAgentsPlugin",
             data_converter=_data_converter,
-            interceptors=[interceptor],
+            interceptors=[interceptor, ModelBehaviorErrorInterceptor()],
             activities=add_activities,
             workflow_runner=workflow_runner,
             workflow_failure_exception_types=[AgentsWorkflowError],

@@ -5,10 +5,10 @@ import type { TestFn } from 'ava';
 import { optionalTsToMs } from '@temporalio/common/lib/time';
 import type { temporal } from '@temporalio/proto';
 import type { BaseContext } from '@temporalio/test-helpers';
-import { createBaseBundlerOptions, TestWorkflowEnvironment } from '@temporalio/test-helpers';
+import { createBaseBundlerOptions } from '@temporalio/test-helpers';
 import { bundleWorkflowCode, DefaultLogger } from '@temporalio/worker';
 import { StrandsPlugin } from '../..';
-import { startLocalWithRetry } from './environment';
+import { createTestEnvironment } from './environment';
 
 const STUB_TRANSPORT: Transport = {
   async start() {},
@@ -130,7 +130,7 @@ export class StubMcpClient extends McpClient {
 /** Register the local server and workflow bundle for one integration test file. */
 export function setupTestEnv(test: TestFn<BaseContext>): void {
   test.before(async (t) => {
-    const env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+    const env = await createTestEnvironment();
     // Pass a `StrandsPlugin` to `bundleWorkflowCode` so the plugin can stub out
     // `@strands-agents/sdk/mcp-config.js`'s dynamic `node:*`/MCP-transport
     // imports and inline async chunks.

@@ -6,6 +6,8 @@ GOFLAGS += -mod=readonly
 export GOFLAGS
 .DEFAULT_GOAL := help
 
+include $(dir $(lastword $(MAKEFILE_LIST)))../../scripts/dev/temporal-test.mk
+
 .PHONY: help sync sync-latest lint test build
 
 help:
@@ -30,7 +32,7 @@ lint:
 	$(GO) vet ./...
 
 test:
-	$(GO) test -count=1 -timeout=10m $(TEST_ARGS) ./...
+	$(TEMPORAL_TEST) --server-arg=--dynamic-config-value --server-arg=frontend.enableServerVersionCheck=false -- $(GO) test -count=1 -timeout=10m $(TEST_ARGS) ./...
 
 build:
 	$(GO) build ./...

@@ -47,10 +47,26 @@ tasks.withType(Test).configureEach {
     maxHeapSize = '1g'
     testLogging { events 'failed', 'skipped'; exceptionFormat = 'full' }
 }
+def googleJavaFormatVersion = '1.28.0'
+// Expose the formatter to dependency resolution before Spotless creates its configuration.
+configurations {
+    spotlessFormatter {
+        canBeConsumed = false
+        canBeResolved = true
+        attributes {
+            attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category, Category.LIBRARY))
+            attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling, Bundling.EXTERNAL))
+            attribute(Attribute.of('org.gradle.jvm.environment', String), 'standard-jvm')
+        }
+    }
+}
+dependencies {
+    spotlessFormatter "com.google.googlejavaformat:google-java-format:$googleJavaFormatVersion"
+}
 spotless {
     java {
         target 'src/**/*.java'
-        googleJavaFormat('1.28.0')
+        googleJavaFormat(googleJavaFormatVersion)
     }
 }
 dependencyLocking {
@@ -63,11 +79,10 @@ dependencyLocking {
     lockFile = file("gradle/dependency-locks/${lockName}$suffix")
 }
 tasks.register('resolveDependencies') {
-    // Spotless registers and resolves its formatter dependencies when this task runs.
-    dependsOn 'spotlessJava'
     doLast { configurations.findAll { it.canBeResolved }.each { it.resolve() } }
 }
 tasks.register('resolveAndLockAll') {
+    // Spotless creates a separate configuration whose lock state must also be written.
     dependsOn 'spotlessJava'
     doFirst {
         if (!gradle.startParameter.writeDependencyLocks) {

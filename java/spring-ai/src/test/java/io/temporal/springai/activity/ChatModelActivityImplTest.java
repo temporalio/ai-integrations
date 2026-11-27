@@ -5,11 +5,16 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
 import io.temporal.springai.model.ChatModelTypes.*;
+import io.temporal.springai.util.MessagePartsCodec;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.MessageType;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
@@ -31,22 +36,24 @@ class ChatModelActivityImplTest {
 
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            null, List.of(new Message("You are helpful", Message.Role.SYSTEM)), null, List.of());
+            null,
+            List.of(MessagePartsCodec.encode(new SystemMessage("You are helpful"))),
+            null,
+            List.of());
 
     ChatModelActivityOutput output = impl.callChatModel(input);
 
     assertNotNull(output);
     assertEquals(1, output.generations().size());
-    assertEquals("reply", output.generations().get(0).message().rawContent());
-    assertEquals(Message.Role.ASSISTANT, output.generations().get(0).message().role());
+    assertEquals("reply", assistantOutput(output).getText());
+    assertEquals(MessageType.ASSISTANT, output.generations().get(0).message().role());
 
     // Verify the prompt was constructed with a SystemMessage
     ArgumentCaptor<Prompt> captor = ArgumentCaptor.forClass(Prompt.class);
     verify(mockModel).call(captor.capture());
     Prompt prompt = captor.getValue();
     assertEquals(1, prompt.getInstructions().size());
-    assertInstanceOf(
-        org.springframework.ai.chat.messages.SystemMessage.class, prompt.getInstructions().get(0));
+    assertInstanceOf(SystemMessage.class, prompt.getInstructions().get(0));
     assertEquals("You are helpful", prompt.getInstructions().get(0).getText());
   }
 
@@ -63,15 +70,14 @@ class ChatModelActivityImplTest {
 
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            null, List.of(new Message("hello", Message.Role.USER)), null, List.of());
+            null, List.of(MessagePartsCodec.encode(new UserMessage("hello"))), null, List.of());
 
     ChatModelActivityOutput output = impl.callChatModel(input);
 
     ArgumentCaptor<Prompt> captor = ArgumentCaptor.forClass(Prompt.class);
     verify(mockModel).call(captor.capture());
     Prompt prompt = captor.getValue();
-    assertInstanceOf(
-        org.springframework.ai.chat.messages.UserMessage.class, prompt.getInstructions().get(0));
+    assertInstanceOf(UserMessage.class, prompt.getInstructions().get(0));
   }
 
   @Test
@@ -98,18 +104,15 @@ class ChatModelActivityImplTest {
 
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            null, List.of(new Message("What's the weather?", Message.Role.USER)), null, List.of());
+            null,
+            List.of(MessagePartsCodec.encode(new UserMessage("What's the weather?"))),
+            null,
+            List.of());
 
     ChatModelActivityOutput output = impl.callChatModel(input);
 
     // Verify tool calls are preserved in output
-    Message outputMsg = output.generations().get(0).message();
-    assertNotNull(outputMsg.toolCalls());
-    assertEquals(1, outputMsg.toolCalls().size());
-    assertEquals("call_123", outputMsg.toolCalls().get(0).id());
-    assertEquals("function", outputMsg.toolCalls().get(0).type());
-    assertEquals("getWeather", outputMsg.toolCalls().get(0).function().name());
-    assertEquals("{\"city\":\"Seattle\"}", outputMsg.toolCalls().get(0).function().arguments());
+    assertEquals(assistantWithTools.getToolCalls(), assistantOutput(output).getToolCalls());
   }
 
   @Test
@@ -127,8 +130,13 @@ class ChatModelActivityImplTest {
         new ChatModelActivityInput(
             null,
             List.of(
-                new Message(
-                    "Weather: 55F", Message.Role.TOOL, "getWeather", "call_123", null, null)),
+                MessagePartsCodec.encode(
+                    ToolResponseMessage.builder()
+                        .responses(
+                            List.of(
+                                new ToolResponseMessage.ToolResponse(
+                                    "call_123", "getWeather", "Weather: 55F")))
+                        .build())),
             null,
             List.of());
 
@@ -138,9 +146,7 @@ class ChatModelActivityImplTest {
     ArgumentCaptor<Prompt> captor = ArgumentCaptor.forClass(Prompt.class);
     verify(mockModel).call(captor.capture());
     Prompt prompt = captor.getValue();
-    assertInstanceOf(
-        org.springframework.ai.chat.messages.ToolResponseMessage.class,
-        prompt.getInstructions().get(0));
+    assertInstanceOf(ToolResponseMessage.class, prompt.getInstructions().get(0));
   }
 
   @Test
@@ -158,7 +164,7 @@ class ChatModelActivityImplTest {
 
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            null, List.of(new Message("hi", Message.Role.USER)), opts, List.of());
+            null, List.of(MessagePartsCodec.encode(new UserMessage("hi"))), opts, List.of());
 
     impl.callChatModel(input);
 
@@ -190,7 +196,7 @@ class ChatModelActivityImplTest {
 
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            null, List.of(new Message("hi", Message.Role.USER)), null, List.of(tool));
+            null, List.of(MessagePartsCodec.encode(new UserMessage("hi"))), null, List.of(tool));
 
     impl.callChatModel(input);
 
@@ -228,10 +234,10 @@ class ChatModelActivityImplTest {
     // Call with specific model
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            "anthropic", List.of(new Message("hi", Message.Role.USER)), null, List.of());
+            "anthropic", List.of(MessagePartsCodec.encode(new UserMessage("hi"))), null, List.of());
 
     ChatModelActivityOutput output = impl.callChatModel(input);
-    assertEquals("anthropic", output.generations().get(0).message().rawContent());
+    assertEquals("anthropic", assistantOutput(output).getText());
     verify(anthropic).call(any(Prompt.class));
     verify(openAi, never()).call(any(Prompt.class));
   }
@@ -251,10 +257,10 @@ class ChatModelActivityImplTest {
 
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            null, List.of(new Message("hi", Message.Role.USER)), null, List.of());
+            null, List.of(MessagePartsCodec.encode(new UserMessage("hi"))), null, List.of());
 
     ChatModelActivityOutput output = impl.callChatModel(input);
-    assertEquals("openai", output.generations().get(0).message().rawContent());
+    assertEquals("openai", assistantOutput(output).getText());
     verify(openAi).call(any(Prompt.class));
   }
 
@@ -265,7 +271,10 @@ class ChatModelActivityImplTest {
 
     ChatModelActivityInput input =
         new ChatModelActivityInput(
-            "nonexistent", List.of(new Message("hi", Message.Role.USER)), null, List.of());
+            "nonexistent",
+            List.of(MessagePartsCodec.encode(new UserMessage("hi"))),
+            null,
+            List.of());
 
     assertThrows(IllegalArgumentException.class, () -> impl.callChatModel(input));
   }
@@ -285,10 +294,10 @@ class ChatModelActivityImplTest {
         new ChatModelActivityInput(
             null,
             List.of(
-                new Message("You are helpful", Message.Role.SYSTEM),
-                new Message("Hello", Message.Role.USER),
-                new Message("Hi there", Message.Role.ASSISTANT, null, null, null, null),
-                new Message("What's up?", Message.Role.USER)),
+                MessagePartsCodec.encode(new SystemMessage("You are helpful")),
+                MessagePartsCodec.encode(new UserMessage("Hello")),
+                MessagePartsCodec.encode(new AssistantMessage("Hi there")),
+                MessagePartsCodec.encode(new UserMessage("What's up?"))),
             null,
             List.of());
 
@@ -297,5 +306,10 @@ class ChatModelActivityImplTest {
     ArgumentCaptor<Prompt> captor = ArgumentCaptor.forClass(Prompt.class);
     verify(mockModel).call(captor.capture());
     assertEquals(4, captor.getValue().getInstructions().size());
+  }
+
+  private static AssistantMessage assistantOutput(ChatModelActivityOutput output) {
+    return assertInstanceOf(
+        AssistantMessage.class, MessagePartsCodec.decode(output.generations().get(0).message()));
   }
 }

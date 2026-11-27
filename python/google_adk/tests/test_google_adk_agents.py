@@ -293,9 +293,10 @@ async def test_single_agent(client: Client, use_local_model: bool):
     client = Client(**new_config)
 
     # Run Worker with the ADK plugin
+    task_queue = f"adk-task-queue-{uuid.uuid4()}"
     async with Worker(
         client,
-        task_queue="adk-task-queue",
+        task_queue=task_queue,
         activities=[
             get_weather,
         ],
@@ -313,7 +314,7 @@ async def test_single_agent(client: Client, use_local_model: bool):
                 "weather_model" if use_local_model else "gemini-2.5-pro",
             ],
             id=f"weather-agent-workflow-{uuid.uuid4()}",
-            task_queue="adk-task-queue",
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
         result = await handle.result()
@@ -404,9 +405,10 @@ async def test_multi_agent(client: Client, use_local_model: bool):
     client = Client(**new_config)
 
     # Run Worker with the ADK plugin
+    task_queue = f"adk-task-queue-multi-agent-{uuid.uuid4()}"
     async with Worker(
         client,
-        task_queue="adk-task-queue-multi-agent",
+        task_queue=task_queue,
         workflows=[MultiAgentWorkflow],
         max_cached_workflows=0,
     ):
@@ -421,7 +423,7 @@ async def test_multi_agent(client: Client, use_local_model: bool):
                 "research_model" if use_local_model else "gemini-2.5-pro",
             ],
             id=f"multi-agent-workflow-{uuid.uuid4()}",
-            task_queue="adk-task-queue-multi-agent",
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
         result = await handle.result()
@@ -556,9 +558,10 @@ async def test_mcp_agent(client: Client, use_local_model: bool):
     client = Client(**new_config)
 
     # Run Worker with the ADK plugin
+    task_queue = f"adk-task-queue-mcp-{uuid.uuid4()}"
     async with Worker(
         client,
-        task_queue="adk-task-queue-mcp",
+        task_queue=task_queue,
         workflows=[McpAgent],
         max_cached_workflows=0,
     ):
@@ -573,7 +576,7 @@ async def test_mcp_agent(client: Client, use_local_model: bool):
                 "mcp_model" if use_local_model else "gemini-2.5-pro",
             ],
             id=f"mcp-agent-workflow-{uuid.uuid4()}",
-            task_queue="adk-task-queue-mcp",
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
         result = await handle.result()
