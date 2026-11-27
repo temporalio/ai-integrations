@@ -317,6 +317,71 @@ artifact, keep their JSON form, so a `Document` artifact arrives as a dict.
 Update activity workers before or together with workflow workers: an older
 activity worker still passes the messages to the tool as dicts.
 
+A tool activity that Temporal gives up on (a non-retryable error, or a retry
+policy that ran out) raises `ActivityError` out of the tool node and fails the
+whole agent run. To let the model handle the failure instead, add a tool-call
+middleware to `create_deep_agent`. By the time the error reaches it, Temporal's
+retry policy has already finished, so the middleware only decides what the
+model sees: which tools and failure types to recover, and with what wording.
+
+Bound the tool's retries first. Temporal's default retry policy has no attempt
+limit and `start_to_close_timeout` applies to each attempt, so a tool that keeps
+failing with a retryable error retries forever and the middleware never sees an
+`ActivityError`. In the tools module, give the tool a retry policy (or a
+`schedule_to_close_timeout`):
+
+```python
+from datetime import timedelta
+
+from temporalio.common import RetryPolicy
+from temporalio.deepagents import tool_as_activity
+
+# Three attempts, then the ActivityError reaches the middleware.
+search_tool = tool_as_activity(
+    web_search,
+    start_to_close_timeout=timedelta(seconds=30),
+    activity_options={"retry_policy": RetryPolicy(maximum_attempts=3)},
+)
+```
+
+Then catch the error in the middleware. Re-raise cancellation so cancelling the
+workflow still cancels the run:
+
+```python
+from deepagents import create_deep_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import ToolMessage
+from temporalio import workflow
+from temporalio.exceptions import ActivityError, is_cancelled_exception
+
+with workflow.unsafe.imports_passed_through():
+    from myapp.tools import search_tool
+
+
+class ReturnSearchFailuresToModel(AgentMiddleware):
+    async def awrap_tool_call(self, request, handler):
+        try:
+            return await handler(request)
+        except ActivityError as err:
+            if is_cancelled_exception(err) or request.tool_call["name"] != "web_search":
+                raise
+            return ToolMessage(
+                content="Search is unavailable; try another source.",
+                tool_call_id=request.tool_call["id"],
+                status="error",
+            )
+
+
+agent = create_deep_agent(
+    model="anthropic:claude-sonnet-4-5",
+    tools=[search_tool],
+    middleware=[ReturnSearchFailuresToModel()],
+)
+```
+
+The middleware runs as workflow code, so keep it deterministic: build the
+message from the error and the request, not from the clock or random values.
+
 ## Durable file and shell backends
 
 Use `TemporalBackend("name", ...)` for a real-I/O backend
