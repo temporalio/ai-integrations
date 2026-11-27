@@ -1209,7 +1209,7 @@ async def test_a_retried_call_reuses_its_decision() -> None:
 
     asked: list[str] = []
 
-    async def edit(request_id: str, request: HITLRequest) -> HITLResponse:
+    async def edit(request_id: str, _request: HITLRequest) -> HITLResponse:
         asked.append(request_id)
         return {
             "decisions": [
@@ -1241,7 +1241,8 @@ async def test_a_retried_call_reuses_its_decision() -> None:
     )
     assert asked == ["c-1"]
     assert ran == [{"note": "y"}, {"note": "y"}]
-    assert result.content.endswith("ok")
+    assert isinstance(result, ToolMessage)
+    assert str(result.content).endswith("ok")
     assert original["args"] == {"note": "x"}
 
 
