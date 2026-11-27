@@ -1,0 +1,164 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-25T01:30:04.315615051Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048606",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "StatefulMcpRaisingBlockWorkflow"
+        },
+        "taskQueue": {
+          "name": "c7c997ed-eccf-4465-803d-de1661518e9f",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImM3Yzk5N2VkLWVjY2YtNDQ2NS04MDNkLWRlMTY2MTUxOGU5Zi1ob3N0Ig=="
+            }
+          ]
+        },
+        "workflowExecutionTimeout": "30s",
+        "workflowRunTimeout": "30s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a21052-fe9b-795e-be68-09ab9658ff93",
+        "identity": "555@b93d0cb518d3",
+        "firstExecutionRunId": "01a21052-fe9b-795e-be68-09ab9658ff93",
+        "attempt": 1,
+        "workflowExecutionExpirationTime": "2026-11-25T01:30:34.315Z",
+        "firstWorkflowTaskBackoff": "0s",
+        "header": {
+          "fields": {
+            "__openai_span": {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "eyJzcGFuSWQiOm51bGwsInRyYWNlSWQiOm51bGwsInRyYWNlTmFtZSI6IlVua25vd24gV29ya2Zsb3cifQ=="
+            }
+          }
+        },
+        "workflowId": "stateful-mcp-raising-block-d306bebe-d966-4e5d-b93c-518637689c73",
+        "priority": {}
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-25T01:30:04.315737681Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048607",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "c7c997ed-eccf-4465-803d-de1661518e9f",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-25T01:30:04.329424228Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048613",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "555@b93d0cb518d3",
+        "requestId": "0194bb82-424b-485b-b10a-5b510e8dacfd",
+        "historySizeBytes": "558",
+        "workerVersion": {
+          "buildId": "589a8618fab6574a5aaff62186cf70ca"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-25T01:30:04.358640229Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048617",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "555@b93d0cb518d3",
+        "workerVersion": {
+          "buildId": "589a8618fab6574a5aaff62186cf70ca"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            1,
+            4,
+            3
+          ],
+          "langUsedFlags": [
+            2
+          ],
+          "sdkName": "temporal-python",
+          "sdkVersion": "1.36.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-25T01:30:04.358706653Z",
+      "eventType": "EVENT_TYPE_MARKER_RECORDED",
+      "taskId": "1048618",
+      "markerRecordedEventAttributes": {
+        "markerName": "core_patch",
+        "details": {
+          "patch-data": {
+            "payloads": [
+              {
+                "metadata": {
+                  "encoding": "anNvbi9wbGFpbg=="
+                },
+                "data": "eyJpZCI6Im9wZW5haS1hZ2VudHMtc3RhdGVmdWwtbWNwLXVuc3RhcnRlZC1zZXNzaW9uIiwiZGVwcmVjYXRlZCI6ZmFsc2V9"
+              }
+            ]
+          }
+        },
+        "workflowTaskCompletedEventId": "4"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-11-25T01:30:04.359340883Z",
+      "eventType": "EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES",
+      "taskId": "1048619",
+      "upsertWorkflowSearchAttributesEventAttributes": {
+        "workflowTaskCompletedEventId": "4",
+        "searchAttributes": {
+          "indexedFields": {
+            "TemporalChangeVersion": {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg==",
+                "type": "S2V5d29yZExpc3Q="
+              },
+              "data": "WyJvcGVuYWktYWdlbnRzLXN0YXRlZnVsLW1jcC11bnN0YXJ0ZWQtc2Vzc2lvbiJd"
+            }
+          }
+        }
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-11-25T01:30:04.359430032Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED",
+      "taskId": "1048620",
+      "workflowExecutionFailedEventAttributes": {
+        "failure": {
+          "message": "body failed",
+          "stackTrace": "  File \"/ws/ai-integrations/python/openai_agents/.venv/lib/python3.12/site-packages/temporalio/worker/_workflow_instance.py\", line 2906, in _run_top_level_workflow_function\n    await coro\n\n  File \"/ws/ai-integrations/python/openai_agents/.venv/lib/python3.12/site-packages/temporalio/worker/_workflow_instance.py\", line 1220, in run_workflow\n    result = await self._inbound.execute_workflow(input)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n  File \"/ws/ai-integrations/python/openai_agents/.venv/lib/python3.12/site-packages/temporalio/testing/_workflow.py\", line 918, in execute_workflow\n    return await super().execute_workflow(input)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n  File \"/ws/ai-integrations/python/openai_agents/.venv/lib/python3.12/site-packages/temporalio/worker/_interceptor.py\", line 439, in execute_workflow\n    return await self.next.execute_workflow(input)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n  File \"/ws/ai-integrations/python/openai_agents/.venv/lib/python3.12/site-packages/temporalio/openai_agents/_trace_interceptor.py\", line 381, in execute_workflow\n    return await self.next.execute_workflow(input)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\n  File \"/ws/ai-integrations/python/openai_agents/.venv/lib/python3.12/site-packages/temporalio/worker/_workflow_instance.py\", line 3317, in execute_workflow\n    return await input.run_fn(*args)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^\n\n  File \"/ws/ai-integrations/python/openai_agents/tests/helpers/stateful_replay.py\", line 145, in run\n    raise ApplicationError(\"body failed\")\n",
+          "applicationFailureInfo": {}
+        },
+        "retryState": "RETRY_STATE_RETRY_POLICY_NOT_SET",
+        "workflowTaskCompletedEventId": "4"
+      }
+    }
+  ]
+}

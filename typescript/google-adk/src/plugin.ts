@@ -26,12 +26,11 @@ const ADK_PACKAGE = '@google/adk';
  * the host layout hoists. Under a strict layout (pnpm `hoist=false`, Yarn PnP)
  * nothing is reachable from ADK's own directory and the Workflow bundle fails
  * with `Can't resolve 'uuid'`. The plugin therefore depends on `uuid` itself
- * and answers ADK's request with its own copy's CJS entry, whose `crypto`
- * import the deterministic shim serves ({@link CRYPTO_SHIM_ISSUER_PATTERN}), so
- * the ids are the same whatever the consumer's layout or webpack target. On
- * the Worker, where the same layout fails ADK's `require('uuid')` as soon as
- * the plugin imports ADK, the resolution hook in `./adk-uuid-resolution`
- * answers the request with the same copy.
+ * and answers ADK's request with the entry Node resolves for that copy. UUID
+ * generation uses the sandbox's deterministic `crypto` global, and the shim
+ * serves `crypto` imports ({@link CRYPTO_SHIM_ISSUER_PATTERN}). On the Worker,
+ * the resolution hook in `./adk-uuid-resolution` supplies the same copy when
+ * ADK's `require('uuid')` cannot find one.
  */
 const UUID_PACKAGE = 'uuid';
 
@@ -92,15 +91,12 @@ const ADK_ISSUER_PATTERN = /[\\/]@google[\\/]adk[\\/]/;
 /**
  * Issuers whose `crypto` / `node:crypto` requests the deterministic shim
  * answers: ADK's own files, and the installed `uuid` package, which ADK >= 2.1
- * imports for its retry plugins. `uuid`'s browser build reads the `crypto`
- * global (which the polyfill loader supplies), but its node build — the one a
- * consumer's webpack target or browserslist can select — imports `randomUUID`
- * / `randomFillSync` from the `crypto` builtin, and `uuid` is strict ESM, so
- * the bundler's empty-module alias would fail the build on the missing
- * exports. Any installed `uuid` copy matches — the one ADK's request is pinned
- * to ({@link UUID_PACKAGE}) and one a user's own Workflow code imports, which
- * then draws from the same stream; the `node_modules` segment keeps a user's
- * own `uuid/` source directory out.
+ * imports for its retry plugins. `uuid` 14 generates random UUIDs using the
+ * sandbox's `crypto` global. Its Node build still imports `createHash` for
+ * name-based UUIDs. The Node builds of earlier `uuid` releases import
+ * `randomUUID` and `randomFillSync`. The shim provides these exports so webpack
+ * can resolve the imports. The pattern matches both the copy pinned for ADK
+ * ({@link UUID_PACKAGE}) and copies imported by a user's Workflow code.
  */
 const CRYPTO_SHIM_ISSUER_PATTERN = /[\\/](?:@google[\\/]adk|node_modules[\\/]uuid)[\\/]/;
 
@@ -525,8 +521,7 @@ function googleAdkSandboxCompatPlugin(): unknown {
   const processShimUri = toDataUri(PROCESS_SHIM_SOURCE);
   const apigeeShimUri = toDataUri(APIGEE_LLM_SHIM_SOURCE);
   const cryptoShimPath = require.resolve('./crypto-shim');
-  // The CJS entry: its `require('crypto')` is answered by the shim above, with
-  // no strict-ESM export check to satisfy, whatever the consumer's webpack target.
+  // Use Node's resolved entry across webpack targets and browserslist settings.
   const uuidEntry = require.resolve(UUID_PACKAGE);
   return {
     name: 'google-adk-sandbox-compat',

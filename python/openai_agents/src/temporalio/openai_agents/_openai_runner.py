@@ -41,6 +41,9 @@ from temporalio.openai_agents._temporal_model_stub import (
     _TemporalModelStub,
 )
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
+from temporalio.openai_agents._workflow_failure import (
+    model_behavior_error_fails_workflow,
+)
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
@@ -410,6 +413,8 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        # Evaluate the gate before the run schedules its first model Activity.
+        model_behavior_error_fails_workflow()
 
         run = _AgentRun()
         parent = _current_agent_run.get()
@@ -504,6 +509,8 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        # Evaluate the gate before the run schedules its first model Activity.
+        model_behavior_error_fails_workflow()
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.

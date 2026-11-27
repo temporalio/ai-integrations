@@ -128,20 +128,21 @@ async def test_can_defaults_to_server_suggestion(
     or generating thousands of events to reach its default threshold.
     """
     plugin = DeepAgentsPlugin()
+    task_queue = f"da-can-suggested-{uuid.uuid4()}"
     with patch.object(
         workflow.Info, "is_continue_as_new_suggested", return_value=suggested
     ) as suggestion:
         async with Worker(
             env.client,
-            task_queue="da-can-suggested",
+            task_queue=task_queue,
             workflows=[SuggestedCanWorkflow],
             plugins=[plugin],
         ):
             handle = await env.client.start_workflow(
                 SuggestedCanWorkflow.run,
                 {"messages": ["start"]},
-                id=f"da-can-suggested-{uuid.uuid4()}",
-                task_queue="da-can-suggested",
+                id=task_queue,
+                task_queue=task_queue,
             )
             result = await handle.result()
         suggestion.assert_called()
