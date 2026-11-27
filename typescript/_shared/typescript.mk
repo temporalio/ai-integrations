@@ -1,8 +1,12 @@
 # Each plugin installs and locks its own published dependencies.
 PNPM ?= pnpm
 TEST_ARGS ?=
+TEST_SERVER_ARGS ?=
+TEST_COMMAND = "$(MAKE)" run-tests
 
-.PHONY: sync sync-latest check-deps lint test build clean help
+include $(dir $(lastword $(MAKEFILE_LIST)))../../scripts/dev/temporal-test.mk
+
+.PHONY: sync sync-latest check-deps lint test run-tests build clean help
 sync:
 	$(PNPM) install --frozen-lockfile
 
@@ -21,6 +25,9 @@ lint:
 
 test:
 	$(PNPM) run build
+	$(TEMPORAL_TEST) $(TEST_SERVER_ARGS) -- $(TEST_COMMAND)
+
+run-tests:
 	$(PNPM) run test $(TEST_ARGS)
 
 build:

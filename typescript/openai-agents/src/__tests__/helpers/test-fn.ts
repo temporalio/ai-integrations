@@ -1,14 +1,12 @@
 import type { ExecutionContext, TestFn } from 'ava';
-import type { LocalTestWorkflowEnvironmentOptions } from '@temporalio/testing';
 import type { BaseContext } from '@temporalio/test-helpers';
-import { test as anyTest, createTestWorkflowBundle, createTestWorkflowEnvironment } from '@temporalio/test-helpers';
+import { test as anyTest, createTestWorkflowBundle } from '@temporalio/test-helpers';
 import type { BundlerPlugin } from '@temporalio/worker';
-import { startLocalWithRetry } from './environment';
+import { createTestEnvironment } from './environment';
 
 export interface TestFunctionOptions {
   workflowsPath: string;
   workflowInterceptorModules?: string[];
-  workflowEnvironmentOpts?: LocalTestWorkflowEnvironmentOptions;
   plugins?: BundlerPlugin[];
 }
 
@@ -19,7 +17,7 @@ export interface TestFunctionOptions {
 export function makeTestFunction(opts: TestFunctionOptions): TestFn<BaseContext> {
   const test = anyTest as TestFn<BaseContext>;
   test.before(async (t: ExecutionContext<BaseContext>) => {
-    const env = await startLocalWithRetry(() => createTestWorkflowEnvironment(opts.workflowEnvironmentOpts));
+    const env = await createTestEnvironment();
     const workflowBundle = await createTestWorkflowBundle({
       workflowsPath: opts.workflowsPath,
       workflowInterceptorModules: opts.workflowInterceptorModules,

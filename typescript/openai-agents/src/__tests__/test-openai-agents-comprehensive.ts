@@ -14,7 +14,7 @@ import type { WorkflowBundleWithSourceMap } from '@temporalio/worker';
 import { bundleWorkflowCode, NativeConnection } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import type { TestWorkflowEnvironment } from '@temporalio/test-helpers';
-import { Worker, createTestWorkflowEnvironment } from '@temporalio/test-helpers';
+import { Worker } from '@temporalio/test-helpers';
 import {
   OpenAIAgentsPlugin,
   StatelessMCPServerProvider,
@@ -31,7 +31,7 @@ import {
 } from './stubs/openai-agents-fakes';
 import { FakeSandboxClient } from './stubs/sandbox-fakes';
 import { installOtelCollector, installAgentSdkCollector } from './helpers/openai-agents-spans';
-import { startLocalWithRetry } from './helpers/environment';
+import { createTestEnvironment } from './helpers/environment';
 import * as activities from './activities/openai-agents-comprehensive';
 import {
   simpleAgentWorkflow,
@@ -717,7 +717,7 @@ function withoutTurnSpans(traces: string[][]): string[][] {
  * tests share no state and can run concurrently.
  */
 async function withTestEnv(fn: (env: TestWorkflowEnvironment) => Promise<void>): Promise<void> {
-  const env = await startLocalWithRetry(() => createTestWorkflowEnvironment());
+  const env = await createTestEnvironment();
   try {
     await fn(env);
   } finally {

@@ -23,7 +23,7 @@ cadence.
 | [`python/google_genai`](python/google_genai) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-genai.svg)](https://pypi.org/project/temporalio-google-genai/) |
 | [`python/langgraph`](python/langgraph) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langgraph.svg)](https://pypi.org/project/temporalio-langgraph/) |
 | [`python/langsmith`](python/langsmith) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langsmith.svg)](https://pypi.org/project/temporalio-langsmith/) |
-| [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Pre-release) |
+| [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Public Preview) |
 | [`python/microsoft_agent_framework`](python/microsoft_agent_framework) | [![PyPI](https://img.shields.io/pypi/v/temporalio-microsoft-agent-framework.svg)](https://pypi.org/project/temporalio-microsoft-agent-framework/) (Pre-release) |
 | [`python/openai_codex`](python/openai_codex) | [![PyPI](https://img.shields.io/pypi/v/temporalio-openai-codex.svg)](https://pypi.org/project/temporalio-openai-codex/) (Pre-release) |
 | [`python/openai_agents`](python/openai_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-openai-agents.svg)](https://pypi.org/project/temporalio-openai-agents/) |

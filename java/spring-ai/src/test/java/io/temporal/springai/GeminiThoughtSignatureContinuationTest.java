@@ -12,12 +12,17 @@ import io.temporal.testing.WorkflowReplayer;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 import java.time.Duration;
-import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.part.MessagePart;
+import org.springframework.ai.chat.messages.part.OpaquePayload;
+import org.springframework.ai.chat.messages.part.ReasoningPart;
+import org.springframework.ai.chat.messages.part.TextPart;
+import org.springframework.ai.chat.messages.part.ToolCallPart;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
@@ -29,22 +34,20 @@ class GeminiThoughtSignatureContinuationTest {
   void toolContinuationRestoresBinarySignaturesAndPreservesUnsignedParts() throws Exception {
     byte[] first = {0, 1, -1, 42};
     byte[] last = {7, 8, -128};
+    List<MessagePart> parts =
+        List.of(
+            new ReasoningPart("thinking", null, signature(first), Map.of()),
+            TextPart.of("checking"),
+            new ToolCallPart(
+                new AssistantMessage.ToolCall("call", "function", "echo", "{}"),
+                signature(last),
+                Map.of()));
     AtomicInteger calls = new AtomicInteger();
     ChatModel provider =
         prompt -> {
           if (calls.getAndIncrement() == 0) {
             return new ChatResponse(
-                List.of(
-                    new Generation(
-                        AssistantMessage.builder()
-                            .content("")
-                            .properties(
-                                Map.of("thoughtSignatures", Arrays.asList(first, null, last)))
-                            .toolCalls(
-                                List.of(
-                                    new AssistantMessage.ToolCall(
-                                        "call", "function", "echo", "{}")))
-                            .build())));
+                List.of(new Generation(AssistantMessage.builder().parts(parts).build())));
           }
           AssistantMessage assistant =
               prompt.getInstructions().stream()
@@ -52,12 +55,7 @@ class GeminiThoughtSignatureContinuationTest {
                   .map(AssistantMessage.class::cast)
                   .findFirst()
                   .orElseThrow();
-          List<?> signatures =
-              assertInstanceOf(List.class, assistant.getMetadata().get("thoughtSignatures"));
-          assertEquals(3, signatures.size());
-          assertArrayEquals(first, assertInstanceOf(byte[].class, signatures.get(0)));
-          assertNull(signatures.get(1));
-          assertArrayEquals(last, assertInstanceOf(byte[].class, signatures.get(2)));
+          assertEquals(parts, assistant.getParts());
           return new ChatResponse(List.of(new Generation(new AssistantMessage("done"))));
         };
     try (TestWorkflowEnvironment env = TestWorkflowEnvironment.newInstance()) {
@@ -80,6 +78,11 @@ class GeminiThoughtSignatureContinuationTest {
           ThinkingWorkflowImpl.class);
     }
     assertEquals(2, calls.get());
+  }
+
+  private static OpaquePayload signature(byte[] data) {
+    return new OpaquePayload(
+        "google", "thought_signature", Base64.getEncoder().encodeToString(data));
   }
 
   @WorkflowInterface

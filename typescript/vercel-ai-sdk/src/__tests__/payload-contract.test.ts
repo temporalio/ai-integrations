@@ -8,11 +8,11 @@ import type {
   LanguageModelV4GenerateResult,
   ProviderV4,
 } from '@ai-sdk/provider';
-import { MockActivityEnvironment, TestWorkflowEnvironment } from '@temporalio/testing';
+import { MockActivityEnvironment, type TestWorkflowEnvironment } from '@temporalio/testing';
 import { Worker } from '@temporalio/worker';
 import { AiSdkPlugin, createActivities } from '..';
 import type { InvokeEmbeddingModelArgs, InvokeModelArgs, InvokeModelResult } from '..';
-import { startLocalWithRetry } from './helpers/environment';
+import { createTestEnvironment } from './helpers/environment';
 import { findPayloadChange } from './helpers/payload-round-trip';
 import { payloadContractWorkflow } from './workflows/payload-contract';
 
@@ -85,7 +85,7 @@ type Activities = {
 };
 
 test.before(async (t) => {
-  t.context.env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+  t.context.env = await createTestEnvironment();
 });
 
 test.after.always(async (t) => {

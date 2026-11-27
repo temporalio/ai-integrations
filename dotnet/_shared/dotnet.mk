@@ -34,6 +34,8 @@ export RestoreLockedMode := true
 .DEFAULT_GOAL := help
 .PHONY: help sync sync-latest lock check-deps format lint test build clean
 
+include $(dir $(lastword $(MAKEFILE_LIST)))../../scripts/dev/temporal-test.mk
+
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
@@ -63,7 +65,7 @@ lint: ## Formatting, style and analyzer fixers would change nothing
 	$(DOTNET) format $(SOLUTION) --verify-no-changes --exclude-diagnostics CA2007
 
 test: ## Build in Release with the release version and run the suite under Microsoft.Testing.Platform
-	$(DOTNET) test --solution $(SOLUTION) -c $(CONFIGURATION) $(BUILD_PROPS) $(if $(TEST_FRAMEWORK),--framework $(TEST_FRAMEWORK)) --results-directory TestResults --minimum-expected-tests 1 -- --report-trx $(TEST_ARGS)
+	$(TEMPORAL_TEST) -- $(DOTNET) test --solution $(SOLUTION) -c $(CONFIGURATION) $(BUILD_PROPS) $(if $(TEST_FRAMEWORK),--framework $(TEST_FRAMEWORK)) --results-directory TestResults --minimum-expected-tests 1 -- --report-trx $(TEST_ARGS)
 
 build: ## Pack the tested build into dist/ (nupkg and snupkg)
 	rm -rf dist
