@@ -143,9 +143,11 @@ _LANES_TASK_TEXT = {
 }
 # The sub-agents the two tasks go to, when not lanes a and b.
 _LANES_SUBAGENTS = {"customers": ("b", "b")}
-_LANES_HISTORY = (
-    Path(__file__).parent / "histories" / "parallel_subagents_sequence_ids.json"
-)
+# Replay is promised within a major, so this 0.x history has to replay until
+# Deep Agents 1.0.
+REPLAY_MAJOR = 0
+_HISTORIES = Path(__file__).parent / "histories" / f"{REPLAY_MAJOR}.x"
+_LANES_HISTORY = _HISTORIES / "parallel_subagents_sequence_ids.json"
 _PATCH_ID = "deepagents.parallel-model-call-ids"
 
 
