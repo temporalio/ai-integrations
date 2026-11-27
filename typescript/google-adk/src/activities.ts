@@ -48,6 +48,9 @@ const DEFAULT_STREAM_BATCH_INTERVAL = '100 milliseconds';
 
 const RETRYABLE_STATUS = new Set([408, 409, 429]);
 
+/** The JSON-RPC parse error, invalid request, method not found and invalid params codes. */
+const PERMANENT_MCP_ERROR_CODES: ReadonlySet<unknown> = new Set([-32700, -32600, -32601, -32602]);
+
 /**
  * Lets a cancellation out of an Activity untouched, ahead of any failure
  * classification.
@@ -519,6 +522,9 @@ export function toApplicationFailure(err: unknown, baseType: string = MODEL_ERRO
   } else if (shouldRetry === 'true') {
     retryable = true;
   }
+  if (baseType === MCP_ERROR_FAILURE_TYPE && isPermanentMcpError(err)) {
+    retryable = false;
+  }
 
   return ApplicationFailure.create({
     message,
@@ -526,6 +532,21 @@ export function toApplicationFailure(err: unknown, baseType: string = MODEL_ERRO
     nonRetryable: !retryable,
     nextRetryDelay: parseRetryAfter(headers),
   });
+}
+
+/**
+ * Whether `err`, or an error in its `cause` chain, is an MCP server's rejection of a request that a
+ * retry would send again unchanged. The chain matters because `MCPSessionManager` wraps a failed
+ * handshake. The SDK's `McpError` is matched by name because `@modelcontextprotocol/sdk` is an
+ * optional peer dependency.
+ */
+function isPermanentMcpError(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  for (let current = err; current instanceof Error && !seen.has(current); current = current.cause) {
+    seen.add(current);
+    if (current.name === 'McpError') return PERMANENT_MCP_ERROR_CODES.has((current as { code?: unknown }).code);
+  }
+  return false;
 }
 
 /** The gRPC status codes `INVALID_ARGUMENT` and `RESOURCE_EXHAUSTED`. */
