@@ -16,10 +16,10 @@ endif
 # plugin cannot reliably extend it with another package root. Every uv command below runs non-editable.
 export UV_NO_EDITABLE := 1
 
-PYTEST_ARGS ?=
+TEST_ARGS ?=
 # Keep the dependency versions selected by sync or sync-latest through all tool runs.
 UV_RUN := uv run --locked
-PYTEST := $(UV_RUN) pytest -n auto --dist=worksteal
+PYTEST := pytest -n auto --dist=worksteal
 
 .PHONY: help sync sync-latest check-deps format lint test build clean
 
@@ -51,7 +51,7 @@ lint: ## Import order, formatting, pyright, mypy, basedpyright, docstrings
 	$(UV_RUN) pydocstyle --ignore-decorators=overload src
 
 test: ## Run the suite against a local dev server
-	$(PYTEST) $(PYTEST_ARGS)
+	$(UV_RUN) python ../../scripts/dev/run_temporal_tests.py -- $(PYTEST) $(TEST_ARGS)
 
 build: ## Build sdist and wheel into dist/
 	rm -rf dist

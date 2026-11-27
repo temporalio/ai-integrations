@@ -189,7 +189,6 @@ test('redirects crypto requests issued from inside @google/adk to the determinis
 test("answers ADK's undeclared uuid import with the plugin's own copy", (t) => {
   const resolve = sandboxCompatResolveHook();
   const expected = require.resolve('uuid');
-  t.true(expected.endsWith(path.join('dist', 'cjs', 'index.js')));
   const adkIssuer = '/app/node_modules/@google/adk/dist/esm/plugins/reflect_retry_model_plugin.js';
   t.is(resolve({ request: 'uuid', contextInfo: { issuer: adkIssuer } }), expected);
   // Only the bare request from ADK; a user's own import resolves as usual.

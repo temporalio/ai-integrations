@@ -47,8 +47,6 @@ from temporalio.google_adk import (
 from temporalio.google_adk.workflow import activity_node
 from temporalio.worker import Worker
 
-TASK_QUEUE = "adk-dynamic-task-queue"
-
 # Worker-side record of real activity executions, keyed by workflow id.
 # Replayed workflow tasks do not re-execute activities, so this counts
 # actual executions only.
@@ -301,10 +299,10 @@ def _adk_client(client: Client) -> Client:
     return Client(**new_config)
 
 
-def _worker(client: Client) -> Worker:
+def _worker(client: Client, task_queue: str) -> Worker:
     return Worker(
         client,
-        task_queue=TASK_QUEUE,
+        task_queue=task_queue,
         activities=[enrich_number, counted_fetch],
         workflows=[
             DynamicLoopWorkflow,
@@ -317,58 +315,58 @@ def _worker(client: Client) -> Worker:
 
 
 @pytest.mark.asyncio
-async def test_dynamic_loop(client: Client):
+async def test_dynamic_loop(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             DynamicLoopWorkflow.run,
             3,
             id=f"dynamic-loop-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == ["enriched-0", "enriched-1", "enriched-2"]
 
 
 @pytest.mark.asyncio
-async def test_dynamic_gather(client: Client):
+async def test_dynamic_gather(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         result = await client.execute_workflow(
             DynamicGatherWorkflow.run,
             4,
             id=f"dynamic-gather-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert result == ["enriched-0", "enriched-1", "enriched-2", "enriched-3"]
 
 
 @pytest.mark.asyncio
-async def test_workflow_as_tool(client: Client):
+async def test_workflow_as_tool(client: Client, task_queue: str):
     client = _adk_client(client)
-    async with _worker(client):
+    async with _worker(client, task_queue):
         LLMRegistry.register(WorkflowToolModel)
         result = await client.execute_workflow(
             WorkflowAsToolWorkflow.run,
             "workflow_tool_model",
             id=f"workflow-as-tool-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
         )
     assert "enriched-7" in result
 
 
 @pytest.mark.asyncio
-async def test_dynamic_resume_skips_completed_children(client: Client):
+async def test_dynamic_resume_skips_completed_children(client: Client, task_queue: str):
     client = _adk_client(client)
     workflow_id = f"dynamic-resume-{uuid.uuid4()}"
-    async with _worker(client):
+    async with _worker(client, task_queue):
         handle = await client.start_workflow(
             DynamicResumeWorkflow.run,
             "go",
             id=workflow_id,
-            task_queue=TASK_QUEUE,
+            task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
 
