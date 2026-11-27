@@ -298,6 +298,15 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
             'plugins) instead of the NativeConnection.'
         );
       }
+      // Worker.create appends the NativeConnection's plugins to the Worker's, so a plugin on both runs
+      // twice and would start each extra Worker twice.
+      if ((options.plugins ?? []).filter((plugin) => plugin === this).length > 1) {
+        throw new TypeError(
+          'This OpenAIAgentsPlugin has an OnHostSandboxClientProvider and is registered more than once on the ' +
+            'Worker, as on both the NativeConnection and the Worker, so it would start its extra Workers twice. ' +
+            'Register it on the Worker (Worker.create plugins) only.'
+        );
+      }
       this.activityConcurrency.set(workerKey(options.namespace, options.taskQueue), {
         tuner: options.tuner,
         maxConcurrentActivityTaskExecutions: options.maxConcurrentActivityTaskExecutions,

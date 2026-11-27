@@ -85,12 +85,19 @@ class _HasState(BaseModel):
         return _parse_session_state(value)
 
 
+class _SessionOperationArgs(_HasState):
+    # The state's manifest with the mount credentials that serializing the state
+    # drops. A Worker that rebuilds the session rebinds them into the state for
+    # the backend's resume().
+    trusted_manifest: Manifest | None = None
+
+
 # ---------------------------------------------------------------------------
 # Argument models (workflow -> activity)
 # ---------------------------------------------------------------------------
 
 
-class ExecArgs(_HasState):
+class ExecArgs(_SessionOperationArgs):
     """Arguments for exec activity."""
 
     command: list[str]
@@ -99,38 +106,38 @@ class ExecArgs(_HasState):
     user: str | User | None = None
 
 
-class ReadArgs(_HasState):
+class ReadArgs(_SessionOperationArgs):
     """Arguments for read activity."""
 
     path: str
 
 
-class WriteArgs(_HasState):
+class WriteArgs(_SessionOperationArgs):
     """Arguments for write activity."""
 
     path: str
     data: JsonSafeBytes
 
 
-class RunningArgs(_HasState):
+class RunningArgs(_SessionOperationArgs):
     """Arguments for running check activity."""
 
     pass
 
 
-class PersistWorkspaceArgs(_HasState):
+class PersistWorkspaceArgs(_SessionOperationArgs):
     """Arguments for persist workspace activity."""
 
     pass
 
 
-class HydrateWorkspaceArgs(_HasState):
+class HydrateWorkspaceArgs(_SessionOperationArgs):
     """Arguments for hydrate workspace activity."""
 
     data: JsonSafeBytes
 
 
-class PtyExecStartArgs(_HasState):
+class PtyExecStartArgs(_SessionOperationArgs):
     """Arguments for PTY exec start activity."""
 
     command: list[str]
@@ -142,7 +149,7 @@ class PtyExecStartArgs(_HasState):
     max_output_tokens: int | None = None
 
 
-class PtyWriteStdinArgs(_HasState):
+class PtyWriteStdinArgs(_SessionOperationArgs):
     """Arguments for PTY write stdin activity."""
 
     session_id: int
@@ -151,13 +158,13 @@ class PtyWriteStdinArgs(_HasState):
     max_output_tokens: int | None = None
 
 
-class StartArgs(_HasState):
+class StartArgs(_SessionOperationArgs):
     """Arguments for start activity."""
 
     pass
 
 
-class StopArgs(_HasState):
+class StopArgs(_SessionOperationArgs):
     """Arguments for stop activity."""
 
     pass
@@ -237,12 +244,10 @@ class CreateSessionArgs(BaseModel):
         return BaseSandboxClientOptions.parse(value)
 
 
-class ResumeSessionArgs(_HasState):
+class ResumeSessionArgs(_SessionOperationArgs):
     """Arguments for resume session activity."""
 
-    # The state's manifest with the mount credentials that serializing the state
-    # drops. The Worker rebinds them into the state for the backend's resume().
-    trusted_manifest: Manifest | None = None
+    pass
 
 
 class SessionResult(_HasState):

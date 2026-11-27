@@ -557,6 +557,8 @@ def nexus_operation_as_tool(
 def temporal_sandbox_client(
     name: str,
     config: ActivityConfig | None = None,
+    *,
+    backend_id: str | None = None,
 ) -> Any:
     """Create a sandbox client reference for use in a Temporal workflow ``RunConfig``.
 
@@ -583,8 +585,15 @@ def temporal_sandbox_client(
             worker.  Must match exactly.
         config: Optional activity configuration for controlling timeouts,
             retries, etc.  Defaults to a 5-minute ``start_to_close_timeout``.
+        backend_id: The sandbox backend's own id, such as ``"docker"`` or
+            ``"daytona"``. Defaults to ``name``. Set it when ``name`` differs
+            from the backend's id and the run's mounts use that backend's mount
+            strategies with credentials: OpenAI's SDK checks those mounts
+            against this id when it resumes a paused run. OpenAI saves the id
+            in a paused run's ``RunState`` and refuses to resume the run when it
+            changes, so don't change it while runs are paused.
     """
-    return TemporalSandboxClient(name=name, config=config)
+    return TemporalSandboxClient(name=name, config=config, backend_id=backend_id)
 
 
 def stateless_mcp_server(

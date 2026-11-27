@@ -1782,12 +1782,12 @@ async def test_an_on_host_session_with_mount_credentials_comes_back_after_a_paus
 
     # How OpenAI's Runner saves the state at a pause, restores it, and rebinds
     # its mount credentials from the run's manifest.
-    workflow_client = TemporalSandboxClient("mock")
+    workflow_client = TemporalSandboxClient("mock", backend_id="docker")
     restored = workflow_client.deserialize_session_state(
         json.loads(json.dumps(workflow_client.serialize_session_state(state)))
     )
     rebound = restored.rebind_persisted_mount_authority(
-        _credentialed_manifest(), provider_backend_id=restored.type
+        _credentialed_manifest(), provider_backend_id=workflow_client.backend_id
     )
     # The resume reaches the Worker after a restart, so it doesn't hold the session.
     _, restarted = _on_host_activities(client)
@@ -1815,6 +1815,41 @@ async def test_an_on_host_session_with_mount_credentials_comes_back_after_a_paus
     await restarted["mock-sandbox_session_exec"](
         ExecArgs(state=results[0].state, command=["true"])
     )
+
+
+async def test_a_hosted_session_with_mount_credentials_runs_on_a_worker_that_did_not_create_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session = _MockSandboxSession()
+    session.state = _DockerLikeSessionState(
+        manifest=Manifest(), snapshot=NoopSnapshot(id=str(uuid.uuid4()))
+    )
+    client = _MountCredentialCheckingClient(session)
+    creator = _activity_map(SandboxClientProvider("mock", client))
+    other = _activity_map(SandboxClientProvider("mock", client))
+
+    async def execute_activity(
+        name: str,
+        *,
+        arg: BaseModel,
+        result_type: Any,
+        **kwargs: Any,  # type: ignore[reportUnusedParameter]
+    ) -> Any:
+        # Create runs on one Worker and the operation on another.
+        acts = creator if name == "mock-sandbox_client_create" else other
+        result = await acts[name](type(arg).model_validate_json(arg.model_dump_json()))
+        return result_type.model_validate_json(result.model_dump_json())
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    workflow_session = await TemporalSandboxClient("mock").create(
+        manifest=_credentialed_manifest(), options=_TestSandboxClientOptions()
+    )
+    await workflow_session.exec("true")
+
+    assert client.resume_calls == 1
+    mount = session.state.manifest.entries["data"]
+    assert isinstance(mount, S3Mount)
+    assert mount.secret_access_key == "secret"
 
 
 async def test_an_on_host_provider_does_not_resume_a_state_it_did_not_return():
