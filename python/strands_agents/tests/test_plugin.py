@@ -3,6 +3,7 @@ import functools
 import importlib.metadata
 import inspect
 import logging
+import re
 import sys
 import typing
 from collections.abc import AsyncGenerator
@@ -530,28 +531,81 @@ async def test_mcp_rejected_results(
     assert error.value.non_retryable
 
 
-def _tenant_factory(tenant: str) -> mcp.Client:
-    return mcp.Client(f"https://{tenant}.example.com/mcp")
+def _tenant_region_factory(tenant: str, region: str) -> mcp.Client:
+    return mcp.Client(f"https://{tenant}.{region}.example.com/mcp")
 
 
 def _keyword_tenant_factory(*, tenant: str) -> mcp.Client:
     return mcp.Client(f"https://{tenant}.example.com/mcp")
 
 
+def _tenant_keyword_region_factory(tenant: str, *, region: str) -> mcp.Client:
+    return mcp.Client(f"https://{tenant}.{region}.example.com/mcp")
+
+
 @pytest.mark.parametrize(
-    "tenant_factory",
-    [_tenant_factory, _keyword_tenant_factory],
-    ids=["positional", "keyword-only"],
+    ("tenant_factory", "reason"),
+    [
+        (_tenant_region_factory, "missing a required argument: 'region'"),
+        (_keyword_tenant_factory, "too many positional arguments"),
+        (_tenant_keyword_region_factory, "missing a required argument: 'region'"),
+    ],
+    ids=["two-positional", "keyword-only", "positional-and-keyword-only"],
 )
-def test_mcp_factory_that_needs_arguments_fails_when_the_plugin_is_built(
-    tenant_factory: typing.Callable[..., mcp.Client],
+def test_mcp_factory_that_needs_more_arguments_fails_when_the_plugin_is_built(
+    tenant_factory: typing.Callable[..., mcp.Client], reason: str
 ) -> None:
+    """Only a parameterless factory or one with a single positional parameter is accepted."""
     with pytest.raises(
-        TypeError, match="MCP server factory 'weather' must take no arguments"
+        TypeError,
+        match=re.escape(
+            "MCP server factory 'weather' must take no arguments or one positional "
+            f"parameter: {reason}"
+        ),
     ):
         StrandsPlugin(
             models={}, mcp_clients={"weather": typing.cast(typing.Any, tenant_factory)}
         )
+
+
+async def test_mcp_factory_with_one_parameter_receives_the_factory_argument() -> None:
+    """A one-parameter factory is accepted; the activity passes it the request's argument."""
+    received: list[typing.Any] = []
+
+    def factory(temp: int | None) -> mcp.Client:
+        received.append(temp)
+        return _weather_client(21 if temp is None else temp)
+
+    plugin = StrandsPlugin(models={}, mcp_clients={"weather": factory})
+    activities = typing.cast(list[typing.Any], plugin.activities)
+    call_tool = next(
+        a
+        for a in activities
+        if a.__temporal_activity_definition.name == "temporalio.mcp.weather.call-tool"
+    )
+    request: dict[str, typing.Any] = {"name": "weather", "arguments": {}}
+
+    for temp, reported in ((None, 21), (23, 23)):
+        result = await ActivityEnvironment().run(
+            call_tool, {**request, "factory_argument": temp}
+        )
+        assert result["structured_content"] == {"temp": reported}
+    assert received == [None, 23]
+
+    # The same checks as for a parameterless factory apply to what it returns.
+    plugin = StrandsPlugin(
+        models={}, mcp_clients={"old": lambda _: _old_strands_client()}
+    )
+    activities = typing.cast(list[typing.Any], plugin.activities)
+    list_tools = next(
+        a
+        for a in activities
+        if a.__temporal_activity_definition.name == "temporalio.mcp.old.list-tools"
+    )
+    with pytest.raises(ApplicationError) as error:
+        await ActivityEnvironment().run(list_tools, {"factory_argument": "acme"})
+    assert error.value.type == "MCPServerFactoryTypeError"
+    assert error.value.non_retryable
 
 
 def _weather_client(temp: object = 21) -> mcp.Client:

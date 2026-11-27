@@ -2,6 +2,7 @@ import asyncio
 import re
 import sys
 from collections import Counter
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from strands.types.exceptions import EventLoopException
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, RetryState
 from temporalio.mcp import TemporalMCPClient as DurableMCPClient
 from temporalio.strands_agents import (
     MCPToolNameConflictError,
@@ -261,6 +262,240 @@ async def test_mcp_connection_idle_timeout(client: Client):
 
     # One connection for list-tools and another for call-tool.
     assert factory_calls[0] == 2
+
+
+@workflow.defn
+class MCPCallerWorkflow:
+    """Act for one caller, whose id is the handle's ``factory_argument``."""
+
+    @workflow.run
+    async def run(self, caller: str | None) -> str:
+        echo = TemporalMCPClient(
+            server="echo_caller",
+            cache_tools=True,
+            factory_argument=caller,
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        agent = TemporalAgent(
+            model="mock",
+            start_to_close_timeout=timedelta(seconds=30),
+            tools=[echo],
+        )
+        result = await agent.invoke_async("echo twice")
+        return str(result)
+
+
+def _caller_factory(
+    events: list[str], closed: asyncio.Event
+) -> Callable[[str | None], MCPClient]:
+    """A one-parameter factory that records what it receives and each close."""
+
+    class ClosingClient(MCPClient):
+        async def __aexit__(self, *args: Any) -> None:
+            await super().__aexit__(*args)
+            events.append("close")
+            closed.set()
+
+    def factory(caller: str | None) -> MCPClient:
+        events.append(f"open:{caller}")
+        return ClosingClient(stdio_client(_ECHO_PARAMS))
+
+    return factory
+
+
+def _echo_twice_model() -> MockModel:
+    return MockModel(
+        [
+            {"name": "echo", "input": {"message": "one"}},
+            {"name": "echo", "input": {"message": "two"}},
+            "Done!",
+        ]
+    )
+
+
+async def test_mcp_factory_argument_opens_a_client_per_activity(client: Client):
+    """A one-parameter factory gets the handle's factory_argument, once per activity."""
+    task_queue = f"test_mcp_factory_argument_opens_a_client_per_activity-{uuid4()}"
+    events: list[str] = []
+    plugin = StrandsPlugin(
+        models={"mock": _echo_twice_model},
+        mcp_clients={"echo_caller": _caller_factory(events, asyncio.Event())},
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPCallerWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            MCPCallerWorkflow.run,
+            "alice",
+            id=f"test_mcp_factory_argument_opens_a_client_per_activity_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert await handle.result() == "Done!\n"
+        # A fresh client for list-tools and for each call-tool, each closed when
+        # its activity ends: a non-None argument is never pooled.
+        assert events == ["open:alice", "close"] * 3
+
+    history = await handle.fetch_history()
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "temporalio.mcp.echo_caller.list-tools",
+        "invoke_model",
+        "temporalio.mcp.echo_caller.call-tool",
+        "invoke_model",
+        "temporalio.mcp.echo_caller.call-tool",
+        "invoke_model",
+    ]
+
+    await Replayer(
+        workflows=[MCPCallerWorkflow],
+        plugins=[plugin],
+    ).replay_workflow(history)
+
+
+async def test_mcp_factory_argument_none_shares_the_connection(client: Client):
+    """Without an argument, a one-parameter factory gets None and is pooled as before."""
+    task_queue = f"test_mcp_factory_argument_none_shares_the_connection-{uuid4()}"
+    events: list[str] = []
+    closed = asyncio.Event()
+    plugin = StrandsPlugin(
+        models={"mock": _echo_twice_model},
+        mcp_clients={"echo_caller": _caller_factory(events, closed)},
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPCallerWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            MCPCallerWorkflow.run,
+            None,
+            id=f"test_mcp_factory_argument_none_shares_the_connection_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert await handle.result() == "Done!\n"
+        # One connection served list-tools and both tool calls, and it is still open.
+        assert events == ["open:None"]
+
+    # Worker shutdown closes the cached connection; wait for it, as leaving
+    # ``async with Worker`` does not.
+    await asyncio.wait_for(closed.wait(), timeout=10)
+    assert events == ["open:None", "close"]
+
+
+@workflow.defn
+class MCPCallerOnPlainFactoryWorkflow:
+    """Pass a caller id to a server whose factory takes no arguments."""
+
+    @workflow.run
+    async def run(self) -> str:
+        echo = TemporalMCPClient(
+            server="echo_plain",
+            cache_tools=True,
+            factory_argument="alice",
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        agent = TemporalAgent(
+            model="mock",
+            start_to_close_timeout=timedelta(seconds=30),
+            tools=[echo],
+        )
+        result = await agent.invoke_async("echo")
+        return str(result)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        _echo_client_factory,
+        # A defaulted parameter does not take the argument: the plugin keeps
+        # calling such a factory with no arguments (see test_mcp).
+        lambda params=_ECHO_PARAMS: MCPClient(stdio_client(params)),
+    ],
+    ids=["parameterless", "defaulted"],
+)
+async def test_mcp_factory_argument_to_a_parameterless_factory_fails(
+    client: Client, factory: Callable[[], MCPClient]
+):
+    """A non-None factory_argument on a parameterless factory fails the run without a retry."""
+    task_queue = f"test_mcp_factory_argument_to_a_parameterless_factory_fails-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"mock": lambda: MockModel(["Done!"])},
+        mcp_clients={"echo_plain": factory},
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPCallerOnPlainFactoryWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await client.execute_workflow(
+                MCPCallerOnPlainFactoryWorkflow.run,
+                id=f"test_mcp_factory_argument_to_a_parameterless_factory_{uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    # The first listing fails, so the error reaches the workflow as the
+    # list-tools ActivityError, with temporalio-mcp's error as its cause.
+    error = exc_info.value.cause
+    assert isinstance(error, ActivityError)
+    assert error.retry_state == RetryState.NON_RETRYABLE_FAILURE
+    cause = error.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.non_retryable
+    assert cause.message == (
+        "MCP server factory 'echo_plain' declares no parameters, so it cannot "
+        "receive a factory_argument; give the factory a single positional "
+        "parameter to accept one"
+    )
+
+
+async def test_mcp_defaulted_parameter_factory_is_called_with_no_arguments(
+    client: Client,
+):
+    """A factory whose parameter has a default keeps its default and its pooled connection."""
+    task_queue = f"test_mcp_defaulted_parameter_factory-{uuid4()}"
+    received: list[StdioServerParameters] = []
+
+    def record(params: StdioServerParameters) -> MCPClient:
+        received.append(params)
+        return MCPClient(stdio_client(params))
+
+    plugin = StrandsPlugin(
+        models={"mock": _echo_twice_model},
+        # A default that captures the server's parameters, as in a loop over
+        # servers. MCPPlugin alone would pass it the argument, None here.
+        mcp_clients={"echo": lambda params=_ECHO_PARAMS: record(params)},
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        result = await client.execute_workflow(
+            MCPWorkflow.run,
+            "echo twice",
+            id=f"test_mcp_defaulted_parameter_factory_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert result == "Done!\n"
+
+    # Called with no arguments, so the default applies, and once for the whole
+    # run: the connection is pooled as for any parameterless factory.
+    assert received == [_ECHO_PARAMS]
 
 
 @workflow.defn

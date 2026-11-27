@@ -3,10 +3,10 @@ from __future__ import annotations
 import importlib.metadata
 import inspect
 import sys
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import replace
 from datetime import timedelta
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from botocore.config import Config as BotocoreConfig
 from strands.models import BedrockModel, Model
@@ -58,11 +58,14 @@ class StrandsPlugin(SimplePlugin):
     When ``mcp_clients`` is supplied, registers the activities of a
     ``temporalio.mcp.MCPPlugin`` (``temporalio.mcp.{server}.list-tools``,
     ``temporalio.mcp.{server}.call-tool`` and the other MCP operations) for each
-    entry. Each factory takes no arguments, returns an ``mcp.Client`` (MCP
-    Python SDK v2) and needs the ``mcp`` extra. The worker calls a factory each
-    time it opens a connection, so return a new ``mcp.Client`` and transport
-    from every call instead of caching one. Workflow-side
-    ``TemporalMCPClient(server="...")`` discovers tools by running
+    entry. Each factory returns an ``mcp.Client`` (MCP Python SDK v2) and needs
+    the ``mcp`` extra. A factory takes no arguments, or one required positional
+    parameter, which receives the ``factory_argument`` of the workflow-side
+    ``TemporalMCPClient`` (``None`` when the handle sets none); a factory whose
+    positional parameters all have defaults is called with no arguments. The
+    worker calls a factory each time it opens a connection, so return a new
+    ``mcp.Client`` and transport from every call instead of caching one.
+    Workflow-side ``TemporalMCPClient(server="...")`` discovers tools by running
     ``list-tools``; whether it lists once per workflow or once per agent turn is
     controlled by its ``cache_tools`` option. Don't register the same server
     name through ``MCPPlugin`` or ``OpenAIAgentsPlugin`` on the same worker:
@@ -74,7 +77,9 @@ class StrandsPlugin(SimplePlugin):
     connections until the worker shuts down, and zero closes them as soon as
     they are idle. Only servers that negotiate the modern MCP protocol share a
     connection; a server on an older protocol, such as one built with MCP
-    Python SDK 1.x, gets a new connection for every activity.
+    Python SDK 1.x, gets a new connection for every activity, and so does a
+    handle with a non-``None`` ``factory_argument``, whose client is closed
+    when its activity ends.
 
     When ``sandboxes`` is supplied, registers one stable set of activities that
     dispatches each operation by sandbox name. Each factory receives the
@@ -91,7 +96,8 @@ class StrandsPlugin(SimplePlugin):
         self,
         *,
         models: dict[str, Callable[[], Model]] | None = None,
-        mcp_clients: dict[str, Callable[[], Client]] | None = None,
+        mcp_clients: Mapping[str, Callable[[], Client] | Callable[[Any], Client]]
+        | None = None,
         sandboxes: dict[str, SandboxFactory] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
@@ -174,10 +180,9 @@ class StrandsPlugin(SimplePlugin):
             return ""
 
 
-def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], Client]:
-    # MCPPlugin passes a factory argument (None) to any factory with a positional
-    # parameter, even a defaulted one such as ``lambda params=params: ...``, so the
-    # wrapper takes none.
+def _client_factory(
+    server: str, factory: Callable[[], Client] | Callable[[Any], Client]
+) -> Callable[[], Client] | Callable[[Any], Client]:
     import mcp
 
     # Fail when the plugin is built, not on every activity attempt.
@@ -202,17 +207,28 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
         signature = (
             None  # Some callables have no signature; the call reports a mismatch.
         )
+    # MCPPlugin passes the handle's factory_argument, None when it set none, to
+    # any factory with a positional parameter, even a defaulted one such as
+    # ``lambda params=params: ...``, or ``*args``. A factory that binds with no
+    # arguments therefore gets a parameterless wrapper, which keeps it called
+    # that way, and only a factory that needs exactly one positional argument
+    # gets a wrapper that takes the argument: a narrower rule than MCPPlugin's.
+    takes_argument = False
     if signature is not None:
         try:
             signature.bind()
-        except TypeError as err:
-            # Fail when the plugin is built, not on every activity attempt.
-            raise TypeError(
-                f"MCP server factory {server!r} must take no arguments: {err}"
-            ) from err
+        except TypeError:
+            try:
+                signature.bind(None)
+            except TypeError as err:
+                # Fail when the plugin is built, not on every activity attempt.
+                raise TypeError(
+                    f"MCP server factory {server!r} must take no arguments or one "
+                    f"positional parameter: {err}"
+                ) from err
+            takes_argument = True
 
-    def create() -> Client:
-        client = factory()
+    def check(client: Any) -> Client:
         if not isinstance(client, mcp.Client):
             kind = type(client)
             if inspect.iscoroutine(client):
@@ -239,6 +255,19 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
                 non_retryable=True,
             )
         return client
+
+    if takes_argument:
+        with_argument = cast("Callable[[Any], Client]", factory)
+
+        def create_with_argument(argument: Any) -> Client:
+            return check(with_argument(argument))
+
+        return create_with_argument
+
+    without_argument = cast("Callable[[], Client]", factory)
+
+    def create() -> Client:
+        return check(without_argument())
 
     return create
 
