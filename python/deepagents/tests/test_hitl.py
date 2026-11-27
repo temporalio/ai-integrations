@@ -25,11 +25,16 @@ both a live execution and its replay.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import gc
 import importlib
 import re
+import threading
+import time
 import uuid
+import weakref
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -40,7 +45,19 @@ pytest.importorskip("langchain_core")
 pytest.importorskip("langgraph")
 
 from temporalio import workflow  # noqa: E402
-from temporalio.worker import Replayer, Worker  # noqa: E402
+from temporalio.api.common.v1 import WorkflowExecution  # noqa: E402
+from temporalio.api.enums.v1 import EventType, WorkflowTaskFailedCause  # noqa: E402
+from temporalio.api.workflowservice.v1 import (  # noqa: E402
+    ResetWorkflowExecutionRequest,
+)
+from temporalio.worker import (  # noqa: E402
+    Interceptor,
+    Replayer,
+    Worker,
+    WorkflowInboundInterceptor,
+    WorkflowInterceptorClassInput,
+    WorkflowOutboundInterceptor,
+)
 
 # Resolve framework symbols through the imported module to avoid confusing
 # the top-level package with this same-named test directory.
@@ -547,11 +564,11 @@ class PlainLangGraphIdWorkflow:
 async def test_checkpoint_patch_leaves_plugin_free_workers_alone(
     env: WorkflowEnvironment,
 ) -> None:
-    # The patch is process-wide, but per-run state is cleaned up only by the
-    # plugin's CheckpointIdInterceptor. A Worker running LangGraph without
-    # the plugin has no such interceptor, so its runs must keep real uuid6
-    # and leave no tick-floor entry behind, completed and evicted runs alike
-    # (max_cached_workflows=0 evicts after every task).
+    # The patch is process-wide, but per-instance state exists only where the
+    # plugin's CheckpointIdInterceptor creates it. A Worker running LangGraph
+    # without the plugin has no such interceptor, so its runs must keep real
+    # uuid6, completed and evicted runs alike (max_cached_workflows=0 evicts
+    # after every task).
     from temporalio.deepagents import _checkpoint_ids
 
     original = checkpoint_id_module.uuid6
@@ -592,8 +609,6 @@ async def test_checkpoint_patch_leaves_plugin_free_workers_alone(
                 )
                 run_node, _ = _checkpoint_ids._run_id_bits(handle.result_run_id or "")
                 assert checkpoint_id_module.UUID(minted).node != run_node
-
-        assert not _checkpoint_ids._last_tick
 
 
 @workflow.defn(sandboxed=False)
@@ -693,3 +708,292 @@ async def test_failed_checkpoint_install_unwinds_earlier_patches(
     assert _model._original_resolve_model is None
     assert not _tools._original_backend_async_defaults
     assert _checkpoint_ids._original_uuid6 is None
+
+
+@workflow.defn(sandboxed=False)
+class ApproveByCheckpointIdWorkflow:
+    """Records a decision keyed on a minted id: a timer only if the id matches."""
+
+    def __init__(self) -> None:
+        self._minted: str | None = None
+        self._approved: str | None = None
+        self._done = False
+
+    @workflow.signal
+    def approve(self, checkpoint_id: str) -> None:
+        self._approved = checkpoint_id
+
+    @workflow.signal
+    def finish(self) -> None:
+        self._done = True
+
+    @workflow.query
+    def minted(self) -> str | None:
+        return self._minted
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        self._minted = str(checkpoint_id_module.uuid6(clock_seq=0))
+        await workflow.wait_condition(lambda: self._approved is not None)
+        if self._approved == self._minted:
+            await workflow.sleep(timedelta(milliseconds=10))
+        await workflow.wait_condition(lambda: self._done)
+        return [self._minted, self._approved or ""]
+
+
+async def _event_types(handle: Any) -> list[int]:
+    return [e.event_type for e in (await handle.fetch_history()).events]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_ids_survive_reset(env: WorkflowEnvironment) -> None:
+    # A reset copies the history prefix into a new run with a new run id and
+    # replays it. An id minted in that prefix, and any decision already
+    # recorded against it (here: a timer started only because the signalled
+    # id matched), must be re-derived as it was; hashing the new run id made
+    # the replayed branch skip the TimerStarted in the copied history and
+    # fail the reset run with a nondeterminism error.
+    from temporalio.deepagents import _checkpoint_ids
+
+    workflow_id = f"da-reset-ids-{uuid.uuid4()}"
+    task_queue = f"da-reset-ids-{uuid.uuid4()}"
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[ApproveByCheckpointIdWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        handle = await env.client.start_workflow(
+            ApproveByCheckpointIdWorkflow.run, id=workflow_id, task_queue=task_queue
+        )
+        for _ in range(100):
+            minted = await handle.query(ApproveByCheckpointIdWorkflow.minted)
+            if minted is not None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("workflow never minted a checkpoint id")
+        await handle.signal(ApproveByCheckpointIdWorkflow.approve, minted)
+
+        # Wait for the task that handles the fired timer to complete; reset
+        # to it, so the copied prefix holds the matching-id branch's timer.
+        completed = EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+        for _ in range(100):
+            types = await _event_types(handle)
+            if EventType.EVENT_TYPE_TIMER_FIRED in types and types[-1] == completed:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the approved branch never started and fired its timer")
+        history = await handle.fetch_history()
+        reset_to = max(e.event_id for e in history.events if e.event_type == completed)
+        original_run_id = handle.result_run_id or ""
+
+        reset = await env.client.workflow_service.reset_workflow_execution(
+            ResetWorkflowExecutionRequest(
+                namespace=env.client.namespace,
+                workflow_execution=WorkflowExecution(
+                    workflow_id=workflow_id, run_id=original_run_id
+                ),
+                reason="checkpoint ids survive reset",
+                workflow_task_finish_event_id=reset_to,
+                request_id=str(uuid.uuid4()),
+            )
+        )
+        assert reset.run_id != original_run_id
+        reset_handle = env.client.get_workflow_handle(workflow_id, run_id=reset.run_id)
+        await reset_handle.signal(ApproveByCheckpointIdWorkflow.finish)
+        for _ in range(200):
+            types = await _event_types(reset_handle)
+            # The reset itself records one failed task (cause ResetWorkflow)
+            # at the reset point; any other is the replayed prefix diverging.
+            assert not [
+                e.workflow_task_failed_event_attributes
+                for e in (await reset_handle.fetch_history()).events
+                if e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED
+                and e.workflow_task_failed_event_attributes.cause
+                != WorkflowTaskFailedCause.WORKFLOW_TASK_FAILED_CAUSE_RESET_WORKFLOW
+            ]
+            if EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED in types:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the reset run never completed")
+        result = await reset_handle.result()
+
+    assert result == [minted, minted]
+    # The namespace is the original run's, not the reset run's.
+    original_node, _ = _checkpoint_ids._run_id_bits(original_run_id)
+    assert checkpoint_id_module.UUID(minted).node == original_node
+
+
+@workflow.defn(sandboxed=False)
+class ValidatorMintWorkflow:
+    """An Update whose validator and handler both mint a checkpoint id."""
+
+    def __init__(self) -> None:
+        self._done = False
+
+    @workflow.update
+    def mint(self) -> str:
+        minted = str(checkpoint_id_module.uuid6(clock_seq=0))
+        mode = "replay" if workflow.unsafe.is_replaying() else "live"
+        print(f"minted-id {mode} {workflow.info().workflow_id} {minted}")
+        self._done = True
+        return minted
+
+    @mint.validator
+    def validate_mint(self) -> None:
+        # Temporal skips validators on replay, so this mint must not move
+        # the floor the handler's id is derived from.
+        checkpoint_id_module.uuid6(clock_seq=0)
+
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(lambda: self._done)
+
+
+@pytest.mark.asyncio
+async def test_update_validator_mint_does_not_shift_replayed_ids(
+    env: WorkflowEnvironment, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow_id = f"da-validator-ids-{uuid.uuid4()}"
+    task_queue = f"da-validator-ids-{uuid.uuid4()}"
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[ValidatorMintWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        handle = await env.client.start_workflow(
+            ValidatorMintWorkflow.run, id=workflow_id, task_queue=task_queue
+        )
+        minted = await handle.execute_update(ValidatorMintWorkflow.mint)
+        await handle.result()
+        history = await handle.fetch_history()
+
+    assert _printed_ids(capsys.readouterr().out, "live", workflow_id) == [minted]
+    await Replayer(
+        workflows=[ValidatorMintWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(history)
+    assert _printed_ids(capsys.readouterr().out, "replay", workflow_id) == [minted]
+
+
+def test_checkpoint_state_lives_and_dies_with_the_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tick floor is created with the instance, before the SDK decodes
+    # the start arguments, and a start payload that fails to decode evicts
+    # the instance without ever entering the run method. So the state must
+    # be owned by the instance's inbound interceptor, not by a module-level
+    # map that only run-method cleanup empties: dropping the interceptor
+    # must free it, whatever the run method did or did not do.
+    from temporalio.deepagents import _checkpoint_ids
+
+    alive: weakref.WeakSet[Any] = weakref.WeakSet()
+
+    class TrackedState(_checkpoint_ids._InstanceState):
+        def __init__(self) -> None:
+            super().__init__()
+            alive.add(self)
+
+    monkeypatch.setattr(_checkpoint_ids, "_InstanceState", TrackedState)
+    interceptor = _checkpoint_ids.CheckpointIdInterceptor()
+    inbound_class = interceptor.workflow_interceptor_class(cast(Any, None))
+    inbound = inbound_class(cast(Any, object()))
+    assert len(alive) == 1
+    del inbound
+    gc.collect()
+    assert not alive
+
+
+class _ReplacedInfoInterceptor(Interceptor):
+    """Returns a fresh ``Info`` copy from every ``workflow.info()`` call."""
+
+    def workflow_interceptor_class(
+        self, input: WorkflowInterceptorClassInput
+    ) -> type[WorkflowInboundInterceptor]:
+        class Outbound(WorkflowOutboundInterceptor):
+            def info(self) -> workflow.Info:
+                return dataclasses.replace(super().info())
+
+        class Inbound(WorkflowInboundInterceptor):
+            def init(self, outbound: WorkflowOutboundInterceptor) -> None:
+                super().init(Outbound(outbound))
+
+        return Inbound
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_ids_with_interceptor_replacing_info(
+    env: WorkflowEnvironment,
+) -> None:
+    # The instance state must not be found through the identity of the
+    # ``workflow.info()`` result: an outbound interceptor may return a new
+    # object on every call, which made the patch fall back to wall-clock,
+    # random-node uuid6 for the whole run.
+    from temporalio.deepagents import _checkpoint_ids
+
+    task_queue = f"da-replaced-info-{uuid.uuid4()}"
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[PlainLangGraphIdWorkflow],
+        plugins=[DeepAgentsPlugin()],
+        interceptors=[_ReplacedInfoInterceptor()],
+    ):
+        handle = await env.client.start_workflow(
+            PlainLangGraphIdWorkflow.run,
+            id=f"da-replaced-info-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        minted = await handle.result()
+
+    run_node, _ = _checkpoint_ids._run_id_bits(handle.result_run_id or "")
+    assert checkpoint_id_module.UUID(minted).node == run_node
+
+
+def test_concurrent_checkpoint_installs_are_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two workers starting on separate threads: the second install must wait
+    # for the first instead of also seeing "unpatched", so both are counted
+    # and the saved original is LangGraph's function, not the first wrapper.
+    # The first install is held inside its LangGraph import while the second
+    # starts.
+    from temporalio.deepagents import _checkpoint_ids
+
+    original = checkpoint_id_module.uuid6
+    real_import = importlib.import_module
+    first_importing = threading.Event()
+
+    def slow_import(name: str, package: str | None = None) -> Any:
+        if name == "langgraph.checkpoint.base.id" and not first_importing.is_set():
+            first_importing.set()
+            time.sleep(0.3)
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", slow_import)
+    first = threading.Thread(target=_checkpoint_ids.install_checkpoint_id_patch)
+    second = threading.Thread(target=_checkpoint_ids.install_checkpoint_id_patch)
+    try:
+        first.start()
+        assert first_importing.wait(5)
+        second.start()
+        first.join(5)
+        second.join(5)
+        monkeypatch.undo()
+
+        assert _checkpoint_ids._original_uuid6 is original
+        _checkpoint_ids.uninstall_checkpoint_id_patch()
+        # The other install is still active.
+        assert checkpoint_id_module.uuid6 is not original
+        _checkpoint_ids.uninstall_checkpoint_id_patch()
+        assert checkpoint_id_module.uuid6 is original
+    finally:
+        while _checkpoint_ids._original_uuid6 is not None:
+            _checkpoint_ids.uninstall_checkpoint_id_patch()
+        # Never leave a wrapper behind for later tests, even when the
+        # assertions above failed with the original lost.
+        for name in _checkpoint_ids._PATCHED_MODULE_NAMES:
+            setattr(importlib.import_module(name), "uuid6", original)

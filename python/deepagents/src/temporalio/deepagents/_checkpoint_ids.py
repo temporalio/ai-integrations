@@ -17,9 +17,11 @@ running, :func:`install_checkpoint_id_patch` swaps the ``uuid6`` bindings
 LangGraph's checkpoint modules hold for :func:`_workflow_uuid6`, a drop-in
 built only from replay-safe inputs. Only workflow runs that carry the
 plugin's :class:`CheckpointIdInterceptor` get the drop-in: outside workflows,
-and in workflows on another Worker of the same process that runs LangGraph
-without the plugin, the original ``uuid6`` still answers, so that code is
-untouched and leaves no per-run state behind.
+in workflows on another Worker of the same process that runs LangGraph
+without the plugin, and in Query handlers and Update validators (which
+Temporal does not re-run on replay, so they have nothing to reproduce), the
+original ``uuid6`` still answers, so that code is untouched and leaves no
+per-run state behind.
 
 The time field carries the workflow's own time, with a per-run floor.
 ``workflow.time_ns()`` is the current workflow task's *recorded* timestamp:
@@ -35,17 +37,21 @@ any unpatched ids they might be compared with.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import importlib.util
+import threading
 from typing import Any
 
 from temporalio import workflow
 from temporalio.worker import (
     ExecuteWorkflowInput,
+    HandleQueryInput,
+    HandleSignalInput,
+    HandleUpdateInput,
     Interceptor,
     WorkflowInboundInterceptor,
     WorkflowInterceptorClassInput,
-    WorkflowOutboundInterceptor,
 )
 
 _original_uuid6: Any = None
@@ -54,6 +60,12 @@ _patched_modules: list[Any] = []
 # Active install() nestings: two workers with this plugin can be alive in one
 # process, and the first to shut down must not unpatch the survivor.
 _patch_depth = 0
+# Workers can start and stop on separate event-loop threads. The check of
+# ``_original_uuid6``, the LangGraph imports, the rebinding and the depth
+# count are one critical section for install and uninstall alike, so two
+# installers never both see "unpatched" and the second never saves the
+# first one's wrapper as the original.
+_patch_lock = threading.Lock()
 
 # Modules whose own ``uuid6`` binding is swapped. Every ``from ... import
 # uuid6`` freezes a binding in the importing module, so each holder — the
@@ -69,20 +81,37 @@ _PATCHED_MODULE_NAMES = (
 # constant langgraph's own uuid6 adds to Unix 100-ns ticks.
 _UUID6_EPOCH_OFFSET_TICKS = 122192928000000000
 
-# Highest tick minted so far, per workflow *instance*. Keyed by the identity
-# of the instance's ``Info`` object, not by run id, because one process can
-# hold two live instances of one run (a workflow-task timeout moves a run to
-# another Worker while the first still caches its instance, or a Replayer
-# re-executes it) and one instance's eviction must not delete the other's
-# state. A shared value across interleaved runs on one event loop would also
-# make a run's ids depend on that interleaving; plain dict operations, with
-# no await between them, cannot interleave. Only
-# :class:`CheckpointIdInterceptor` adds an entry (reset to 0 when the
-# workflow instance is (re)created — see it for why that is replay-safe) and
-# drops it when that instance finishes, and an instance with no entry is not
-# patched, so a run on a Worker without that interceptor never creates an
-# entry no one would remove.
-_last_tick: dict[int, int] = {}
+
+class _InstanceState:
+    """Highest tick minted so far by one workflow *instance*.
+
+    Owned by that instance's :class:`CheckpointIdInterceptor` inbound
+    interceptor, so it lives exactly as long as the instance and is freed
+    with it whether or not the run method was ever reached (a start payload
+    that fails to decode never gets there). Per instance, not per run,
+    because one process can hold two live instances of one run (a
+    workflow-task timeout moves a run to another Worker while the first
+    still caches its instance, or a Replayer re-executes it), and one
+    instance must not reset or advance the other's floor.
+    """
+
+    __slots__ = ("last_tick",)
+
+    def __init__(self) -> None:
+        self.last_tick = 0
+
+
+# The state the code running now mints against. The inbound interceptor sets
+# it at the top of each recorded handler — the run method, Signal handlers,
+# Update handlers — inside the task the SDK runs that handler in, and every
+# task the handler starts (LangGraph's included) inherits it, so the state
+# is found without asking ``workflow.info()`` for an identity that an
+# outbound interceptor may replace. ``None`` (the default, and what Query
+# handlers and Update validators run with) means "not a recorded execution
+# path of a plugin-enabled instance": LangGraph's own ``uuid6`` answers.
+_current_state: contextvars.ContextVar[_InstanceState | None] = contextvars.ContextVar(
+    "temporalio_deepagents_checkpoint_ids", default=None
+)
 
 
 def _uuid6_int(tick: int, node: int, clock_seq: int) -> int:
@@ -115,7 +144,9 @@ def _run_id_bits(run_id: str) -> tuple[int, int]:
     )
 
 
-def _workflow_uuid6(node: int | None = None, clock_seq: int | None = None) -> Any:
+def _workflow_uuid6(
+    state: _InstanceState, node: int | None = None, clock_seq: int | None = None
+) -> Any:
     """Drop-in for LangGraph's ``uuid6`` whose value depends only on the code path.
 
     The id keeps uuid6's exact bit layout and version, so checkpoint ids keep
@@ -129,23 +160,28 @@ def _workflow_uuid6(node: int | None = None, clock_seq: int | None = None) -> An
       from the recorded history, so re-execution — replay, worker restart,
       eviction — re-derives the same value at the same point in the code
       (see the module docstring);
-    - the 48-bit node field is fixed per run, derived from the run id, so
-      different executions of the same workflow mint different ids without
-      drawing from the workflow RNG (which would couple checkpoint ids to
-      unrelated user code's randomness). LangGraph normally passes
-      ``clock_seq=step``, so two runs alive at the same moment differ in
-      those 48 hash bits — distinct with overwhelming probability, not by
-      construction.
+    - the 48-bit node field is fixed per run, derived from the run id
+      recorded on the run's ``WorkflowExecutionStarted`` event
+      (``Info.original_execution_run_id``), so different executions of the
+      same workflow — a retry, a cron run, a continue-as-new run each record
+      a new started event — mint different ids without drawing from the
+      workflow RNG (which would couple checkpoint ids to unrelated user
+      code's randomness). A reset copies that event into the new run, so
+      the copied history re-derives the ids the original run minted (and
+      any approval already recorded against them still matches) instead of
+      hashing the new run id. LangGraph normally passes ``clock_seq=step``,
+      so two runs alive at the same moment differ in those 48 hash bits —
+      distinct with overwhelming probability, not by construction.
 
     Args:
+        state: The minting instance's tick floor.
         node: Passed through by LangGraph as ``None`` (uuid6's random-node
             default); hashed from the run id when absent.
         clock_seq: LangGraph always passes the superstep here; hashed from
             the run id only to mirror the original signature.
     """
-    info = workflow.info()
-    run_id = info.run_id
-    key = id(info)
+    # Preserved across reset; equal to the run id otherwise.
+    run_id = workflow.info().original_execution_run_id
     # uuid6 ticks of the workflow's current time. ``workflow.time_ns()`` is
     # the current activation's recorded timestamp — original on first pass,
     # the same recorded value on every re-execution — so ids land in the
@@ -154,9 +190,9 @@ def _workflow_uuid6(node: int | None = None, clock_seq: int | None = None) -> An
     # fall between two events (same timestamp) stay distinct and increasing.
     tick = max(
         workflow.time_ns() // 100 + _UUID6_EPOCH_OFFSET_TICKS,
-        _last_tick.get(key, 0) + 1,
+        state.last_tick + 1,
     )
-    _last_tick[key] = tick
+    state.last_tick = tick
     run_node, run_clock_seq = _run_id_bits(run_id)
     value = _uuid6_int(
         tick,
@@ -179,6 +215,11 @@ def install_checkpoint_id_patch() -> None:
     overlapping install/uninstall pairs; pair with
     :func:`uninstall_checkpoint_id_patch`.
     """
+    with _patch_lock:
+        _install_locked()
+
+
+def _install_locked() -> None:
     global _original_uuid6, _langgraph_uuid, _patched_modules, _patch_depth
     if _original_uuid6 is not None:
         _patch_depth += 1
@@ -212,13 +253,14 @@ def install_checkpoint_id_patch() -> None:
         # Inert outside workflows: the same worker process may run plain
         # client- or activity-side LangGraph code, which keeps real uuid6.
         # Inert too in a workflow run without CheckpointIdInterceptor (another
-        # Worker in this process running LangGraph without the plugin): it
-        # keeps real uuid6 and gets no tick-floor entry it could never drop.
+        # Worker in this process running LangGraph without the plugin), and
+        # in Query handlers and Update validators: no state is set there.
         # Delegates to the local ``original``, not the module global, so a
         # reference imported while patched (``from ... import uuid6``) keeps
         # working after the last worker uninstalls the patch.
-        if workflow.in_workflow() and id(workflow.info()) in _last_tick:
-            return _workflow_uuid6(node, clock_seq)
+        state = _current_state.get()
+        if state is not None and workflow.in_workflow():
+            return _workflow_uuid6(state, node, clock_seq)
         return original(node, clock_seq)
 
     for module in modules:
@@ -227,10 +269,15 @@ def install_checkpoint_id_patch() -> None:
 
 
 def uninstall_checkpoint_id_patch() -> None:
-    """Restore the original ``uuid6`` bindings and drop all tick floors.
+    """Restore the original ``uuid6`` bindings.
 
     Restore only when the last overlapping install has uninstalled.
     """
+    with _patch_lock:
+        _uninstall_locked()
+
+
+def _uninstall_locked() -> None:
     global _original_uuid6, _langgraph_uuid, _patched_modules, _patch_depth
     if _original_uuid6 is None:
         return
@@ -243,7 +290,6 @@ def uninstall_checkpoint_id_patch() -> None:
     _langgraph_uuid = None
     _patched_modules = []
     _patch_depth = 0
-    _last_tick.clear()
 
 
 class CheckpointIdInterceptor(Interceptor):
@@ -252,35 +298,44 @@ class CheckpointIdInterceptor(Interceptor):
     def workflow_interceptor_class(
         self, input: WorkflowInterceptorClassInput
     ) -> type[WorkflowInboundInterceptor]:
-        """Return an inbound interceptor that resets the tick floor per instance."""
+        """Return an inbound interceptor that owns the instance's tick floor."""
 
         class Inbound(WorkflowInboundInterceptor):
-            # Set in init(); defaulted so the declaration is a complete one.
-            # The Info object is held so its identity (the state key) cannot
-            # be reused by another instance while this one is alive.
-            _info: Any = None
-
-            def init(self, outbound: WorkflowOutboundInterceptor) -> None:
-                # Captured once here: the cleanup in execute_workflow must
-                # not depend on workflow context still being available while
-                # the instance is being torn down.
-                self._info = outbound.info()
-                # A newly constructed instance re-executes its run from the
-                # start (first task after an eviction, every replay), so the
-                # tick floor must restart with it to re-derive the same ids.
-                # The entry also marks the run as one the patched uuid6
-                # serves: runs without this interceptor keep real uuid6.
-                _last_tick[id(self._info)] = 0
-                super().init(outbound)
+            # One inbound interceptor is built per workflow instance, so its
+            # state is the instance's own. A newly constructed instance
+            # re-executes its run from the start (first task after an
+            # eviction, every replay), so the tick floor starts at 0 with it
+            # to re-derive the same ids.
+            def __init__(self, next: WorkflowInboundInterceptor) -> None:
+                super().__init__(next)
+                self._state = _InstanceState()
 
             async def execute_workflow(self, input: ExecuteWorkflowInput) -> Any:
+                _current_state.set(self._state)
+                return await self.next.execute_workflow(input)
+
+            async def handle_signal(self, input: HandleSignalInput) -> None:
+                _current_state.set(self._state)
+                return await self.next.handle_signal(input)
+
+            async def handle_update_handler(self, input: HandleUpdateInput) -> Any:
+                _current_state.set(self._state)
+                return await self.next.handle_update_handler(input)
+
+            # Neither runs on replay: a mint here must not advance the floor
+            # the recorded handlers re-derive their ids from, so both run
+            # with no state and get LangGraph's own uuid6.
+            async def handle_query(self, input: HandleQueryInput) -> Any:
+                _current_state.set(None)
+                return await self.next.handle_query(input)
+
+            def handle_update_validator(self, input: HandleUpdateInput) -> None:
+                # Synchronous, and the Update handler runs later in the same
+                # task: restore what was there.
+                token = _current_state.set(None)
                 try:
-                    return await self.next.execute_workflow(input)
+                    self.next.handle_update_validator(input)
                 finally:
-                    # This instance is over; drop only its own floor so a
-                    # long-lived worker does not accumulate an entry per run
-                    # and another live instance of the same run (a handoff
-                    # between Workers, a Replayer) keeps its state.
-                    _last_tick.pop(id(self._info), None)
+                    _current_state.reset(token)
 
         return Inbound

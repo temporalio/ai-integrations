@@ -505,10 +505,17 @@ which change every time the same history is replayed, but under this plugin
 checkpoint ids are minted from replay-safe workflow state while a worker is
 running, so the id a reviewer was shown live is the id the workflow computes
 again on replay, worker restart, or eviction. The guarantee is per run and per
-code version: a workflow retry, reset, continue-as-new, or a code change that
-alters checkpoint ordering mints different ids. Different executions of the
-same workflow are overwhelmingly unlikely to share an id (the id carries the
-run's recorded time plus 48 hash bits of its run id), not provably distinct.
+code version. A reset keeps the ids of the history it copies into the new
+run, so a decision already recorded against one still matches; a workflow
+retry, cron run, continue-as-new, or a code change that alters checkpoint
+ordering mints different ids. Different executions of the same workflow are
+overwhelmingly unlikely to share an id (the id carries the run's recorded time
+plus 48 hash bits of the run id on its `WorkflowExecutionStarted` event, which
+a reset preserves, so ids a reset run mints past the reset point differ from
+the original run's by recorded time alone), not provably distinct. Query
+handlers and Update
+validators do not run on replay, so an id minted there comes from LangGraph's
+own generator and is not reproduced.
 
 ## Streaming
 
