@@ -96,6 +96,14 @@ class DeepAgentsPlugin(SimplePlugin):
             provider that blocks for longer than the heartbeat timeout (loading
             a local model), so the heartbeater keeps beating meanwhile; the
             provider must then not depend on the running loop.
+        backend_ops_in_thread: Run synchronous backend methods on a worker
+            thread instead of the activity's event loop. Off by default: a
+            synchronous method may need the running loop (to create an
+            ``aiohttp`` session) and fails off-loop. Turn it on for backends
+            whose synchronous methods block, such as a shell command, so the
+            heartbeater keeps beating meanwhile; those methods must then not
+            depend on the running loop. Async methods run on the loop either
+            way.
         passthrough_modules: Extra sandbox-passthrough modules, merged with the
             plugin's LangChain/deepagents defaults.
         data_converter: Explicit converter override. ``None`` adapts the client
@@ -115,6 +123,7 @@ class DeepAgentsPlugin(SimplePlugin):
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
         model_provider_in_thread: bool = False,
+        backend_ops_in_thread: bool = False,
         passthrough_modules: Sequence[str] | None = None,
         data_converter: DataConverter | None = None,
     ) -> None:
@@ -159,6 +168,7 @@ class DeepAgentsPlugin(SimplePlugin):
         self._backends = dict(backends or {})
         self._streaming_batch_interval = streaming_batch_interval
         self._model_provider_in_thread = model_provider_in_thread
+        self._backend_ops_in_thread = backend_ops_in_thread
 
         # The activities that carry the nondeterministic work. model_provider and
         # the batch interval are captured here so API keys never enter an input.
@@ -167,6 +177,7 @@ class DeepAgentsPlugin(SimplePlugin):
             backends=backends,
             streaming_batch_interval=streaming_batch_interval,
             model_provider_in_thread=model_provider_in_thread,
+            backend_ops_in_thread=backend_ops_in_thread,
         )
         # Kept apart from the public ``activities`` setting, which callers may change.
         self._builtin_activities = (
@@ -357,6 +368,9 @@ class DeepAgentsPlugin(SimplePlugin):
             ),
             "model_provider_in_thread": (
                 self._model_provider_in_thread == other._model_provider_in_thread
+            ),
+            "backend_ops_in_thread": (
+                self._backend_ops_in_thread == other._backend_ops_in_thread
             ),
         }
         return [name for name, is_same in same.items() if not is_same]

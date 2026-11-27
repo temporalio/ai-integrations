@@ -25,7 +25,10 @@ Every method:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import dataclasses
+import functools
 import importlib
 import inspect
 from collections.abc import Mapping
@@ -202,18 +205,39 @@ def _auto_heartbeater(fn: Callable) -> Callable:
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
         heartbeat_timeout = activity.info().heartbeat_timeout
         beat_task: asyncio.Task | None = None
+        token = None
         if heartbeat_timeout:
             interval = heartbeat_timeout.total_seconds() / 2
+            # Temporal keeps only the latest heartbeat's details, so a timer
+            # beat with no details would overwrite a checkpoint the
+            # application saved with ``activity.heartbeat(...)``. Record the
+            # latest application details (starting from the previous
+            # attempt's) and repeat them on every timer beat.
+            context = activity._Context.current()  # pyright: ignore[reportPrivateUsage]
+            send = context.heartbeat
+            latest: list[tuple[Any, ...]] = [tuple(activity.info().heartbeat_details)]
+            if send is not None:
+
+                def record(*details: Any) -> None:
+                    latest[0] = details
+                    send(*details)
+
+                token = activity._Context.set(  # pyright: ignore[reportPrivateUsage]
+                    dataclasses.replace(context, heartbeat=record)
+                )
 
             async def beat() -> None:
                 while True:
-                    activity.heartbeat()
+                    if send is not None:
+                        send(*latest[0])
                     await asyncio.sleep(interval)
 
             beat_task = asyncio.create_task(beat())
         try:
             return await fn(*args, **kwargs)
         finally:
+            if token is not None:
+                activity._Context.reset(token)  # pyright: ignore[reportPrivateUsage]
             if beat_task is not None:
                 beat_task.cancel()
                 # Let the cancellation land before returning so no pending task
@@ -236,7 +260,19 @@ def _is_async_callable(fn: Any) -> bool:
     )
 
 
-async def _call_backend(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _call_on_loop(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Call ``fn`` on the activity's event loop and await what it returns.
+
+    ``fn`` is positional-only so a backend method's own ``fn=`` keyword
+    reaches it unchanged.
+    """
+    result = fn(*args, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+async def _call_backend(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     """Call a backend method or factory, or the model provider, off the loop.
 
     A native async callable runs directly on the activity's event loop, so it
@@ -248,32 +284,52 @@ async def _call_backend(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> An
     to the activity's loop: the SDK's heartbeat for an async activity schedules
     a task on the running loop and fails from any other thread. An awaitable
     returned either way is awaited on the loop.
+
+    A thread cannot be stopped, so when the activity is cancelled while the
+    synchronous call runs, the cancellation is acknowledged only once the call
+    has returned: cleanup that waits for the cancelled activity then never
+    overlaps a write still in progress. ``fn`` is positional-only so a backend
+    method's own ``fn=`` keyword reaches it unchanged.
     """
     if _is_async_callable(fn):
-        result = fn(*args, **kwargs)
-    else:
-        loop = asyncio.get_running_loop()
-        context = (
-            activity._Context.current()  # pyright: ignore[reportPrivateUsage]
-            if activity.in_activity()
-            else None
-        )
+        return await _call_on_loop(fn, *args, **kwargs)
+    loop = asyncio.get_running_loop()
+    context = (
+        activity._Context.current()  # pyright: ignore[reportPrivateUsage]
+        if activity.in_activity()
+        else None
+    )
 
-        def run() -> Any:
-            # asyncio.to_thread runs this in a copy of the caller's contextvars,
-            # so the context set here is seen only by this call.
-            if context is not None and context.heartbeat is not None:
-                heartbeat = context.heartbeat
+    def run() -> Any:
+        # This runs in a copy of the caller's contextvars, so the context
+        # set here is seen only by this call.
+        if context is not None and context.heartbeat is not None:
+            heartbeat = context.heartbeat
 
-                def heartbeat_from_thread(*details: Any) -> None:
-                    loop.call_soon_threadsafe(heartbeat, *details)
+            def heartbeat_from_thread(*details: Any) -> None:
+                loop.call_soon_threadsafe(heartbeat, *details)
 
-                activity._Context.set(  # pyright: ignore[reportPrivateUsage]
-                    dataclasses.replace(context, heartbeat=heartbeat_from_thread)
-                )
-            return fn(*args, **kwargs)
+            activity._Context.set(  # pyright: ignore[reportPrivateUsage]
+                dataclasses.replace(context, heartbeat=heartbeat_from_thread)
+            )
+        return fn(*args, **kwargs)
 
-        result = await asyncio.to_thread(run)
+    # What asyncio.to_thread does, keeping the executor future so a
+    # cancellation can wait for the thread instead of abandoning it.
+    future = loop.run_in_executor(
+        None, functools.partial(contextvars.copy_context().run, run)
+    )
+    try:
+        result = await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait([future])
+        if not future.cancelled() and future.exception() is None:
+            leftover = future.result()
+            if inspect.iscoroutine(leftover):
+                leftover.close()
+        raise
     if inspect.isawaitable(result):
         result = await result
     return result
@@ -454,10 +510,12 @@ class DeepAgentActivities:
         backends: Mapping[str, Callable[..., Any]] | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
         model_provider_in_thread: bool = False,
+        backend_ops_in_thread: bool = False,
     ) -> None:
         """Store worker-side model and backend factories and streaming settings."""
         self._model_provider = model_provider or _default_model_provider
         self._model_provider_in_thread = model_provider_in_thread
+        self._backend_ops_in_thread = backend_ops_in_thread
         self._backends = {
             name: _BackendFactory(name, factory)
             for name, factory in (backends or {}).items()
@@ -473,10 +531,7 @@ class DeepAgentActivities:
         """
         if self._model_provider_in_thread:
             return await _call_backend(fn, *args)
-        result = fn(*args)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
+        return await _call_on_loop(fn, *args)
 
     def _build_bound_model(self, input: ModelActivityInput) -> Any:
         model = self._model_provider(input.model_name)
@@ -625,9 +680,13 @@ class DeepAgentActivities:
                 type="DeepAgentsUnknownBackendOp",
                 non_retryable=True,
             )
-        # Sync methods run on a worker thread so they don't block the event
-        # loop the heartbeat task needs; async methods run on the loop.
-        result = await _call_backend(
+        # A sync method runs on the event loop by default, because it may need
+        # the running loop (to create an ``aiohttp`` session, say). With
+        # ``backend_ops_in_thread`` it runs on a worker thread instead, so a
+        # blocking call does not starve the heartbeat task; async methods run
+        # on the loop either way.
+        call = _call_backend if self._backend_ops_in_thread else _call_on_loop
+        result = await call(
             method,
             *_serde.load_backend_result(input.args),
             **_serde.load_backend_result(input.kwargs),

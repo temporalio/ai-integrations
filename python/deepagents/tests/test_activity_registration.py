@@ -120,6 +120,11 @@ def _backend() -> Any:
             [{"streaming_batch_interval": timedelta(seconds=1)}],
             "2 times for this Worker (1 on the Client, 1 on the Worker) with a different streaming_batch_interval.",
         ),
+        (
+            [{}],
+            [{"backend_ops_in_thread": True}],
+            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different backend_ops_in_thread.",
+        ),
     ],
     ids=[
         "two-on-client",
@@ -128,6 +133,7 @@ def _backend() -> Any:
         "different-model-provider",
         "different-backend-factory",
         "different-batch-interval",
+        "different-backend-ops-in-thread",
     ],
 )
 async def test_second_instance_is_refused(
