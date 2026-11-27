@@ -27,6 +27,8 @@ from temporalio.exceptions import ApplicationError, is_cancelled_exception
 if TYPE_CHECKING:
     from langchain_core.language_models import ModelProfile
 
+    from temporalio.deepagents._approvals import ApprovalHandler
+
 # Reserved key under which the CAN result cache rides inside a state snapshot.
 _CACHE_KEY = "__temporal_cache__"
 _INPUT_CARRIED_KEY = "__temporal_input_in_transcript__"
@@ -403,6 +405,7 @@ def _has_pending_work(result: Any) -> bool:
 def create_temporal_deep_agent(
     *args: Any,
     activity_options: Mapping[str, Any] | None = None,
+    approval_handler: ApprovalHandler | None = None,
     **kwargs: Any,
 ) -> Any:
     """Build a Deep Agent whose model calls run as durable activities.
@@ -418,6 +421,28 @@ def create_temporal_deep_agent(
     plugin substitutes the durable model automatically, using the plugin's
     ``model_activity_options``); use this wrapper to scope activity options
     to one agent instead of configuring them plugin-wide.
+
+    ``approval_handler`` changes how ``interrupt_on`` waits. Without it, a
+    guarded tool call raises the native ``__interrupt__`` and the run resumes
+    with ``Command(resume=...)``. With it, each guarded call waits on its own:
+    the tool call awaits ``approval_handler(request_id, request)``, where
+    ``request_id`` is the model's tool call id (with a ``#2``, ``#3``, ...
+    suffix when this agent already asked under that id, so an id is never
+    reused) and ``request`` is a native ``HITLRequest`` with one action, and
+    applies the native ``HITLResponse`` it returns (one decision). A call that
+    tool middleware retries keeps its decision. Sibling sub-agents keep
+    running meanwhile; the agent still waits for all of a message's tool
+    results before its next model call. ``interrupt_on`` keeps its meaning:
+    sub-agents inherit or override it as usual, and ``allowed_decisions``,
+    ``description`` and ``when`` apply. The handler runs in the workflow, so
+    it usually records the request for a Query and waits with
+    ``workflow.wait_condition`` for an Update. It needs ``ainvoke``.
+
+    Raises:
+        ValueError: If ``approval_handler`` is combined with a
+            ``HumanInTheLoopMiddleware`` passed in ``middleware`` (the agent's
+            or a sub-agent's), or the installed langchain or deepagents cannot
+            apply decisions per tool call.
     """
     with workflow.unsafe.imports_passed_through():
         # importlib keeps this resolution absolute: a static
@@ -452,7 +477,17 @@ def create_temporal_deep_agent(
         args = (model, *args[1:])
     else:
         kwargs["model"] = model
-    return deepagents_mod.create_deep_agent(*args, **kwargs)
+    if approval_handler is None:
+        return deepagents_mod.create_deep_agent(*args, **kwargs)
+    from temporalio.deepagents._approvals import (
+        approval_scope,
+        check_approval_config,
+    )
+
+    # Deep Agents also takes tools as the second positional argument.
+    check_approval_config({**kwargs, "tools": args[1]} if len(args) > 1 else kwargs)
+    with approval_scope(approval_handler):
+        return deepagents_mod.create_deep_agent(*args, **kwargs)
 
 
 async def get_model_profile(
