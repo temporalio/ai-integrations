@@ -650,7 +650,7 @@ uv add "temporalio-strands-agents[mcp]"
 
 `StrandsPlugin(mcp_clients=...)` takes a mapping of `name → mcp.Client factory`. The worker calls a factory each time it opens a connection, so return a new `mcp.Client` and transport from every call, and do not cache it. The plugin registers the `temporalio-mcp` activities for each server, such as `temporalio.mcp.{name}.list-tools` and `temporalio.mcp.{name}.call-tool`. Workflow-side, `TemporalMCPClient(server="name")` is a pure handle: it references the server by name, discovers tools by running `list-tools`, and carries the per-call activity options.
 
-These are the activities that `temporalio.mcp.MCPPlugin` registers, so `temporalio.mcp.TemporalMCPClient` can also use these servers, for prompts and resources for example, as long as it passes no `factory_argument`. Don't register the same server name through `MCPPlugin` or `OpenAIAgentsPlugin` on the same worker: Temporal rejects the duplicate activity types.
+These are the activities that `temporalio.mcp.MCPPlugin` registers, so `temporalio.mcp.TemporalMCPClient` can also use these servers, for prompts and resources for example; its `factory_argument` follows the rules below. Don't register the same server name through `MCPPlugin` or `OpenAIAgentsPlugin` on the same worker: Temporal rejects the duplicate activity types.
 
 ```python
 from mcp import Client, StdioServerParameters, stdio_client
@@ -728,6 +728,38 @@ StrandsPlugin(
     mcp_connection_idle_timeout=timedelta(seconds=30),
 )
 ```
+
+A factory may instead take one required positional parameter. `TemporalMCPClient(server=..., factory_argument=...)` passes its `factory_argument` to it, `None` when the handle sets none. A non-`None` argument creates a fresh client for every activity, closed when the activity ends, instead of sharing the worker-process connection. It is recorded in workflow history, so use only a stable, non-secret identifier, and resolve URLs, tokens and other secrets inside the worker-side factory. For example, a workflow that acts for a human caller, against an MCP server that authorizes each request with that caller's own credential, passes the caller's id; a shared connection would carry one caller's credential into another caller's run:
+
+```python
+# workflow
+@workflow.defn
+class CallerWorkflow:
+    @workflow.run
+    async def run(self, caller_id: str, prompt: str) -> str:
+        github = TemporalMCPClient(
+            server="github",
+            factory_argument=caller_id,
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        agent = TemporalAgent(start_to_close_timeout=timedelta(seconds=60), tools=[github])
+        return str(await agent.invoke_async(prompt))
+
+# worker
+def github_client(caller_id: str | None) -> Client:
+    # Only caller_id is in workflow history; the credential is resolved here.
+    token = credentials.token_for(caller_id)
+    return Client(
+        streamable_http_client(
+            "https://mcp.example.com/github",
+            http_client=httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}),
+        )
+    )
+
+Worker(..., plugins=[StrandsPlugin(mcp_clients={"github": github_client})])
+```
+
+A handle that passes a non-`None` `factory_argument` to a factory that takes no arguments fails its activity without a retry, with `temporalio-mcp`'s error naming the server. `StrandsPlugin` passes the argument only to a factory that needs it: unlike `MCPPlugin`, which passes it to any positional parameter, it calls a factory whose positional parameters all have defaults, such as `lambda params=params: Client(stdio_client(params))`, with no arguments, as before. `StrandsPlugin(...)` raises `TypeError` for a factory that needs two arguments or a keyword-only one.
 
 Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools` and `{name}-call-tool` activities. To upgrade:
 

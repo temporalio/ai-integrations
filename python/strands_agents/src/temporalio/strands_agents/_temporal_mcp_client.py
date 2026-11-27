@@ -70,17 +70,27 @@ class TemporalMCPClient(ToolProvider):
     ``MCPAgentTool`` whose ``mcp_client`` is the durable client, and runs in the
     workflow, so it must be deterministic.
 
+    ``factory_argument`` goes to the server's factory when that factory takes
+    one positional parameter (see ``StrandsPlugin``); it is ``None`` by
+    default. A non-``None`` argument opens a fresh worker-side client for every
+    activity instead of sharing the worker's pooled connection, and with a
+    factory that takes no arguments it fails the activity without a retry. The
+    argument is recorded in workflow history, so it must be a stable,
+    non-secret identifier, such as the id of the caller the run acts for; the
+    worker-side factory resolves it into URLs, tokens and other secrets.
+
     The activity options apply to every MCP activity. With neither
     ``start_to_close_timeout`` nor ``schedule_to_close_timeout``, a one-minute
     ``start_to_close_timeout`` applies. The default retry policy retries a
     failed activity, such as one whose MCP server is down, without limit; set
     ``retry_policy`` or ``schedule_to_close_timeout`` to bound it.
 
-    Construct once at module level and pass to ``TemporalAgent(tools=[...])``
-    inside the workflow. Multiple handles may reference the same server name
-    with different activity options or prefixes. On one agent, two handles of
-    a server must not list the same name: give them different prefixes or
-    disjoint ``tool_filters``.
+    Construct once at module level, or inside the workflow when the
+    ``factory_argument`` depends on the run, and pass to
+    ``TemporalAgent(tools=[...])``. Multiple handles may reference the same
+    server name with different activity options, prefixes or factory
+    arguments. On one agent, two handles of a server must not list the same
+    name: give them different prefixes or disjoint ``tool_filters``.
     """
 
     def __init__(
@@ -90,6 +100,7 @@ class TemporalMCPClient(ToolProvider):
         cache_tools: bool = False,
         prefix: str | None = None,
         tool_filters: ToolFilters | None = None,
+        factory_argument: Any = None,
         task_queue: str | None = None,
         schedule_to_close_timeout: timedelta | None = None,
         schedule_to_start_timeout: timedelta | None = None,
@@ -131,6 +142,7 @@ class TemporalMCPClient(ToolProvider):
             ),
             # TemporalAgent stops calling _refresh once a cached listing is fetched.
             cache_tools_list=False,
+            factory_argument=factory_argument,
         )
 
     @property
