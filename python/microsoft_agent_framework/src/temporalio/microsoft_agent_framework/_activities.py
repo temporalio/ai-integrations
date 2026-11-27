@@ -12,7 +12,7 @@ from email.utils import parsedate_to_datetime
 from functools import wraps
 from typing import Any, TypeVar, cast
 
-from agent_framework import SupportsChatGetResponse
+from agent_framework import ChatResponseUpdate, SupportsChatGetResponse
 
 from temporalio import activity
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
@@ -361,20 +361,35 @@ class ChatClientActivities:
         client = self._client(input.model)
         messages = _serde.load_messages(input.messages)
         options = _serde.load_options(input.options, self._hosted_mcp_headers)
-        recorder = _serde.StreamRecorder()
+        updates: list[ChatResponseUpdate] = []
 
         async def consume(publish: Callable[[dict[str, Any]], None] | None) -> None:
+            published = _serde.StreamRecorder()
             with _classify_provider_errors(input.model):
-                async for update in client.get_response(
+                stream = client.get_response(
                     messages, stream=True, options=options, client_kwargs=input.kwargs
-                ):
-                    serialized = recorder.add(update)
+                )
+                async for update in stream:
+                    updates.append(update)
+                    serialized = published.add(update)
                     if serialized is not None and publish is not None:
                         publish(serialized)
+                # The provider client's finalizer completes the updates in
+                # place (the OpenAI Responses client adds MCP search and Azure
+                # AI Search citation metadata and pairs completed computer
+                # calls). The workflow can only rebuild the response from the
+                # record, so the record is taken after it.
+                await stream.get_final_response()
+
+        def record() -> list[dict[str, Any]]:
+            recorder = _serde.StreamRecorder()
+            for update in updates:
+                recorder.add(update)
+            return recorder.updates
 
         if input.streaming_topic is None:
             await consume(None)
-            return recorder.updates
+            return record()
 
         # A batch goes out on the interval or at 256 updates, whichever comes
         # first, so a burst of token deltas stays under the payload limit.
@@ -400,4 +415,4 @@ class ChatClientActivities:
             raise _stream_publish_error(
                 err, input.model, input.streaming_topic
             ) from err
-        return recorder.updates
+        return record()

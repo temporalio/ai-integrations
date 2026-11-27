@@ -188,9 +188,15 @@ async def test_response_format_matches_the_native_request(
 
 
 class _SSEHandler(BaseHTTPRequestHandler):
-    """A Responses API endpoint that streams ``deltas`` as server-sent events."""
+    """A Responses API endpoint that streams ``deltas`` as server-sent events.
+
+    ``items`` are completed output items streamed before the message, and
+    ``annotations`` are added to the message's text.
+    """
 
     deltas: list[str] = []
+    items: list[dict[str, Any]] = []
+    annotations: list[dict[str, Any]] = []
     bodies: list[dict[str, Any]] = []
 
     def do_POST(self) -> None:
@@ -242,15 +248,26 @@ class _SSEHandler(BaseHTTPRequestHandler):
             "status": "in_progress",
             "content": [],
         }
-        where = {"item_id": "msg_1", "output_index": 0, "content_index": 0}
+        items = type(self).items
+        annotations = type(self).annotations
+        index = len(items)
+        where = {"item_id": "msg_1", "output_index": index, "content_index": 0}
         yield event(
             {"type": "response.created", "response": response("in_progress", [])}
         )
         yield event(
             {"type": "response.in_progress", "response": response("in_progress", [])}
         )
+        for output_index, done in enumerate(items):
+            yield event(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": done,
+                }
+            )
         yield event(
-            {"type": "response.output_item.added", "output_index": 0, "item": item}
+            {"type": "response.output_item.added", "output_index": index, "item": item}
         )
         yield event({"type": "response.content_part.added", **where, "part": part})
         for delta in type(self).deltas:
@@ -262,14 +279,27 @@ class _SSEHandler(BaseHTTPRequestHandler):
                     "logprobs": [],
                 }
             )
+        for annotation_index, annotation in enumerate(annotations):
+            yield event(
+                {
+                    "type": "response.output_text.annotation.added",
+                    **where,
+                    "annotation_index": annotation_index,
+                    "annotation": annotation,
+                }
+            )
         yield event(
             {"type": "response.output_text.done", **where, "text": full, "logprobs": []}
         )
-        done_part = {**part, "text": full}
+        done_part = {**part, "text": full, "annotations": annotations}
         yield event({"type": "response.content_part.done", **where, "part": done_part})
         done_item = {**item, "status": "completed", "content": [done_part]}
         yield event(
-            {"type": "response.output_item.done", "output_index": 0, "item": done_item}
+            {
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": done_item,
+            }
         )
         usage = {
             "input_tokens": 3,
@@ -281,7 +311,7 @@ class _SSEHandler(BaseHTTPRequestHandler):
         yield event(
             {
                 "type": "response.completed",
-                "response": response("completed", [done_item], usage),
+                "response": response("completed", [*items, done_item], usage),
             }
         )
 
@@ -291,7 +321,11 @@ class _SSEHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def sse_server() -> Iterator[tuple[str, type[_SSEHandler]]]:
-    handler = type("SSEHandler", (_SSEHandler,), {"deltas": [], "bodies": []})
+    handler = type(
+        "SSEHandler",
+        (_SSEHandler,),
+        {"deltas": [], "items": [], "annotations": [], "bodies": []},
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -348,3 +382,73 @@ async def test_streamed_record_stays_small_with_the_real_client(
     assert rebuilt.usage_details.get("output_token_count") == 200
     # The option the workflow sends reached the request body.
     assert handler.bodies[0]["store"] is False
+
+
+async def test_streamed_record_keeps_the_clients_citation_metadata(
+    sse_server: tuple[str, type[_SSEHandler]],
+) -> None:
+    url, handler = sse_server
+    document = {"id": "doc1", "title": "Refunds", "source": "https://kb.example/r"}
+    handler.deltas = ["Refunds take ", "5 days."]
+    handler.items = [
+        {
+            "id": "mcp_1",
+            "type": "mcp_call",
+            "server_label": "kb",
+            "name": "search",
+            "arguments": "{}",
+            "output": json.dumps(document),
+            "error": None,
+            "status": "completed",
+        }
+    ]
+    handler.annotations = [
+        {
+            "type": "url_citation",
+            "url": "mcp://searchindex/doc1",
+            "title": "doc1",
+            "start_index": 0,
+            "end_index": 20,
+        }
+    ]
+
+    def client() -> OpenAIChatClient:
+        return OpenAIChatClient(
+            model="gpt-4o",
+            async_client=AsyncOpenAI(api_key="test", base_url=url, max_retries=0),
+        )
+
+    def citations(response: ChatResponse) -> list[Any]:
+        return [
+            annotation.get("additional_properties")
+            for message in response.messages
+            for content in message.contents
+            if content.type == "text"
+            for annotation in content.annotations or []
+        ]
+
+    messages = [Message(role="user", contents=["refunds?"])]
+    stream = client().get_response(messages, stream=True, options={"store": False})
+    native = await stream.get_final_response()
+    activities = ChatClientActivities({"model": client})
+    record = await ActivityEnvironment().run(
+        activities.invoke_model_streaming,
+        InvokeModelStreamingInput(
+            model="model",
+            messages=[message.to_dict() for message in messages],
+            options={"store": False},
+        ),
+    )
+    # The client's stream finalizer adds the search document to the citation;
+    # the workflow rebuilds the response from the record alone, so the record
+    # must carry what the finalizer added.
+    rebuilt = ChatResponse.from_updates([load_update(entry) for entry in record])
+    assert citations(native) == [
+        {
+            "annotation_index": 0,
+            "mcp_document_id": "doc1",
+            "document_title": "Refunds",
+            "source": "https://kb.example/r",
+        }
+    ]
+    assert citations(rebuilt) == citations(native)
