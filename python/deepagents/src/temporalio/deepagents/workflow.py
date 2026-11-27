@@ -426,15 +426,17 @@ def create_temporal_deep_agent(
     guarded tool call raises the native ``__interrupt__`` and the run resumes
     with ``Command(resume=...)``. With it, each guarded call waits on its own:
     the tool call awaits ``approval_handler(request_id, request)``, where
-    ``request_id`` is the model's tool call id and ``request`` is a native
-    ``HITLRequest`` with one action, and applies the native ``HITLResponse``
-    it returns (one decision). Sibling sub-agents keep running meanwhile; the
-    agent still waits for all of a message's tool results before its next
-    model call. ``interrupt_on`` keeps its meaning: sub-agents inherit or
-    override it as usual, and ``allowed_decisions``, ``description`` and
-    ``when`` apply. The handler runs in the workflow, so it usually records the
-    request for a Query and waits with ``workflow.wait_condition`` for an
-    Update. It needs ``ainvoke``.
+    ``request_id`` is the model's tool call id (with a ``#2``, ``#3``, ...
+    suffix when this agent already asked under that id, so an id is never
+    reused) and ``request`` is a native ``HITLRequest`` with one action, and
+    applies the native ``HITLResponse`` it returns (one decision). A call that
+    tool middleware retries keeps its decision. Sibling sub-agents keep
+    running meanwhile; the agent still waits for all of a message's tool
+    results before its next model call. ``interrupt_on`` keeps its meaning:
+    sub-agents inherit or override it as usual, and ``allowed_decisions``,
+    ``description`` and ``when`` apply. The handler runs in the workflow, so
+    it usually records the request for a Query and waits with
+    ``workflow.wait_condition`` for an Update. It needs ``ainvoke``.
 
     Raises:
         ValueError: If ``approval_handler`` is combined with a
@@ -482,7 +484,8 @@ def create_temporal_deep_agent(
         check_approval_config,
     )
 
-    check_approval_config(kwargs)
+    # Deep Agents also takes tools as the second positional argument.
+    check_approval_config({**kwargs, "tools": args[1]} if len(args) > 1 else kwargs)
     with approval_scope(approval_handler):
         return deepagents_mod.create_deep_agent(*args, **kwargs)
 

@@ -920,11 +920,10 @@ async def test_guarded_structured_output_chosen_at_run_time_is_refused() -> None
     }
     with pytest.raises(ValueError, match="structured-output tool 'Answer'"):
         await middleware.aafter_model(state, None)
-    # Without structured output the hook does nothing.
-    assert (
-        await middleware.aafter_model({**state, "structured_response": None}, None)
-        is None
-    )
+    # A guarded call the model step did not answer goes to the tool node,
+    # where the handler asks; the hook does nothing.
+    unanswered = {"messages": state["messages"][:1], "structured_response": None}
+    assert await middleware.aafter_model(unanswered, None) is None
 
 
 @pytest.mark.asyncio
@@ -980,7 +979,8 @@ def test_guarded_structured_output_is_refused_on_the_sync_path_too() -> None:
     }
     with pytest.raises(ValueError, match="structured-output tool 'Answer'"):
         middleware.after_model(state, None)
-    assert middleware.after_model({**state, "structured_response": None}, None) is None
+    unanswered = {"messages": state["messages"][:1], "structured_response": None}
+    assert middleware.after_model(unanswered, None) is None
 
 
 class _ExecutingMiddleware(AgentMiddleware):
@@ -1131,3 +1131,261 @@ async def test_guarded_return_direct_tool_from_other_sources_is_refused_at_call(
 
     with pytest.raises(ValueError, match="return_direct tool 'direct_publish'"):
         await middleware.awrap_tool_call(request, handler)
+
+
+def test_approval_handler_refuses_a_guarded_return_direct_tool_passed_positionally() -> (
+    None
+):
+    """Deep Agents takes tools as the second positional argument; they are
+    checked the same as tools=."""
+    with pytest.raises(ValueError, match="return_direct tool 'direct_publish'"):
+        create_temporal_deep_agent(
+            "fake:main",
+            [direct_publish],
+            interrupt_on={"direct_publish": True},
+            approval_handler=_never,
+        )
+    create_temporal_deep_agent(
+        "fake:main",
+        [direct_publish],
+        interrupt_on={"direct_publish": False},
+        approval_handler=_never,
+    )
+
+
+def _guarded_request(call_id: str, note: str) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        tool_call={"name": "publish_note", "args": {"note": note}, "id": call_id},
+        tool=None,
+        state={},
+        runtime=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_ids_are_not_reused_after_a_decision() -> None:
+    """A model can reuse a call id in a later turn; the second call gets its
+    own request id, so a late decision for the first cannot match it."""
+    from temporalio.deepagents._approvals import (
+        _ApprovalScope,
+        _PerCallApprovalMiddleware,
+    )
+
+    asked: list[tuple[str, Any]] = []
+
+    async def approve(request_id: str, request: HITLRequest) -> HITLResponse:
+        asked.append((request_id, request["action_requests"][0]["args"]))
+        return {"decisions": [{"type": "approve"}]}
+
+    middleware = _PerCallApprovalMiddleware(
+        _ApprovalScope(approve), interrupt_on={"publish_note": True}
+    )
+
+    async def run(request: Any) -> Any:
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    for note in ("x", "y", "z"):
+        await middleware.awrap_tool_call(_guarded_request("c-1", note), run)
+    assert asked == [
+        ("c-1", {"note": "x"}),
+        ("c-1#2", {"note": "y"}),
+        ("c-1#3", {"note": "z"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_retried_call_reuses_its_decision() -> None:
+    """ToolRetryMiddleware outside the approval runs the same call again after
+    a retryable error; native HITL reviews a call once, so the retry reuses
+    the decision instead of asking again."""
+    from langchain.agents.middleware import ToolRetryMiddleware
+
+    from temporalio.deepagents._approvals import (
+        _ApprovalScope,
+        _PerCallApprovalMiddleware,
+    )
+
+    asked: list[str] = []
+
+    async def edit(request_id: str, request: HITLRequest) -> HITLResponse:
+        asked.append(request_id)
+        return {
+            "decisions": [
+                {
+                    "type": "edit",
+                    "edited_action": {"name": "publish_note", "args": {"note": "y"}},
+                }
+            ]
+        }
+
+    middleware = _PerCallApprovalMiddleware(
+        _ApprovalScope(edit),
+        interrupt_on={"publish_note": {"allowed_decisions": ["edit"]}},
+    )
+    retry = ToolRetryMiddleware(max_retries=2, initial_delay=0.0, jitter=False)
+    ran: list[Any] = []
+
+    async def flaky(request: Any) -> Any:
+        ran.append(request.tool_call["args"])
+        if len(ran) == 1:
+            raise RuntimeError("transient")
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    request = _guarded_request("c-1", "x")
+    original = request.tool_call
+    request.override = lambda **kw: type(request)(**{**vars(request), **kw})
+    result = await retry.awrap_tool_call(
+        request, lambda r: middleware.awrap_tool_call(r, flaky)
+    )
+    assert asked == ["c-1"]
+    assert ran == [{"note": "y"}, {"note": "y"}]
+    assert result.content.endswith("ok")
+    assert original["args"] == {"note": "x"}
+
+
+@pytest.mark.asyncio
+async def test_guarded_structured_output_that_fails_validation_is_refused() -> None:
+    """LangChain answers a schema call that fails validation with a retry tool
+    message and no structured response; that guarded call is refused too."""
+    from temporalio.deepagents._approvals import (
+        _ApprovalScope,
+        _PerCallApprovalMiddleware,
+    )
+
+    middleware = _PerCallApprovalMiddleware(
+        _ApprovalScope(_never), interrupt_on={"Answer": True}
+    )
+    call = {"name": "Answer", "args": {"wrong": 1}, "id": "a-1"}
+    state: dict[str, Any] = {
+        "messages": [
+            AIMessage(content="", tool_calls=[call]),
+            ToolMessage(
+                content="Error: validation failed, please fix your mistakes.",
+                tool_call_id="a-1",
+                name="Answer",
+            ),
+        ],
+    }
+    with pytest.raises(ValueError, match="structured-output tool 'Answer'"):
+        await middleware.aafter_model(state, None)
+    with pytest.raises(ValueError, match="structured-output tool 'Answer'"):
+        middleware.after_model(state, None)
+
+
+def _schema_task_with_inner_agent() -> _ScriptedModels:
+    task = _call("task", {"description": "Publish x.", "subagent_type": "pub"}, "t-1")
+    return _ScriptedModels(
+        {
+            "fake:main": [AIMessage(content="", tool_calls=[task]), "Done."],
+            "fake:pub": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        _call("build_inner_agent", {}, "b-1"),
+                        _call("publish_note", {"note": "x"}, "pub-1"),
+                    ],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[_call("Report", {"summary": "published x"}, "r-1")],
+                ),
+            ],
+        }
+    )
+
+
+@workflow.defn
+class CompileScopeWorkflow:
+    """A sub-agent compiled at run time asks the handler, while an agent one
+    of its tools builds without a handler keeps the native interrupt."""
+
+    def __init__(self) -> None:
+        self.approvals = _Approvals()
+        self.inner_middleware: list[str] = []
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        from deepagents.middleware.subagents import (
+            SUBAGENT_RESPONSE_FORMAT_CONFIG_KEY,
+        )
+
+        @lc_tool
+        async def build_inner_agent() -> str:
+            """Build another agent, without an approval handler."""
+            inner = create_temporal_deep_agent(
+                model="fake:inner", interrupt_on={"write_file": True}
+            )
+            self.inner_middleware = sorted(
+                node for node in inner.get_graph().nodes if "after_model" in node
+            )
+            return "built"
+
+        agent = create_temporal_deep_agent(
+            model="fake:main",
+            subagents=[
+                {
+                    "name": "pub",
+                    "description": "Publishes.",
+                    "system_prompt": "Publish.",
+                    "model": "fake:pub",
+                    "tools": [
+                        build_inner_agent,
+                        activity_as_tool(publish_note, activity_options=_OPTIONS),
+                    ],
+                }
+            ],
+            interrupt_on={"publish_note": _APPROVE_OR_REJECT},
+            approval_handler=self.approvals.review_tool_call,
+        )
+        await agent.ainvoke(
+            {"messages": [{"role": "user", "content": "Publish x."}]},
+            {"configurable": {SUBAGENT_RESPONSE_FORMAT_CONFIG_KEY: Report}},
+        )
+        return self.inner_middleware
+
+    @workflow.query
+    def pending_approvals(self) -> dict[str, HITLRequest]:
+        return self.approvals.pending
+
+    @workflow.update
+    def decide(self, request_id: str, response: HITLResponse) -> None:
+        self.approvals.responses[request_id] = response
+
+    @decide.validator
+    def check_decide(self, request_id: str, response: HITLResponse) -> None:
+        self.approvals.validate(request_id, response)
+
+
+@pytest.mark.asyncio
+async def test_approval_scope_ends_with_the_run_time_compilation(
+    env: WorkflowEnvironment,
+) -> None:
+    """Only the run-time compilation of the sub-agent uses the outer handler;
+    an agent built while the sub-agent runs keeps its own (native) setting."""
+    _LANE.reset()
+    async with Worker(
+        env.client,
+        task_queue="da-compile-scope",
+        workflows=[CompileScopeWorkflow],
+        activities=[publish_note],
+        plugins=[DeepAgentsPlugin(model_provider=_schema_task_with_inner_agent())],
+    ):
+        handle = await env.client.start_workflow(
+            CompileScopeWorkflow.run,
+            id=f"da-compile-scope-{uuid.uuid4()}",
+            task_queue="da-compile-scope",
+        )
+
+        async def pending() -> dict[str, Any]:
+            return await handle.query(CompileScopeWorkflow.pending_approvals)
+
+        assert sorted(await _eventually(pending, "the request")) == ["pub-1"]
+        await handle.execute_update(
+            CompileScopeWorkflow.decide, args=["pub-1", _decision(True)]
+        )
+        inner = await handle.result()
+    assert _LANE.published == ["x"]
+    assert "HumanInTheLoopMiddleware.after_model" in inner
+    assert not any("_PerCallApproval" in node for node in inner)

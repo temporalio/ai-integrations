@@ -508,7 +508,10 @@ the policy, and each call it guards awaits `approval_handler(request_id,
 request)` instead of interrupting the graph, while sibling sub-agents keep
 running. `request_id` is the model's tool call id, `request` a native
 `HITLRequest` with one action, and the handler returns a native `HITLResponse`
-with one decision. No checkpointer is needed.
+with one decision. A model can reuse a call id in a later turn, so when the
+agent already asked under that id, the next request gets `#2`, then `#3`, and
+so on: an id is never reused, even after its decision, so a late decision
+cannot be applied to a different call. No checkpointer is needed.
 
 ```python
 from langchain.agents.middleware.human_in_the_loop import HITLRequest, HITLResponse
@@ -562,10 +565,14 @@ with, for example, `{"decisions": [{"type": "approve"}]}` or
 Decisions are applied as `interrupt_on` applies them: `allowed_decisions`,
 `description` and `when` hold, sub-agents inherit or override `interrupt_on`,
 a rejected or answered (`respond`) call does not run, and an edited one runs
-with the reviewer's arguments (the model's message keeps its own). A sub-agent
+with the reviewer's arguments (the model's message keeps its own). A call that
+tool middleware runs again, such as `ToolRetryMiddleware` after a retryable
+error, keeps its decision instead of asking again. A sub-agent
 that Deep Agents compiles again while the agent runs, for a task call whose
-config carries a response schema, asks the handler too. Validate the decision
-type in the validator: one the tool does not allow fails the workflow task. The agent still collects every result of a message before its next model
+config carries a response schema, asks the handler too; an agent that one of
+the sub-agent's tools builds keeps its own setting. Validate the decision
+type in the validator: one the tool does not allow fails the workflow task.
+The agent still collects every result of a message before its next model
 call. The handler needs `ainvoke`, and cannot be combined with a
 `HumanInTheLoopMiddleware` passed in `middleware=`; that, or a langchain too
 old to apply decisions per call, fails when the agent is built. Structured
@@ -574,7 +581,8 @@ without native structured output) comes back from the model call and never
 reaches the tool-call step, so guarding its schema in `interrupt_on` with a
 handler also fails: when the agent is built, or after the model call for a
 response format chosen at run time (other tool calls in the same message are
-still asked). Use the native interrupt for that. Approval runs inside the
+still asked, and a schema call that fails validation, which LangChain hands
+back to the model, is refused too). Use the native interrupt for that. Approval runs inside the
 tool-call chain, so the handler also cannot be combined with `middleware=`
 (on the agent or a sub-agent) that overrides `wrap_tool_call` or
 `awrap_tool_call`, which could run a tool without calling the next handler and
