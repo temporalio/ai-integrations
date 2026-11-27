@@ -18,13 +18,17 @@ Every method:
 * translates the LLM SDK's HTTP error into Temporal's retry contract so a 429
   honors the upstream ``retry-after`` instead of hammering it;
 * heartbeats on a background task so a slow (thinking-mode / long-context) call
-  is not mistaken for a stuck worker.
+  is not mistaken for a stuck worker — and so cancellation can reach it, since
+  a Python activity observes cancellation only through a heartbeat response.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import dataclasses
+import functools
 import importlib
 import inspect
 from collections.abc import Mapping
@@ -46,6 +50,55 @@ GET_MODEL_PROFILE = "deepagents.get_model_profile"
 
 CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
 """``ApplicationError.type`` of a model call the provider rejected as too long."""
+
+
+# Default heartbeat timeout for model calls (``invoke_model`` and
+# ``invoke_model_streaming``), applied by the model dispatch seam via
+# :func:`apply_default_heartbeat_timeout` (user-supplied options always win,
+# including an explicit ``heartbeat_timeout=None`` opt-out). Tools and backend
+# operations run arbitrary application code, so they get no default: their
+# activities still auto-heartbeat, but only when the caller configures
+# ``heartbeat_timeout`` explicitly. Model calls go through LangChain, which
+# runs sync implementations on worker threads, so the heartbeat task below keeps
+# beating however slow the call is. A synchronous ``model_provider`` is called
+# on the event loop unless the worker opts in to a thread (see
+# ``DeepAgentsPlugin(model_provider_in_thread=...)``), because providers may
+# bind to the running loop. (A model or provider that blocks the loop starves
+# any heartbeat timeout, this default included.) Without a timeout the
+# server cannot tell a crashed worker from a slow call until start-to-close
+# (five minutes for a model call), and cancellation never reaches the call at
+# all, because a Python activity observes cancellation solely through a
+# heartbeat response.
+# Ten seconds, as in the repository's other plugins (#491).
+DEFAULT_HEARTBEAT_TIMEOUT = timedelta(seconds=10)
+
+
+def apply_default_heartbeat_timeout(opts: dict[str, Any]) -> None:
+    """Set ``heartbeat_timeout`` unless already configured, capped by the
+    schedule's own close timeouts.
+
+    The plugin, not server-side normalization, defines the relationship: the
+    heartbeat timeout never outlives ``start_to_close_timeout`` or
+    ``schedule_to_close_timeout`` (whichever are set), so a short activity gets
+    a proportionally short heartbeat timeout rather than a value the platform
+    would have to clamp. Call this after those defaults are resolved.
+    """
+    if "heartbeat_timeout" in opts:
+        return
+    # A zero close timeout is unset to the server, which then enforces the
+    # other one; capping by zero would zero the heartbeat timeout and turn the
+    # default off. Cap only by the close timeout that is in force.
+    caps = [
+        timeout
+        for timeout in (
+            opts.get("start_to_close_timeout"),
+            opts.get("schedule_to_close_timeout"),
+        )
+        if timeout
+    ]
+    opts["heartbeat_timeout"] = (
+        min(DEFAULT_HEARTBEAT_TIMEOUT, *caps) if caps else DEFAULT_HEARTBEAT_TIMEOUT
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -152,18 +205,39 @@ def _auto_heartbeater(fn: Callable) -> Callable:
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
         heartbeat_timeout = activity.info().heartbeat_timeout
         beat_task: asyncio.Task | None = None
+        token = None
         if heartbeat_timeout:
             interval = heartbeat_timeout.total_seconds() / 2
+            # Temporal keeps only the latest heartbeat's details, so a timer
+            # beat with no details would overwrite a checkpoint the
+            # application saved with ``activity.heartbeat(...)``. Record the
+            # latest application details (starting from the previous
+            # attempt's) and repeat them on every timer beat.
+            context = activity._Context.current()  # pyright: ignore[reportPrivateUsage]
+            send = context.heartbeat
+            latest: list[tuple[Any, ...]] = [tuple(activity.info().heartbeat_details)]
+            if send is not None:
+
+                def record(*details: Any) -> None:
+                    latest[0] = details
+                    send(*details)
+
+                token = activity._Context.set(  # pyright: ignore[reportPrivateUsage]
+                    dataclasses.replace(context, heartbeat=record)
+                )
 
             async def beat() -> None:
                 while True:
-                    activity.heartbeat()
+                    if send is not None:
+                        send(*latest[0])
                     await asyncio.sleep(interval)
 
             beat_task = asyncio.create_task(beat())
         try:
             return await fn(*args, **kwargs)
         finally:
+            if token is not None:
+                activity._Context.reset(token)  # pyright: ignore[reportPrivateUsage]
             if beat_task is not None:
                 beat_task.cancel()
                 # Let the cancellation land before returning so no pending task
@@ -173,6 +247,92 @@ def _auto_heartbeater(fn: Callable) -> Callable:
                 await asyncio.wait([beat_task])
 
     return wrapped
+
+
+def _is_async_callable(fn: Any) -> bool:
+    """Return whether calling ``fn`` only creates a coroutine.
+
+    True for an ``async def``, a bound async method, a ``functools.partial``
+    of one, or an object whose ``__call__`` is ``async def``.
+    """
+    return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(
+        getattr(fn, "__call__", None)
+    )
+
+
+async def _call_on_loop(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Call ``fn`` on the activity's event loop and await what it returns.
+
+    ``fn`` is positional-only so a backend method's own ``fn=`` keyword
+    reaches it unchanged.
+    """
+    result = fn(*args, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+async def _call_backend(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Call a backend method or factory, or the model provider, off the loop.
+
+    A native async callable runs directly on the activity's event loop, so it
+    never waits for a free thread in the default executor (which slow
+    synchronous model, tool or backend calls may be holding). A synchronous
+    callable (``subprocess.run`` in ``LocalShellBackend.execute``, filesystem
+    reads) runs on a worker thread so the auto-heartbeater keeps beating. That
+    thread gets a copy of the activity context whose heartbeat is handed back
+    to the activity's loop: the SDK's heartbeat for an async activity schedules
+    a task on the running loop and fails from any other thread. An awaitable
+    returned either way is awaited on the loop.
+
+    A thread cannot be stopped, so when the activity is cancelled while the
+    synchronous call runs, the cancellation is acknowledged only once the call
+    has returned: cleanup that waits for the cancelled activity then never
+    overlaps a write still in progress. ``fn`` is positional-only so a backend
+    method's own ``fn=`` keyword reaches it unchanged.
+    """
+    if _is_async_callable(fn):
+        return await _call_on_loop(fn, *args, **kwargs)
+    loop = asyncio.get_running_loop()
+    context = (
+        activity._Context.current()  # pyright: ignore[reportPrivateUsage]
+        if activity.in_activity()
+        else None
+    )
+
+    def run() -> Any:
+        # This runs in a copy of the caller's contextvars, so the context
+        # set here is seen only by this call.
+        if context is not None and context.heartbeat is not None:
+            heartbeat = context.heartbeat
+
+            def heartbeat_from_thread(*details: Any) -> None:
+                loop.call_soon_threadsafe(heartbeat, *details)
+
+            activity._Context.set(  # pyright: ignore[reportPrivateUsage]
+                dataclasses.replace(context, heartbeat=heartbeat_from_thread)
+            )
+        return fn(*args, **kwargs)
+
+    # What asyncio.to_thread does, keeping the executor future so a
+    # cancellation can wait for the thread instead of abandoning it.
+    future = loop.run_in_executor(
+        None, functools.partial(contextvars.copy_context().run, run)
+    )
+    try:
+        result = await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait([future])
+        if not future.cancelled() and future.exception() is None:
+            leftover = future.result()
+            if inspect.iscoroutine(leftover):
+                leftover.close()
+        raise
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 def _translate_api_error(exc: Exception) -> ApplicationError | None:
@@ -349,14 +509,29 @@ class DeepAgentActivities:
         model_provider: Callable[[str], Any] | None = None,
         backends: Mapping[str, Callable[..., Any]] | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
+        model_provider_in_thread: bool = False,
+        backend_ops_in_thread: bool = False,
     ) -> None:
         """Store worker-side model and backend factories and streaming settings."""
         self._model_provider = model_provider or _default_model_provider
+        self._model_provider_in_thread = model_provider_in_thread
+        self._backend_ops_in_thread = backend_ops_in_thread
         self._backends = {
             name: _BackendFactory(name, factory)
             for name, factory in (backends or {}).items()
         }
         self._streaming_batch_interval = streaming_batch_interval
+
+    async def _construct(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Build a model: on the loop by default, on a worker thread on opt-in.
+
+        A synchronous provider may create an object bound to the running event
+        loop (an ``aiohttp`` session), so it runs on the loop unless
+        ``model_provider_in_thread`` is set. Awaitables are awaited either way.
+        """
+        if self._model_provider_in_thread:
+            return await _call_backend(fn, *args)
+        return await _call_on_loop(fn, *args)
 
     def _build_bound_model(self, input: ModelActivityInput) -> Any:
         model = self._model_provider(input.model_name)
@@ -371,9 +546,11 @@ class DeepAgentActivities:
         return model
 
     @activity.defn(name=GET_MODEL_PROFILE)
+    @_auto_heartbeater
     async def get_model_profile(self, model_name: str) -> dict[str, Any] | None:
         """Return the LangChain profile of the model the provider builds for a name."""
-        profile = getattr(self._model_provider(model_name), "profile", None)
+        model = await self._construct(self._model_provider, model_name)
+        profile = getattr(model, "profile", None)
         return dict(profile) if profile else None
 
     @activity.defn(name=INVOKE_MODEL)
@@ -382,7 +559,7 @@ class DeepAgentActivities:
         """Run exactly one LLM call and return the resulting ``AIMessage``."""
         messages = _serde.load_messages(input.messages)
         config = _serde.rebuild_runnable_config(input.config)
-        model = self._build_bound_model(input)
+        model = await self._construct(self._build_bound_model, input)
         try:
             message = await model.ainvoke(messages, config=config)
         except Exception as exc:
@@ -414,7 +591,7 @@ class DeepAgentActivities:
 
         messages = _serde.load_messages(input.messages)
         config = _serde.rebuild_runnable_config(input.config)
-        model = self._build_bound_model(input)
+        model = await self._construct(self._build_bound_model, input)
 
         final: Any = None
         try:
@@ -485,10 +662,7 @@ class DeepAgentActivities:
                     type="DeepAgentsUnknownBackendFactory",
                     non_retryable=True,
                 )
-            # Preserve the activity context without blocking heartbeat tasks.
-            backend = await asyncio.to_thread(factory, input.factory_argument)
-            if inspect.isawaitable(backend):
-                backend = await backend
+            backend = await _call_backend(factory, input.factory_argument)
         else:
             backend = lookup_backend(input.backend_ref)
         if backend is None:
@@ -506,12 +680,17 @@ class DeepAgentActivities:
                 type="DeepAgentsUnknownBackendOp",
                 non_retryable=True,
             )
-        result = method(
+        # A sync method runs on the event loop by default, because it may need
+        # the running loop (to create an ``aiohttp`` session, say). With
+        # ``backend_ops_in_thread`` it runs on a worker thread instead, so a
+        # blocking call does not starve the heartbeat task; async methods run
+        # on the loop either way.
+        call = _call_backend if self._backend_ops_in_thread else _call_on_loop
+        result = await call(
+            method,
             *_serde.load_backend_result(input.args),
             **_serde.load_backend_result(input.kwargs),
         )
-        if asyncio.iscoroutine(result):
-            result = await result
         # Protocol results are plain dataclasses whose attributes the
         # middleware reads in-workflow — tag them so the stub can rebuild
         # the real type instead of receiving a decayed dict.

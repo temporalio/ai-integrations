@@ -177,11 +177,55 @@ get it. That is the usual order for a tools module imported under
 tool's options there.
 
 When you set nothing, a model call and `get_model_profile` get a 5-minute
-start-to-close timeout. A backend operation gets 1 minute. The plugin sets no
-heartbeat timeout. Without one, a cancelled Workflow's model call runs to its
-end, and a lost Worker is noticed only when the start-to-close timeout expires.
-With `heartbeat_timeout` set, the plugin's model, tool and backend Activities
-heartbeat on a timer.
+start-to-close timeout and a 10-second heartbeat timeout. A backend operation
+gets 1 minute and no heartbeat timeout.
+
+Model calls — `invoke_model` and `invoke_model_streaming` — heartbeat on a
+background task and are scheduled with a default `heartbeat_timeout` of 10
+seconds, as in the other plugins in this repository, never exceeding the schedule's own start-to-close (or
+schedule-to-close) timeout. The heartbeater beats at half the timeout, and LangChain
+runs sync models on worker threads, so slow model calls of any length keep
+heartbeating. A synchronous `model_provider` is called on the activity's event
+loop, because providers may create loop-bound objects such as an `aiohttp`
+session; a provider that blocks longer than the heartbeat timeout (loading a
+local model) should set `DeepAgentsPlugin(model_provider_in_thread=True)` so the
+heartbeater keeps beating while it builds — it then must not depend on the
+running loop. The heartbeat default changes how a dead worker or a
+cancellation is noticed, not how long a healthy call may run. It buys two
+things: a crashed worker's model call is timed out within the heartbeat timeout
+and retried per its retry policy instead of waiting out
+`start_to_close_timeout`, and workflow cancellation — which a Python activity
+only observes through a heartbeat — reaches a running model call instead of
+never. The SDK sends at most one heartbeat per 80% of the heartbeat timeout,
+so cancellation can take up to about the whole heartbeat timeout to arrive
+(10 s with the default), not half of it. Override or disable it with
+`heartbeat_timeout` (including `None`) in the model activity options above.
+`get_model_profile` gets the same default and heartbeats the same way.
+
+Tools and backend operations get no default heartbeat timeout. They run
+arbitrary application code with their own execution, progress-reporting and
+cancellation behavior, so the application decides when background heartbeats
+are appropriate: set `heartbeat_timeout` in `tool_activity_options`, a tool's
+`activity_options`, or `TemporalBackend(activity_options=...)`, and the
+plugin's `invoke_tool` and `backend_op` activities heartbeat in the background
+for you. Those background heartbeats repeat the details of the latest
+`activity.heartbeat(...)` call your code made (or, on a retry, the previous
+attempt's), so they never replace a saved checkpoint with empty details.
+
+`backend_op` calls a sync backend method on the activity's event loop, because
+a method may need the running loop (to create an `aiohttp` session, say), and
+awaits whatever it returns. A sync method that blocks, such as a shell command,
+then also blocks the heartbeater. Set
+`DeepAgentsPlugin(backend_ops_in_thread=True)` to run sync backend methods on a
+worker thread instead, so they keep heartbeating; they then must not depend on
+the running loop. Their `activity.heartbeat(...)` calls still work. A thread
+cannot be interrupted, so when the activity is cancelled during such a call it
+reports the cancellation only after the method returns. Async backend methods
+run on the loop either way, and a sync backend factory always runs on a worker
+thread.
+
+Activities you expose with `activity_as_tool(...)` are your own; the plugin
+never adds a heartbeat timeout to their schedule.
 
 ## Tools: the Workflow-vs-Activity choice, made explicit
 

@@ -12,8 +12,13 @@ A state-only backend needs no wrapping — that path is covered against the real
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import dataclasses
 import gc
 import inspect
+import threading
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -21,21 +26,26 @@ from typing import Any
 
 import pytest
 
-from temporalio.testing import WorkflowEnvironment
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 from temporalio.deepagents import DeepAgentsPlugin, TemporalBackend
+from temporalio.deepagents._activity import BackendOpInput, DeepAgentActivities
 from temporalio.deepagents._tools import (
     lookup_backend,
     register_backend,
     registered_backends,
 )
 from temporalio.worker import Worker
-from tests.helpers.deepagents import count_scheduled_activities
+from tests.helpers.deepagents import (
+    all_scheduled_attributes,
+    count_scheduled_activities,
+    scheduled_attributes,
+)
 
 BACKEND_OP = "deepagents.backend_op"
 
@@ -147,6 +157,340 @@ async def test_temporal_backend_op_activity(env: WorkflowEnvironment) -> None:
     # One activity per op — the sync read, the async aread, and the optional
     # adelete all cross.
     assert counts[BACKEND_OP] == 3, counts
+    # Backend operations are opt-in for heartbeats: no default timeout.
+    attrs = await scheduled_attributes(handle, BACKEND_OP)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+
+
+@workflow.defn
+class BackendHeartbeatOptionsWorkflow:
+    @workflow.run
+    async def run(self, path: str) -> str:
+        overridden = TemporalBackend(
+            RecordingBackend(),
+            activity_options={"heartbeat_timeout": timedelta(seconds=7)},
+        )
+        opted_out = TemporalBackend(
+            RecordingBackend(),
+            activity_options={"heartbeat_timeout": None},
+        )
+        return f"{await overridden.read(path)}|{await opted_out.read(path)}"
+
+
+class BlockingReadBackend:
+    """A backend whose SYNC ``read`` blocks its thread — the shape of
+    ``LocalShellBackend.execute`` (``subprocess.run``) — so heartbeats keep
+    flowing during it only if ``backend_op`` dispatches it off the event
+    loop (``backend_ops_in_thread``)."""
+
+    def read(self, file_path: str) -> str:
+        time.sleep(3)
+        return f"slow contents of {file_path}"
+
+
+@workflow.defn
+class BlockingReadWorkflow:
+    @workflow.run
+    async def run(self, path: str) -> str:
+        backend = TemporalBackend(
+            BlockingReadBackend(),
+            activity_options={
+                "start_to_close_timeout": timedelta(seconds=30),
+                "heartbeat_timeout": timedelta(seconds=2),
+                "retry_policy": RetryPolicy(maximum_attempts=1),
+            },
+        )
+        return await backend.read(path)
+
+
+@pytest.mark.asyncio
+async def test_backend_activity_heartbeat_options_win(
+    env: WorkflowEnvironment,
+) -> None:
+    """``TemporalBackend(activity_options=...)`` heartbeat values are applied
+    as configured (backends have no default), ``heartbeat_timeout=None``
+    included."""
+    async with Worker(
+        env.client,
+        task_queue="da-backend-hb-opts",
+        workflows=[BackendHeartbeatOptionsWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        handle = await env.client.start_workflow(
+            BackendHeartbeatOptionsWorkflow.run,
+            "notes.txt",
+            id=f"da-backend-hb-opts-{uuid.uuid4()}",
+            task_queue="da-backend-hb-opts",
+        )
+        assert "contents of notes.txt|contents of notes.txt" in await handle.result()
+
+    heartbeats = [
+        attrs.heartbeat_timeout.ToTimedelta()
+        for attrs in await all_scheduled_attributes(handle, BACKEND_OP)
+    ]
+    assert heartbeats == [timedelta(seconds=7), timedelta(0)]
+
+
+@pytest.mark.asyncio
+async def test_blocking_backend_op_survives_heartbeat_timeout(
+    env: WorkflowEnvironment,
+) -> None:
+    """With ``backend_ops_in_thread``, a synchronous backend method that
+    outlasts the heartbeat timeout still completes: ``backend_op`` runs it off
+    the event loop, so the auto-heartbeater keeps beating while it blocks. Run
+    on the loop (the default), the same call starves the heartbeater and the
+    activity heartbeat-times out."""
+    async with Worker(
+        env.client,
+        task_queue="da-backend-blocking",
+        workflows=[BlockingReadWorkflow],
+        plugins=[DeepAgentsPlugin(backend_ops_in_thread=True)],
+    ):
+        out = await env.client.execute_workflow(
+            BlockingReadWorkflow.run,
+            "notes.txt",
+            id=f"da-backend-blocking-{uuid.uuid4()}",
+            task_queue="da-backend-blocking",
+        )
+    assert out == "slow contents of notes.txt"
+
+
+class ProgressReadBackend:
+    """A SYNC backend that reports progress with ``activity.heartbeat`` while it
+    works. With ``backend_ops_in_thread`` it runs on a worker thread, so its
+    heartbeats must be handed back to the activity's event loop."""
+
+    def read(self, file_path: str) -> str:
+        for step in range(3):
+            activity.heartbeat(f"step {step}")
+            time.sleep(0.2)
+        return f"contents of {file_path} on attempt {activity.info().attempt}"
+
+
+class AsyncReadBackend:
+    """A native async backend: ``backend_op`` must run it on the event loop."""
+
+    async def read(self, file_path: str) -> str:
+        await asyncio.sleep(0)
+        return f"async contents of {file_path}"
+
+
+@workflow.defn
+class OneReadWorkflow:
+    @workflow.run
+    async def run(self, ref: str, path: str) -> str:
+        backends = {"progress": ProgressReadBackend, "async": AsyncReadBackend}
+        backend = TemporalBackend(
+            backends[ref](),
+            activity_options={
+                "start_to_close_timeout": timedelta(seconds=5),
+                "heartbeat_timeout": timedelta(seconds=2),
+                "retry_policy": RetryPolicy(maximum_attempts=1),
+            },
+        )
+        return await backend.read(path)
+
+
+@pytest.mark.asyncio
+async def test_sync_backend_progress_heartbeats(env: WorkflowEnvironment) -> None:
+    """A synchronous backend method that calls ``activity.heartbeat`` on a
+    worker thread (``backend_ops_in_thread``) succeeds on its first attempt.
+    Its thread gets a heartbeat that the activity's loop sends; the SDK's own
+    heartbeat for an async activity fails with "no running event loop" when
+    called from a worker thread."""
+    async with Worker(
+        env.client,
+        task_queue="da-backend-progress",
+        workflows=[OneReadWorkflow],
+        plugins=[DeepAgentsPlugin(backend_ops_in_thread=True)],
+    ):
+        out = await env.client.execute_workflow(
+            OneReadWorkflow.run,
+            args=["progress", "notes.txt"],
+            id=f"da-backend-progress-{uuid.uuid4()}",
+            task_queue="da-backend-progress",
+        )
+    assert out == "contents of notes.txt on attempt 1"
+
+
+@pytest.mark.asyncio
+async def test_async_backend_op_runs_with_busy_default_executor(
+    env: WorkflowEnvironment,
+) -> None:
+    """A native async backend method runs on the activity's event loop, even
+    with ``backend_ops_in_thread``, so it completes while every thread of the
+    default executor is held by slow synchronous work. Created on a thread, its
+    coroutine would wait for a free thread past its start-to-close timeout."""
+    loop = asyncio.get_running_loop()
+    busy = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(busy)
+    release = threading.Event()
+    blocker = loop.run_in_executor(None, release.wait)
+    try:
+        async with Worker(
+            env.client,
+            task_queue="da-backend-async-busy",
+            workflows=[OneReadWorkflow],
+            plugins=[DeepAgentsPlugin(backend_ops_in_thread=True)],
+        ):
+            out = await env.client.execute_workflow(
+                OneReadWorkflow.run,
+                args=["async", "notes.txt"],
+                id=f"da-backend-async-busy-{uuid.uuid4()}",
+                task_queue="da-backend-async-busy",
+            )
+    finally:
+        release.set()
+        await blocker
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+        busy.shutdown(wait=False)
+    assert out == "async contents of notes.txt"
+
+
+def _heartbeat_env(heartbeat_timeout: timedelta | None) -> ActivityEnvironment:
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, heartbeat_timeout=heartbeat_timeout)
+    return env
+
+
+async def test_sync_backend_op_runs_on_the_loop_by_default() -> None:
+    """A synchronous backend method that needs the running event loop (an
+    ``aread`` wrapper that creates an ``aiohttp`` session before returning its
+    coroutine, say) works by default: ``backend_op`` calls it on the loop.
+    With ``backend_ops_in_thread`` it runs on a worker thread, where
+    ``get_running_loop`` raises."""
+
+    class LoopBoundBackend:
+        def aread(self, file_path: str) -> Any:
+            loop = asyncio.get_running_loop()  # RuntimeError off the loop
+
+            async def read() -> str:
+                assert asyncio.get_running_loop() is loop
+                return f"loop contents of {file_path}"
+
+            return read()
+
+    ref = f"loop-bound-{uuid.uuid4()}"
+    register_backend(ref, LoopBoundBackend())
+    input = BackendOpInput(backend_ref=ref, op="aread", args=["notes.txt"])
+    env = ActivityEnvironment()
+    out = await env.run(DeepAgentActivities().backend_op, input)
+    assert out.result == "loop contents of notes.txt"
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        await env.run(DeepAgentActivities(backend_ops_in_thread=True).backend_op, input)
+
+
+@pytest.mark.parametrize("in_thread", [False, True])
+async def test_backend_op_forwards_fn_keyword(in_thread: bool) -> None:
+    """A backend method's own ``fn`` keyword reaches it unchanged rather than
+    colliding with the dispatch helper's callable parameter."""
+
+    class KeywordBackend:
+        def apply(self, path: str, *, fn: str) -> str:
+            return f"{fn}({path})"
+
+    ref = f"keyword-{uuid.uuid4()}"
+    register_backend(ref, KeywordBackend())
+    out = await ActivityEnvironment().run(
+        DeepAgentActivities(backend_ops_in_thread=in_thread).backend_op,
+        BackendOpInput(
+            backend_ref=ref, op="apply", args=["notes.txt"], kwargs={"fn": "upper"}
+        ),
+    )
+    assert out.result == "upper(notes.txt)"
+
+
+async def test_cancelled_backend_op_waits_for_the_running_thread() -> None:
+    """A thread cannot be interrupted, so a cancelled ``backend_op`` raises
+    ``CancelledError`` only after its synchronous method has returned. A
+    workflow that waits for the cancellation to complete then never runs
+    cleanup while the cancelled write is still changing external state."""
+    started = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+
+    class SlowWriteBackend:
+        def write(self, file_path: str) -> str:
+            started.set()
+            release.wait(5)
+            events.append("write returned")
+            return file_path
+
+    ref = f"slow-write-{uuid.uuid4()}"
+    register_backend(ref, SlowWriteBackend())
+    env = ActivityEnvironment()
+    task = asyncio.create_task(
+        env.run(
+            DeepAgentActivities(backend_ops_in_thread=True).backend_op,
+            BackendOpInput(backend_ref=ref, op="write", args=["notes.txt"]),
+        )
+    )
+    await asyncio.to_thread(started.wait, 5)
+    env.cancel()
+    await asyncio.sleep(0.2)
+    # Still waiting on the thread, not yet acknowledged.
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == ["write returned"]
+
+
+@pytest.mark.parametrize("in_thread", [False, True])
+async def test_timer_heartbeats_keep_the_latest_checkpoint(in_thread: bool) -> None:
+    """The auto-heartbeater's timer beats repeat the latest details the backend
+    sent with ``activity.heartbeat``, rather than empty details that would
+    replace the checkpoint Temporal keeps for the next attempt."""
+
+    class CheckpointBackend:
+        def read(self, file_path: str) -> str:
+            activity.heartbeat("checkpoint 1")
+            time.sleep(0.35)  # past several timer beats
+            return file_path
+
+        async def aread(self, file_path: str) -> str:
+            activity.heartbeat("checkpoint 1")
+            await asyncio.sleep(0.35)
+            return file_path
+
+    ref = f"checkpoint-{uuid.uuid4()}"
+    register_backend(ref, CheckpointBackend())
+    env = _heartbeat_env(timedelta(seconds=0.1))
+    beats: list[tuple[Any, ...]] = []
+    env.on_heartbeat = lambda *details: beats.append(details)
+    await env.run(
+        DeepAgentActivities(backend_ops_in_thread=in_thread).backend_op,
+        BackendOpInput(
+            backend_ref=ref, op="read" if in_thread else "aread", args=["notes.txt"]
+        ),
+    )
+    checkpoint = beats.index(("checkpoint 1",))
+    after = beats[checkpoint:]
+    assert len(after) >= 3, beats
+    assert set(after) == {("checkpoint 1",)}, beats
+
+
+async def test_timer_heartbeats_keep_the_previous_attempts_checkpoint() -> None:
+    """On a retry, timer beats carry the previous attempt's details until the
+    backend sends new ones, so a crash before it re-checkpoints keeps them."""
+
+    class IdleBackend:
+        async def aread(self, file_path: str) -> str:
+            await asyncio.sleep(0.25)
+            return file_path
+
+    ref = f"idle-{uuid.uuid4()}"
+    register_backend(ref, IdleBackend())
+    env = _heartbeat_env(timedelta(seconds=0.1))
+    env.info = dataclasses.replace(env.info, heartbeat_details=["checkpoint 1"])
+    beats: list[tuple[Any, ...]] = []
+    env.on_heartbeat = lambda *details: beats.append(details)
+    await env.run(
+        DeepAgentActivities().backend_op,
+        BackendOpInput(backend_ref=ref, op="aread", args=["notes.txt"]),
+    )
+    assert beats and set(beats) == {("checkpoint 1",)}, beats
 
 
 TEXT_FILE = ("/notes.txt", b"hello\n")
