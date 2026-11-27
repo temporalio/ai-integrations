@@ -323,12 +323,39 @@ whole agent run. To let the model handle the failure instead, add a tool-call
 middleware to `create_deep_agent`. By the time the error reaches it, Temporal's
 retry policy has already finished, so the middleware only decides what the
 model sees: which tools and failure types to recover, and with what wording.
-Re-raise cancellation so cancelling the workflow still cancels the run:
+
+Bound the tool's retries first. Temporal's default retry policy has no attempt
+limit and `start_to_close_timeout` applies to each attempt, so a tool that keeps
+failing with a retryable error retries forever and the middleware never sees an
+`ActivityError`. In the tools module, give the tool a retry policy (or a
+`schedule_to_close_timeout`):
 
 ```python
+from datetime import timedelta
+
+from temporalio.common import RetryPolicy
+from temporalio.deepagents import tool_as_activity
+
+# Three attempts, then the ActivityError reaches the middleware.
+search_tool = tool_as_activity(
+    web_search,
+    start_to_close_timeout=timedelta(seconds=30),
+    activity_options={"retry_policy": RetryPolicy(maximum_attempts=3)},
+)
+```
+
+Then catch the error in the middleware. Re-raise cancellation so cancelling the
+workflow still cancels the run:
+
+```python
+from deepagents import create_deep_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
+from temporalio import workflow
 from temporalio.exceptions import ActivityError, is_cancelled_exception
+
+with workflow.unsafe.imports_passed_through():
+    from myapp.tools import search_tool
 
 
 class ReturnSearchFailuresToModel(AgentMiddleware):

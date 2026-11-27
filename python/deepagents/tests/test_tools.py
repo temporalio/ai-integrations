@@ -35,6 +35,7 @@ from temporalio.exceptions import (  # noqa: E402
     ActivityError,
     ApplicationError,
     CancelledError,
+    RetryState,
 )
 from temporalio.worker import Replayer, Worker  # noqa: E402
 from temporalio.workflow import ActivityConfig  # noqa: E402
@@ -1450,9 +1451,31 @@ async def test_middleware_hands_failed_tool_to_the_model(
         assert "source rejected" in text, text
     else:
         assert "search backend down" in text, text
+    history = await handle.fetch_history()
+    # How Temporal reached the terminal failure: a non-retryable error stops
+    # after one attempt, a retryable one runs the bounded policy to its limit.
+    # The error text alone cannot tell the two apart.
+    events = list(history.events)
+    started = {
+        e.event_id: e.activity_task_started_event_attributes
+        for e in events
+        if e.HasField("activity_task_started_event_attributes")
+    }
+    failed = [
+        e.activity_task_failed_event_attributes
+        for e in events
+        if e.HasField("activity_task_failed_event_attributes")
+    ]
+    assert len(failed) == 1, failed
+    attempt = started[failed[0].started_event_id].attempt
+    if mode == "non_retryable":
+        assert failed[0].retry_state == RetryState.NON_RETRYABLE_FAILURE, failed
+        assert attempt == 1, attempt
+    else:
+        assert failed[0].retry_state == RetryState.MAXIMUM_ATTEMPTS_REACHED, failed
+        assert attempt == _FAST_RETRY.maximum_attempts, attempt
     # The middleware rebuilds its message from the recorded ActivityError, so
     # replaying the same history must reproduce it without nondeterminism.
-    history = await handle.fetch_history()
     await Replayer(
         workflows=[FailingToolMiddlewareWorkflow], plugins=[DeepAgentsPlugin()]
     ).replay_workflow(history)
@@ -1557,3 +1580,62 @@ async def test_middleware_does_not_swallow_cancellation(
             await handle.result()
 
     assert isinstance(excinfo.value.cause, CancelledError), excinfo.value.cause
+
+
+def _activity_error(cause: BaseException, retry_state: RetryState) -> ActivityError:
+    """An ActivityError as the workflow sees it, with ``cause`` as its cause."""
+    err = ActivityError(
+        "Activity task failed",
+        scheduled_event_id=5,
+        started_event_id=6,
+        identity="test-worker",
+        activity_type="stalled_search",
+        activity_id="1",
+        retry_state=retry_state,
+    )
+    err.__cause__ = cause
+    return err
+
+
+@pytest.mark.asyncio
+async def test_middleware_reraises_cancelled_activity_error() -> None:
+    """A cancelled activity of a tool on the recovery list still propagates.
+
+    Cancelling the workflow raises ``asyncio.CancelledError``, which the hook
+    never catches, so the end-to-end test above passes without the guard. An
+    activity cancelled on its own reaches the hook as an ``ActivityError``
+    caused by ``CancelledError`` instead, and only ``is_cancelled_exception``
+    keeps the hook from handing that to the model.
+    """
+    middleware = ReturnToolFailuresToModel(["stalled_search"])
+    request = SimpleNamespace(
+        tool_call={
+            "name": "stalled_search",
+            "args": {"query": "arXiv:2601.00001"},
+            "id": "call_search",
+            "type": "tool_call",
+        }
+    )
+    cancelled = _activity_error(
+        CancelledError("Activity cancelled"), RetryState.CANCEL_REQUESTED
+    )
+
+    async def raise_cancelled(_request: Any) -> Any:
+        raise cancelled
+
+    with pytest.raises(ActivityError) as excinfo:
+        await middleware.awrap_tool_call(request, raise_cancelled)
+    assert excinfo.value is cancelled
+
+    # Same tool, a non-cancellation cause: the hook recovers it, so the
+    # propagation above comes from the cancellation guard, not the tool list.
+    async def raise_failed(_request: Any) -> Any:
+        raise _activity_error(
+            ApplicationError("source rejected", type="SourceRejected"),
+            RetryState.NON_RETRYABLE_FAILURE,
+        )
+
+    result = await middleware.awrap_tool_call(request, raise_failed)
+    assert isinstance(result, ToolMessage), result
+    assert result.status == "error", result
+    assert result.tool_call_id == "call_search", result
