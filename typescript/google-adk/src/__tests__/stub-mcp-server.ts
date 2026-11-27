@@ -6,7 +6,8 @@
  * never a JSON-RPC error frame. An unknown resource gets the JSON-RPC error a real server
  * sends for `resources/read`. `MCP_STUB_HANG` names a request method (`resources/list`,
  * `resources/read`) the server records and then never answers, so a client can only leave
- * it by cancelling.
+ * it by cancelling. `MCP_STUB_ERROR` (`<method>:<code>`) answers that method with a JSON-RPC
+ * error of that code.
  */
 
 import { appendFileSync } from 'node:fs';
@@ -55,6 +56,11 @@ function handle(message: JsonRpcMessage): void {
     return;
   }
   if (message.id === undefined) return;
+  const [failingMethod, errorCode] = (process.env.MCP_STUB_ERROR ?? '').split(':');
+  if (message.method === failingMethod) {
+    replyError(message.id, Number(errorCode), `stub rejected ${message.method}`);
+    return;
+  }
   if (message.method === process.env.MCP_STUB_HANG) {
     record(message.method);
     return;

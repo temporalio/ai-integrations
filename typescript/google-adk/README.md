@@ -256,6 +256,12 @@ reconnecting in the background, one per failed attempt
 ([modelcontextprotocol/typescript-sdk#3193](https://github.com/modelcontextprotocol/typescript-sdk/issues/3193)).
 Prefer `StreamableHTTPConnectionParams` where the server supports it.
 
+When the MCP server rejects a request with a JSON-RPC parse error (`-32700`),
+invalid request (`-32600`), method not found (`-32601`) or invalid params
+(`-32602`), including during the handshake, the Activity's
+`MCP_ERROR_FAILURE_TYPE` (`GoogleAdkMCPError`) failure is non-retryable. Other
+MCP and transport errors are retried.
+
 Gate the toolset's tools behind human approval with
 `requireConfirmation` — see [Durable human-in-the-loop](#durable-human-in-the-loop).
 

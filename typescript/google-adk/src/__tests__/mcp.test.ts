@@ -43,10 +43,10 @@ type CallToolActivity = (args: {
   args: Record<string, unknown>;
 }) => Promise<{ content: unknown; isError?: boolean }>;
 
-function stubServerConnectionParams(log: string): MCPConnectionParams {
+function stubServerConnectionParams(log: string, env: Record<string, string> = {}): MCPConnectionParams {
   return {
     type: 'StdioConnectionParams',
-    serverParams: { command: process.execPath, args: [stubServerPath], env: { MCP_STUB_LOG: log } },
+    serverParams: { command: process.execPath, args: [stubServerPath], env: { MCP_STUB_LOG: log, ...env } },
   };
 }
 
@@ -320,6 +320,34 @@ test.serial('unknownToolAgainstConnectionParamsCompletesWithIsError', async (t) 
   t.deepEqual(result.content, [{ type: 'text', text: 'MCP error -32602: Tool does-not-exist not found' }]);
   t.deepEqual(stubServerRecords(log), ['open', 'tools/call', 'close']);
 });
+
+for (const [rejected, code, nonRetryable] of [
+  ['initialize', -32602, true],
+  ['tools/call', -32700, true],
+  ['tools/call', -32600, true],
+  ['tools/call', -32601, true],
+  ['tools/call', -32602, true],
+  ['tools/call', -32603, false],
+] as const) {
+  test.serial(`mcpErrorRetryability ${rejected} ${code}`, async (t) => {
+    const log = path.join(os.tmpdir(), `${uid('adk-mcp-protocol-error')}.log`);
+    t.teardown(() => rmSync(log, { force: true }));
+    const activities = createMCPActivities({
+      testServer: () => stubServerConnectionParams(log, { MCP_STUB_ERROR: `${rejected}:${code}` }),
+    });
+
+    const failure = await t.throwsAsync(
+      new MockActivityEnvironment().run(activities['testServer-callTool'] as CallToolActivity, {
+        toolName: 'echo',
+        args: { value: 'hi' },
+      }),
+      { instanceOf: ApplicationFailure }
+    );
+
+    t.is(failure?.type, MCP_ERROR_FAILURE_TYPE);
+    t.is(failure?.nonRetryable, nonRetryable);
+  });
+}
 
 test.serial('respectsCallerActivitySummary', async (t) => {
   const env = getEnv();
