@@ -233,10 +233,16 @@ Gemini API for a model named `fast`.
   and is not retried. The plugin counts an error as the tool's own when it
   wraps no other error and is not an `ApplicationError`. ADK's MCP tools wrap
   the error of a failed MCP request, so that error fails `CallMcpTool` with a
-  retryable `googleadk.McpError`, as does an error returned after the Worker
-  stops the call. To have a failure in your own toolset or a `FakeMCPServer`
-  handler retried, wrap its cause with `%w` or return a retryable
-  `temporal.ApplicationError`.
+  `googleadk.McpError`, as does an error returned after the Worker stops the
+  call. A failed MCP request, whether it lists or calls tools, is retried
+  unless the server answered with a JSON-RPC error that a retry cannot fix:
+  parse error, invalid request, method not found, invalid params, header
+  mismatch, missing required client capability, unsupported protocol version
+  or URL elicitation required. Internal errors, other codes, transport errors
+  and a lost session (invalid request with no data and the message
+  `Session not found` or `Session terminated`) stay retryable. To have a
+  failure in your own toolset or a `FakeMCPServer` handler retried, wrap its
+  cause with `%w` or return a retryable `temporal.ApplicationError`.
 
   - The toolset lists its tools once per model step and preserves the command
     order and UUID consumption of Histories recorded with earlier ADK releases.

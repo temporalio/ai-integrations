@@ -8,6 +8,8 @@ import (
 	"sync"
 	"weak"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
 
@@ -569,7 +571,7 @@ func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*gena
 	}
 	tools, err := ts.Tools(newActivityToolContext(ctx, contextSnapshot{}))
 	if err != nil {
-		return nil, newApplicationError(ErrorTypeMCP, true, err,
+		return nil, newApplicationError(ErrorTypeMCP, mcpRetryable(err), err,
 			"list tools for MCP toolset %q: %v", in.Toolset, err)
 	}
 	decls := make([]*genai.FunctionDeclaration, 0, len(tools))
@@ -594,9 +596,10 @@ func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*gena
 // ApplicationError, also goes in the output, so the model sees it once, as it
 // does without Temporal. ADK's MCP tools return an isError result (and, before
 // ADK v2.4.0, a result with no text) that way. They wrap the error of a failed
-// MCP request, which still fails the Activity with a retryable McpError, as
-// does an error returned after the Activity's context is done, such as when
-// the Worker stops. An ApplicationError returned as is fails the Activity with
+// MCP request, which still fails the Activity with an McpError, retryable
+// unless mcpRetryable rejects its JSON-RPC code. An error returned after the
+// Activity's context is done, such as when the Worker stops, also fails the
+// Activity. An ApplicationError returned as is fails the Activity with
 // its own type and retryability; wrapped in another error, it fails as a
 // retryable wrapError.
 func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCallOutput, error) {
@@ -612,7 +615,7 @@ func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCall
 	tctx := newActivityToolContext(ctx, in.Ctx)
 	tools, err := ts.Tools(tctx)
 	if err != nil {
-		return nil, newApplicationError(ErrorTypeMCP, true, err,
+		return nil, newApplicationError(ErrorTypeMCP, mcpRetryable(err), err,
 			"list tools for MCP toolset %q: %v", in.Toolset, err)
 	}
 	for _, t := range tools {
@@ -649,12 +652,45 @@ func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCall
 				msg := runErr.Error()
 				return &mcpCallOutput{Result: map[string]any{"error": msg}, Error: &msg}, nil
 			}
-			return nil, classifyToolError(ErrorTypeMCP, in.Tool, runErr)
+			return nil, classifyMCPToolError(in.Tool, runErr)
 		}
 		return &mcpCallOutput{Result: res}, nil
 	}
 	return nil, newApplicationError(ErrorTypeMCP, false, nil,
 		"tool %q not found in MCP toolset %q", in.Tool, in.Toolset)
+}
+
+// classifyMCPToolError is classifyToolError for an MCP tool call, which also
+// fails without retry on a protocol error that mcpRetryable rejects.
+func classifyMCPToolError(name string, err error) error {
+	var appErr interface{ NonRetryable() bool }
+	if !errors.As(err, &appErr) && !mcpRetryable(err) {
+		return newApplicationError(ErrorTypeMCP, false, err, "tool %q failed: %v", name, err)
+	}
+	return classifyToolError(ErrorTypeMCP, name, err)
+}
+
+// mcpRetryable reports whether a retry of a failed MCP request can succeed. It
+// cannot for a JSON-RPC error that rejects the request itself. INTERNAL_ERROR,
+// unknown codes, transport errors and a lost session stay retryable.
+func mcpRetryable(err error) bool {
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) {
+		return true
+	}
+	switch rpcErr.Code {
+	case jsonrpc.CodeInvalidRequest:
+		// A server that no longer knows the session, for example after a
+		// restart, may say so only with this code, no data and one of these
+		// messages.
+		return len(rpcErr.Data) == 0 &&
+			(rpcErr.Message == "Session not found" || rpcErr.Message == "Session terminated")
+	case jsonrpc.CodeParseError, jsonrpc.CodeMethodNotFound, jsonrpc.CodeInvalidParams,
+		mcp.CodeHeaderMismatch, mcp.CodeMissingRequiredClientCapabilities,
+		mcp.CodeUnsupportedProtocolVersion, mcp.CodeURLElicitationRequired:
+		return false
+	}
+	return true
 }
 
 // isToolAnswer reports whether err, returned by an MCP tool's Run, is the
