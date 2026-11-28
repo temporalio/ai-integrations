@@ -1,7 +1,6 @@
 import asyncio
 import contextvars
 import functools
-import inspect
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -42,6 +41,7 @@ from temporalio.converter import ActivitySerializationContext
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
+    CancelledError,
     is_cancelled_exception,
 )
 from temporalio.service import RPCError, RPCStatusCode
@@ -532,6 +532,12 @@ def _handle_worker_failure(func: Callable) -> Callable:
     return wrapper
 
 
+_SESSION_ENDED_MESSAGE = (
+    "The stateful MCP session activity has ended, so no worker serves "
+    "this toolset's operations."
+)
+
+
 def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
     cause = None if session.cancelled() else session.exception()
     if session.cancelled() or (cause is not None and is_cancelled_exception(cause)):
@@ -541,10 +547,7 @@ def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
             "block."
         )
     else:
-        message = (
-            "The stateful MCP session activity has ended, so no worker serves "
-            "this toolset's operations."
-        )
+        message = _SESSION_ENDED_MESSAGE
     failure = ApplicationError(message, type="DedicatedWorkerFailure")
     failure.__cause__ = cause
     return failure
@@ -1229,59 +1232,31 @@ class TemporalStatefulMcpToolSet(BaseToolset):
     async def cleanup(self) -> None:
         """Cancels the dedicated session activity and awaits its teardown.
 
-        If the session activity ended on its own, raises
+        If the session activity had already failed on its own, raises
         ``ApplicationError(type="DedicatedWorkerFailure")`` with the session's
-        ``ActivityError`` as its cause, as tool calls and ``get_tools`` inside
-        the block do. If the session ended in the workflow task that runs this
-        cleanup, the SDK drops its result when it is cancelled, so the error
-        has no cause; and if a cancellation, such as a workflow cancel or an
-        ``asyncio.timeout``, is then leaving the ``async with`` block, the
-        cancellation leaves it instead.
+        ``ActivityError`` as its cause. If the task invoking cleanup is
+        cancelled during teardown, re-raises ``asyncio.CancelledError``.
         """
-        await self._cleanup(cancelling=False)
+        if not self._connect_handle:
+            return
 
-    async def _cleanup(self, *, cancelling: bool) -> None:
-        if self._connect_handle:
-            session = self._connect_handle
-            # Decide before cancelling whether the session's task ever ran: a
-            # session cancelled before it started ends cancelled, and so does
-            # one that ended on its own in this workflow task, because the SDK
-            # drops its result when it is cancelled.
-            coro = session.get_coro()
-            started = not (
-                inspect.iscoroutine(coro)
-                and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
-            )
-            current = asyncio.current_task()
-            cancels = current.cancelling() if current else 0
-            session.cancel()
-            try:
-                await session
-            except asyncio.CancelledError:
-                if not session.cancelled() or (
-                    current and current.cancelling() > cancels
-                ):
-                    # A cancellation of this coroutine itself.
-                    raise
-                if not started or cancelling:
-                    # Never ran, or a cancellation already leaving the block
-                    # wins over the result the SDK dropped.
-                    return
-                # The session ended in this workflow task, and the SDK dropped
-                # its failure when it was cancelled.
+        try:
+            self._connect_handle.cancel()
+            await asyncio.shield(self._connect_handle)
+        except ActivityError as e:
+            if not isinstance(
+                e.cause, CancelledError
+            ):  # Re-raise if the activity had already failed
                 raise ApplicationError(
-                    "The stateful MCP session activity has ended, so no worker "
-                    "serves this toolset's operations.",
-                    type="DedicatedWorkerFailure",
-                ) from None
-            except Exception as e:
-                if is_cancelled_exception(e):
-                    return
-                if isinstance(e, ActivityError):
-                    raise _session_ended_failure(session) from e
+                    _SESSION_ENDED_MESSAGE, type="DedicatedWorkerFailure"
+                ) from e
+        except asyncio.CancelledError:
+            if (
+                not self._connect_handle.cancelled()
+            ):  # Re-raise if the task that invoked cleanup is cancelled
                 raise
-            finally:
-                self._connect_handle = None
+        finally:
+            self._connect_handle = None
 
     async def close(self) -> None:
         """``BaseToolset`` teardown hook; delegates to :meth:`cleanup`."""
@@ -1299,9 +1274,7 @@ class TemporalStatefulMcpToolSet(BaseToolset):
         traceback: TracebackType | None,
     ) -> None:
         """Cleans up the toolset when exiting the context manager."""
-        await self._cleanup(
-            cancelling=exc_value is not None and is_cancelled_exception(exc_value)
-        )
+        await self.cleanup()
 
     @_handle_worker_failure
     async def get_tools(
