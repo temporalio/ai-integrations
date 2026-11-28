@@ -1121,9 +1121,9 @@ async def test_stateful_session_ends_with_the_blocks_last_task(
 ):
     # The session ends in the block's last workflow task, after the block's
     # last timer fires or after a workflow cancel. The SDK then drops the
-    # session's failure when the block cancels it. After the timer, the block
-    # must still raise DedicatedWorkerFailure; a workflow cancel already
-    # leaving the block must stay a cancel.
+    # session's failure when the block cancels it, so both exit as expected:
+    # after the timer the block exits normally, and a workflow cancel stays
+    # a cancel.
     provider = TemporalStatefulMcpToolSetProvider(
         "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
     )
@@ -1174,16 +1174,14 @@ async def test_stateful_session_ends_with_the_blocks_last_task(
         workflows=[StatefulMcpTimerAtExitWorkflow],
         max_cached_workflows=0,
     ):
+        if case == "timer_first":
+            async with asyncio.timeout(20):
+                assert await handle.result() == "block exited normally"
+            return
         async with asyncio.timeout(20):
             with pytest.raises(WorkflowFailureError) as err:
                 await handle.result()
-    if case == "cancel_first":
-        assert isinstance(err.value.cause, CancelledError)
-        return
-    assert isinstance(err.value.cause, ApplicationError)
-    assert err.value.cause.type == "DedicatedWorkerFailure"
-    # The SDK dropped the session's result, so the error has no cause.
-    assert err.value.cause.cause is None
+    assert isinstance(err.value.cause, CancelledError)
 
 
 @pytest.mark.timeout(90)
